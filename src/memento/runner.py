@@ -281,7 +281,10 @@ def connect_drive(service, *, port=0, timeout=600):
                         400: 'Drive authorization was rejected.',
                         409: 'Drive authorization is pending or conflicts with the original connection.',
                         410: expired,
-                        503: 'Drive authorization is not configured or available.',
+                        503: ('Drive authorization is not configured or available. '
+                              'Provision the original Desktop client, intended account and existing folder '
+                              'through the service-owner helper before requesting a consent link. '
+                              f'Installing-agent instructions: {service.base_url}/connect'),
                     }.get(error.code, failure)
                     if error.code == 409:
                         # Only recognize this fixed service outcome; never echo error bodies.
@@ -654,6 +657,8 @@ def setup(args):
             run_process(['systemctl', '--user', 'enable', '--now', 'memento-runner.timer'], timeout=30)
         print('Server runner configured; timer ' + ('not activated.' if args.no_activate else 'activated.'))
     print(native.get('notice') or 'Reload native integrations, then verify Memento capture and recall.')
+    print('Native setup does not connect Google Drive. For Drive prerequisites and consent: '
+          + args.url.rstrip('/') + '/connect')
     return config_path
 
 

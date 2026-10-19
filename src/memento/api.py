@@ -463,11 +463,28 @@ from which you fetched this guide, not the public product website.
    alone is not a connected result. Report any actual permission/reload blocker
    precisely instead of claiming success.
 
-Google Drive is service-wide, not a separate grant for each agent. If needed,
-the agent on the human's browser device runs runner.py drive-connect --url
-SERVICE_ORIGIN and gives the human the printed official Google consent link.
-The human chooses the intended account and approves; the runner and service
-finish the connection. Never read or copy private Google credential files.
+Google Drive is optional and service-wide, not a separate grant for each agent.
+Native setup, a healthy API, the public website and Google branding do not mean
+Drive is connected. Complete these steps when the human requests Drive:
+1. On the human's browser device run runner.py drive-connect --url SERVICE_ORIGIN.
+   An already-connected service needs no new credential lookup. If a Google
+   link is printed, keep the helper running, let the human approve drive.file,
+   and await verified success. Only an unavailable-authorization error sends
+   you to the provisioning steps below; never present that error as a link.
+2. On the SERVICE HOST, the service owner provisions the original Desktop
+   client, intended account and existing app-created folder with:
+   memento-drive configure --client-json PRIVATE_CLIENT_PATH --account EMAIL
+   --folder-id EXISTING_FOLDER_ID --data-dir DATA_DIR
+   Look in the human's authorized credential store first; an Infisical
+   deployment may use MEMENTO_GOOGLE_DESKTOP_CLIENT_JSON. Install its CLI if
+   missing and surface only its required human login. Reuse original binding
+   metadata; ask only for metadata not available. Do not repeat Google Console
+   setup or create a replacement client or folder.
+3. Use explicitly authorized credential-manager injection into the owner
+   helper; never display secret values, move token files, share the service
+   identity or elevate privileges. If owner approval is missing, pause.
+   After provisioning, retry step 1 on the browser device. Only verified
+   service activation and a successful helper exit mean Drive is connected.
 """,
             media_type='text/plain', headers={'Cache-Control': 'no-store'})
 

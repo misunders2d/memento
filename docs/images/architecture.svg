@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 620" role="img" aria-labelledby="title desc" style="color-scheme:light dark">
+  <title id="title">Memento architecture and trust boundaries</title>
+  <desc id="desc">Ordinary-user native agents send raw conversations to a private service under a separate identity. Local retrieval injects relevant cited memories into new prompts. One native processor extracts candidates using its existing login. Nightly consolidation promotes supported memories. Optional Google Drive holds cold artifacts and owner-requested backups.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 9 5 1 9" fill="none" stroke="currentColor" stroke-width="1.5"/></marker>
+    <style>
+      text { fill:currentColor; font-family:system-ui,-apple-system,sans-serif; font-size:15px }
+      .heading { font-size:23px; font-weight:650 }
+      .label { font-size:17px; font-weight:650 }
+      .small { font-size:14px; opacity:.72 }
+      .zone { fill:none; stroke:currentColor; stroke-opacity:.24; stroke-dasharray:5 5 }
+      .box { fill:none; stroke:currentColor; stroke-opacity:.55; stroke-width:1.2 }
+      .flow { fill:none; stroke:currentColor; stroke-opacity:.72; stroke-width:1.5; marker-end:url(#arrow) }
+    </style>
+  </defs>
+  <text class="heading" x="20" y="30">A shared memory. Separate trust boundaries.</text>
+  <rect class="zone" x="20" y="88" width="272" height="482" rx="14"/>
+  <rect class="zone" x="340" y="88" width="600" height="482" rx="14"/>
+  <text class="label" x="40" y="117">Native host · ordinary user</text>
+  <text class="label" x="370" y="117">Private service · dedicated identity</text>
+  <rect class="box" x="40" y="145" width="232" height="86" rx="10"/>
+  <text class="label" x="56" y="173">Your native agents</text>
+  <text x="56" y="198">Pi · OMP · Claude · Codex</text>
+  <text class="small" x="56" y="219">Capture + automatic recall</text>
+  <rect class="box" x="370" y="145" width="230" height="86" rx="10"/>
+  <text class="label" x="386" y="173">Raw evidence</text>
+  <text x="386" y="198">SQLite + original artifacts</text>
+  <text class="small" x="386" y="219">Exact text, sources and offsets</text>
+  <rect class="box" x="670" y="145" width="240" height="86" rx="10"/>
+  <text class="label" x="686" y="173">Semantic retrieval</text>
+  <text x="686" y="198">Local embedding model</text>
+  <text class="small" x="686" y="219">Citations + unconfirmed labels</text>
+  <path class="flow" d="M272 181H370"/>
+  <text class="small" x="282" y="167">capture</text>
+  <path class="flow" d="M600 181H670"/>
+  <text class="small" x="608" y="167">index</text>
+  <path class="flow" d="M790 231V278H156V231"/>
+  <text class="small" x="295" y="265">Relevant memories into the next prompt</text>
+  <text class="small" x="56" y="310">Raw user text stays original.</text>
+  <rect class="box" x="40" y="350" width="232" height="114" rx="10"/>
+  <text class="label" x="56" y="379">One native processor</text>
+  <text x="56" y="405">Pi, OMP or Claude</text>
+  <text class="small" x="56" y="429">Existing login · queued jobs</text>
+  <text class="small" x="56" y="450">Tool-free model calls</text>
+  <rect class="box" x="370" y="350" width="230" height="114" rx="10"/>
+  <text class="label" x="386" y="379">Candidate memories</text>
+  <text x="386" y="405">Backed by raw source spans</text>
+  <text class="small" x="386" y="429">Visible before promotion</text>
+  <text class="small" x="386" y="450">30 min inactive / compaction</text>
+  <rect class="box" x="670" y="350" width="240" height="114" rx="10"/>
+  <text class="label" x="686" y="379">Durable memories</text>
+  <text x="686" y="405">Consolidated + versioned</text>
+  <text class="small" x="686" y="429">02:00–07:00 local window</text>
+  <text class="small" x="686" y="450">Human review when required</text>
+  <path class="flow" d="M272 395H370"/>
+  <text class="small" x="283" y="381">extract</text>
+  <path class="flow" d="M600 395H670"/>
+  <text class="small" x="607" y="381">night</text>
+  <text class="small" x="56" y="501">Model usage follows your</text>
+  <text class="small" x="56" y="522">native provider's terms.</text>
+  <rect class="box" x="370" y="491" width="540" height="59" rx="10"/>
+  <text class="label" x="386" y="515">Optional Google Drive · app-owned folder</text>
+  <text class="small" x="386" y="537">Cold artifacts + owner-requested backups · plaintext copies</text>
+  <text class="small" x="20" y="603">Loopback or restricted tailnet HTTPS only. The public information website is separate.</text>
+</svg>
