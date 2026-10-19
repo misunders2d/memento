@@ -326,6 +326,7 @@ Drive copies are **plaintext**, and retained versions consume quota. Protect loc
 | API is healthy, but no memory appears | Verify actual native capture first; then compaction/30-minute inactivity, the single processor's journal, and candidate history. |
 | A candidate is not durable yet | Check the configured timezone, real night window, candidate boundary and review/deferral decision. Do not force a tick to claim normal schedule acceptance. |
 | Timer ran, but extraction did not finish | Inspect the native CLI's existing login/default model and safety-flag refusal. Failed work remains pending; do not bypass tools-zero requirements. |
+| Processing exits 1, but the journal shows only backlog counts | Before recreating the container, inspect `docker compose logs --since 30m memory` for a backend traceback. Preserve pending work and original evidence; do not force promotion or bypass validation. |
 | Native setup worked, but Drive did not connect | Run `drive-connect`; only verified activation proves a grant. Missing bootstrap requires service-owner provisioning, not a replacement OAuth client. |
 | Remote MCP/HTTP is rejected | Check the exact allowed tailnet hostname, HTTPS and ACLs. Do not disable host protection or expose the API publicly. |
 | Reinstalling another harness | Keep the server config; select a distinct private client config and retain its existing identity. |

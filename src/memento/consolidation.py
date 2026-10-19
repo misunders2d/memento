@@ -201,8 +201,8 @@ class Consolidator:
                 if self.graph._node(target)['version'] != snapshot['version']:
                     raise ConflictError('Consolidation graph context changed; derive a fresh plan')
             for target, snapshot in edges.items():
-                current = db.execute('SELECT version FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1', (target,)).fetchone()
-                if current['version'] != snapshot['version']:
+                current_edge = db.execute('SELECT version FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1', (target,)).fetchone()
+                if current_edge['version'] != snapshot['version']:
                     raise ConflictError('Consolidation relation context changed; derive a fresh plan')
             results = {}
             actions = sorted(plan.actions, key=lambda item: (

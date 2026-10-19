@@ -589,3 +589,50 @@ def test_promotion_preserves_committed_citation_usage_and_feedback(tmp_path, nod
         assert tuple(feedback) == (expected, expected)
     finally:
         store.close()
+
+
+def test_night_promotion_with_existing_relations_preserves_loop_and_evidence(tmp_path):
+    store = Store(tmp_path)
+    try:
+        graph = Graph(store)
+        processing = Processing(graph)
+        text = 'HarborGlass needs a report for release.'
+        quote = 'HarborGlass needs a report'
+        episode, _ = store.capture(dict(source='related-promotion', event_id='report',
+            conversation_id='c', kind='user', text=text, occurred_at=None, metadata={}))
+        evidence = [dict(episode_id=episode['id'], quote=text)]
+        nodes = [graph.remember(command_id=f'known-{index}', actor='user',
+            why='Explicit existing source assertion', type='knowledge', text=value,
+            scope=['professional'], evidence=evidence)['id']
+            for index, value in enumerate((quote, text))]
+        edge = graph.link(command_id='known-relation', actor='user', why='Related source assertions',
+            a=nodes[0], rel='related_to', b=nodes[1], evidence=evidence)['id']
+        relation_before = graph.history(edge)
+        args = dict(agent='fixture', timezone_name='UTC',
+                    now=datetime(2030, 1, 1, 3, tzinfo=timezone.utc))
+        task = processing.claim(**args,
+            compaction=dict(source='related-promotion', conversation_id='c'))['work'][0]
+        fact = draft('report', 'memory', 'knowledge', quote, quote)
+        fact['open_loop'] = True
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+            output=dict(windows=[dict(id=task['input']['windows'][0]['id'], candidates=[fact])]))
+        task = processing.claim(**args)['work'][0]
+        assert [item['id'] for item in task['input']['existing_relations']] == [edge]
+        candidate = task['input']['candidates'][0]
+        action = dict(candidate_id=candidate['id'], operation='remember', type='knowledge',
+            text=quote, scope=['professional'], open_loop=True, target=None,
+            src=None, dst=None, relation=None, change_kind=None, valid_at=None,
+            valid_from=None, valid_to=None, category=None, sensitive=None,
+            evidence=[dict(episode_id=episode['id'], quote=quote, occurrence=None)],
+            why='Promote the explicitly supported pending report')
+        result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+                                     output=dict(actions=[action]))
+        target = result['results'][candidate['id']]['id']
+        history = graph.history(target)
+        assert history[0]['text'] == quote
+        assert history[0]['evidence'][0]['quote'] == quote
+        assert [item['id'] for item in graph.loop(action='list')['loops']] == [target]
+        assert graph.history(edge) == relation_before
+        assert processing.queue.get(task['id'])['state'] == 'done'
+    finally:
+        store.close()
