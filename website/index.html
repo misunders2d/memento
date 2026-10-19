@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Memento is a self-hosted memory system for personal AI assistants. Keep the original evidence, recall what matters, and stay in control."
+    />
+    <meta name="theme-color" content="#f5f4ed" />
+    <title>Memento — Memory with a paper trail</title>
+    <link rel="canonical" href="https://memento.bezosapp.uk/" />
+    <link rel="icon" href="/assets/memento.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/site.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="wordmark" href="/" aria-label="Memento home"
+        ><svg viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M8 6h14v20H8zM4 10v20h14M12 12h6M12 16h6M12 20h4" /></svg
+        >Memento<span class="wordmark-dot">.</span></a
+      >
+      <nav aria-label="Main navigation">
+        <a href="#how-it-works">How it works</a><a href="/privacy/">Privacy</a
+        ><a class="source-link" href="https://github.com/misunders2d/memento"
+          >Source <span aria-hidden="true">↗</span></a
+        >
+      </nav>
+    </header>
+    <main id="main">
+      <section class="hero wrap" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">
+            <span class="small-line" aria-hidden="true"></span> A memory system
+            for your personal assistant
+          </p>
+          <h1 id="hero-title">
+            Remember what matters.<br /><em>Know where it came from.</em>
+          </h1>
+          <p class="hero-description">
+            Conversations move on. The useful details shouldn’t disappear with
+            them. Memento gives your AI assistant a lasting memory, with the
+            original evidence always attached.
+          </p>
+          <div class="hero-actions">
+            <a
+              class="button"
+              href="https://github.com/misunders2d/memento/blob/main/AGENTS.md"
+              >Read the setup guide <span aria-hidden="true">↗</span></a
+            ><a class="text-link" href="#how-it-works"
+              >Take a closer look <span aria-hidden="true">↓</span></a
+            >
+          </div>
+          <p class="hero-note">
+            Self-hosted. Evidence-backed. Your instance, your data.
+          </p>
+        </div>
+        <figure class="memory-figure">
+          <figcaption class="figure-heading">
+            <span class="eyebrow">From conversation to context</span
+            ><span class="example-label">Illustrative example</span>
+          </figcaption>
+          <div class="source-record">
+            <p class="record-label">
+              <span class="record-number">01</span> Original conversation
+            </p>
+            <blockquote>
+              “For the Juniper test project, the release checklist is in the
+              amber folder.”
+            </blockquote>
+            <p class="record-meta">User message · exact source text retained</p>
+          </div>
+          <div class="record-connector" aria-hidden="true"><span></span>↓</div>
+          <div class="memory-record">
+            <p class="record-label">
+              <span class="record-number">02</span> A useful memory
+            </p>
+            <p class="remembered-text">
+              Juniper’s release checklist lives in the amber folder.
+            </p>
+            <div class="record-bottom">
+              <span class="scope-label">Professional</span
+              ><span
+                >Linked to its original evidence
+                <span aria-hidden="true">↗</span></span
+              >
+            </div>
+          </div>
+          <p class="figure-note">
+            Not a live memory. A small example of the provenance Memento keeps.
+          </p>
+        </figure>
+      </section>
+      <div class="integration-strip wrap">
+        <p>Fits the way you already work</p>
+        <div class="integration-names" aria-label="Native agent integrations">
+          <span>Pi</span><span>OMP</span><span>Claude</span
+          ><span>Codex<span class="footnote-mark">*</span></span>
+        </div>
+        <p class="integration-note">
+          * Codex capture and recall require native consent. Its server
+          processor stays disabled unless the tool-free prerequisite is
+          resolved.
+        </p>
+      </div>
+      <section
+        class="how-section wrap section-rule"
+        id="how-it-works"
+        aria-labelledby="how-title"
+      >
+        <div class="section-heading">
+          <p class="eyebrow">Less re-explaining. More continuity.</p>
+          <h2 id="how-title">
+            A memory should be useful.<br />And accountable.
+          </h2>
+          <p>
+            Memento keeps raw history and derived memories distinct. You can
+            retrieve the useful detail without losing the conversation that
+            supports it.
+          </p>
+        </div>
+        <ol class="process-list">
+          <li>
+            <span class="process-number" aria-hidden="true">01 /</span>
+            <div>
+              <h3>Keep the original</h3>
+              <p>
+                Native integrations capture conversation records. Imported
+                histories use stable identities, so repeating an import doesn’t
+                create another copy of the same event.
+              </p>
+            </div>
+          </li>
+          <li>
+            <span class="process-number" aria-hidden="true">02 /</span>
+            <div>
+              <h3>Find the relevant detail</h3>
+              <p>
+                Recall combines semantic search with exact source evidence.
+                Personal and professional scopes help keep context focused.
+                Unconfirmed candidates remain distinguishable from confirmed
+                memories.
+              </p>
+            </div>
+          </li>
+          <li>
+            <span class="process-number" aria-hidden="true">03 /</span>
+            <div>
+              <h3>See what changed</h3>
+              <p>
+                Corrections and refinements preserve history, reasons and
+                supporting quotes. Follow-ups are reactive markers—not an
+                autonomous agent making promises on your behalf.
+              </p>
+            </div>
+          </li>
+        </ol>
+      </section>
+      <section
+        class="control-section wrap section-rule"
+        aria-labelledby="control-title"
+      >
+        <div>
+          <p class="eyebrow">A public website. Not a public memory.</p>
+          <h2 id="control-title">
+            Private by architecture.<br />Not by wishful thinking.
+          </h2>
+        </div>
+        <div class="control-copy">
+          <p>
+            Your memory service runs on your infrastructure. This website is an
+            introduction: it does not expose a memory database, a search
+            endpoint or an account portal.
+          </p>
+          <p>
+            Google Drive is an optional archive and recovery destination.
+            Memento requests <code>drive.file</code> access for its
+            app-accessible files, not blanket access to your Drive. Backups are
+            requested by the owner, not silently scheduled.
+          </p>
+          <a class="text-link" href="/privacy/"
+            >Read the data and privacy details
+            <span aria-hidden="true">↗</span></a
+          >
+        </div>
+      </section>
+      <section class="closing-section wrap">
+        <p class="eyebrow">Keep the context. Keep the evidence.</p>
+        <h2>Give your assistant<br />something to remember.</h2>
+        <a
+          class="button"
+          href="https://github.com/misunders2d/memento/blob/main/AGENTS.md"
+          >Explore Memento on GitHub <span aria-hidden="true">↗</span></a
+        >
+      </section>
+    </main>
+    <footer class="site-footer wrap">
+      <a class="footer-brand" href="/">Memento.</a>
+      <p>Memory for a personal AI assistant.</p>
+      <nav aria-label="Footer navigation">
+        <a href="/privacy/">Privacy</a><a href="/terms/">Terms</a
+        ><a href="https://github.com/misunders2d/memento/issues">Contact</a>
+      </nav>
+      <span class="footer-year">© 2026 Memento</span>
+    </footer>
+  </body>
+</html>

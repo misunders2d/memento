@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="How Memento handles conversation records, memories, Google Drive files, backups and your choices."
+    />
+    <meta name="theme-color" content="#f5f4ed" />
+    <title>Privacy — Memento</title>
+    <link rel="canonical" href="https://memento.bezosapp.uk/privacy/" />
+    <link rel="icon" href="/assets/memento.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/site.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="wordmark" href="/" aria-label="Memento home"
+        ><svg viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M8 6h14v20H8zM4 10v20h14M12 12h6M12 16h6M12 20h4" /></svg
+        >Memento<span class="wordmark-dot">.</span></a
+      >
+      <nav class="legal-nav" aria-label="Main navigation">
+        <a href="/#how-it-works">How it works</a
+        ><a href="/privacy/" aria-current="page">Privacy</a
+        ><a href="https://github.com/misunders2d/memento"
+          >Source <span aria-hidden="true">↗</span></a
+        >
+      </nav>
+    </header>
+    <main class="legal-main wrap" id="main">
+      <p class="eyebrow">Your data, without the fine-print fog</p>
+      <h1>Privacy policy</h1>
+      <p class="legal-intro">
+        Memento is a self-hosted memory system for personal AI assistants. This
+        policy describes the public website and the data handled by a Memento
+        installation, including its optional Google Drive integration.
+      </p>
+      <p class="updated">Last updated: 19 October 2026</p>
+      <div class="legal-summary">
+        <p>
+          <strong>The short version.</strong> This public website does not let
+          visitors search private memories or connect a Google account. A
+          Memento installation stores conversation evidence and derived memories
+          on its operator’s infrastructure. Google Drive is optional and uses
+          file-limited access.
+        </p>
+      </div>
+      <section aria-labelledby="website-data">
+        <h2 id="website-data">1. This public website</h2>
+        <p>
+          The pages on <strong>memento.bezosapp.uk</strong> provide product,
+          setup and policy information. They contain no analytics scripts,
+          advertising trackers, third-party fonts or memory database connection.
+          The site does not set application cookies or provide a sign-in form.
+        </p>
+        <p>
+          The hosting and network providers may process ordinary connection
+          information, such as IP addresses, request paths, browser information
+          and access times, to deliver HTTPS traffic and operate or secure the
+          service. Their infrastructure practices are separate from the absence
+          of tracking code on these pages.
+        </p>
+      </section>
+      <section aria-labelledby="memory-data">
+        <h2 id="memory-data">2. Data in a Memento installation</h2>
+        <p>
+          When its native integration is enabled, Memento captures conversation
+          records and associated source, conversation and time metadata.
+          Explicit history import processes the local files selected by the
+          operator. The system can also store submitted artifacts, including
+          images, audio, video and documents.
+        </p>
+        <p>
+          Processing may derive memories, scope labels, relationships and
+          follow-up markers from that evidence. These records can include
+          original quotes, source offsets, change history and known
+          processing-model or usage metadata. Raw evidence and derived
+          assertions remain distinct.
+        </p>
+        <p>
+          This information is used for the installation’s memory capture,
+          retrieval, provenance, correction, follow-up, archival and recovery
+          features. The public website does not publish it.
+        </p>
+      </section>
+      <section aria-labelledby="google-drive">
+        <h2 id="google-drive">3. Optional Google Drive access</h2>
+        <p>
+          The Google Drive integration is connected through an explicit Google
+          consent flow. Memento requests the
+          <code>https://www.googleapis.com/auth/drive.file</code> scope. It does
+          not request blanket access to all files in your Google Drive.
+        </p>
+        <ul>
+          <li>
+            <strong>Account verification:</strong> Memento verifies that the
+            connected Google account matches the account specified during setup.
+          </li>
+          <li>
+            <strong>Dedicated storage:</strong> it creates its own Memento
+            folder and app-accessible files for cold archives and
+            owner-requested backups.
+          </li>
+          <li>
+            <strong>Archive and recovery:</strong> it uploads, retrieves and
+            verifies those artifacts and backup snapshots to support the
+            installation’s storage and recovery features.
+          </li>
+        </ul>
+        <p>
+          A private connection file retains the authorization information
+          required for future access, together with the verified account and
+          folder identity. The installation protects that file with
+          owner-private filesystem permissions. It must not be committed to
+          source control or shared through this website.
+        </p>
+        <p>
+          Google API information is used to deliver Memento’s user-facing
+          memory, archive and recovery features, not to sell data or target
+          advertisements. Memento’s use and transfer of information received
+          from Google APIs must adhere to the
+          <a
+            href="https://developers.google.com/terms/api-services-user-data-policy"
+            >Google API Services User Data Policy</a
+          >, including its Limited Use requirements.
+        </p>
+      </section>
+      <section aria-labelledby="processing">
+        <h2 id="processing">4. Model providers and other services</h2>
+        <p>
+          Memory extraction and consolidation use the operator’s configured
+          native agent CLI and its existing model account. Conversation content
+          supplied for those operations may be processed by that model provider.
+          Its policies and the operator’s account settings govern that
+          processing. Memento has no model-training feature; this does not make
+          a promise about an independently selected provider’s retention or
+          training practices.
+        </p>
+        <p>
+          The operator is responsible for choosing compatible providers,
+          permissions and account settings. Optional Google Drive transfers send
+          the selected archive or backup data to Google. Memento itself does not
+          add an advertising or data-sale integration.
+        </p>
+      </section>
+      <section aria-labelledby="storage">
+        <h2 id="storage">5. Storage, security and retention</h2>
+        <p>
+          The memory service is designed to run on private infrastructure with
+          restricted access. This public site is separate from the
+          unauthenticated memory API; deploying that API directly to the public
+          internet is not supported. Operators must maintain the documented
+          service ownership and network protections.
+        </p>
+        <p>
+          <strong
+            >Memento does not provide application-level encryption for Drive
+            archive or backup contents.</strong
+          >
+          Drive copies are plaintext to the application, and retained versions
+          consume the owner’s storage quota. Filesystem permissions and private
+          networking do not replace an operator’s responsibility for disk,
+          account, backup and transport security.
+        </p>
+        <p>
+          Records remain until the installation’s operator removes them under
+          its retention and recovery procedures. There is no universal automatic
+          deletion period. Native CLI histories, exported files and
+          provider-side copies may have separate retention rules.
+        </p>
+      </section>
+      <section aria-labelledby="choices">
+        <h2 id="choices">6. Your choices and deletion limits</h2>
+        <ul>
+          <li>
+            Enable only the native integrations you intend to use, and select
+            history-import paths explicitly.
+          </li>
+          <li>
+            Use evidence and history tools to inspect the source of a memory and
+            its subsequent changes.
+          </li>
+          <li>
+            Correct or refine inaccurate memories through the supported tools.
+          </li>
+          <li>
+            Disconnect Memento through your
+            <a href="https://myaccount.google.com/connections"
+              >Google account’s third-party connections</a
+            >
+            to revoke future Google access. Revocation does not automatically
+            delete files already stored locally or in Drive.
+          </li>
+          <li>
+            Ask the installation operator to carry out owner-only administrative
+            actions and any necessary manual data or backup removal.
+          </li>
+        </ul>
+        <p>
+          <strong>“Forget” is not a promise of complete erasure.</strong> The
+          owner-only forget action removes active memory and suppresses
+          re-extraction, but it retains raw history, artifacts and existing
+          backups. An old backup can restore previously forgotten content.
+          Separate removal is needed when those copies must also be erased.
+        </p>
+      </section>
+      <section aria-labelledby="contact">
+        <h2 id="contact">7. Contact and policy changes</h2>
+        <p>
+          For questions about a particular installation or its retained data,
+          contact that installation’s operator. For product or policy questions,
+          contact the maintainer through the
+          <a href="https://github.com/misunders2d/memento/issues"
+            >Memento issue tracker</a
+          >. Do not post private conversations, authorization files or other
+          sensitive data in a public issue.
+        </p>
+        <p>
+          Material changes to this policy will be reflected on this page with an
+          updated date. The actual deployment configuration and the policies of
+          independently used providers still matter.
+        </p>
+      </section>
+      <a class="text-link back-link" href="/">← Back to Memento</a>
+    </main>
+    <footer class="site-footer wrap">
+      <a class="footer-brand" href="/">Memento.</a>
+      <p>Memory for a personal AI assistant.</p>
+      <nav aria-label="Footer navigation">
+        <a href="/privacy/" aria-current="page">Privacy</a
+        ><a href="/terms/">Terms</a
+        ><a href="https://github.com/misunders2d/memento/issues">Contact</a>
+      </nav>
+      <span class="footer-year">© 2026 Memento</span>
+    </footer>
+  </body>
+</html>
