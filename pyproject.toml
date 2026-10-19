@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memento-memory"
+version = "0.1.0"
+description = "Durable evidence capture for a personal assistant"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "sqlite-vec>=0.1.6,<0.2", "fastmcp==4.1.0", "httpx>=0.28,<1", "tzdata>=2025.2"]
+
+[project.optional-dependencies]
+media = ["numpy>=2,<3", "Pillow>=11,<13", "av==19.0.1", "pypdfium2==5.14.0", "pillow-heif==1.8.1"]
+embedding = ["numpy>=2,<3", "sentence-transformers==6.1.0", "transformers==5.19.0", "torch==2.14.1", "torchvision==0.29.1"]
+drive = ["google-auth[requests]==2.61.0", "google-auth-oauthlib>=1.2.2,<2", "google-api-python-client>=2.180,<3"]
+
+[project.scripts]
+memento = "memento.__main__:main"
+memento-admin = "memento.admin:main"
+memento-restore = "memento.restore:main"
+memento-runner = "memento.runner:main"
+memento-bridge = "memento.bridge:main"
+memento-drive = "memento.drive_connect:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "httpx2>=2.13,<3"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memento"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"THIRD_PARTY_NOTICES.md" = "memento/THIRD_PARTY_NOTICES.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

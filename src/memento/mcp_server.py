@@ -1,0 +1,113 @@
+"""MCP shares the HTTP service's sole writer; no approval tool is exposed."""
+
+from typing import Annotated, Literal
+from pydantic import AwareDatetime, BeforeValidator
+from fastmcp import FastMCP
+from fastmcp.tools.base import ToolResult
+
+from .commands import Link, Loop, Remember, Supersede
+
+
+def _empty_as_none(value):
+    return None if value == '' else value
+
+
+def _omit_empty_fields(value):
+    if isinstance(value, dict):
+        return {key: _omit_empty_fields(item) for key, item in value.items() if item != ''}
+    if isinstance(value, list):
+        return [_omit_empty_fields(item) for item in value]
+    return value
+
+
+# Omission sentinels are a tool-boundary concern; HTTP commands stay strict.
+_OptionalDate = Annotated[AwareDatetime | Literal[''] | None, BeforeValidator(_empty_as_none)]
+_OptionalString = Annotated[str | None, BeforeValidator(_empty_as_none)]
+_OptionalScope = Annotated[Literal['personal', 'professional', ''] | None, BeforeValidator(_empty_as_none)]
+
+
+def recall_memories(state, query='', effort='normal', limit=10, *, scope=None,
+                    since=None, source=None):
+    """Keep ordinary semantic recall separate from bounded raw activity search."""
+    if effort not in ('cheap', 'normal', 'deep') or not 1 <= limit <= 100 or scope not in (None, 'personal', 'professional'):
+        raise ValueError('Invalid effort, limit or scope')
+    if len(query) > 4096 or '\x00' in query:
+        raise ValueError('Recall text must be at most 4096 characters without NUL')
+    if query.strip() and since is None and source is None:
+        if state.retrieval is None:
+            raise ValueError('Native embedding runtime is disabled')
+        return state.retrieval.recall(query, effort, limit, scope=scope)
+    # Raw evidence has no personal/professional labels. Do not infer a label
+    # from an assertion that happens to cite one part of a conversation.
+    if scope is not None:
+        return []
+    return [dict(row, type='raw_episode', tier='raw', state='raw', confirmed=False,
+                 text=row['excerpt'], score=0.0, source_url='/episodes/' + row['id'],
+                 match='keyword' if query.strip() else 'activity')
+            for row in state.store.search(query, limit, source=source, since=since)]
+
+
+def create_mcp(state):
+    mcp = FastMCP('Memento', instructions=(
+        'Routine capture and passive recall belong to the harness. '
+        'Use recall(deep) when passive context is insufficient; cite memory ids. '
+        'Remember only explicit saves. Every assertion cites an exact source episode quote. '
+        'Correct beliefs with one atomic supersede; history explains when, why, and evidence. '
+        'Reuse command_id only when retrying the identical command. '
+        'Tools cannot approve sensitive changes or forget data.'
+    ))
+
+    @mcp.tool
+    def recall(query: str = '', effort: _OptionalString = 'normal', limit: int = 10,
+               scope: _OptionalScope = None,
+               since: _OptionalDate = None, source: _OptionalString = None) -> ToolResult:
+        """Recall memories, or omit query for recent activity; since/source filter raw evidence."""
+        memories = recall_memories(state, query, effort or 'normal', limit, scope=scope,
+            since=since.isoformat() if since is not None else None, source=source)
+        lines = [f"{item['id']} | {item['type']} | "
+                 f"{' '.join(item['text'].split())[:240]} | {item['score']:.3f}"
+                 for item in memories]
+        return ToolResult(content='\n'.join(lines) or 'No matching memories.',
+                          structured_content={'memories': memories})
+
+    @mcp.tool
+    def remember(command: Annotated[Remember, BeforeValidator(_omit_empty_fields)]) -> dict:
+        """Explicitly save a typed assertion supported by exact episode quotes."""
+        return state.graph.remember(**command.arguments())
+
+    @mcp.tool
+    def link(command: Annotated[Link, BeforeValidator(_omit_empty_fields)]) -> dict:
+        """Add an evidence-backed directional relation from a to b."""
+        return state.graph.link(**command.arguments())
+
+    @mcp.tool
+    def supersede(command: Annotated[Supersede, BeforeValidator(_omit_empty_fields)]) -> dict:
+        """Atomically correct an old assertion with inline replacement and reason."""
+        return state.graph.supersede(**command.arguments())
+
+    @mcp.tool
+    def history(id: str) -> list[dict]:
+        """Read full supersession lineage, immutable versions, word diffs, reasons and exact evidence."""
+        versions = state.graph.history(id)
+        if not versions:
+            raise ValueError('Node not found')
+        return versions
+
+    @mcp.tool
+    def loop(action: Literal['list', 'open', 'close', 'later', 'remind'],
+             id: _OptionalString = None, days: float = 7,
+             due_at: _OptionalDate = None, due_before: _OptionalDate = None,
+             scope: _OptionalScope = None,
+             command_id: _OptionalString = None, actor: _OptionalString = None,
+             why: _OptionalString = None, limit: int = 20) -> dict:
+        """List or adjust a memory's loop marker; only remind sets an explicit reminder time."""
+        command = Loop(action=action, id=id, days=days, due_at=due_at,
+                       due_before=due_before, scope=scope, command_id=command_id,
+                       actor=actor, why=why, limit=limit)
+        arguments = command.arguments()
+        if action == 'list':
+            arguments.pop('id', None)
+            arguments.pop('days', None)
+        return state.graph.loop(**arguments)
+
+    return mcp

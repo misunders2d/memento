@@ -1,0 +1,25 @@
+services:
+  memory:
+    build: .
+    restart: unless-stopped
+    user: "${MEMENTO_UID:-10001}:${MEMENTO_GID:-10001}"
+    env_file:
+      - path: "${MEMENTO_ENV_FILE:-.env}"
+        required: false
+    environment:
+      MEMENTO_AGENT_UID: "${MEMENTO_AGENT_UID:-1000}"
+      MEMENTO_EMBEDDINGS: "${MEMENTO_EMBEDDINGS:-1}"
+    ports:
+      - "127.0.0.1:${MEMENTO_PORT:-8765}:8765"
+    volumes:
+      - "${MEMENTO_DATA_DIR:-./data}:/data"
+    cpus: 2.0
+    mem_limit: 5g
+    pids_limit: 256
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

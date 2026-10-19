@@ -1,0 +1,6 @@
+*
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+!THIRD_PARTY_NOTICES.md
