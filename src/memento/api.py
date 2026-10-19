@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from .store import ConflictError, Store
 from .commands import Link, Loop, MediaInput, Remember, Supersede
@@ -137,6 +137,22 @@ class CitationInput(WorkInput):
     shown: list[str] = Field(default_factory=list)
 
 
+class DriveBeginInput(WorkInput):
+    callback_port: int = Field(ge=1, le=65535)
+
+
+class DriveFinishInput(WorkInput):
+    state: str = Field(min_length=16, max_length=512)
+    code: str | None = Field(default=None, min_length=1, max_length=4096)
+    error: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode='after')
+    def one_result(self):
+        if (self.code is None) == (self.error is None):
+            raise ValueError('Provide exactly one authorization code or denial')
+        return self
+
+
 def create_app(data_dir: Path) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
@@ -146,8 +162,10 @@ def create_app(data_dir: Path) -> FastAPI:
         backend = None
         cold_runtime = None
         worker = None
+        drive_authorization = None
         app.state.cold = None
         app.state.cold_runtime = None
+        app.state.drive_reauthorization_required = False
         try:
             app.state.graph = Graph(app.state.store)
             from .jobs import Queue, Worker
@@ -158,18 +176,46 @@ def create_app(data_dir: Path) -> FastAPI:
             admin = await serve_admin(app.state.graph, data_dir, app.state)
             app.state.blobs = BlobStore(data_dir / 'blobs')
             app.state.artifacts = Artifacts(app.state.store, app.state.blobs)
+            from .cold_manager import ColdManager
+            from .cold_runtime import ColdRuntime
+            from .drive_auth import DriveAuthorization, DriveAuthorizationError, requires_reauthorization
+            from .drive_connect import _publish
             drive = data_dir / 'drive-oauth.json'
-            if drive.exists() or drive.is_symlink():
-                from .cold import DriveColdStore
-                from .cold_manager import ColdManager
-                from .cold_runtime import ColdRuntime
-                backend = await asyncio.to_thread(DriveColdStore.from_file, drive)
-                app.state.cold = ColdManager(app.state.artifacts, backend, data_dir,
+
+            def prepare_drive(verified_backend):
+                manager = ColdManager(app.state.artifacts, verified_backend, data_dir,
                     max_importance=float(os.environ.get('MEMENTO_COLD_MAX_IMPORTANCE', '0.75')))
-                cold_runtime = ColdRuntime(app.state.cold,
+                runtime = ColdRuntime(manager,
                     after_days=int(os.environ.get('MEMENTO_COLD_AFTER_DAYS', '90')),
                     min_bytes=int(os.environ.get('MEMENTO_COLD_MIN_BYTES', str(10 * 1024 * 1024))))
-                app.state.cold_runtime = cold_runtime
+                return manager, runtime
+
+            def install_drive(verified_backend, config):
+                nonlocal backend, cold_runtime
+                if app.state.cold is not None:
+                    raise DriveAuthorizationError(409, 'Drive is already connected')
+                manager, runtime = prepare_drive(verified_backend)
+                _publish(drive, config)
+                app.state.cold, app.state.cold_runtime = manager, runtime
+                try:
+                    runtime.start()
+                except BaseException:
+                    app.state.cold = app.state.cold_runtime = None
+                    raise
+                backend, cold_runtime = verified_backend, runtime
+                app.state.drive_reauthorization_required = False
+
+            if drive.exists() or drive.is_symlink():
+                from .cold import DriveColdStore
+                try:
+                    backend = await asyncio.to_thread(DriveColdStore.from_file, drive)
+                except Exception as error:
+                    if not requires_reauthorization(error):
+                        raise
+                    app.state.drive_reauthorization_required = True
+                else:
+                    app.state.cold, cold_runtime = prepare_drive(backend)
+                    app.state.cold_runtime = cold_runtime
             app.state.media = None
             enabled = os.environ.get('MEMENTO_EMBEDDINGS', '0')
             if enabled not in ('0', '1'):
@@ -189,9 +235,13 @@ def create_app(data_dir: Path) -> FastAPI:
             app.state.retrieval = retrieval
             if cold_runtime is not None:
                 cold_runtime.start()
+            drive_authorization = DriveAuthorization(data_dir, install_drive)
+            app.state.drive_authorization = drive_authorization
             async with mcp_app.lifespan(app):
                 yield
         finally:
+            if drive_authorization is not None:
+                await asyncio.to_thread(drive_authorization.close)
             if worker is not None:
                 await asyncio.to_thread(worker.close)
             if admin is not None:
@@ -233,11 +283,39 @@ def create_app(data_dir: Path) -> FastAPI:
                 app.state.retrieval.health()
             except RuntimeError as error:
                 raise HTTPException(503, str(error)) from error
+        if app.state.drive_reauthorization_required:
+            raise HTTPException(503, 'Drive reauthorization required')
         if app.state.cold_runtime is not None and app.state.cold_runtime.last_error is not None:
             cold = app.state.cold_runtime
             raise HTTPException(503, dict(error='Cold archival incomplete',
                 archive_error=cold.last_error, archive_failure_count=cold.sweep_failure_count))
         return {'status': 'ok', 'processing': 'host_runner'}
+
+    async def drive_request(request, operation, arguments):
+        # Only the local runner relays OAuth results. Browsers never POST these
+        # endpoints directly, including a hostile page targeting loopback.
+        if request.headers.get('origin') is not None:
+            raise HTTPException(403, 'Use the Memento runner for Drive authorization')
+        from .drive_auth import DriveAuthorizationError
+        try:
+            return await asyncio.to_thread(operation, **arguments)
+        except DriveAuthorizationError as error:
+            raise HTTPException(error.status_code, str(error)) from None
+        except Exception:
+            # Provider exceptions can contain authorization codes or tokens.
+            raise HTTPException(502, 'Drive authorization failed; no connection is confirmed') from None
+
+    @app.post('/drive/connect/begin')
+    async def begin_drive(value: DriveBeginInput, request: Request, response: Response):
+        response.headers['Cache-Control'] = 'no-store'
+        if app.state.cold is not None:
+            raise HTTPException(409, 'Drive is already connected')
+        return await drive_request(request, app.state.drive_authorization.begin, value.arguments())
+
+    @app.post('/drive/connect/finish')
+    async def finish_drive(value: DriveFinishInput, request: Request, response: Response):
+        response.headers['Cache-Control'] = 'no-store'
+        return await drive_request(request, app.state.drive_authorization.finish, value.arguments())
 
     @app.post('/episodes', status_code=201)
     def capture(episode: EpisodeInput, response: Response):
@@ -353,6 +431,45 @@ def create_app(data_dir: Path) -> FastAPI:
         if result is None:
             raise HTTPException(404, 'Job not found')
         return result
+
+    @app.get('/connect')
+    def agent_connection():
+        return Response(
+            """Memento: connect this native agent to the private service.
+
+The agent performs installation; do not ask the human to run commands, edit
+configuration, move credentials, or change chats. Use the private service origin
+from which you fetched this guide, not the public product website.
+
+1. Identify your native harness: pi, omp, claude, or codex. Keep its existing
+   account, login, model selection, unrelated hooks and MCP definitions.
+2. Download /runner from this service into ~/.local/share/memento/runner.py
+   (create its parent directory privately). It needs only Python 3's stdlib.
+3. Reuse an existing Memento config for this harness and service if present.
+   For a new client choose ${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS.json
+   so connecting a second harness does not overwrite the first. Run:
+   python3 ~/.local/share/memento/runner.py setup --client --agent HARNESS --config CONFIG_PATH --url SERVICE_ORIGIN
+   Substitute the harness, private config path and service origin yourself.
+   No timezone, model API key, new model login or processing timer is needed.
+   Never downgrade an existing server config with --client: retain its setup,
+   and reinstall its native definitions with its sibling bridge.py install
+   --config CONFIG_PATH instead. Only one designated server processes memory.
+4. Load the installed native integration using the harness's supported reload
+   or a fresh native session. Native trust/permission prompts remain human
+   decisions: surface just that approval if required; never grant it yourself
+   or evade an owner-session admission guard.
+5. Verify the six native tools (recall, remember, link, supersede, history, loop),
+   call recall, and verify a new native exchange was captured. Installation
+   alone is not a connected result. Report any actual permission/reload blocker
+   precisely instead of claiming success.
+
+Google Drive is service-wide, not a separate grant for each agent. If needed,
+the agent on the human's browser device runs runner.py drive-connect --url
+SERVICE_ORIGIN and gives the human the printed official Google consent link.
+The human chooses the intended account and approves; the runner and service
+finish the connection. Never read or copy private Google credential files.
+""",
+            media_type='text/plain', headers={'Cache-Control': 'no-store'})
 
     @app.get('/runner')
     def runner_source():

@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hmac
+import http.client
+import http.server
+import ipaddress
 import json
 import math
 import os
@@ -228,13 +232,153 @@ class Service:
             if not isinstance(result, dict):
                 raise ValueError('object required')
             return result
-        except (OSError, ValueError, urllib.error.URLError) as exc:
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as exc:
             raise RunnerError('service_rejected') from exc
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+
+
+def connect_drive(service, *, port=0, timeout=600):
+    """Relay one human-approved Google callback to the private service."""
+    failure = 'Drive connection failed'
+    try:
+        remote = urllib.parse.urlsplit(service.base_url)
+        loopback = remote.hostname == 'localhost'
+        with contextlib.suppress(ValueError):
+            loopback = loopback or ipaddress.ip_address(remote.hostname).is_loopback
+        if remote.scheme != 'https' and not (remote.scheme == 'http' and loopback):
+            raise RunnerError('Drive connection requires HTTPS or loopback HTTP')
+        if (isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535
+                or isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or not 0 < timeout <= 600):
+            raise RunnerError(failure)
+        deadline = time.monotonic() + timeout
+        state = None
+        finished = False
+        connected = False
+
+        def post(path, value):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RunnerError(failure)
+            previous_timeout = service.timeout
+            service.timeout = remaining
+            try:
+                return service.post(path, value)
+            finally:
+                service.timeout = previous_timeout
+
+        class Callback(http.server.BaseHTTPRequestHandler):
+            # Never log request targets, including malformed requests or codes.
+            def log_message(self, *_):
+                pass
+
+            def setup(self):
+                self.request.settimeout(min(1, max(.001, deadline - time.monotonic())))
+                super().setup()
+
+            def result(self, status, success=False):
+                body = (b'<!doctype html><meta charset="utf-8"><title>Memento Drive</title>'
+                        + (b'<p>Google Drive connected. You may close this window.</p>' if success
+                           else b'<p>Drive connection not completed. Return to your terminal.</p>'))
+                self.send_response(status)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Security-Policy',
+                                 "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+                self.send_header('Referrer-Policy', 'no-referrer')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.end_headers()
+                with contextlib.suppress(OSError):
+                    self.wfile.write(body)
+
+            def send_error(self, code, message=None, explain=None):
+                self.result(code)
+
+            def do_GET(self):
+                nonlocal finished, connected
+                try:
+                    target = urllib.parse.urlsplit(self.path)
+                    pairs = urllib.parse.parse_qsl(target.query, keep_blank_values=True,
+                                                   strict_parsing=True, max_num_fields=16)
+                    fields = dict(pairs)
+                    if (len(self.path) > 16384 or target.scheme or target.netloc
+                            or target.path != '/' or target.fragment
+                            or self.headers.get_all('Host') != [f'127.0.0.1:{self.server.server_port}']
+                            or self.headers.get('Origin') is not None
+                            or len(fields) != len(pairs) or finished
+                            or not isinstance(state, str)
+                            or not hmac.compare_digest(fields.get('state', '').encode(), state.encode())
+                            or ('code' in fields) == ('error' in fields)):
+                        raise ValueError
+                    value = fields.get('code', fields.get('error'))
+                    if (not value or len(value) > 8192
+                            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+                        raise ValueError
+                except (ValueError, UnicodeError):
+                    self.result(400)
+                    return
+                # Only an authentic, unambiguous callback consumes the local flow.
+                finished = True
+                try:
+                    response = post('/drive/connect/finish',
+                                    {'state': state, 'code': fields.get('code'),
+                                     'error': fields.get('error')})
+                    connected = 'code' in fields and response.get('status') == 'connected'
+                except (RunnerError, OSError, ValueError):
+                    connected = False
+                with contextlib.suppress(OSError):
+                    self.result(200 if connected else 400, connected)
+
+        class Listener(http.server.HTTPServer):
+            def handle_error(self, request, client_address):
+                # Disconnected or malformed local clients never produce tracebacks.
+                pass
+
+        # HTTPServer is IPv4 and binds/listens in its constructor, before begin.
+        with Listener(('127.0.0.1', port), Callback) as listener:
+            listener.timeout = .1
+            response = post('/drive/connect/begin', {'callback_port': listener.server_port})
+            authorization_url = response.get('authorization_url')
+            state = response.get('state')
+            expires = response.get('expires_in')
+            if (not isinstance(authorization_url, str) or len(authorization_url) > 16384
+                    or any(ord(char) < 33 or ord(char) == 127 for char in authorization_url)
+                    or not isinstance(state, str) or not 1 <= len(state) <= 512
+                    or not state.isascii()
+                    or any(ord(char) < 33 or ord(char) == 127 for char in state)
+                    or isinstance(expires, bool) or not isinstance(expires, (int, float))
+                    or not math.isfinite(expires) or not 0 < expires <= 600):
+                raise RunnerError(failure)
+            url = urllib.parse.urlsplit(authorization_url)
+            pairs = urllib.parse.parse_qsl(url.query, keep_blank_values=True,
+                                           strict_parsing=True, max_num_fields=20)
+            fields = dict(pairs)
+            private_fields = {'client_secret', 'access_token', 'refresh_token', 'id_token', 'code_verifier'}
+            if (url.scheme != 'https' or url.netloc != 'accounts.google.com'
+                    or url.path != '/o/oauth2/v2/auth' or url.fragment
+                    or len(fields) != len(pairs) or fields.keys() & private_fields
+                    or fields.get('scope') != 'https://www.googleapis.com/auth/drive.file'
+                    or fields.get('state') != state or fields.get('response_type') != 'code'
+                    or fields.get('redirect_uri') != f'http://127.0.0.1:{listener.server_port}/'):
+                raise RunnerError(failure)
+            deadline = min(deadline, time.monotonic() + expires)
+            print(authorization_url, flush=True)
+            while not finished and time.monotonic() < deadline:
+                listener.handle_request()
+            if not connected:
+                raise RunnerError(failure)
+        print('Google Drive connected.', flush=True)
+    except KeyboardInterrupt:
+        raise RunnerError('Drive connection cancelled') from None
+    except (RunnerError, OSError, ValueError, TypeError, AttributeError):
+        raise RunnerError(failure) from None
 
 
 class Leases:
@@ -401,8 +545,6 @@ def install_native(config_path, config, native_config_dir=None):
             raise ValueError('invalid installer status')
     except (RunnerError, ValueError, OSError) as exc:
         raise RunnerError('native integration installation failed') from exc
-    if config['preset'] == 'codex':
-        print('Codex hooks require native /hooks review; setup never grants hook trust.')
     return result
 
 
@@ -412,6 +554,8 @@ def setup(args):
     Client configs install capture/compaction integrations only: no model CLI
     discovery, generation, user-unit writing, or systemctl calls.
     """
+    if not args.client and args.timezone is None:
+        raise RunnerError('server setup requires an explicit --timezone')
     preset = args.custom_preset if args.agent == 'custom' else args.agent
     if args.agent == 'custom':
         if not preset or not args.command_json:
@@ -428,13 +572,15 @@ def setup(args):
         raise RunnerError('command must contain exactly one native executable, without arguments')
     if not args.client:
         command = check_cli(command, preset)
-    zone = timezone_name(args.timezone)
-    Service(args.url)
     config_path = args.config.expanduser().absolute()
+    previous = load_config(config_path) if config_path.exists() else None
+    # Clients never schedule work; do not ask the human for a processing timezone.
+    zone = timezone_name(args.timezone if args.timezone is not None else (previous['timezone'] if previous else 'Etc/UTC'))
+    Service(args.url)
     deadline = args.deadline_seconds
     if not math.isfinite(deadline) or deadline <= 0:
         raise RunnerError('deadline must be finite and positive')
-    client_uid = load_config(config_path)['client_uid'] if config_path.exists() else uuid.uuid4().hex
+    client_uid = previous['client_uid'] if previous else uuid.uuid4().hex
     config = {'uid': os.getuid(), 'client_uid': client_uid,
               'agent': args.agent, 'preset': preset, 'command': command,
               'mode': 'client' if args.client else 'server',
@@ -453,7 +599,7 @@ def setup(args):
                  'OnBootSec=2min\nOnUnitInactiveSec=15min\nUnit=memento-runner.service\n\n'
                  '[Install]\nWantedBy=timers.target\n')
     private_write(config_path, encode(config) + b'\n')
-    install_native(config_path, config, args.native_config_dir)
+    native = install_native(config_path, config, args.native_config_dir)
     if args.client:
         print('Client configured for capture/compaction hooks only; no model work or timer.')
     else:
@@ -463,9 +609,7 @@ def setup(args):
             run_process(['systemctl', '--user', 'daemon-reload'], timeout=30)
             run_process(['systemctl', '--user', 'enable', '--now', 'memento-runner.timer'], timeout=30)
         print('Server runner configured; timer ' + ('not activated.' if args.no_activate else 'activated.'))
-    print('Compaction hook command (replace SOURCE and CONVERSATION_ID with captured identifiers):')
-    print(shlex.join([sys.executable, str(runner), '--config', str(config_path),
-                      'compaction', '--source', 'SOURCE', '--conversation-id', 'CONVERSATION_ID']))
+    print(native.get('notice') or 'Reload native integrations, then verify Memento capture and recall.')
     return config_path
 
 
@@ -504,7 +648,7 @@ def main(argv=None):
     install.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex', 'custom'), required=True)
     install.add_argument('--custom-preset', choices=('pi', 'omp', 'claude', 'codex'))
     install.add_argument('--command-json', help='custom native executable as a one-element JSON argv')
-    install.add_argument('--timezone', required=True, help='explicit IANA timezone; no host detection')
+    install.add_argument('--timezone', help='explicit IANA timezone required for server processing')
     install.add_argument('--client', action='store_true', help='capture/compaction hooks only; no timer or generation')
     install.add_argument('--native-config-dir', type=Path, help='override selected harness config root for isolated setup')
     install.add_argument('--url', default='http://127.0.0.1:8765')
@@ -517,10 +661,17 @@ def main(argv=None):
     compact = sub.add_parser('compaction', help='nudge compaction; server mode also drains due work')
     compact.add_argument('--source', required=True)
     compact.add_argument('--conversation-id', required=True)
+    drive = sub.add_parser('drive-connect', help='connect Google Drive with human browser consent')
+    drive.add_argument('--url', help='private service URL; defaults to the existing runner config')
+    drive.add_argument('--port', type=int, default=0, help='IPv4 loopback callback port (default: automatic)')
     args = parser.parse_args(argv)
     try:
         if args.operation == 'setup':
             setup(args)
+            return 0
+        if args.operation == 'drive-connect':
+            url = args.url if args.url is not None else load_config(args.config.expanduser())['url']
+            connect_drive(Service(url), port=args.port)
             return 0
         config = load_config(args.config.expanduser())
         compaction = None

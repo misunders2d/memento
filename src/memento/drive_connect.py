@@ -112,15 +112,29 @@ def main():
     command.add_argument('--folder-id', help='Reuse an existing app-accessible Memento folder; never create a replacement')
     command.add_argument('--no-browser', action='store_true', help='Print the official loopback consent URL; use an SSH tunnel when remote')
     command.add_argument('--port', type=int, default=8766, help='Loopback callback port, also forwarded by an SSH tunnel (default: 8766)')
+    configure = subcommands.add_parser('configure',
+        help='Operator: provision the original client and existing folder for one-link authorization')
+    configure.add_argument('--client-json', type=Path, required=True,
+        help='Original private Desktop app OAuth client JSON')
+    configure.add_argument('--account', required=True, help='Exact Google account to authorize')
+    configure.add_argument('--folder-id', required=True, help='Existing app-accessible folder; never create another')
+    configure.add_argument('--data-dir', type=Path, required=True, help='Service-owned private data directory')
     args = parser.parse_args()
     try:
-        connect(args.client_json, args.account, args.output, no_browser=args.no_browser,
-                port=args.port, folder_id=args.folder_id)
+        if args.command == 'configure':
+            from .drive_auth import configure_client
+            configure_client(args.client_json, args.account, args.folder_id, args.data_dir)
+        else:
+            connect(args.client_json, args.account, args.output, no_browser=args.no_browser,
+                    port=args.port, folder_id=args.folder_id)
     except Exception as error:
         # OAuth exceptions can contain tokens or callback codes. Never echo them.
         print(f'Drive connection failed ({type(error).__name__}); connection setup did not complete.', file=sys.stderr)
         raise SystemExit(1) from None
-    print('Drive account and dedicated folder verified; private connection saved.')
+    if args.command == 'configure':
+        print('Original Desktop client and existing Drive folder configured for one-link authorization.')
+    else:
+        print('Drive account and dedicated folder verified; private connection saved.')
 
 
 if __name__ == '__main__':

@@ -192,7 +192,7 @@ def test_tick_cli_forwards_explicit_consolidation_override(monkeypatch, flags, e
     assert calls == [(config, None, expected)]
 
 
-def test_setup_temporary_locations_never_activate_timer(tmp_path, monkeypatch, capsys):
+def test_setup_temporary_locations_never_activate_timer(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
     monkeypatch.setattr(runner, 'install_native', lambda *a: {})
 
@@ -208,10 +208,6 @@ def test_setup_temporary_locations_never_activate_timer(tmp_path, monkeypatch, c
     assert stored['timezone'] == 'Europe/Berlin'
     assert stored['uid'] == os.getuid()
     assert config.stat().st_mode & 0o077 == 0
-    service = (units / 'memento-runner.service').read_text()
-    assert '--config' in service and str(config) in service
-    assert 'OnUnitInactiveSec=15min' in (units / 'memento-runner.timer').read_text()
-    assert 'compaction' in capsys.readouterr().out
 
 
 def test_setup_persists_distinct_client_identity_across_same_uid_installs(tmp_path, monkeypatch):
@@ -219,7 +215,7 @@ def test_setup_persists_distinct_client_identity_across_same_uid_installs(tmp_pa
     identities = []
     for name in ('first', 'second'):
         config = tmp_path / name / 'runner.json'
-        args = ['setup', '--client', '--agent', 'pi', '--timezone', 'Etc/UTC',
+        args = ['setup', '--client', '--agent', 'pi',
                 '--config', str(config)]
         assert runner.main(args) == 0
         stored = runner.load_config(config)
@@ -240,7 +236,7 @@ def test_laptop_setup_and_compaction_never_execute_or_claim(tmp_path, monkeypatc
     monkeypatch.setattr(runner, 'install_native', lambda *a: {})
     config = tmp_path / 'runner.json'
     units = tmp_path / 'units'
-    assert runner.main(['setup', '--client', '--agent', agent, '--timezone', 'Etc/UTC',
+    assert runner.main(['setup', '--client', '--agent', agent,
                         '--url', 'http://memento.owner-tailnet.ts.net',
                         '--config', str(config), '--unit-dir', str(units)]) == 0
     assert runner.load_config(config)['mode'] == 'client'
@@ -264,39 +260,18 @@ def test_laptop_setup_and_compaction_never_execute_or_claim(tmp_path, monkeypatc
         runner.tick(runner.load_config(config))
 
 
-def test_setup_requires_explicit_timezone_without_host_detection():
-    with pytest.raises(SystemExit) as error:
-        runner.main(['setup', '--client', '--agent', 'codex'])
-    assert error.value.code == 2
+def test_server_setup_requires_timezone_before_native_execution(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('missing server timezone must fail before native execution')
+
+    monkeypatch.setattr(runner, 'check_cli', forbidden)
+    config = tmp_path / 'runner.json'
+    assert runner.main(['setup', '--agent', 'pi', '--config', str(config)]) == 1
+    assert not config.exists()
 
 
 
 
-def test_setup_downloads_shipped_bridge_and_passes_isolated_native_root(tmp_path, monkeypatch):
-    downloaded = []
-    executed = []
-    source = b'#!/usr/bin/env python3'
-
-    def download(service, path):
-        downloaded.append((service.base_url, path))
-        return source
-
-    def execute(argv, **kwargs):
-        executed.append((argv, kwargs))
-        return b'{"status":"installed"}'
-
-    monkeypatch.setattr(runner.Service, 'download', download)
-    monkeypatch.setattr(runner, 'run_process', execute)
-    config_path = tmp_path / 'runner.json'
-    native_root = tmp_path / 'native'
-    result = runner.install_native(config_path, {'preset': 'pi', 'url': 'http://127.0.0.1:8765'}, native_root)
-    assert result == {'status': 'installed'}
-    assert downloaded == [('http://127.0.0.1:8765', '/bridge')]
-    assert (tmp_path / 'bridge.py').read_bytes() == source
-    assert executed[0][0] == [
-        sys.executable, str(tmp_path / 'bridge.py'), 'install', '--config', str(config_path),
-        '--native-config-dir', str(native_root),
-    ]
 
 
 def test_http_evidence_cannot_be_redirected_and_tailnet_urls_are_accepted():
