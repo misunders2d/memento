@@ -53,7 +53,7 @@ class MediaIngest:
 
     def _text(self, text, sha256, page):
         source = self._save(io.BytesIO(text.encode('utf-8')), 'text/plain')
-        with self.retrieval._inference:
+        with self.retrieval._inference, self.retrieval._tokenization:
             passages = chunks(text, self.retrieval.model.tokenizer)
         for offset in range(0, len(passages), TEXT_BATCH):
             batch = passages[offset:offset + TEXT_BATCH]

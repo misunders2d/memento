@@ -246,6 +246,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def connect_drive(service, *, port=0, timeout=600):
     """Relay one human-approved Google callback to the private service."""
     failure = 'Drive connection failed'
+    already_connected = 'Google Drive is already connected.'
+    expired = 'Drive authorization expired or was already used.'
+    state = None
+    finished = False
     try:
         remote = urllib.parse.urlsplit(service.base_url)
         loopback = remote.hostname == 'localhost'
@@ -258,18 +262,34 @@ def connect_drive(service, *, port=0, timeout=600):
                 or not math.isfinite(timeout) or not 0 < timeout <= 600):
             raise RunnerError(failure)
         deadline = time.monotonic() + timeout
-        state = None
-        finished = False
         connected = False
 
         def post(path, value):
+            nonlocal failure
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                failure = expired
                 raise RunnerError(failure)
             previous_timeout = service.timeout
             service.timeout = remaining
             try:
                 return service.post(path, value)
+            except RunnerError as exc:
+                error = exc.__cause__
+                if isinstance(error, urllib.error.HTTPError):
+                    failure = {
+                        400: 'Drive authorization was rejected.',
+                        409: 'Drive authorization is pending or conflicts with the original connection.',
+                        410: expired,
+                        503: 'Drive authorization is not configured or available.',
+                    }.get(error.code, failure)
+                    if error.code == 409:
+                        # Only recognize this fixed service outcome; never echo error bodies.
+                        with contextlib.suppress(OSError, ValueError, http.client.HTTPException):
+                            detail = decode(error.read(MAX_BODY + 1))
+                            if isinstance(detail, dict) and detail.get('detail') == 'Drive is already connected':
+                                failure = already_connected
+                raise
             finally:
                 service.timeout = previous_timeout
 
@@ -302,7 +322,7 @@ def connect_drive(service, *, port=0, timeout=600):
                 self.result(code)
 
             def do_GET(self):
-                nonlocal finished, connected
+                nonlocal finished, connected, failure
                 try:
                     target = urllib.parse.urlsplit(self.path)
                     pairs = urllib.parse.parse_qsl(target.query, keep_blank_values=True,
@@ -333,6 +353,8 @@ def connect_drive(service, *, port=0, timeout=600):
                     connected = 'code' in fields and response.get('status') == 'connected'
                 except (RunnerError, OSError, ValueError):
                     connected = False
+                if fields.get('error') == 'access_denied':
+                    failure = 'Drive connection cancelled'
                 with contextlib.suppress(OSError):
                     self.result(200 if connected else 400, connected)
 
@@ -344,7 +366,13 @@ def connect_drive(service, *, port=0, timeout=600):
         # HTTPServer is IPv4 and binds/listens in its constructor, before begin.
         with Listener(('127.0.0.1', port), Callback) as listener:
             listener.timeout = .1
-            response = post('/drive/connect/begin', {'callback_port': listener.server_port})
+            try:
+                response = post('/drive/connect/begin', {'callback_port': listener.server_port})
+            except RunnerError:
+                if failure == already_connected:
+                    print(already_connected, flush=True)
+                    return
+                raise
             authorization_url = response.get('authorization_url')
             state = response.get('state')
             expires = response.get('expires_in')
@@ -373,9 +401,15 @@ def connect_drive(service, *, port=0, timeout=600):
             while not finished and time.monotonic() < deadline:
                 listener.handle_request()
             if not connected:
+                if not finished:
+                    failure = expired
                 raise RunnerError(failure)
         print('Google Drive connected.', flush=True)
     except KeyboardInterrupt:
+        if state is not None and not finished and time.monotonic() < deadline:
+            # Consume our pending flow so reconnecting need not wait ten minutes.
+            with contextlib.suppress(RunnerError, OSError, ValueError):
+                service.post('/drive/connect/finish', {'state': state, 'error': 'access_denied'})
         raise RunnerError('Drive connection cancelled') from None
     except (RunnerError, OSError, ValueError, TypeError, AttributeError):
         raise RunnerError(failure) from None
@@ -574,6 +608,8 @@ def setup(args):
         command = check_cli(command, preset)
     config_path = args.config.expanduser().absolute()
     previous = load_config(config_path) if config_path.exists() else None
+    if args.client and previous and previous['mode'] == 'server':
+        raise RunnerError('client setup cannot replace a server config; reuse server setup or choose a separate --config')
     # Clients never schedule work; do not ask the human for a processing timezone.
     zone = timezone_name(args.timezone if args.timezone is not None else (previous['timezone'] if previous else 'Etc/UTC'))
     Service(args.url)
@@ -598,8 +634,16 @@ def setup(args):
         timer = ('[Unit]\nDescription=Poll Memento due work every fifteen minutes\n\n[Timer]\n'
                  'OnBootSec=2min\nOnUnitInactiveSec=15min\nUnit=memento-runner.service\n\n'
                  '[Install]\nWantedBy=timers.target\n')
+    previous_bytes = config_path.read_bytes() if previous else None
     private_write(config_path, encode(config) + b'\n')
-    native = install_native(config_path, config, args.native_config_dir)
+    try:
+        native = install_native(config_path, config, args.native_config_dir)
+    except BaseException:
+        # Hooks read this exact path during installation; restore a working
+        # connection if reinstall fails before the replacement is ready.
+        if previous_bytes is not None:
+            private_write(config_path, previous_bytes)
+        raise
     if args.client:
         print('Client configured for capture/compaction hooks only; no model work or timer.')
     else:

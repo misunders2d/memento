@@ -7,6 +7,7 @@ a document "title: {title or 'none'} | text: {text}" (built by the caller), medi
 from __future__ import annotations
 
 import os
+from threading import RLock
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -25,15 +26,29 @@ AUDIO_BATCH = 2
 
 def load_model(model_id: str, revision: str, *, text_only: bool) -> SentenceTransformer:
     import torch
-    torch.set_num_threads(int(os.environ.get('OMP_NUM_THREADS', '2')))
+    # One CPU thread in each of the bounded foreground/background lanes avoids
+    # oversubscribing the production two-CPU quota during automatic recall.
+    torch.set_num_threads(int(os.environ.get('OMP_NUM_THREADS', '1')))
     from sentence_transformers import SentenceTransformer
+
+    class _CPUModel(SentenceTransformer):
+        def __init__(self, *args, **kwargs):
+            self.tokenization_lock = RLock()
+            super().__init__(*args, **kwargs)
+
+        def preprocess(self, *args, **kwargs):
+            # Fast-tokenizer padding/truncation settings are mutable. Serialize
+            # preprocessing, not the read-only forward pass shared by queries
+            # and one background encoder.
+            with self.tokenization_lock:
+                return super().preprocess(*args, **kwargs)
 
     # dtype=float32 is MANDATORY: the checkpoint's config default is bfloat16 (loaded silently if omitted, and
     # its vectors drift from an fp32 index); the model card forbids float16.
     # Text-only query vectors are bit-identical to full-model query vectors (verified).
     config_kwargs = {"vision_config": None, "audio_config": None} if text_only else None
-    return SentenceTransformer(model_id, revision=revision, device="cpu",
-                               model_kwargs={"dtype": torch.float32}, config_kwargs=config_kwargs)
+    return _CPUModel(model_id, revision=revision, device="cpu",
+                     model_kwargs={"dtype": torch.float32}, config_kwargs=config_kwargs).eval()
 
 
 def _unit_rows(v: np.ndarray) -> np.ndarray:

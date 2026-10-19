@@ -1,5 +1,7 @@
 import math
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from uuid import uuid4
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -352,3 +354,55 @@ def test_restart_fills_older_index_gaps_and_later_appends(retrieval, monkeypatch
         pass
     assert {hit['id'] for hit in restarted.recall('unmatchedword', effort='cheap')} == {
         older, newer, appended}
+
+
+def test_semantic_recall_does_not_wait_for_background_encoding(retrieval, monkeypatch):
+    r = retrieval
+    known, _ = assertion(r, 'established archive decision')
+    index(r, known, .8)
+    pending, _ = assertion(r, 'new background evidence')
+    encoding = Event()
+    release = Event()
+
+    def encode(model, texts):
+        encoding.set()
+        if not release.wait(5):
+            raise RuntimeError('background encoder was not released')
+        vectors = np.zeros((len(texts), 768), np.float32)
+        vectors[:, 0] = 1
+        return vectors
+
+    monkeypatch.setattr('memento.retrieval.embed_texts', encode)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        background = pool.submit(r.index_pending)
+        try:
+            assert encoding.wait(3)
+            hits = pool.submit(r.recall, 'unmatchedword', effort='cheap').result(timeout=3)
+            assert [hit['id'] for hit in hits] == [known]
+        finally:
+            release.set()
+        background.result(timeout=3)
+    assert {hit['id'] for hit in r.recall('unmatchedword', effort='cheap')} == {known, pending}
+    r.health()
+
+
+def test_shutdown_commits_completed_vectors_and_leaves_the_rest_indexable(retrieval, monkeypatch):
+    r = retrieval
+    targets = [assertion(r, f'shutdown backlog item {i}')[0] for i in range(3)]
+
+    def encode(model, texts):
+        r._stop.set()
+        vectors = np.zeros((len(texts), 768), np.float32)
+        vectors[:, 0] = 1
+        return vectors
+
+    monkeypatch.setattr('memento.retrieval.embed_texts', encode)
+    r.index_pending(limit=3)
+    assert [hit['id'] for hit in r.recall('unmatchedword', effort='cheap')] == targets[:1]
+    r.health()
+
+    resumed = Retrieval(r.graph, model=r.model)
+    while resumed.index_pending():
+        pass
+    assert {hit['id'] for hit in resumed.recall('unmatchedword', effort='cheap')} == set(targets)
+    resumed.health()

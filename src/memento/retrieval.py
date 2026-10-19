@@ -45,12 +45,14 @@ class Retrieval:
         self.graph = graph
         self.store = graph.store
         self._inference = RLock()
+        self._query_inference = RLock()
         self._stop = Event()
         self._worker = None
         self.index_error = None
         self._episode_cursor = 0
         self._index_cursors = dict(node=0, candidate=0, episode=0)
         self.model = model if model is not None else load_model(MODEL_ID, MODEL_REVISION, text_only=False)
+        self._tokenization = getattr(self.model, 'tokenization_lock', None) or RLock()
         with self.store._mutex:
             db = self.store._db
             db.execute('BEGIN IMMEDIATE')
@@ -79,7 +81,7 @@ class Retrieval:
             cursor = episodes[-1]['seq'] if len(episodes) == limit else through
         prepared = []
         for episode in episodes:
-            with self._inference:
+            with self._inference, self._tokenization:
                 passages = chunks(episode['text'], self.model.tokenizer)
             prepared.append((episode, passages or [TextChunk(0, len(episode['text']), episode['text'])]))
         with self.store._mutex:
@@ -154,8 +156,10 @@ class Retrieval:
                 row['text'] = sources[row['episode_id']][row['start']:row['end']]
         prepared = []
         for row in rows:
+            if self._stop.is_set():
+                break
             try:
-                # Release the model between passages so passive recall can interleave.
+                # Bound background activations independently of foreground queries.
                 with self._inference:
                     vector = embed_texts(self.model, ['title: none | text: ' + row['text']])[0]
                 prepared.append((row, vector, None))
@@ -192,7 +196,8 @@ class Retrieval:
                     finally:
                         db.execute('RELEASE index_item')
                 db.execute('COMMIT')
-                self._index_cursors = cursors
+                if len(prepared) == len(rows):
+                    self._index_cursors = cursors
                 return count
             except BaseException:
                 db.execute('ROLLBACK')
@@ -320,7 +325,7 @@ class Retrieval:
         keywords = self.graph.recall_keywords(query, min(100, limit * 4),
                                              scope=scope, include_archived=effort == 'deep')
         matches = {row['id']: dict(row, score=TEXT_COSINE_FLOOR + 0.25, match='keyword') for row in keywords}
-        with self._inference:
+        with self._query_inference:
             query_vector = embed_query(self.model, query)
         with self.store._mutex:
             match = ' '.join('"' + term.replace('"', '""') + '"' for term in query.split())

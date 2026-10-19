@@ -434,7 +434,8 @@ def passive(spool, conversation, query, cwd=None):
     except (OSError, ValueError, TypeError):
         row = spool.db.execute('SELECT context,shown FROM recall_cache WHERE conversation=? AND query=? AND updated>?',
                                (conversation, query, time.time() - 300)).fetchone()
-        return {'context': row[0], 'shown': json.loads(row[1])} if row else {'context': '', 'shown': []}
+        return {**({'context': row[0], 'shown': json.loads(row[1])} if row else {'context': '', 'shown': []}),
+                'error': 'recall_unavailable'}
 
 
 def native(spool, data):

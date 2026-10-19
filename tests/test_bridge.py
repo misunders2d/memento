@@ -157,6 +157,13 @@ def test_passive_recall_is_bounded_and_never_usage(tmp_path, monkeypatch):
     spool.close()
 
 
+def test_healthy_empty_recall_is_not_reported_as_unavailable(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {'memories': []})
+    assert bridge.passive(spool, 'session', 'query') == {'context': '', 'shown': []}
+    spool.close()
+
+
 def test_tool_fragment_cap_applies_once_per_original_output(tmp_path):
     spool = spool_at(tmp_path)
     text = '🧠' * 400000
@@ -181,8 +188,9 @@ def test_offline_cache_does_not_leak_previous_request(tmp_path, monkeypatch):
         raise OSError('offline')
 
     monkeypatch.setattr(bridge, 'http', offline)
-    assert bridge.passive(spool, 'session', 'original query') == first
-    assert bridge.passive(spool, 'session', 'different query') == {'context': '', 'shown': []}
+    assert bridge.passive(spool, 'session', 'original query') == {**first, 'error': 'recall_unavailable'}
+    assert bridge.passive(spool, 'session', 'different query') == {
+        'context': '', 'shown': [], 'error': 'recall_unavailable'}
     spool.close()
 
 
