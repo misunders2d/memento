@@ -3,7 +3,7 @@ import json
 import pytest
 
 from memento.cold import DriveColdStore
-from memento.drive_connect import SCOPES, _publish, connect, load_connection
+from memento.drive_connect import SCOPES, _publish, connect, load_connection, main
 
 
 ACCOUNT = 'owner@example.test'
@@ -64,7 +64,9 @@ def oauth(tmp_path, monkeypatch):
                 return Request(dict(user=dict(emailAddress=state['account'])))
             if not state['folder_exists']:
                 raise RuntimeError('HTTP 404')
-            return Request(dict(id=kwargs['fileId'], mimeType='application/vnd.google-apps.folder', ownedByMe=True))
+            folder = dict(id=kwargs['fileId'], mimeType='application/vnd.google-apps.folder', ownedByMe=True)
+            folder.update(state.get('folder_metadata', {}))
+            return Request(folder)
         def create(self, **kwargs):
             state['created'] += 1
             assert kwargs['body']['mimeType'] == 'application/vnd.google-apps.folder'
@@ -92,7 +94,9 @@ def oauth(tmp_path, monkeypatch):
             state['authorized'] += 1
             assert kwargs['host'] == '127.0.0.1' and not kwargs['open_browser']
             assert kwargs['login_hint'] == ACCOUNT
-            return Credentials()
+            credentials = Credentials()
+            credentials.granted_scopes = state.get('granted_scopes', SCOPES)
+            return credentials
     monkeypatch.setattr(flow_module, 'InstalledAppFlow', Flow)
     monkeypatch.setattr(discovery, 'build', lambda *args, **kwargs: Service())
     client = tmp_path / 'desktop-client.json'
@@ -141,3 +145,85 @@ def test_from_file_verifies_bound_account_and_never_uses_another(tmp_path, oauth
     with pytest.raises(ValueError, match='differs'):
         DriveColdStore.from_file(path)
     assert state['closed'] == 1
+
+
+def test_recover_existing_folder_without_previous_connection(tmp_path, oauth):
+    client, state = oauth
+    path = tmp_path / 'drive-oauth.json'
+    connect(client, ACCOUNT, path, no_browser=True, folder_id='original_folder')
+    assert load_connection(path)['memento'] == dict(account=ACCOUNT, folder_id='original_folder')
+    assert state['authorized'] == 1 and state['created'] == 0 and state['closed'] == 1
+
+
+def test_cli_recovers_existing_folder(tmp_path, oauth, monkeypatch):
+    client, state = oauth
+    path = tmp_path / 'drive-oauth.json'
+    monkeypatch.setattr('sys.argv', ['memento-drive', 'connect', '--client-json', str(client),
+        '--account', ACCOUNT, '--output', str(path), '--no-browser', '--folder-id', 'original_folder'])
+    main()
+    assert load_connection(path)['memento']['folder_id'] == 'original_folder'
+    assert state['authorized'] == 1 and state['created'] == 0
+
+
+@pytest.mark.parametrize('folder_id', ['', 'folder/child', ' folder', 'folder?query'])
+def test_invalid_recovery_folder_fails_before_consent(tmp_path, oauth, folder_id):
+    client, state = oauth
+    path = tmp_path / 'drive-oauth.json'
+    with pytest.raises(ValueError, match='Invalid Drive object id'):
+        connect(client, ACCOUNT, path, no_browser=True, folder_id=folder_id)
+    assert not path.exists() and state['authorized'] == 0 and state['created'] == 0
+
+
+def test_inaccessible_recovery_folder_never_creates_or_publishes(tmp_path, oauth):
+    client, state = oauth
+    state['folder_exists'] = False
+    path = tmp_path / 'drive-oauth.json'
+    with pytest.raises(RuntimeError, match='HTTP 404'):
+        connect(client, ACCOUNT, path, no_browser=True, folder_id='original_folder')
+    assert not path.exists() and state['created'] == 0 and state['closed'] == 1
+
+
+@pytest.mark.parametrize('metadata', [
+    {'id': 'another_folder'}, {'mimeType': 'text/plain'}, {'trashed': True}, {'ownedByMe': False},
+])
+def test_unsuitable_recovery_folder_never_creates_or_publishes(tmp_path, oauth, metadata):
+    client, state = oauth
+    state['folder_metadata'] = metadata
+    path = tmp_path / 'drive-oauth.json'
+    with pytest.raises(ValueError, match='owned, untrashed dedicated Drive folder'):
+        connect(client, ACCOUNT, path, no_browser=True, folder_id='original_folder')
+    assert not path.exists() and state['created'] == 0 and state['closed'] == 1
+
+
+@pytest.mark.parametrize('change', ['account', 'scope'])
+def test_recovery_still_requires_bound_account_and_drive_file_only(tmp_path, oauth, change):
+    client, state = oauth
+    if change == 'account':
+        state['account'] = 'other@example.test'
+    else:
+        state['granted_scopes'] = SCOPES + ['https://www.googleapis.com/auth/drive']
+    path = tmp_path / 'drive-oauth.json'
+    with pytest.raises(ValueError):
+        connect(client, ACCOUNT, path, no_browser=True, folder_id='original_folder')
+    assert not path.exists() and state['authorized'] == 1 and state['created'] == 0
+
+
+def test_explicit_reconnect_folder_cannot_override_previous_binding(tmp_path, oauth):
+    client, state = oauth
+    path = tmp_path / 'drive-oauth.json'
+    _publish(path, connection())
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match='previously verified folder'):
+        connect(client, ACCOUNT, path, no_browser=True, folder_id='another_folder')
+    assert path.read_bytes() == original and state['authorized'] == 0 and state['created'] == 0
+
+
+def test_explicit_reconnect_preserves_original_client_check(tmp_path, oauth):
+    client, state = oauth
+    path = tmp_path / 'drive-oauth.json'
+    _publish(path, connection())
+    original = path.read_bytes()
+    client.write_text(json.dumps(dict(installed=dict(client_id='different-client'))))
+    with pytest.raises(ValueError, match='original OAuth client'):
+        connect(client, ACCOUNT, path, no_browser=True, folder_id='original_folder')
+    assert path.read_bytes() == original and state['authorized'] == 0 and state['created'] == 0

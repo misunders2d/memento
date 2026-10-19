@@ -54,8 +54,9 @@ def _publish(path: Path, config: dict):
         temporary.unlink(missing_ok=True)
 
 
-def connect(client_json: Path, account: str, output: Path, *, no_browser=False, port=8766):
-    """Obtain a fresh explicit grant and retain a previous connection's folder."""
+def connect(client_json: Path, account: str, output: Path, *, no_browser=False, port=8766,
+            folder_id: str | None = None):
+    """Obtain a fresh explicit grant, retaining or explicitly recovering its folder."""
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
     from .cold import DriveColdStore
@@ -63,9 +64,13 @@ def connect(client_json: Path, account: str, output: Path, *, no_browser=False, 
     account = account.strip()
     if not account or not 1 <= port <= 65535:
         raise ValueError('An explicit account and valid loopback port are required')
+    if folder_id is not None:
+        folder_id = DriveColdStore._id(folder_id)
     previous = load_connection(output) if output.exists() or output.is_symlink() else None
     if previous and previous['memento']['account'].casefold() != account.casefold():
         raise ValueError('Reconnect must use the previously verified account')
+    if previous and folder_id is not None and folder_id != previous['memento']['folder_id']:
+        raise ValueError('Reconnect must use the previously verified folder')
     with client_json.open(encoding='utf-8') as source:
         client_config = json.load(source)
     if 'installed' not in client_config or 'web' in client_config:
@@ -84,7 +89,7 @@ def connect(client_json: Path, account: str, output: Path, *, no_browser=False, 
         DriveColdStore._verify_account(service, account)
         if previous:
             folder_id = previous['memento']['folder_id']
-        else:
+        if folder_id is None:
             folder = service.files().create(body={'name': 'Memento',
                 'mimeType': 'application/vnd.google-apps.folder',
                 'appProperties': {'memento': 'cold-storage'}}, fields='id').execute()
@@ -104,11 +109,13 @@ def main():
     command.add_argument('--client-json', type=Path, required=True, help='Dedicated Desktop app OAuth client JSON')
     command.add_argument('--account', required=True, help='Exact Google account email; verified before saving')
     command.add_argument('--output', type=Path, required=True, help='Connection file; use DATA_DIR/drive-oauth.json')
+    command.add_argument('--folder-id', help='Reuse an existing app-accessible Memento folder; never create a replacement')
     command.add_argument('--no-browser', action='store_true', help='Print the official loopback consent URL; use an SSH tunnel when remote')
     command.add_argument('--port', type=int, default=8766, help='Loopback callback port, also forwarded by an SSH tunnel (default: 8766)')
     args = parser.parse_args()
     try:
-        connect(args.client_json, args.account, args.output, no_browser=args.no_browser, port=args.port)
+        connect(args.client_json, args.account, args.output, no_browser=args.no_browser,
+                port=args.port, folder_id=args.folder_id)
     except Exception as error:
         # OAuth exceptions can contain tokens or callback codes. Never echo them.
         print(f'Drive connection failed ({type(error).__name__}); connection setup did not complete.', file=sys.stderr)
