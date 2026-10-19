@@ -43,6 +43,8 @@ After the pages are publicly reachable, use these Google Auth Platform branding 
 - Terms of service: `https://memento.bezosapp.uk/terms/`
 - Authorized domain: `bezosapp.uk`
 
+Before requesting Google brand verification, verify ownership of `bezosapp.uk` in Google Search Console using a Google account associated with this project as Owner or Editor. If needed, add Google's exact verification TXT record in Cloudflare without changing other DNS records. Personal-use apps can be exempt from review; domain verification and branding approval are not implied by hosting the pages. See [Google's authorized-domain requirements](https://developers.google.com/identity/protocols/oauth2/production-readiness/brand-verification#authorized-domains).
+
 Keep the existing **Desktop app** OAuth client and loopback callback; this site needs no Web client or public OAuth callback. Publishing the External app **In production** avoids the seven-day Testing refresh-token limitation. If the connection was authorized in Testing, have the human re-consent after publishing and install the private connection as described below. Public pages, project administration and publishing do not themselves grant `drive.file` access; native Google consent remains an explicit human step.
 
 ### Native capture and processing
@@ -94,6 +96,8 @@ Explicit `upload` drains until empty or a transport error, prints JSON `pending`
 ### Drive, human administration and recovery
 
 Drive is optional and integral when enabled: install `--extra drive` outside Docker (image includes it). Human prerequisite: enable Google Drive API in a dedicated project, create a **Desktop app** OAuth client, and explicitly consent to only `drive.file`. For an External consent screen set publishing status **In production**: Testing refresh tokens expire after seven days. Do not use ambient Google credentials or broaden scopes. The connection verifies the exact account and creates its own dedicated folder; manually created folders are not automatically app-accessible.
+
+**Reconnect/recovery:** retain the original Desktop client, account and app-created folder. The connector reuses a folder only when a valid previous connection file is already present at the exact `--output` path. A human operator must restore that private file there before reconnecting. If the file is lost and cannot be restored, **stop**: the current CLI has no `--folder-id` option and connecting to a new output path creates another folder. A known folder ID alone is not an existing-folder recovery path through this CLI.
 
 Headless server recipe: on the laptop keep `ssh -N -L 8766:127.0.0.1:8766 SERVER` running. In another terminal on SERVER:
 ```sh
