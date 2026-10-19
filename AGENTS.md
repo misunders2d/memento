@@ -24,18 +24,18 @@ Wait for healthy real-model startup; first download needs network, disk space an
 
 Publication stays loopback-only; never expose this unauthenticated API publicly. On the server, set `MEMENTO_ALLOWED_HOSTS=<machine>.<tailnet>.ts.net` in `.env`, restart the memory service, then run `tailscale serve --bg 8765` (tailnet HTTPS enabled). Serve proxies to the unchanged loopback listener; tailnet ACLs must restrict access to your devices. MCP host protection stays enabled; `/mcp/` is the endpoint. On each laptop, download the runner from `https://<machine>.<tailnet>.ts.net/runner` as below, then run `python3 "$HOME/.local/share/memento/runner.py" setup --client --agent pi --timezone Europe/Berlin --url https://<machine>.<tailnet>.ts.net` (choose its actual harness/timezone). The agent must have neither sudo nor Docker-daemon access when human-review isolation matters.
 
-### Public information website (separate origin)
+### Public information website (static Vercel hosting)
 
-`website/` contains only the public product, privacy and terms pages, not a memory dashboard or Google sign-in. Deploy it independently of the memory service:
+`website/` contains only the public product, privacy and terms pages, not a memory dashboard or Google sign-in. Import this repository into Vercel with **Root Directory `website`**, **Framework Preset Other**, and **Output Directory `.`**. Its checked-in `vercel.json` disables installation and build commands and sets response headers and canonical trailing slashes. There are no dependencies, environment variables, functions, API rewrites or server containers. Do not deploy the repository root.
+
+For a local routing preview with a current Vercel CLI, without linking a project or deploying:
 ```sh
-docker compose -f compose.website.yaml up --build --wait
-curl --fail http://127.0.0.1:18765/
-curl --fail http://127.0.0.1:18765/privacy/
-curl --fail http://127.0.0.1:18765/terms/
+vercel dev --local --cwd website --listen 127.0.0.1:18765
 ```
-This separate Compose project publishes only `127.0.0.1:18765`, runs an unprivileged read-only static server, and has no memory data mounts, credentials or API upstream. Unknown paths, including `/mcp/`, `/episodes`, `/runner` and `/docs`, return 404. Redirects stay relative so the HTTPS ingress does not expose the container's HTTP port.
 
-On Contabo, add `memento.bezosapp.uk` to the **existing remotely managed Cloudflare Tunnel**, targeting `http://127.0.0.1:18765`. Let Cloudflare create its proxied tunnel CNAME in the `bezosapp.uk` zone. Preserve all other tunnel routes; do not replace the token-managed setup with a local ingress file, open new public ports, or route this hostname to the private service on 8765.
+Add `memento.bezosapp.uk` to the Vercel project's production domains. In Cloudflare's `bezosapp.uk` zone, add the `memento` **DNS-only CNAME using the exact project-specific target Vercel provides**. Keep the existing nameservers and other records. Keep the production pages publicly readable, without a Vercel authentication challenge, so Google can fetch the policy URLs.
+
+No Contabo changes are needed for this website: do not add a Cloudflare Tunnel route, run an extra website container, open public ports, or point this hostname at the private memory API. The memory service remains private and independent.
 
 After the pages are publicly reachable, use these Google Auth Platform branding values in the existing project:
 - Application home page: `https://memento.bezosapp.uk/`
