@@ -82,20 +82,30 @@ def test_six_mcp_tools_accept_media_reference_without_bytes(client, monkeypatch)
     asyncio.run(scenario())
 
 
-def test_status_is_read_only_source_scoped_and_distinguishes_disabled_indexing(client, monkeypatch):
+@pytest.mark.parametrize('error_name,category', [
+    ('ValueError', 'ValueError'),
+    ('private provider text: synthetic-secret', 'unknown_error'),
+])
+def test_status_is_read_only_source_scoped_and_distinguishes_disabled_indexing(
+        client, monkeypatch, error_name, category):
     _, _, command = media_command(client)
     state = enable_prepared_media(client, monkeypatch)
     accepted = client.post('/media', json=command).json()
-    state.jobs.fail(state.jobs.claim(['media']), ValueError('private bytes must not appear'))
+    error_type = type(error_name, (ValueError,), {})
+    state.jobs.fail(state.jobs.claim(['media']), error_type('private bytes must not appear'))
     before = state.store._db.total_changes
     status = client.get('/status', params={'source': 'native:fixture:pi'}).json()
     assert status['captured'] == dict(episodes=1, conversations=1)
     assert status['indexing'] == dict(available=False, reason='embedding_runtime_disabled')
     assert status['media']['failed_jobs'] == 1 and status['media']['pending_jobs'] == 0
+    assert status['media']['errors'] == [dict(state='failed', category=category, count=1)]
+    assert 'private' not in str(status)
+    assert status['extraction']['errors'] == status['consolidation']['errors'] == []
     assert status['extraction']['pending_conversations'] == 1
-    assert client.get('/status', params={'source': 'other'}).json()['media']['failed_jobs'] == 0
+    other = client.get('/status', params={'source': 'other'}).json()
+    assert other['media']['failed_jobs'] == 0 and other['media']['errors'] == []
     assert state.store._db.total_changes == before
-    assert client.get(accepted['status_url']).json()['error'] == 'ValueError'
+    assert client.get(accepted['status_url']).json()['error'] == error_name
 
 
 def test_http_automatic_recall_forwards_bounded_context_without_changing_raw_search(client):
@@ -110,13 +120,25 @@ def test_http_automatic_recall_forwards_bounded_context_without_changing_raw_sea
     assert client.get('/recall', params=dict(q='query', context='x' * 4097)).status_code == 422
 
 
-def test_status_reports_candidates_waiting_for_night_even_without_consolidation_jobs(client):
+def test_status_reports_candidates_waiting_for_night_even_without_consolidation_jobs(client, monkeypatch):
+    clock = [datetime.now(timezone.utc).timestamp()]
+    monkeypatch.setattr('memento.jobs.time.time', lambda: clock[0])
     client.post('/episodes', json=dict(source='native:fixture:pi', event_id='durable-fact',
         conversation_id='current', kind='user', text='The project uses blue folders.', metadata={}))
     processing = client.app.state.processing
     work = processing.claim(agent='fixture', timezone_name='UTC',
         compaction=dict(source='native:fixture:pi', conversation_id='current'),
         now=datetime.now(timezone.utc).replace(hour=12))['work'][0]
+    assert client.post('/work/release', json=dict(
+        id=work['id'], owner=work['owner'], error='invalid_output')).json() == dict(released=True)
+    status = client.get('/status', params={'source': 'native:fixture:pi'}).json()
+    assert status['extraction']['retrying_jobs'] == 1
+    assert status['extraction']['errors'] == [dict(state='pending', category='invalid_output', count=1)]
+    assert client.get('/status', params={'source': 'other'}).json()['extraction']['errors'] == []
+    clock[0] += 31
+    work = processing.claim(agent='fixture', timezone_name='UTC',
+        now=datetime.now(timezone.utc).replace(hour=12))['work'][0]
+    assert client.get('/status').json()['extraction']['errors'] == []  # The retry is now leased.
     candidate = dict(key='fact', kind='memory', type='knowledge', text='The project uses blue folders.',
         quote='The project uses blue folders.', why='Explicit durable user statement', occurrence=None,
         src_key=None, dst_key=None, valid_from=None, valid_to=None, scope=['professional'],
@@ -125,6 +147,7 @@ def test_status_reports_candidates_waiting_for_night_even_without_consolidation_
         output=dict(windows=[dict(id=work['input']['windows'][0]['id'], candidates=[candidate])]))
     status = client.get('/status', params={'source': 'native:fixture:pi'}).json()
     assert status['extraction']['completed_jobs'] == 1
+    assert status['extraction']['errors'] == [] and status['extraction']['retrying_jobs'] == 0
     assert status['consolidation']['pending_jobs'] == 0
     assert status['consolidation']['pending_candidates'] == 1
     assert status['consolidation']['ready_candidates'] == 1

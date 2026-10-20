@@ -5,6 +5,13 @@ import time
 from .extraction import ACTIVE_CANDIDATE_SQL
 
 
+_JOB_ERROR_CATEGORIES = frozenset({
+    'cli_failed', 'invalid_output', 'service_rejected', 'night_window_closed',
+    'ValueError', 'ConflictError', 'OSError', 'FileNotFoundError',
+    'PermissionError', 'TimeoutError', 'RuntimeError',
+})
+
+
 def operational_status(state, source=None):
     with state.store.read_snapshot() as db:
         captured = dict(episodes=db.execute(
@@ -45,10 +52,18 @@ def operational_status(state, source=None):
             result = dict(available=True, pending_jobs=0, leased_jobs=0, completed_jobs=0,
                           failed_jobs=0, retrying_jobs=0)
             fields = dict(pending='pending_jobs', leased='leased_jobs', done='completed_jobs', failed='failed_jobs')
+            errors = {}
             for row in rows:
                 result[fields[row['state']]] += row['count']
                 if row['state'] == 'pending' and row['error'] is not None:
                     result['retrying_jobs'] += row['count']
+                if row['state'] in ('pending', 'failed') and row['error'] is not None:
+                    # Only fixed categories may leave the service, never arbitrary stored error text.
+                    category = row['error'] if row['error'] in _JOB_ERROR_CATEGORIES else 'unknown_error'
+                    key = row['state'], category
+                    errors[key] = errors.get(key, 0) + row['count']
+            result['errors'] = [dict(state=state, category=category, count=count)
+                                for (state, category), count in sorted(errors.items())]
             return result
 
         extraction = jobs('extract')
