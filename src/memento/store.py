@@ -7,6 +7,7 @@ import os
 import stat
 import sqlite3
 import sqlite_vec
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -16,6 +17,7 @@ from .schema import initialize, upgrade_episode_fts, upgrade_raw_text
 from .blobs import BlobStore
 from .artifacts import Artifacts
 from .raw_text import KINDS as RAW_KINDS, MIME as RAW_MIME, elide, hydrate
+from .portable import _connect
 
 
 class ConflictError(Exception):
@@ -98,6 +100,19 @@ class Store:
         with self._mutex:
             self._db.execute('BEGIN IMMEDIATE')
             self._db.execute('ROLLBACK')
+
+    @contextmanager
+    def read_snapshot(self):
+        """Read one WAL snapshot without holding the capture mutex during queries."""
+        with self._mutex:
+            path = self._db.execute('PRAGMA database_list').fetchone()['file']
+        with closing(_connect(Path(path), readonly=True)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute('BEGIN')
+            try:
+                yield db
+            finally:
+                db.rollback()
 
     @staticmethod
     def _episode(row):

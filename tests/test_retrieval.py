@@ -1,6 +1,8 @@
 import math
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from threading import Event
 from uuid import uuid4
 from datetime import datetime, timezone
@@ -13,6 +15,7 @@ np = pytest.importorskip('numpy')
 from memento.graph import Graph
 from memento.retrieval import Retrieval
 from memento.store import Store
+from memento.status import operational_status
 
 
 @pytest.fixture
@@ -379,7 +382,7 @@ def test_index_status_counts_current_units_failures_and_unprepared_sources(retri
     assert r.status(source='other')['total'] == 0
 
 
-def test_index_status_counts_real_vectors_without_repeated_per_unit_probes(retrieval):
+def test_index_status_counts_real_vectors_without_repeated_per_unit_probes(retrieval, monkeypatch):
     r = retrieval
     total, prepared, vector_count = 2056, 2048, 1536
     vector = np.zeros(768, np.float32).tobytes()
@@ -407,19 +410,117 @@ def test_index_status_counts_real_vectors_without_repeated_per_unit_probes(retri
     indexed = {i for i in range(1, vector_count + 1) if i % 13 != 0}
     failed = {i for i in range(7, prepared + 1, 7) if i % 11 != 0} - indexed
     probes = []
-    db.set_trace_callback(lambda sql: probes.append(1) if sql.startswith('--')
-                          and 'memory_vectors_rowids' in sql and 'WHERE rowid = ?' in sql else None)
-    try:
-        status = r.status(source='bulk')
-    finally:
-        db.set_trace_callback(None)
+    snapshot = r.store.read_snapshot
+
+    @contextmanager
+    def observed_snapshot():
+        with snapshot() as reader:
+            reader.set_trace_callback(lambda sql: probes.append(1) if sql.startswith('--')
+                                      and 'memory_vectors_rowids' in sql and 'WHERE rowid = ?' in sql else None)
+            yield reader
+
+    monkeypatch.setattr(r.store, 'read_snapshot', observed_snapshot)
+    status = r.status(source='bulk')
     assert status == dict(available=True, total=prepared, indexed=len(indexed), failed=len(failed),
                          pending=prepared - len(indexed) - len(failed), unprepared_episodes=0, error=None)
     # A status observation must not perform several sqlite-vec point probes for
-    # every indexed passage while holding the capture mutex.
+    # every indexed passage during a status observation.
     assert len(probes) <= prepared
     assert r.status(source='other') == dict(available=True, total=0, indexed=0, pending=0, failed=0,
                                           unprepared_episodes=8, error=None)
+
+
+@pytest.mark.parametrize('stage', ['raw', 'index'])
+@pytest.mark.parametrize('source', [None, 'test'])
+def test_status_wal_snapshot_allows_capture_during_real_raw_and_index_queries(retrieval, monkeypatch, stage, source):
+    r = retrieval
+    target, _ = assertion(r, 'The initial status fixture has indexed evidence.')
+    index(r, target, .9)
+    for origin, kind in (('test', 'native_record'), ('other', 'user'), ('other', 'native_record')):
+        r.store.capture(dict(source=origin, event_id=kind, conversation_id='c', kind=kind,
+                             text=origin + ' exact raw Ω text', occurred_at=None,
+                             metadata={'extraction_mode': 'skip'} if kind == 'native_record' else {}))
+    state = SimpleNamespace(store=r.store, retrieval=r, cold_runtime=None, cold=None,
+                            drive_reauthorization_required=False)
+    expected = operational_status(state, source=source)
+    entered, release = Event(), Event()
+    snapshot = r.store.read_snapshot
+    active, paused = False, False
+
+    def trace(sql):
+        nonlocal active
+        active = ('AS inline_raw_episodes' in sql if stage == 'raw'
+                  else sql.startswith('WITH indexed_units AS MATERIALIZED'))
+
+    def pause_query():
+        nonlocal paused
+        if active and not paused:
+            paused = True
+            entered.set()
+            return 0 if release.wait(10) else 1
+        return 0
+
+    @contextmanager
+    def gated_snapshot():
+        with snapshot() as reader:
+            reader.set_trace_callback(trace)
+            reader.set_progress_handler(pause_query, 1)
+            yield reader
+
+    monkeypatch.setattr(r.store, 'read_snapshot', gated_snapshot)
+
+    def capture_and_index():
+        episode, created = r.store.capture(dict(source='test', event_id='during-status', conversation_id='c',
+            kind='user', text='Captured while status is still reading.', occurred_at=None, metadata={}))
+        assert created
+        with r.store._mutex:
+            db = r.store._db
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                db.execute('INSERT INTO episode_chunks VALUES (?,?,0,?)', ('later-chunk', episode['id'], len(episode['text'])))
+                vector = np.zeros(768, np.float32)
+                vector[0] = 1
+                r._put('later-chunk', 'episode', 1, vector)
+                db.execute('COMMIT')
+            except BaseException:
+                db.execute('ROLLBACK')
+                raise
+        return episode
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        status = pool.submit(operational_status, state, source)
+        try:
+            assert entered.wait(5), 'the actual status SQL did not reach the pause'
+            captured = pool.submit(capture_and_index).result(timeout=5)
+            assert not release.is_set() and not status.done()
+        finally:
+            release.set()
+        assert status.result(timeout=5) == expected
+    assert r.store.get(captured['id'])['text'] == 'Captured while status is still reading.'
+    current = operational_status(state, source=source)
+    assert current['captured']['episodes'] == expected['captured']['episodes'] + 1
+    assert current['indexing']['total'] == expected['indexing']['total'] + 1
+    assert current['indexing']['indexed'] == expected['indexing']['indexed'] + 1
+    assert current['raw_storage'] == expected['raw_storage']
+
+
+def test_status_reader_is_read_only_and_closes_its_snapshot_on_failure(retrieval):
+    store = retrieval.store
+    statements = []
+    with pytest.raises(RuntimeError, match='synthetic status failure'):
+        with store.read_snapshot() as reader:
+            reader.set_trace_callback(statements.append)
+            assert reader.in_transaction
+            assert reader.execute('SELECT count(*) FROM memory_vectors').fetchone()[0] == 0
+            with pytest.raises(sqlite3.OperationalError, match='readonly'):
+                reader.execute('DELETE FROM episodes')
+            raise RuntimeError('synthetic status failure')
+    assert 'ROLLBACK' in statements
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        reader.execute('SELECT 1')
+    assert store._db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+    assert store._db.execute('PRAGMA synchronous').fetchone()[0] == 2
+    assert store._db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
 
 
 def test_legacy_serialized_media_never_sends_binary_to_passage_tokenizer(retrieval):

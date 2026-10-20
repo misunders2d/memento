@@ -685,11 +685,13 @@ class Retrieval:
 
     def status(self, source=None):
         """Exact current index-unit counts; unchunked episodes are reported separately."""
-        with self.store._mutex:
-            db = self.store._db
-            # Probe vector metadata once, rather than repeating a virtual-table
-            # row lookup for every unit and aggregate expression under the mutex.
-            row = db.execute(f'''WITH indexed_units AS MATERIALIZED (
+        with self.store.read_snapshot() as db:
+            return self._status(db, source)
+
+    def _status(self, db, source):
+        # Probe vector metadata once, rather than repeating a virtual-table
+        # row lookup for every unit and aggregate expression.
+        row = db.execute(f'''WITH indexed_units AS MATERIALIZED (
                 SELECT i.target,i.kind,i.version FROM memory_vectors v
                 JOIN vector_items i ON i.seq=v.rowid WHERE v.current=1),
                 units AS (
@@ -706,14 +708,14 @@ class Retrieval:
                     coalesce(sum(NOT indexed AND NOT failed),0) AS pending,
                     coalesce(sum(NOT indexed AND failed),0) AS failed FROM states''',
                 (source, source, source)).fetchone()
-            unprepared = db.execute('''SELECT count(*) FROM episodes e
+        unprepared = db.execute('''SELECT count(*) FROM episodes e
                 WHERE (? IS NULL OR e.source=?)
                 AND coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip'
                 AND NOT EXISTS (SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id)
                 AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)''',
                 (source, source)).fetchone()[0]
-            return dict(available=True, **dict(row), unprepared_episodes=unprepared,
-                        error=type(self.index_error).__name__ if self.index_error else None)
+        return dict(available=True, **dict(row), unprepared_episodes=unprepared,
+                    error=type(self.index_error).__name__ if self.index_error else None)
 
     def health(self):
         if self.index_error is not None:

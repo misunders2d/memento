@@ -6,8 +6,7 @@ from .extraction import ACTIVE_CANDIDATE_SQL
 
 
 def operational_status(state, source=None):
-    with state.store._mutex:
-        db = state.store._db
+    with state.store.read_snapshot() as db:
         captured = dict(episodes=db.execute(
             'SELECT count(*) FROM episodes WHERE (? IS NULL OR source=?)', (source, source)).fetchone()[0],
             conversations=db.execute('''SELECT count(*) FROM (
@@ -67,8 +66,8 @@ def operational_status(state, source=None):
             AND (? IS NULL OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
                 WHERE g.target=c.id AND e.source=?))''', (time.time(), source, source)).fetchone()
         consolidation.update(dict(pending))
-    indexing = (state.retrieval.status(source=source) if state.retrieval is not None else
-                dict(available=False, reason='embedding_runtime_disabled'))
+        indexing = (state.retrieval._status(db, source) if state.retrieval is not None else
+                    dict(available=False, reason='embedding_runtime_disabled'))
     cold = state.cold_runtime
     return dict(source=source, captured=captured, raw_storage=raw_storage, artifact_storage=artifact_storage,
                 indexing=indexing, extraction=extraction,
