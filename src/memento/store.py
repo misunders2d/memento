@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import sqlite3
 import sqlite_vec
@@ -19,9 +20,34 @@ from .artifacts import Artifacts
 from .raw_text import KINDS as RAW_KINDS, MIME as RAW_MIME, elide, hydrate
 from .portable import _connect
 
+LEGACY_CONTEXT_PREFIX = '# AGENTS.md instructions'
+
 
 class ConflictError(Exception):
     """An event identifier was reused with different evidence."""
+
+
+def legacy_native_context(source, kind, text, metadata):
+    """Recognize only complete, metadata-less Codex instruction envelopes."""
+    if kind != 'user' or not isinstance(source, str) or re.fullmatch(r'native:[^:]+:codex', source) is None:
+        return False
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return False
+    if (not isinstance(metadata, dict) or 'native_context_kinds' in metadata or 'content_item_kinds' in metadata
+            or metadata.get('extraction_mode', 'message') != 'message' or not isinstance(text, str)):
+        return False
+    opening = re.match(r'\A' + re.escape(LEGACY_CONTEXT_PREFIX) + r'(?: for [^\r\n]+)?\r?\n[ \t\r\n]*<INSTRUCTIONS>', text)
+    if opening is None or text.count('<INSTRUCTIONS>') != 1 or text.count('</INSTRUCTIONS>') != 1:
+        return False
+    _, closing, suffix = text[opening.end():].partition('</INSTRUCTIONS>')
+    if not closing:
+        return False
+    suffix = suffix.strip()
+    return not suffix or (suffix.startswith('<environment_context>') and suffix.endswith('</environment_context>')
+        and suffix.count('<environment_context>') == 1 and suffix.count('</environment_context>') == 1)
 
 
 class Store:
@@ -46,6 +72,9 @@ class Store:
             self._db = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
             db_path.chmod(0o600)
             self._db.row_factory = sqlite3.Row
+            # Extraction filters before its LIMIT using the same pure predicate
+            # as authority/recall checks. No schema or persisted flags are added.
+            self._db.create_function('legacy_native_context', 4, legacy_native_context, deterministic=True)
             self._db.enable_load_extension(True)
             try:
                 sqlite_vec.load(self._db)

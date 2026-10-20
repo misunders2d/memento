@@ -127,6 +127,38 @@ def test_own_feedback_outside_pasted_content_keeps_its_authority(tmp_path, autho
         store.close()
 
 
+@pytest.mark.parametrize('authority', ['inferred', 'explicit_user'])
+def test_preexisting_legacy_native_instructions_cannot_authorize_behavior(tmp_path, monkeypatch, authority):
+    from memento.store import legacy_native_context
+    store = Store(tmp_path)
+    try:
+        processing = Processing(Graph(store))
+        source = 'native:synthetic-device:codex'
+        incident = 'Manual setup caused errors; using the supported installer removed them.'
+        text = '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n' + incident + '\n</INSTRUCTIONS>'
+        episode, _ = store.capture(dict(source=source, event_id='old-context', conversation_id='c',
+            kind='user', text=text, occurred_at=None, metadata={}))
+        args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc).replace(hour=12))
+        # Seed the exact pre-fix derivation pathway, without rewriting evidence.
+        store._db.create_function('legacy_native_context', 4, lambda *_: False, deterministic=True)
+        with monkeypatch.context() as old:
+            old.setattr('memento.extraction.legacy_native_context', lambda *_: False)
+            task = processing.claim(**args, compaction=dict(source=source, conversation_id='c'))['work'][0]
+            item = dict(key='incident', kind='memory', type='experience', text=incident, quote=incident,
+                why='Previous source derivation', occurrence=None, src_key=None, dst_key=None,
+                valid_from=None, valid_to=None, scope=['professional'], open_loop=False, confidence=.8)
+            processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+                output=dict(windows=[dict(id=task['input']['windows'][0]['id'], candidates=[item])]))
+        store._db.create_function('legacy_native_context', 4, legacy_native_context, deterministic=True)
+        task = processing.claim(**args, consolidate_now=True)['work'][0]
+        assert task['input']['raw_windows'][0]['behavior_ground_truth'] is False
+        with pytest.raises(ValueError, match='consolidation_behavior_requires_user_ground_truth'):
+            complete(processing, task, action(task, episode, quote=incident, behavior=dict(BEHAVIOR, authority=authority)))
+        assert not store._db.execute('SELECT 1 FROM node_versions').fetchone()
+    finally:
+        store.close()
+
+
 def test_relevant_corrections_find_unindexed_pattern_and_refine_with_distinct_evidence(tmp_path):
     store = Store(tmp_path)
     try:

@@ -43,6 +43,7 @@ class Processing:
             rows = db.execute('''SELECT id,seq,text,kind,metadata FROM episodes e
                 WHERE source=? AND conversation_id=? AND seq<=? AND seq>?
                 AND coalesce(json_extract(metadata,'$.extraction_mode'),'message')!='skip'
+                AND NOT legacy_native_context(e.source,e.kind,e.text,e.metadata)
                 AND NOT EXISTS (SELECT 1 FROM forgotten_sources f
                     WHERE f.source=e.source AND f.event_id=e.event_id)
                 ORDER BY seq LIMIT 65''',

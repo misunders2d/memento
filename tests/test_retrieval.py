@@ -368,6 +368,89 @@ def test_personal_factual_control_type_preserves_evidence_and_automatic_eligibil
         assert automatic[0]['evidence'][0]['episode_id'] == raw['id']
 
 
+@pytest.mark.parametrize('tier', ['candidate', 'durable', 'segment'])
+def test_legacy_context_backed_records_are_only_excluded_from_automatic_recall(retrieval, tier):
+    r = retrieval
+    text = 'Use concise responses for routine questions.'
+    raw = '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n' + text + '\n</INSTRUCTIONS>'
+    source = 'native:synthetic-device:codex'
+    if tier == 'candidate':
+        target, episode = candidate(r, text, source=source, raw=raw)
+        r._put(target, 'candidate', 1, np.eye(1, 768, dtype=np.float32)[0])
+    else:
+        episode, _ = r.store.capture(dict(source=source, event_id='legacy', conversation_id='c',
+            kind='user', text=raw, occurred_at=None, metadata={}))
+        target = r.graph.remember(command_id='legacy-record', actor='fixture', why='Previously extracted source claim',
+            type='media' if tier == 'segment' else 'decision', text=text, scope=['professional'],
+            evidence=[dict(episode_id=episode['id'], quote=text)])['id']
+        if tier == 'durable':
+            index(r, target, .99)
+        else:
+            r.store._db.execute('INSERT INTO media_files VALUES (?,?,?,?,?)',
+                (target, 'a' * 64, 'synthetic.txt', 'document', r.graph._node(target)['commit_id']))
+            r.store._db.execute('''INSERT INTO segments(id,node_id,modality,text,artifact_sha256,source_sha256)
+                VALUES (?,?,?,?,?,?)''', ('legacy-segment', target, 'text', text, 'b' * 64, 'c' * 64))
+            r._put('legacy-segment', 'segment', 1, np.eye(1, 768, dtype=np.float32)[0])
+    assert r.recall('concise responses', automatic=True) == []
+    assert any(hit['id'] == target for hit in r.recall('concise responses', effort='cheap'))
+    assert r.store.get(episode['id'])['text'] == raw
+    assert r.store.capture(dict(source=source, event_id=episode['event_id'], conversation_id='c',
+        kind='user', text=raw, occurred_at=episode['occurred_at'], metadata=episode['metadata']))[1] is False
+
+
+@pytest.mark.parametrize('tier', ['candidate', 'durable'])
+def test_genuine_evidence_after_five_context_spans_keeps_automatic_eligibility(retrieval, monkeypatch, tier):
+    r = retrieval
+    identities = iter(f'{index:032x}' for index in range(1, 20))
+    monkeypatch.setattr('memento.store.uuid4', lambda: SimpleNamespace(hex=next(identities)))
+    text = 'Use concise responses for routine questions.'
+    raw = '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n' + text + '\n</INSTRUCTIONS>'
+    source = 'native:synthetic-device:codex'
+    target, _ = candidate(r, text, source=source, raw=raw) if tier == 'candidate' else (None, None)
+    refs = []
+    for index_value in range(6):
+        episode, _ = r.store.capture(dict(source=source, event_id=f'context-{index_value}', conversation_id='c',
+            kind='user', text=raw, occurred_at=None, metadata={}))
+        refs.append(dict(episode_id=episode['id'], quote=text))
+    genuine, _ = r.store.capture(dict(source=source, event_id='genuine', conversation_id='c',
+        kind='user', text=text, occurred_at=None, metadata={}))
+    refs.append(dict(episode_id=genuine['id'], quote=text))
+    if tier == 'durable':
+        target = r.graph.remember(command_id='mixed-provenance', actor='fixture', why='Corroborated source claim',
+            type='knowledge', text=text, scope=['professional'], evidence=refs)['id']
+        index(r, target, .99)
+    else:
+        def attach(commit):
+            r.graph._evidence(target, 1, refs)
+            return dict(id=target)
+        r.graph._command('mixed-provenance', 'fixture', 'Corroborate existing fixture', dict(op='fixture'), attach)
+        r._put(target, 'candidate', 1, np.eye(1, 768, dtype=np.float32)[0])
+    monkeypatch.setattr(r.store, 'get', lambda *_: pytest.fail('automatic recall hydrated source text'))
+    hits = r.recall('concise responses', automatic=True)
+    assert [hit['id'] for hit in hits] == [target]
+    assert len(hits[0]['evidence']) == 5
+    assert genuine['id'] not in {ref['episode_id'] for ref in hits[0]['evidence']}
+
+
+@pytest.mark.parametrize('source,kind,text', [
+    ('native:synthetic-device:codex', 'user', 'Ordinary source ' + 'x' * 500000),
+    ('native:synthetic-device:codex', 'tool', '# AGENTS.md instructions\n' + 'x' * 500000),
+    ('native:synthetic-device:pi', 'user', '# AGENTS.md instructions\n' + 'x' * 500000),
+])
+def test_automatic_context_check_does_not_copy_obviously_unmatched_large_text(retrieval, monkeypatch, source, kind, text):
+    r = retrieval
+    episode, _ = r.store.capture(dict(source=source, event_id='large', conversation_id='c', kind=kind,
+        text=text, occurred_at=None, metadata={}))
+    target = r.graph.remember(command_id='large-source', actor='fixture', why='Supported ordinary fact',
+        type='knowledge', text='The source uses a documented configuration.', scope=['professional'],
+        evidence=[dict(episode_id=episode['id'], quote=text[:30])])['id']
+    index(r, target, .99)
+    monkeypatch.setattr('memento.retrieval.legacy_native_context', lambda *_: pytest.fail('large unmatched text reached classifier'))
+    monkeypatch.setattr(r.store, 'get', lambda *_: pytest.fail('automatic recall hydrated source text'))
+    r.store._db.create_function('legacy_native_context', 4, lambda *_: pytest.fail('recall called extraction UDF'))
+    assert [hit['id'] for hit in r.recall('documented configuration', automatic=True)] == [target]
+
+
 def test_index_status_counts_current_units_failures_and_unprepared_sources(retrieval):
     r = retrieval
     ready, _ = assertion(r, 'The cobalt release checklist is approved.')
@@ -591,10 +674,10 @@ def test_one_invalid_embedding_does_not_block_other_assertions(retrieval, monkey
     assert r.store._db.execute('SELECT resolved FROM index_failures WHERE target=?', (bad,)).fetchone()[0] == 0
 
 
-def candidate(r, text, *, type='knowledge', kind='memory', scope=None):
+def candidate(r, text, *, type='knowledge', kind='memory', scope=None, source='candidate-fixture', raw=None):
     key = uuid4().hex
-    episode, _ = r.store.capture(dict(source='candidate-fixture', event_id=key, conversation_id='c',
-        kind='user', text=text, occurred_at='2000-01-01T00:00:00+00:00', metadata={}))
+    episode, _ = r.store.capture(dict(source=source, event_id=key, conversation_id='c',
+        kind='user', text=text if raw is None else raw, occurred_at='2000-01-01T00:00:00+00:00', metadata={}))
     target = 'c_' + uuid4().hex
     def create(commit):
         r.store._db.execute('INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)',

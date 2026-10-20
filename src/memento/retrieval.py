@@ -15,6 +15,7 @@ from .graph import Graph, NODE_SUMMARY, ENTITY_TYPES
 from .extraction import ACTIVE_CANDIDATE_SQL, source_text_ranges
 from .text_chunks import TextChunk, chunks
 from .importance import query_key
+from .store import LEGACY_CONTEXT_PREFIX, legacy_native_context
 
 MODEL_ID = 'google/embeddinggemma-2'
 MODEL_REVISION = '914f7f89142e33e77833254d9c9b90c3cef7303b'
@@ -432,6 +433,21 @@ class Retrieval:
             (row['target'],)).fetchone()
         return dict(record) if record else None
 
+    def _legacy_context_only(self, target, version):
+        # Indexed target/version lookup, independent of the five display spans.
+        # Ordinary episode text is read directly; never hydrate cold/raw data.
+        context_only = False
+        for episode in self.store._db.execute('''SELECT e.source,e.kind,e.metadata,
+            CASE WHEN e.kind='user' AND e.source GLOB 'native:*:codex' AND substr(e.text,1,?)=?
+                 THEN e.text END AS text
+            FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
+            WHERE g.target=? AND g.version=?''', (len(LEGACY_CONTEXT_PREFIX), LEGACY_CONTEXT_PREFIX, target, version)):
+            if (episode['text'] is None
+                    or not legacy_native_context(episode['source'], episode['kind'], episode['text'], episode['metadata'])):
+                return False
+            context_only = True
+        return context_only
+
     def _automatic(self, query, limit, scope, context):
         limit = min(limit, AUTOMATIC_RESULT_LIMIT)
         with self._query_inference:
@@ -450,6 +466,7 @@ class Retrieval:
                     ORDER BY v.distance''',
                     (vector.tobytes(), min(120, max(24, limit * 20)), kind, scope, scope)).fetchall())
             matches = {}
+            context_only = {}
             for row in sorted(rows, key=lambda item: (-item['cosine'], item['target'])):
                 if row['cosine'] < AUTOMATIC_COSINE_FLOOR:
                     continue
@@ -457,6 +474,11 @@ class Retrieval:
                 if record is None or record['id'] in matches:
                     continue
                 if not _automatic_content(record.get('match_text') or record['text']):
+                    continue
+                identity = (record['id'], record['version'])
+                if identity not in context_only:
+                    context_only[identity] = self._legacy_context_only(*identity)
+                if context_only[identity]:
                     continue
                 if record.get('tier') == 'candidate':
                     record.update(self._candidate_details(record['id']))

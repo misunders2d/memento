@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from .store import ConflictError, Store
+from .store import ConflictError, Store, legacy_native_context
 
 NODE_TYPES = frozenset(('experience', 'knowledge', 'decision', 'media', 'person',
                         'organization', 'project', 'concept', 'place', 'tool'))
@@ -21,6 +21,8 @@ def behavior_ground_truth(episode, start=None, end=None):
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     text = episode.get('text', '')
+    if legacy_native_context(episode.get('source'), episode.get('kind'), text, metadata):
+        return False
     pasted, depth, opened = [], 0, None
     for tag in re.finditer(r'<(/?)pasted_content\b[^>]*>', text, re.I):
         if not tag.group(1):

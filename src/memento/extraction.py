@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .graph import ENTITY_TYPES, RELATIONS
 from .commands import Scope
+from .store import legacy_native_context
 
 VERSION = 'extract-v2'
 MEMORY_TYPES = frozenset(('experience', 'knowledge', 'decision'))
@@ -154,7 +155,8 @@ class Extractor:
             if episode is None:
                 raise ValueError('extraction_source_missing')
             projection = episode['metadata'].get('extraction_mode', 'message')
-            if projection == 'skip' or source_blocked(self.store, episode['source'], episode['event_id']):
+            if (projection == 'skip' or source_blocked(self.store, episode['source'], episode['event_id'])
+                    or legacy_native_context(episode['source'], episode['kind'], episode['text'], episode['metadata'])):
                 continue
             end = min(item['end'], item['start'] + 2000) if projection == 'tool_output' or episode['kind'] == 'tool' else item['end']
             windows.append(dict(id=item['id'], episode_id=episode['id'], source=episode['source'],
@@ -172,7 +174,11 @@ class Extractor:
         prepared = {}
         for batch in drafts.windows:
             window = windows[batch.id]
-            raw = self.store.get(window['episode_id'])['text'][window['start']:window['end']]
+            episode = self.store.get(window['episode_id'])
+            if legacy_native_context(episode['source'], episode['kind'], episode['text'], episode['metadata']):
+                prepared[batch.id] = []
+                continue
+            raw = episode['text'][window['start']:window['end']]
             keys, local = {}, []
             for draft in batch.candidates:
                 if draft.key in keys:
@@ -222,7 +228,8 @@ class Extractor:
             for window_id, items in prepared.items():
                 window = windows[window_id]
                 episode = self.store.get(window['episode_id'])
-                if source_blocked(self.store, episode['source'], episode['event_id']):
+                if (source_blocked(self.store, episode['source'], episode['event_id'])
+                        or legacy_native_context(episode['source'], episode['kind'], episode['text'], episode['metadata'])):
                     continue
                 run_id = job.id + '/' + window_id
                 db.execute('INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)',

@@ -9,6 +9,17 @@ from memento.store import Store
 
 
 TEXT = '😀 Сергей, Mellanni, Memory. Связи: Сергей → Mellanni; Memory → Mellanni.'
+NATIVE_SOURCE = 'native:synthetic-device:codex'
+LEGACY_CONTEXTS = [
+    '# AGENTS.md instructions for /workspace/example\n\n<INSTRUCTIONS>\n' + TEXT +
+        '\n</INSTRUCTIONS>\n<environment_context>\ncwd: /workspace/example\nshell: bash\n</environment_context>',
+    '# AGENTS.md instructions\n\n<INSTRUCTIONS>\nThese AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n' +
+        TEXT + '\n</INSTRUCTIONS>',
+    '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n' + TEXT +
+        '\n</INSTRUCTIONS>\n<environment_context>\ncurrent_date: 2026-01-01\n</environment_context>',
+    '# AGENTS.md instructions for /workspace/other\n\n<INSTRUCTIONS>\n' + TEXT +
+        '\n</INSTRUCTIONS>\n<environment_context>\nfilesystem: local\n</environment_context>',
+]
 
 
 def draft(key, kind, type, text, quote, src=None, dst=None):
@@ -114,6 +125,139 @@ def test_newer_due_conversation_precedes_imported_backlog_without_reordering_win
             processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
                 output=dict(windows=[dict(id=window['id'], candidates=[])
                                      for window in task['input']['windows']]))
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('text', LEGACY_CONTEXTS)
+def test_exact_legacy_native_context_preserves_raw_identity_and_excludes_behavior(tmp_path, text):
+    from memento.graph import behavior_ground_truth
+    from memento.store import legacy_native_context
+    payload = dict(source=NATIVE_SOURCE, event_id='legacy', conversation_id='c', kind='user',
+                   text=text, occurred_at=None, metadata={'extraction_mode': 'message', 'native_id': 'old-item'})
+    store = Store(tmp_path)
+    try:
+        episode, created = store.capture(payload)
+        assert created and legacy_native_context(episode['source'], episode['kind'], episode['text'], episode['metadata'])
+        assert not behavior_ground_truth(episode)
+        assert not behavior_ground_truth(episode, text.index('Сергей'), text.index('Сергей') + len('Сергей'))
+        assert store.capture(payload) == (episode, False)
+        assert store.get(episode['id']) == episode
+    finally:
+        store.close()
+    reopened = Store(tmp_path)
+    try:
+        assert reopened.get(episode['id']) == episode
+        assert reopened._db.execute('SELECT legacy_native_context(source,kind,text,metadata) FROM episodes').fetchone()[0] == 1
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize('change', [
+    'prefix', 'suffix', 'quoted', 'incomplete_instructions', 'incomplete_environment',
+    'standalone_environment', 'other_harness', 'ordinary_source', 'assistant', 'modern_metadata', 'closing_in_heading',
+])
+def test_legacy_context_predicate_keeps_unmatched_and_genuine_user_messages(change):
+    from memento.store import legacy_native_context
+    source, kind, metadata = NATIVE_SOURCE, 'user', {'extraction_mode': 'message'}
+    text = LEGACY_CONTEXTS[0]
+    if change == 'prefix':
+        text = 'My actual request follows.\n' + text
+    elif change == 'suffix':
+        text += '\nPlease remember my actual correction.'
+    elif change == 'quoted':
+        text = '```markdown\n' + text + '\n```'
+    elif change == 'incomplete_instructions':
+        text = text.replace('</INSTRUCTIONS>', '')
+    elif change == 'incomplete_environment':
+        text = text.replace('</environment_context>', '')
+    elif change == 'standalone_environment':
+        text = '<environment_context>cwd: /workspace/example</environment_context>'
+    elif change == 'other_harness':
+        source = 'native:synthetic-device:pi'
+    elif change == 'ordinary_source':
+        source = 'user-document'
+    elif change == 'assistant':
+        kind = 'assistant'
+    elif change == 'modern_metadata':
+        metadata['native_context_kinds'] = []
+    elif change == 'closing_in_heading':
+        text = '# AGENTS.md instructions for /workspace/</INSTRUCTIONS>\n\n<INSTRUCTIONS>\nOrdinary incomplete content.'
+    assert not legacy_native_context(source, kind, text, metadata)
+
+
+def test_large_repeated_or_incomplete_legacy_delimiters_are_not_context_only():
+    from memento.store import legacy_native_context
+    prefix = '# AGENTS.md instructions\n\n<INSTRUCTIONS>'
+    for text in (prefix + '<INSTRUCTIONS>' * 30000 + '</INSTRUCTIONS>',
+                 prefix + ' ' * 500000, LEGACY_CONTEXTS[0] + '\n' + 'own words ' * 50000):
+        assert not legacy_native_context(NATIVE_SOURCE, 'user', text, {})
+
+
+def test_extraction_filters_more_than_65_legacy_contexts_before_its_window_limit(tmp_path):
+    store = Store(tmp_path)
+    try:
+        processing = Processing(Graph(store))
+        for index in range(70):
+            store.capture(dict(source=NATIVE_SOURCE, event_id=str(index), conversation_id='c', kind='user',
+                text=LEGACY_CONTEXTS[index % 4], occurred_at=None, metadata={'extraction_mode': 'message'}))
+        genuine, _ = store.capture(dict(source=NATIVE_SOURCE, event_id='genuine', conversation_id='c',
+            kind='user', text=TEXT, occurred_at=None, metadata={}))
+        work = processing.claim(agent='fixture', timezone_name='UTC',
+            compaction=dict(source=NATIVE_SOURCE, conversation_id='c'),
+            now=datetime.now(timezone.utc).replace(hour=12))['work'][0]
+        assert [window['episode_id'] for window in work['input']['windows']] == [genuine['id']]
+        result = processing.complete(id=work['id'], owner=work['owner'], agent='fixture',
+            output=dict(windows=[dict(id=work['input']['windows'][0]['id'], candidates=drafts())]))
+        assert result['candidate_count'] == 5
+        assert store._db.execute('SELECT seq=latest_seq FROM processing_progress').fetchone()[0] == 1
+        assert len(store.search(source=NATIVE_SOURCE, limit=100)) == 71
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('mixed', [False, True])
+@pytest.mark.parametrize('leased', [False, True])
+def test_preexisting_queued_and_leased_context_work_completes_without_losing_real_windows(tmp_path, monkeypatch, mixed, leased):
+    from memento.store import legacy_native_context
+    store = Store(tmp_path)
+    try:
+        processing = Processing(Graph(store))
+        now = datetime.now(timezone.utc).replace(hour=12)
+        context, _ = store.capture(dict(source=NATIVE_SOURCE, event_id='old-context', conversation_id='c',
+            kind='user', text=LEGACY_CONTEXTS[0], occurred_at=None, metadata={}))
+        genuine = None
+        if mixed:
+            genuine, _ = store.capture(dict(source=NATIVE_SOURCE, event_id='real-message', conversation_id='c',
+                kind='user', text=TEXT, occurred_at=None, metadata={}))
+        processing.compact(NATIVE_SOURCE, 'c')
+        # Simulate a job created/leased by the old classifier without altering
+        # any immutable raw source or its metadata.
+        store._db.create_function('legacy_native_context', 4, lambda *_: False, deterministic=True)
+        with monkeypatch.context() as old:
+            old.setattr('memento.extraction.legacy_native_context', lambda *_: False)
+            processing._enqueue_extract(now)
+            job_id = store._db.execute("SELECT id FROM jobs WHERE kind='extract'").fetchone()[0]
+            if leased:
+                work = processing.claim(agent='fixture', timezone_name='UTC', now=now)['work'][0]
+        store._db.create_function('legacy_native_context', 4, legacy_native_context, deterministic=True)
+        if not leased:
+            claimed = processing.claim(agent='fixture', timezone_name='UTC', now=now)['work']
+            if not mixed:
+                assert claimed == []
+            else:
+                work = claimed[0]
+                assert [window['episode_id'] for window in work['input']['windows']] == [genuine['id']]
+        if leased or mixed:
+            output = dict(windows=[dict(id=window['id'], candidates=drafts()) for window in work['input']['windows']])
+            result = processing.complete(id=work['id'], owner=work['owner'], agent='fixture', output=output)
+            assert result['candidate_count'] == (5 if mixed else 0)
+        assert processing.queue.get(job_id)['state'] == 'done'
+        assert store._db.execute('SELECT seq=latest_seq FROM processing_progress').fetchone()[0] == 1
+        assert store._db.execute('SELECT count(*) FROM candidates').fetchone()[0] == (5 if mixed else 0)
+        assert not store._db.execute('SELECT 1 FROM graph_evidence WHERE episode_id=?', (context['id'],)).fetchone()
+        assert store.get(context['id'])['text'] == LEGACY_CONTEXTS[0]
+        assert processing.claim(agent='fixture', timezone_name='UTC', now=now)['work'] == []
     finally:
         store.close()
 
