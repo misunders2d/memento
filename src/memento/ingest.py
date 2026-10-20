@@ -74,7 +74,10 @@ class MediaIngest:
                        start_s=None, end_s=None, page=None, vector=vector)
         elif kind == 'video':
             for start, end, image in keyframes(path):
-                artifact, vector = self._image(image)
+                try:
+                    artifact, vector = self._image(image)
+                finally:
+                    image.close()
                 yield dict(modality='image', text='', artifact_sha256=artifact,
                            start_s=start, end_s=end, page=None, vector=vector)
             yield from self._audio(path)
@@ -85,7 +88,10 @@ class MediaIngest:
                 pages = pdf_pages(path)
                 for page in pages.pages:
                     if page.image is not None:
-                        artifact, vector = self._image(page.image)
+                        try:
+                            artifact, vector = self._image(page.image)
+                        finally:
+                            page.image.close()
                         yield dict(modality='image', text=page.text, artifact_sha256=artifact,
                                    start_s=None, end_s=None, page=page.number, vector=vector)
                     else:

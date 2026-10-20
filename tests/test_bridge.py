@@ -404,6 +404,66 @@ def test_live_journal_then_import_preserves_conversation_and_events(tmp_path, ha
     spool.close()
 
 
+def test_large_legacy_outbox_upload_selects_in_bounded_work_and_preserves_priority(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    config = spool.config
+    config_path = tmp_path / 'runner.json'
+    original = b'original artifact bytes'
+    spool.db.execute('DROP INDEX outbox_pending_order')
+    spool.db.execute('INSERT INTO outbox(key,endpoint,body,content_type) VALUES(?,?,?,?)',
+                     ('oldest-blob', '/blobs', original, 'application/octet-stream'))
+    spool.db.execute("INSERT INTO outbox(key,endpoint,body,state) VALUES(?,?,?,'conflict')",
+                     ('collision', '/episodes', bridge.encode({'text': 'Retained collision.'})))
+    spool.db.executemany('INSERT INTO outbox(key,endpoint,body) VALUES(?,?,?)',
+                         ((f'text{i}', '/episodes', bridge.encode({'text': f'Queued text {i}.'}))
+                          for i in range(3, 100001)))
+    spool.commit()
+    spool.close()
+
+    real_spool = bridge.Spool
+    selection_work = []
+
+    def open_spool(*args, **kwargs):
+        result = real_spool(*args, **kwargs)
+
+        def progress():
+            selection_work[-1] += 100
+            return selection_work[-1] > 1000
+
+        def trace(sql):
+            if sql.startswith('SELECT id,endpoint,body,content_type FROM outbox'):
+                selection_work.append(0)
+                result.db.set_progress_handler(progress, 100)
+            else:
+                result.db.set_progress_handler(None, 0)
+
+        result.db.set_trace_callback(trace)
+        return result
+
+    attempted = []
+
+    def transport(_config, endpoint, body, **_kwargs):
+        assert endpoint == '/episodes'
+        attempted.append(body['text'])
+        if len(attempted) == 2:
+            raise OSError('synthetic transport outage')
+        return {}
+
+    monkeypatch.setattr(bridge, 'Spool', open_spool)
+    monkeypatch.setattr(bridge, 'http', transport)
+    assert bridge.upload(config_path, config) == {'pending': 99998, 'conflicts': 1}
+    assert attempted == ['Queued text 3.', 'Queued text 4.']
+    assert len(selection_work) == 2 and max(selection_work) <= 1000
+    spool = real_spool(config_path, config)
+    try:
+        assert spool.db.execute('SELECT body FROM outbox WHERE key=?', ('oldest-blob',)).fetchone() == (original,)
+        assert spool.db.execute('SELECT state FROM outbox WHERE key=?', ('collision',)).fetchone() == ('conflict',)
+        assert spool.db.execute('SELECT count(*) FROM outbox WHERE key=?', ('text3',)).fetchone()[0] == 0
+        assert spool.db.execute('SELECT count(*) FROM outbox WHERE key=?', ('text4',)).fetchone()[0] == 1
+    finally:
+        spool.close()
+
+
 @pytest.mark.parametrize('background,expected_pending', [(False, 0), (True, 1)])
 def test_upload_drain_and_background_bound_preserve_pending_work(tmp_path, monkeypatch, capsys,
                                                               background, expected_pending):

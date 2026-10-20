@@ -191,6 +191,8 @@ class Spool:
             columns = {row[1] for row in self.db.execute('PRAGMA table_info(' + table + ')')}
             if name not in columns:
                 self.db.execute('ALTER TABLE ' + table + ' ADD COLUMN ' + name + ' ' + declaration)
+        self.db.execute('''CREATE INDEX IF NOT EXISTS outbox_pending_order
+            ON outbox(content_type IS NOT NULL,id) WHERE state='pending' ''')
         self.attachment_roots = ()
         self.coverage = {'unsupported_records': 0, 'attachments': 0,
                          'missing_attachments': 0, 'unsupported_attachments': 0,
