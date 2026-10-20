@@ -11,14 +11,21 @@ from threading import Event, RLock, Thread
 import numpy as np
 
 from .embedder import EMBED_DIM, embed_query, embed_texts, load_model
-from .graph import Graph, NODE_SUMMARY
-from .extraction import ACTIVE_CANDIDATE_SQL
+from .graph import Graph, NODE_SUMMARY, ENTITY_TYPES
+from .extraction import ACTIVE_CANDIDATE_SQL, source_text_ranges
 from .text_chunks import TextChunk, chunks
 from .importance import query_key
 
 MODEL_ID = 'google/embeddinggemma-2'
 MODEL_REVISION = '914f7f89142e33e77833254d9c9b90c3cef7303b'
 TEXT_COSINE_FLOOR = 0.685  # corporate_search's measured native text relevance floor
+# Pinned-model calibration: ordinary negatives reached .6562; actual native
+# learning yielded a useful neutral-query transfer at .66375. At .66, frozen
+# synthetic/holdout pairs are unchanged from .67; topical behavior overlap still
+# requires the receiving agent's applicability check, not a confidence claim.
+AUTOMATIC_COSINE_FLOOR = 0.66
+AUTOMATIC_RESULT_LIMIT = 6
+AUTOMATIC_SUGGESTION_LIMIT = 2
 
 _INDEX_SOURCES = (
     ('node', 'node_versions', '''SELECT n.id,'node' AS kind,n.version,n.text,n.type,
@@ -39,6 +46,47 @@ _INDEXABLE = ' UNION ALL '.join(source for _, _, source in _INDEX_SOURCES)
 _RECALL_ELIGIBLE = f'''SELECT a.id,a.kind,a.version,a.scope,a.id AS rank_target FROM ({_INDEXABLE}) a
     UNION ALL SELECT s.id,'segment',1,n.scope,n.id FROM segments s JOIN node_versions n ON n.id=s.node_id
     WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)'''
+
+_ENTITY_SQL = ','.join("'" + kind + "'" for kind in sorted(ENTITY_TYPES))
+_AUTOMATIC_ELIGIBLE = f'''SELECT n.id,'node' AS kind,n.version,n.scope,n.id AS rank_target
+    FROM node_versions n WHERE n.state='active'
+    AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+    AND n.type NOT IN ({_ENTITY_SQL},'media')
+    AND NOT EXISTS (SELECT 1 FROM memory_types t WHERE t.name=n.type AND t.category='entity')
+    UNION ALL SELECT c.id,'candidate',1,c.scope,c.id FROM candidates c
+    WHERE c.kind='memory' AND c.type NOT IN ({_ENTITY_SQL},'experience')
+    AND NOT EXISTS (SELECT 1 FROM memory_types t WHERE t.name=c.type AND t.category='entity')
+    AND {ACTIVE_CANDIDATE_SQL}
+    UNION ALL SELECT s.id,'segment',1,n.scope,n.id FROM segments s JOIN node_versions n ON n.id=s.node_id
+    WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)'''
+
+
+def _automatic_content(text):
+    """Do not spend injection space on labels, paths or generic associations."""
+    text = text.strip().strip('`\"\'')
+    words = re.findall(r'[^\W_]+', text, re.UNICODE)
+    if len(words) < 3:
+        return False
+    if '\n' not in text and re.fullmatch(r'\S+(?:[/\\]\S+|\.[A-Za-z0-9]{1,8})', text):
+        return False
+    if re.fullmatch(r'(?:~?/|[A-Za-z]:[/\\]|\.{1,2}/).+\.[A-Za-z0-9]{1,8}', text):
+        return False
+    if re.fullmatch(r'.{1,120}\s+(?:is\s+)?(?:related to|associated with|mentions)\s+.{1,120}[.!]?', text, re.I):
+        return False
+    return True
+
+
+def _automatic_query(query, context):
+    # A follow-up needs its antecedent; an independent new request should not be
+    # pulled toward the previous topic merely because context was supplied.
+    followup = (len(query.split()) <= 2 or re.search(
+        r'^(?:and\b|what about\b|how about\b|continue\b|go on\b|а\b|как насчет\b|что насчет\b)|'
+        r'^(?:what|how|why|when|where|which)\b.{0,100}\b(?:it|that|this|those|them|same)\b|'
+        r'^(?:does|do|can|could|would|should|is|are|will)\s+(?:it|that|this|those|they|them)\b|'
+        r'^(?:please )?(?:do|use|apply|repeat) (?:it|that|this|the same)\b', query, re.I))
+    if context.strip() and followup:
+        return (query + '\nRecent conversation:\n' + context.strip())[:4096]
+    return query
 
 
 class Retrieval:
@@ -126,8 +174,12 @@ class Retrieval:
         prepared = []
         for episode in episodes:
             with self._inference, self._tokenization:
-                passages = chunks(episode['text'], self.model.tokenizer)
-            prepared.append((episode, passages or [TextChunk(0, len(episode['text']), episode['text'])]))
+                passages = []
+                for start, end in source_text_ranges(episode['text']):
+                    text = episode['text'][start:end]
+                    local = chunks(text, self.model.tokenizer)
+                    passages.extend(TextChunk(start + part.start, start + part.end, part.text) for part in local)
+            prepared.append((episode, passages or [TextChunk(0, 0, '')]))
         with self.store._mutex:
             db = self.store._db
             db.execute('BEGIN IMMEDIATE')
@@ -361,11 +413,109 @@ class Retrieval:
             from .loops import current
             return [dict(row, scope=json.loads(row['scope']), loop=current(self.graph, row['id'])) for row in rows]
 
-    def recall(self, query, effort='normal', limit=10, *, scope=None):
+    def _automatic_record(self, row):
+        db = self.store._db
+        if row['kind'] == 'candidate':
+            return self._candidate_record(row['target'])
+        if row['kind'] == 'node':
+            record = db.execute(f'''SELECT {NODE_SUMMARY} FROM node_versions n
+                WHERE n.id=? AND n.version=? AND n.state='active' ''',
+                (row['target'], row['version'])).fetchone()
+            return dict(record) if record else None
+        record = db.execute(f'''SELECT {NODE_SUMMARY},s.id AS segment_id,s.modality,
+            s.start_s,s.end_s,s.page,s.char_start,s.char_end,substr(s.text,1,240) AS match_text,
+            '/blobs/'||s.source_sha256 AS source_text_url,'/blobs/'||f.sha256 AS blob_url,
+            '/blobs/'||s.artifact_sha256 AS artifact_url
+            FROM segments s JOIN media_files f ON f.node_id=s.node_id
+            JOIN node_versions n ON n.id=s.node_id WHERE s.id=? AND n.state='active'
+            AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)''',
+            (row['target'],)).fetchone()
+        return dict(record) if record else None
+
+    def _automatic(self, query, limit, scope, context):
+        limit = min(limit, AUTOMATIC_RESULT_LIMIT)
+        with self._query_inference:
+            vector = embed_query(self.model, _automatic_query(query, context))
+        with self.store._mutex:
+            db = self.store._db
+            rows = []
+            for kind in ('node', 'candidate', 'segment'):
+                rows.extend(db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
+                    FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
+                    WHERE v.embedding MATCH ? AND k=? AND v.current=1
+                    AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({_AUTOMATIC_ELIGIBLE}) a
+                        ON a.id=i.target AND a.kind=i.kind AND a.version=i.version
+                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?))
+                        AND coalesce((SELECT archived FROM node_stats WHERE node_id=a.rank_target),0)=0)
+                    ORDER BY v.distance''',
+                    (vector.tobytes(), min(120, max(24, limit * 20)), kind, scope, scope)).fetchall())
+            matches = {}
+            for row in sorted(rows, key=lambda item: (-item['cosine'], item['target'])):
+                if row['cosine'] < AUTOMATIC_COSINE_FLOOR:
+                    continue
+                record = self._automatic_record(row)
+                if record is None or record['id'] in matches:
+                    continue
+                if not _automatic_content(record.get('match_text') or record['text']):
+                    continue
+                if record.get('tier') == 'candidate':
+                    record.update(self._candidate_details(record['id']))
+                else:
+                    record.update(tier='durable', confirmed=True)
+                    record.update(self.graph._recall_details(record['id'], record['version']))
+                    # Incidents remain explicitly searchable. Only consolidated
+                    # reusable behavior enters automatic context as experience.
+                    if record['type'] == 'experience' and not record.get('behavior'):
+                        continue
+                if isinstance(record.get('scope'), str):
+                    record['scope'] = json.loads(record['scope'])
+                record.setdefault('category', 'memory')
+                if record.get('tier') == 'candidate':
+                    full = db.execute('SELECT text FROM candidates WHERE id=?', (record['id'],)).fetchone()
+                else:
+                    full = db.execute('SELECT text FROM node_versions WHERE id=? AND version=?',
+                                      (record['id'], record['version'])).fetchone()
+                record.update(cosine=float(row['cosine']), score=float(row['cosine']),
+                              match='semantic', related=[], _full_text=full['text'] if full else record['text'])
+                matches[record['id']] = record
+            # Collapse equivalent assertions while retaining every returned source
+            # identity and evidence span. Similar but different facts stay separate.
+            grouped = {}
+            for record in matches.values():
+                signature = (record['category'], record.get('authority'), tuple(record['scope']),
+                             ' '.join(record.pop('_full_text').casefold().split()).rstrip('.!'))
+                previous = grouped.get(signature)
+                if previous is None:
+                    record['duplicate_ids'] = []
+                    grouped[signature] = record
+                    continue
+                previous['duplicate_ids'].append(record['id'])
+                seen = {(ref['episode_id'], ref['start'], ref['end']) for ref in previous.get('evidence', [])}
+                for ref in record.get('evidence', []):
+                    identity = (ref['episode_id'], ref['start'], ref['end'])
+                    if identity not in seen:
+                        previous.setdefault('evidence', []).append(ref)
+                        seen.add(identity)
+            results, suggestions = [], 0
+            for record in grouped.values():
+                if record['category'] == 'behavioral_suggestion':
+                    if suggestions == AUTOMATIC_SUGGESTION_LIMIT:
+                        continue
+                    suggestions += 1
+                results.append(record)
+                if len(results) == limit:
+                    break
+            return results
+
+    def recall(self, query, effort='normal', limit=10, *, scope=None, automatic=False, context=''):
         if effort not in ('cheap', 'normal', 'deep') or not 1 <= limit <= 100 or scope not in (None, 'personal', 'professional'):
             raise ValueError('Invalid effort, limit or scope')
         if not query.strip() or len(query) > 4096 or '\x00' in query:
             raise ValueError('Recall requires 1..4096 characters without NUL')
+        if not isinstance(automatic, bool) or not isinstance(context, str) or len(context) > 4096 or '\x00' in context:
+            raise ValueError('Invalid automatic recall context')
+        if automatic:
+            return self._automatic(query, limit, scope, context)
         keywords = self.graph.recall_keywords(query, min(100, limit * 4),
                                              scope=scope, include_archived=effort == 'deep')
         matches = {row['id']: dict(row, score=TEXT_COSINE_FLOOR + 0.25, match='keyword') for row in keywords}
@@ -532,6 +682,34 @@ class Retrieval:
         self._stop.set()
         if self._worker is not None:
             self._worker.join()
+
+    def status(self, source=None):
+        """Exact current index-unit counts; unchunked episodes are reported separately."""
+        with self.store._mutex:
+            db = self.store._db
+            row = db.execute(f'''WITH units AS (
+                SELECT a.* FROM ({_RECALL_ELIGIBLE}) a WHERE ? IS NULL
+                OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
+                    WHERE g.target=a.rank_target AND e.source=?)
+                OR (a.kind='episode' AND EXISTS (SELECT 1 FROM episode_chunks x
+                    JOIN episodes e ON e.id=x.episode_id WHERE x.id=a.id AND e.source=?))),
+                states AS (SELECT a.*,
+                    EXISTS (SELECT 1 FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
+                        WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version AND v.current=1) AS indexed,
+                    EXISTS (SELECT 1 FROM index_failures f WHERE f.target=a.id
+                        AND f.version=a.version AND f.resolved=0) AS failed FROM units a)
+                SELECT count(*) AS total,coalesce(sum(indexed),0) AS indexed,
+                    coalesce(sum(NOT indexed AND NOT failed),0) AS pending,
+                    coalesce(sum(NOT indexed AND failed),0) AS failed FROM states''',
+                (source, source, source)).fetchone()
+            unprepared = db.execute('''SELECT count(*) FROM episodes e
+                WHERE (? IS NULL OR e.source=?)
+                AND coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip'
+                AND NOT EXISTS (SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id)
+                AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)''',
+                (source, source)).fetchone()[0]
+            return dict(available=True, **dict(row), unprepared_episodes=unprepared,
+                        error=type(self.index_error).__name__ if self.index_error else None)
 
     def health(self):
         if self.index_error is not None:

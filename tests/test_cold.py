@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -13,6 +14,7 @@ from memento.artifacts import Artifacts
 from memento.blobs import BlobStore
 from memento.cold import ColdObject, DriveColdStore, _hashes
 from memento.cold_manager import ColdManager
+from memento.cold_runtime import ColdRuntime
 from memento.graph import Graph
 from memento.store import Store
 
@@ -403,7 +405,7 @@ def test_sweep_failure_does_not_starve_other_artifacts_and_retries_after_backoff
     assert manager.fetch(bad['sha256']).read_bytes() == original
 
 
-def test_protected_artifact_does_not_hide_unprotected_items_beyond_sweep_limit(cold):
+def test_high_importance_media_archives_promptly_without_an_infinite_hot_copy(cold):
     graph, manager, backend = cold
     protected = manager.blobs.put(io.BytesIO(b'important old document'))
     ordinary = manager.blobs.put(io.BytesIO(b'ordinary old document'))
@@ -420,5 +422,227 @@ def test_protected_artifact_does_not_hide_unprotected_items_beyond_sweep_limit(c
     graph.store._db.execute("UPDATE blobs SET created_at='2001-01-01T00:00:00+00:00'")
     graph.store._db.execute("UPDATE blobs SET created_at='2000-01-01T00:00:00+00:00' WHERE sha256=?", (protected['sha256'],))
     result = manager.sweep(min_bytes=1, limit=1)
-    assert [row['sha256'] for row in result['promoted']] == [ordinary['sha256']]
-    assert manager.blobs.path(protected['sha256']).read_bytes() == b'important old document'
+    assert [row['sha256'] for row in result['promoted']] == [protected['sha256']]
+    assert not manager.blobs.path(protected['sha256']).exists()
+    assert manager.fetch(protected['sha256']).read_bytes() == b'important old document'
+    assert graph.history(node['id'])[0]['text'] == 'Important document.'
+
+
+def test_fresh_small_media_and_large_generic_objects_do_not_wait_for_archive_age(cold):
+    graph, manager, backend = cold
+    image = manager.blobs.put(io.BytesIO(b'\x00\xffphoto' * (648 * 1024 // 7)))
+    generic = manager.blobs.put(io.BytesIO(b'large generic payload' * 100))
+    small = manager.blobs.put(io.BytesIO(b'ordinary recent small payload'))
+    manager.artifacts.register(image, 'image/png')
+    manager.artifacts.register(generic)
+    manager.artifacts.register(small)
+    result = manager.sweep(min_bytes=1024)
+    assert {row['sha256'] for row in result['promoted']} == {image['sha256'], generic['sha256']}
+    assert manager.blobs.path(small['sha256']).exists()
+    assert manager.fetch(image['sha256']).read_bytes() == (backend.root / image['sha256']).read_bytes()
+
+
+def test_prompt_upload_keeps_pending_media_bytes_until_processing_finishes(cold):
+    from memento.jobs import Queue
+
+    graph, manager, backend = cold
+    original = b'pending original photograph\x00\xff'
+    blob = manager.blobs.put(io.BytesIO(original))
+    manager.artifacts.register(blob, 'image/png')
+    episode, _ = graph.store.capture(dict(source='fixture', event_id='pending-media', conversation_id='c',
+        kind='user', text='Keep this original photograph.', occurred_at=None, metadata={}))
+    queue = Queue(graph)
+    queue.submit_media(command_id='pending-media', actor='fixture', why='Explicit image save',
+        sha256=blob['sha256'], kind='image', filename='original.png', scope=['personal'],
+        evidence=[dict(episode_id=episode['id'], quote='Keep this original photograph.')])
+    result = manager.sweep()
+    assert result['promoted'][0]['tier'] == 'cold'
+    assert manager.blobs.path(blob['sha256']).read_bytes() == original
+    assert (backend.root / blob['sha256']).read_bytes() == original
+    assert manager.trim_cache(max_bytes=0, ttl_seconds=0)['evicted'] == []
+    job = queue.claim(['media'])
+    assert manager.trim_cache(max_bytes=0, ttl_seconds=0)['evicted'] == []
+    queue.complete(job, dict(indexed=True))
+    assert manager.trim_cache(max_bytes=0, ttl_seconds=0)['evicted'] == [blob['sha256']]
+    assert manager.fetch(blob['sha256']).read_bytes() == original
+
+
+def test_fetched_cache_budget_ttl_restart_and_active_reader_protection(cold):
+    graph, manager, backend = cold
+    originals = [b'older cached original', b'newer cached original']
+    infos = [manager.artifacts.register(manager.blobs.put(io.BytesIO(content))) for content in originals]
+    for info in infos:
+        manager.promote(info['sha256'])
+        manager.fetch(info['sha256'])
+    os.utime(manager.blobs.path(infos[0]['sha256']), (1, 1))
+    result = manager.trim_cache(max_bytes=len(originals[1]), ttl_seconds=10**12)
+    assert result == dict(bytes=len(originals[1]), evicted=[infos[0]['sha256']])
+    # Cache membership and age are reconstructible after a service restart.
+    restarted = ColdManager(manager.artifacts, backend, manager.data_dir)
+    with restarted.reader(infos[1]['sha256']) as source:
+        assert restarted.trim_cache(max_bytes=0, ttl_seconds=0)['evicted'] == []
+        assert source.read() == originals[1]
+    assert restarted.trim_cache(max_bytes=0, ttl_seconds=0)['evicted'] == [infos[1]['sha256']]
+    restarted.fetch(infos[0]['sha256'])
+    os.utime(restarted.blobs.path(infos[0]['sha256']), (1, 1))
+    assert restarted.trim_cache(max_bytes=10**9, ttl_seconds=3600)['evicted'] == [infos[0]['sha256']]
+    assert all((backend.root / info['sha256']).read_bytes() == content
+               for info, content in zip(infos, originals, strict=True))
+
+
+def test_blob_reader_hashing_does_not_hold_capture_writer_lock(cold, monkeypatch):
+    graph, manager, backend = cold
+    blob = manager.blobs.put(io.BytesIO(b'exact original'))
+    manager.artifacts.register(blob)
+    started, release, captured = Event(), Event(), Event()
+    verify = manager.blobs.verify
+    errors = []
+
+    def blocked_verify(sha256):
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError('Fixture verifier release deadline')
+        return verify(sha256)
+
+    def reading():
+        try:
+            with manager.reader(blob['sha256']) as source:
+                assert source.read() == b'exact original'
+        except Exception as error:
+            errors.append(error)
+
+    def capture():
+        try:
+            graph.store.capture(dict(source='fixture', event_id='during-hash', conversation_id='c',
+                kind='user', text='Capture remains responsive.', occurred_at=None, metadata={}))
+        except Exception as error:
+            errors.append(error)
+        finally:
+            captured.set()
+
+    monkeypatch.setattr(manager.blobs, 'verify', blocked_verify)
+    reader = Thread(target=reading)
+    reader.start()
+    writer = None
+    try:
+        assert started.wait(2)
+        writer = Thread(target=capture)
+        writer.start()
+        responsive = captured.wait(2)
+    finally:
+        release.set()
+        reader.join(5)
+        if writer is not None:
+            writer.join(5)
+    assert responsive and errors == []
+    assert manager._readers == {}
+
+
+def test_http_disconnect_before_body_starts_releases_reader(cold):
+    import asyncio
+    from starlette.requests import ClientDisconnect
+    from memento.api import BlobResponse
+
+    graph, manager, backend = cold
+    blob = manager.blobs.put(io.BytesIO(b'exact cached original'))
+    manager.artifacts.register(blob)
+    manager.promote(blob['sha256'])
+    reader = manager.reader(blob['sha256'])
+    source = reader.__enter__()
+    started = []
+
+    async def content():
+        started.append(True)
+        yield source.read()
+
+    async def disconnected_send(message):
+        raise OSError('Synthetic disconnect before body')
+
+    async def receive():
+        return {'type': 'http.disconnect'}
+
+    response = BlobResponse(content(), reader)
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(response({'type': 'http', 'asgi': {'spec_version': '2.4'}}, receive, disconnected_send))
+    assert started == [] and source.closed and manager._readers == {}
+    assert manager.trim_cache(max_bytes=0, ttl_seconds=0)['evicted'] == [blob['sha256']]
+
+
+def _recent_images(manager, count):
+    return [manager.artifacts.register(manager.blobs.put(io.BytesIO(f'original photo {index}'.encode())),
+                                       'image/png') for index in range(count)]
+
+
+def _finish_at_idle(runtime, monkeypatch):
+    waits = []
+    def idle(seconds):
+        waits.append(seconds)
+        runtime.stop.set()
+        return True
+    monkeypatch.setattr(runtime.stop, 'wait', idle)
+    runtime.start()
+    runtime.thread.join(5)
+    try:
+        assert not runtime.thread.is_alive(), 'Bounded test worker did not reach its idle boundary'
+    finally:
+        runtime.close()
+    return waits
+
+
+def test_cold_runtime_drains_full_successful_batches_before_waiting(cold, monkeypatch):
+    graph, manager, backend = cold
+    infos = _recent_images(manager, 25)
+    batches = []
+    sweep = manager.sweep
+    def observed(**kwargs):
+        result = sweep(**kwargs)
+        batches.append((len(result['promoted']), result['batch_full']))
+        return result
+    monkeypatch.setattr(manager, 'sweep', observed)
+    runtime = ColdRuntime(manager)
+    assert _finish_at_idle(runtime, monkeypatch) == [60]
+    assert batches == [(10, True), (10, True), (5, False)]
+    assert all(manager.artifacts.get(info['sha256'])['remote_id'] for info in infos)
+    assert runtime.last_error is None
+
+
+def test_cold_runtime_exhausted_backoff_does_not_spin_or_retry_early(cold, monkeypatch):
+    graph, manager, backend = cold
+    infos = _recent_images(manager, 11)
+    calls = []
+    def unavailable(path, *args):
+        calls.append(path)
+        raise ConnectionError('Synthetic unavailable Drive')
+    monkeypatch.setattr(backend, 'upload', unavailable)
+    runtime = ColdRuntime(manager)
+    assert _finish_at_idle(runtime, monkeypatch) == [60]
+    assert len(calls) == 11 and runtime.sweep_failure_count == 11
+    assert not runtime.run_once()
+    runtime.next_sweep = 0
+    assert not runtime.run_once()
+    assert len(calls) == 11
+    assert runtime.last_error == 'PendingArchives'
+    assert all(manager.blobs.path(info['sha256']).exists() for info in infos)
+
+
+def test_cold_runtime_checks_stop_between_full_batches(cold, monkeypatch):
+    graph, manager, backend = cold
+    _recent_images(manager, 20)
+    runtime = ColdRuntime(manager)
+    sweep = manager.sweep
+    batches = []
+    def stop_after_batch(**kwargs):
+        result = sweep(**kwargs)
+        batches.append(result['batch_full'])
+        runtime.stop.set()
+        return result
+    monkeypatch.setattr(manager, 'sweep', stop_after_batch)
+    runtime.start()
+    runtime.thread.join(5)
+    try:
+        assert not runtime.thread.is_alive()
+        assert batches == [True]
+        assert graph.store._db.execute('SELECT count(*) FROM blobs WHERE remote_id IS NOT NULL').fetchone()[0] == 10
+        assert graph.store._db.execute("SELECT count(*) FROM blobs WHERE tier='hot'").fetchone()[0] == 10
+    finally:
+        runtime.close()

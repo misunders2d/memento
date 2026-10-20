@@ -60,6 +60,322 @@ def test_keyword_bonus_uses_one_formula_even_below_semantic_floor(retrieval):
     assert [hit['id'] for hit in r.recall('needle', effort='cheap')] == [stronger, weaker]
 
 
+def test_automatic_eligibility_precedes_vector_limit_and_explicit_entities_remain(retrieval):
+    r = retrieval
+    for _ in range(30):
+        entity, _ = assertion(r, 'Memento', type='project')
+        index(r, entity, .99)
+    useful, _ = assertion(r, 'Memento stores exact source evidence for each assertion.')
+    index(r, useful, .85)
+    automatic = r.recall('Memento evidence', automatic=True, limit=1)
+    assert [item['id'] for item in automatic] == [useful]
+    assert automatic[0]['category'] == 'memory' and automatic[0]['related'] == []
+    assert any(item['type'] == 'project' for item in r.recall('Memento', effort='cheap', limit=100))
+
+
+@pytest.mark.parametrize('text', [
+    '/home/example/My Project/src/memento/retrieval.py',
+    'src/memento/retrieval.py', 'Memento is related to memory',
+])
+def test_automatic_omits_paths_and_generic_associations_even_at_high_similarity(retrieval, text):
+    target, _ = assertion(retrieval, text)
+    index(retrieval, target, .99)
+    assert retrieval.recall('unrelated current question', automatic=True) == []
+    assert retrieval.recall(text, effort='cheap')[0]['id'] == target
+
+
+def test_automatic_keyword_match_never_bypasses_relevance_floor(retrieval):
+    from memento.retrieval import AUTOMATIC_COSINE_FLOOR
+    target, _ = assertion(retrieval, 'Needle is the old project codename.')
+    index(retrieval, target, AUTOMATIC_COSINE_FLOOR - .05)
+    assert retrieval.recall('Needle', automatic=True) == []
+    assert retrieval.recall('Needle', effort='cheap')[0]['id'] == target
+
+
+def test_calibrated_automatic_floor_keeps_weak_useful_fact_above_ordinary_negative(retrieval):
+    useful, _ = assertion(retrieval, 'The synthetic user avoids peanuts because of a food allergy.')
+    unrelated, _ = assertion(retrieval, 'The release requires a cobalt checklist before shipment.')
+    index(retrieval, useful, .678506)
+    index(retrieval, unrelated, .656186)
+    assert [item['id'] for item in retrieval.recall('ingredient to exclude from lunch', automatic=True)] == [useful]
+
+
+def test_automatic_collapses_duplicate_assertions_without_losing_sources(retrieval):
+    r = retrieval
+    first, first_evidence = assertion(r, 'The release uses a cobalt checklist.')
+    second, second_evidence = assertion(r, 'The release uses a cobalt checklist!')
+    index(r, first, .90)
+    index(r, second, .89)
+    result = r.recall('release checklist', automatic=True)
+    assert len(result) == 1 and result[0]['id'] == first
+    assert result[0]['duplicate_ids'] == [second]
+    assert {item['episode_id'] for item in result[0]['evidence']} == {
+        first_evidence[0]['episode_id'], second_evidence[0]['episode_id']}
+    assert r.graph.history(second)[0]['text'].endswith('!')
+
+
+def test_automatic_does_not_collapse_different_assertions_after_display_excerpt(retrieval):
+    prefix = 'The supported production release checklist ' + 'contains verified steps ' * 15
+    first, _ = assertion(retrieval, prefix + 'for the blue environment.')
+    second, _ = assertion(retrieval, prefix + 'for the green environment.')
+    index(retrieval, first, .9)
+    index(retrieval, second, .89)
+    assert len(retrieval.recall('release checklist', automatic=True)) == 2
+
+
+def test_automatic_duplicate_normalization_preserves_numeric_signs_and_operators(retrieval):
+    r = retrieval
+    for text in ('The blue account balance is -2 dollars.', 'The blue account balance is 2 dollars.',
+                 'The accepted measurement is <3 units.', 'The accepted measurement is >3 units.'):
+        target, _ = assertion(r, text)
+        index(r, target, .9)
+    assert len(r.recall('account balance and accepted measurement', automatic=True)) == 4
+
+
+def test_automatic_followup_uses_context_but_independent_request_does_not(retrieval, monkeypatch):
+    r = retrieval
+    captured = []
+    def encode(model, text):
+        captured.append(text)
+        return np.eye(1, 768, dtype=np.float32)[0]
+    monkeypatch.setattr('memento.retrieval.embed_query', encode)
+    context = 'We were discussing source evidence for release decisions.'
+    assert r.recall('What about that?', automatic=True, context=context) == []
+    assert context in captured[-1]
+    assert r.recall('Translate this restaurant menu', automatic=True, context=context) == []
+    assert captured[-1] == 'Translate this restaurant menu'
+
+
+def test_auxiliary_followup_uses_bounded_context_without_carrying_topic_into_lunch():
+    from memento.retrieval import _automatic_query
+    context = 'review Memento code against its goals/restrictions'
+    query = 'does it introduce unnecessary overhead?'
+    assert _automatic_query(query, context) == query + '\nRecent conversation:\n' + context
+    assert len(_automatic_query(query, context * 200)) <= 4096
+    lunch = 'later, I am off for lunch'
+    assert _automatic_query(lunch, context) == lunch
+    independent = 'Can you translate this restaurant menu?'
+    assert _automatic_query(independent, context) == independent
+
+
+def test_native_acceptance_cannot_pass_conduct_from_an_echoed_lesson(tmp_path, monkeypatch):
+    from memory_acceptance import conduct_cases
+    executable = tmp_path / 'existing-codex'
+    executable.write_text('synthetic executable, never invoked')
+    def invoke(argv, payload=b'', **kwargs):
+        if '--help' in argv:
+            return b'--ignore-user-config --ephemeral --disable --sandbox --json'
+        return b'{"type":"item.completed","item":{"text":"I will follow the lesson."}}\n'
+    monkeypatch.setattr('memento.runner.run_process', invoke)
+    context = {'context': '[memory:fixture] [inferred] Applies: ordinary setup. Conduct: use installer. Exceptions: training.',
+               'shown': ['fixture']}
+    results = []
+    conduct_cases(executable, tmp_path, context, context, results)
+    assert [(item['case'], item['passed']) for item in results] == [
+        ('transfer', False), ('nonapplicability', True), ('override', False), ('adaptation', False),
+        ('transfer_control_empty', False), ('adaptation_control_initial', False)]
+
+
+def test_native_conduct_preserves_sanitized_invocation_error_details(tmp_path, monkeypatch):
+    from memory_acceptance import conduct_cases
+    executable = tmp_path / 'existing-codex'
+    executable.write_text('synthetic executable, never invoked')
+    class InvocationError(Exception):
+        details = dict(returncode=1, stderr='Sanitized startup error', stdout='{"type":"turn.failed"}')
+    def invoke(argv, payload=b'', **kwargs):
+        if '--help' in argv:
+            return b'--ignore-user-config --ephemeral --disable --sandbox --json'
+        assert argv[argv.index('--model') + 1] == 'gpt-6.1-sol'
+        assert 'model_reasoning_effort="xhigh"' in argv
+        raise InvocationError('Native startup failed')
+    monkeypatch.setattr('memento.runner.run_process', invoke)
+    context = dict(context='', shown=[], learned_ids=[])
+    results = []
+    conduct_cases(executable, tmp_path, context, context, results)
+    assert len(results) == 6
+    assert all(item['error_details'] == InvocationError.details for item in results)
+
+
+def test_native_conduct_controls_do_not_claim_learning_from_identical_compatible_actions(tmp_path, monkeypatch):
+    from memory_acceptance import conduct_cases
+    executable = tmp_path / 'existing-codex'
+    executable.write_text('synthetic executable, never invoked')
+    def invoke(argv, payload=b'', **kwargs):
+        if '--help' in argv:
+            return b'--ignore-user-config --ephemeral --disable --sandbox --json'
+        task = payload.decode().split('Current user request:\n')[-1]
+        workspace = kwargs['cwd']
+        if 'INI parser' not in task:
+            (workspace / 'config.json').write_text('{"endpoint":"loopback","mode":"connected"}')
+            if 'training workspace' not in task and 'editing its configuration manually' not in task:
+                (workspace / 'installer.log').write_text('setup invoked\n')
+        return b'{"type":"item.completed","item":{"type":"agent_message","text":"Completed."}}\n'
+    monkeypatch.setattr('memento.runner.run_process', invoke)
+    context = dict(context='[memory:fixture] Advisory setup suggestion.', shown=['fixture'], learned_ids=['fixture'])
+    results = []
+    conduct_cases(executable, tmp_path, context, context, results)
+    assert len(results) == 6 and all(item['compatible_conduct'] for item in results)
+    for item in results:
+        if item['case'] in ('transfer', 'adaptation'):
+            assert item['control_comparison']['outcome_differs'] is False
+            assert item['control_comparison']['differs_in_expected_direction'] is False
+            assert item['control_comparison']['causal_learning_claimed'] is False
+
+
+def test_native_learning_keeps_automatic_failure_while_collecting_corrections(retrieval, tmp_path, monkeypatch):
+    from memory_acceptance import learning
+    lesson = dict(id='native-lesson', category='behavioral_suggestion', type='experience', tier='durable',
+        text='Prefer the supported setup installer when configuring a client.', authority='inferred',
+        behavior=dict(applicability='Configuring a software client.', conduct='Prefer a supported installer.',
+                      exceptions=['Follow current instructions.'], rationale='Manual copying caused errors.'))
+    status = dict(indexing=dict(available=True, pending=0, failed=0, unprepared_episodes=0),
+                  captured=dict(episodes=3, conversations=1))
+    class Service:
+        base_url = 'http://127.0.0.1:1'
+        def get(self, path):
+            if path == '/recall?limit=1':
+                return {'memories': []}
+            if path.startswith('/recall?'):
+                return {'memories': [lesson]}
+            if path.startswith('/history/'):
+                return {'versions': [lesson]}
+            assert path.startswith('/status')
+            return status
+        def post(self, path, payload):
+            assert path == '/episodes'
+            return {'id': payload['event_id']}
+    monkeypatch.setattr('memory_acceptance.shutil.which', lambda agent: '/existing/native')
+    monkeypatch.setattr('memento.runner.tick', lambda *args, **kwargs: 0)
+    monkeypatch.setattr('memento.bridge.http', lambda *args, **kwargs: {'memories': []})
+    def native_actions(executable, directory, initial, revised, cases, **kwargs):
+        cases.extend(dict(case=name, passed=True) for name in ('transfer', 'nonapplicability', 'override',
+            'adaptation', 'transfer_control_empty', 'adaptation_control_initial'))
+        cases.append(dict(case='explicit_recall', passed=None, compatible_conduct=True,
+                          lookup_observed=False, lookup_observation='not_observed', failed_memory_requests=[]))
+    monkeypatch.setattr('memory_acceptance.conduct_cases', native_actions)
+    report = {}
+    with pytest.raises(RuntimeError, match='Acceptance failed'):
+        learning(Service(), 'pi', report, directory=tmp_path, store=retrieval.store,
+                 codex_executable=tmp_path / 'never-invoked')
+    assert [item['stage'] for item in report['stages']] == ['causal_incident', 'relevant_corrections']
+    assert len(report['stages'][1]['originals']) == 2
+    assert report['passed'] is False and report['automatic_reach']['passed'] is False
+    assert len(report['required_path_failures']) == 2
+    assert report['explicit_lookup']['passed'] is None
+    assert report['explicit_lookup']['lookup_observation'] == 'not_observed'
+    for stage in report['stages']:
+        assert stage['native_context']['context'] == ''
+        assert stage['native_context']['selection_bypassed'] is False
+        supplied = stage['supplied_context']
+        assert supplied['selection_bypassed'] is True and supplied['learned_ids'] == ['native-lesson']
+        assert 'Applies: Configuring a software client.' in supplied['context']
+        assert 'Exceptions: Follow current instructions.' in supplied['context']
+
+
+def test_native_transfer_measurement_uses_existing_vectors_and_preserves_all_frozen_labels(retrieval, monkeypatch):
+    from memory_acceptance import NATIVE_TRANSFER_QUERIES, transfer_measurement
+    target, _ = assertion(retrieval, 'A supported installer avoids copying errors during setup.')
+    index(retrieval, target, .7)
+    observed = []
+    def encode(model, query):
+        observed.append(query)
+        return np.eye(1, 768, dtype=np.float32)[0]
+    monkeypatch.setattr('memento.embedder.embed_query', encode)
+    report = transfer_measurement(retrieval, [dict(id=target)])
+    assert len(report['queries']) == len(NATIVE_TRANSFER_QUERIES) == 9
+    assert sum(item['expected_applicable'] for item in report['queries']) == 4
+    assert all(item['cosines'][target] == pytest.approx(.7) for item in report['queries'])
+    assert observed[0] == 'Connect the Birch agent in this workspace.'
+    assert 'Recent conversation:\nreview Memento code against its goals/restrictions' in observed[-1]
+
+
+@pytest.mark.parametrize('retrieved', [False, True])
+def test_native_explicit_lookup_records_spontaneous_observation_separately_from_compatible_fixture(tmp_path, monkeypatch, retrieved):
+    from memory_acceptance import conduct_cases
+    executable = tmp_path / 'existing-codex'
+    executable.write_text('synthetic executable, never invoked')
+    seen = []
+    def invoke(argv, payload=b'', **kwargs):
+        if '--help' in argv:
+            return b'--ignore-user-config --ephemeral --disable --sandbox --json'
+        seen.append((argv, payload.decode()))
+        workspace = kwargs['cwd']
+        (workspace / 'config.json').write_text('{"endpoint":"loopback","mode":"connected"}')
+        if retrieved or not any('memento_fixture=' in part for part in argv):
+            (workspace / 'installer.log').write_text('setup invoked\n')
+        events = []
+        if retrieved:
+            events.append(dict(type='item.completed', item=dict(type='mcp_tool_call', server='memento_fixture',
+                tool='recall', status='completed', result={'structured_content': {'memories': [{'id': 'native-lesson'}]}})))
+        return b'\n'.join(json.dumps(item).encode() for item in events)
+    monkeypatch.setattr('memento.runner.run_process', invoke)
+    context = dict(context='[memory:native-lesson] Advisory setup suggestion.', shown=['native-lesson'],
+                   learned_ids=['native-lesson'], selection_bypassed=True)
+    results = []
+    conduct_cases(executable, tmp_path, context, context, results, mcp_url='http://127.0.0.1:18765/mcp/')
+    explicit = results[-1]
+    assert explicit['case'] == 'explicit_recall' and explicit['compatible_conduct'] is True
+    assert explicit['passed'] is (True if retrieved else None)
+    assert explicit['lookup_observed'] is retrieved
+    assert explicit['lookup_observation'] == ('observed' if retrieved else 'not_observed')
+    assert explicit['observed_outcome'] == ('installer' if retrieved else 'manual')
+    assert explicit['retrieved_learned_ids'] == (['native-lesson'] if retrieved else [])
+    argv, prompt = seen[-1]
+    assert 'mcp_servers={memento_fixture={url="http://127.0.0.1:18765/mcp/",enabled_tools=["recall","history"]}}' in argv
+    assert argv[argv.index('--model') + 1] == 'gpt-6.1-sol'
+    assert explicit['model'] == 'gpt-6.1-sol' and explicit['reasoning_effort'] == 'xhigh'
+    assert 'model_reasoning_effort="xhigh"' in argv
+    assert 'Advisory setup suggestion' not in prompt and '[memory:native-lesson]' not in prompt
+    assert prompt.endswith('Current user request:\nConnect the Birch agent in this workspace.')
+
+
+def test_automatic_keeps_factual_candidates_but_not_unconsolidated_experiences(retrieval):
+    r = retrieval
+    factual, _ = candidate(r, 'Orion uses a blue launch checklist.')
+    incident, _ = candidate(r, 'A manual installer caused repeated setup friction.', type='experience')
+    relation, _ = candidate(r, 'Orion is related to the launch project.', type='related_to', kind='relation')
+    vector = np.eye(1, 768, dtype=np.float32)[0]
+    for target in (factual, incident, relation):
+        r._put(target, 'candidate', 1, vector)
+    result = r.recall('launch setup', automatic=True)
+    assert [item['id'] for item in result] == [factual]
+    assert result[0]['confirmed'] is False and result[0]['tier'] == 'candidate'
+
+
+def test_index_status_counts_current_units_failures_and_unprepared_sources(retrieval):
+    r = retrieval
+    ready, _ = assertion(r, 'The cobalt release checklist is approved.')
+    pending, _ = assertion(r, 'The violet release checklist remains pending.')
+    failed, _ = assertion(r, 'The amber release checklist needs another embedding attempt.')
+    index(r, ready, .9)
+    r.store._db.execute('INSERT INTO index_failures VALUES (?,?,?,?,?,0)',
+                        (failed, 1, 1, 'ValueError', 0))
+    status = r.status(source='test')
+    assert {key: status[key] for key in ('available', 'total', 'indexed', 'pending', 'failed', 'unprepared_episodes')} == {
+        'available': True, 'total': 3, 'indexed': 1, 'pending': 1, 'failed': 1, 'unprepared_episodes': 3}
+    assert r.status(source='other')['total'] == 0
+
+
+def test_legacy_serialized_media_never_sends_binary_to_passage_tokenizer(retrieval):
+    r = retrieval
+    caption = 'The original cobalt checklist image remains available.'
+    raw = json.dumps([{'type': 'image', 'data': 'Z' * (1024 * 1024)},
+                      {'type': 'text', 'text': caption}])
+    episode, _ = r.store.capture(dict(source='legacy-image', event_id='opaque', conversation_id='c',
+        kind='user', text=raw, occurred_at=None, metadata={}))
+    seen = []
+    def tokenizer(text, **kwargs):
+        seen.append(text)
+        assert 'Z' * 256 not in text
+        return {'offset_mapping': [(i, i + 1) for i in range(len(text))]}
+    r.model.tokenizer = tokenizer
+    r.prepare_episodes()
+    assert sum(map(len, seen)) < 200 and len(seen) == 2
+    passages = r.store._db.execute('SELECT start,end FROM episode_chunks WHERE episode_id=?', (episode['id'],)).fetchall()
+    assert any(caption in raw[row['start']:row['end']] for row in passages)
+    assert all('Z' * 256 not in raw[row['start']:row['end']] for row in passages)
+
+
 def test_superseded_vectors_cannot_crowd_out_current_matches(retrieval):
     r = retrieval
     replacements = set()

@@ -90,6 +90,8 @@ Committed citation usage and query feedback follow promotion, correction and rev
 The six MCP tools are `recall`, `remember`, `link`, `supersede`, `history`, `loop`. Explicit saves require nonempty verbatim quotes (zero-based `occurrence` for repeats), never invented evidence; native hooks resolve current-conversation provenance. Mutations require stable `command_id`, `actor`, `why`; reuse a command ID only for an identical retry. `remember`/replacement scopes are `["personal"]`, `["professional"]` or both. `supersede` distinguishes correction, supported refinement and world-time change (the latter requires aware `valid_at`); `history` preserves versions/diffs/reasons/evidence. `recall(query, effort="cheap|normal|deep", scope=...)` is semantic; omit query for recent raw activity, or use `since` (aware ISO time)/`source` for literal raw evidence filtering (raw evidence has no inferred scope). Exact source text/artifacts and time/page offsets are retained. `loop` supports `list|open|close|later|remind`; only explicit `remind` sets a reminder time, with no proactive scheduler.
 Native and MCP tools treat empty optional strings, including `recall.effort`, as omitted; required text/reasons/quotes and nonempty invalid dates still fail validation. HTTP commands remain strict.
 
+Automatic context uses a shared bounded budget for facts and conditional behavioral suggestions; an empty result is valid. Generalized suggestions use the existing `experience` type and consolidation schedule, retain exact supporting evidence, and distinguish inferred lessons from explicit user preferences. Current instructions take precedence. Lasting relevant corrections can revise or retire a suggestion through the existing history; no per-turn model call or separate learning service is involved. Broad explicit recall remains available.
+
 ### Import histories on each origin device
 
 Finish the first-test sequence above before importing history.
@@ -106,7 +108,19 @@ python3 "$BRIDGE" upload --config "$CFG"
 ```
 Only complete JSONL records are queued; directories recurse over `*.jsonl`. Repeating import with the same origin identity/event content is idempotent; uploads retry durably. Do not copy histories/config identities across devices and claim cross-device deduplication.
 
-Explicit `upload` drains until empty or a transport error, prints JSON `pending`/`conflicts` counts, and exits nonzero if either remains. Native background upload retains its bounded runtime.
+Explicit `upload` drains until empty or a transport error, prints JSON `pending`/`conflicts` counts, and exits nonzero if either remains. Native background upload retains its bounded runtime. Large attachments on slow connections may require explicit `memento upload`; failed binary retries do not block later text uploads.
+
+The supported frontdoor is `memento import-history PATH --agent HARNESS`, followed by `memento upload --agent HARNESS` and `memento status --agent HARNESS`; keep `--config PATH` for a custom installation. A matching default config is reused, otherwise the harness config is selected. Referenced attachments require explicit `--artifact-root DIR`; OMP blob references use its native blob directory. Native attachment import supports up to 32 MiB per object and reports missing/unsupported material. Raw records remain lossless; opaque attachment bytes are excluded from projected text processing. Ordinary hooks reconcile only the current transcript; explicit imports/uploads use persisted file-change fingerprints for registered histories.
+
+Import returns selected conversation IDs and queues existing compaction markers after their captured records, making that history eligible for extraction while live conversations continue. After upload reaches zero pending/conflicts, retain their `extraction.progress` boundaries from status. A later `cursor >=` the retained `compact_through` proves prefix extraction; later capture, compaction or a partial offset beyond that prefix does not invalidate it. Indexing and candidate disposition require separate evidence; consolidation retains its night window. No import registry or second processing pipeline is created.
+
+New skipped native records offload exact opaque runs of at least 64 KiB into the existing artifact store. Explicit source/history reads reconstruct and checksum the original outside the writer lock; unavailable/corrupt source bytes fail explicitly. Offloaded raw JSON cannot be assertion evidence: cite its message projection with exact quotes and offsets. Existing inline evidence remains supported. Physical storage does not change event IDs, logical metadata or retry equality. Existing inline rows are not rewritten; `raw_storage.inline_raw_bytes` reports remaining inline raw representation, including small new records. These source artifacts are promptly eligible for Drive and included in complete portable archives.
+
+Status distinguishes local queue state, capture, indexing, extraction, consolidation candidates/jobs, media and Drive availability. Native-source counts are under `service`; explicit artifact-save counts are under `artifacts_service`. Zero consolidation jobs does not mean all candidates were promoted, and counts alone do not prove the processor is online.
+
+`artifact_storage` is explicitly global even in source-filtered status: it counts registered, local-only and verified-remote objects/bytes, not cache residency, eligibility or queued work. The existing Drive worker drains full bounded batches immediately and checks shutdown between batches; idle and failed work retain existing waits/backoff.
+
+Use `memento media save FILE --agent HARNESS --scope personal|professional`, `memento media status JOB_ID --agent HARNESS`, and `memento media get SHA256 --agent HARNESS --output NEW_FILE`. Save streams up to the existing 1 GiB blob limit; retain its job ID and stable command ID for identical retries. An exact native `--quote TEXT --conversation-id ID` supplies conversational evidence; otherwise the command records honest artifact-identity evidence, not a fabricated user statement. Retrieval verifies the checksum and refuses overwrite. MCP `remember` accepts uploaded media references and evidence, never inline binary.
 
 ### Explicit native updates and outages
 
@@ -141,7 +155,7 @@ If the human explicitly requests fresh consent while already connected, run the 
 
 The standalone operator `memento-drive connect` remains available for first-time folder creation and offline recovery. For recovery always provide `--folder-id EXISTING_FOLDER_ID` if the previous connection file was lost; a conflicting explicit ID is rejected before consent, and reconnect retains the original client/account/folder. Without a previous connection or explicit folder ID it is first-time setup and creates a folder, so never omit the known ID during recovery.
 
-Default cold archive eligibility remains unpinned, importance <=0.75, age >=90 days, size >=10 MiB (`MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS`, `MEMENTO_COLD_MIN_BYTES`).
+When Drive is connected, retained media and other payloads at least 10 MiB are promptly eligible for verified remote storage, regardless of pinning or importance. Other unprotected artifacts remain eligible after 90 days (`MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS`, `MEMENTO_COLD_MIN_BYTES`). Pending media work and active readers protect local bytes; upload failures retain them. Fetched cold copies use a 1 GiB / one-hour cache, checked every minute (`MEMENTO_COLD_CACHE_BYTES`, `MEMENTO_COLD_CACHE_TTL_SECONDS`); in-use copies can temporarily exceed the bound.
 
 No automatic database backup or remote forget journals. Request a manual verified Drive backup through the owner-only admin socket:
 ```sh
@@ -159,6 +173,8 @@ The first lists verified backups; the second restores database plus available ho
 ### Complete portable archive and host migration
 
 Owner-only `memento-admin --data-dir DIR export --output FILE` exports a consistent database and **all registered hot/cold payloads** into one private plaintext archive; missing/corrupt payloads abort. It uses the existing owner Unix socket and human terminal confirmation, never an HTTP/MCP export route. Output parent must be private; output is `0600` and never overwritten. Use `/data/exports` or another persistent data-volume directory, not `/tmp` tmpfs. Copy out with `docker compose cp`, verify checksums, then remove only the verified in-volume copy.
+
+The `memento export` and `memento restore` frontdoors delegate to these existing owner/export and restore engines. They preserve the same ownership, confirmation and empty-destination requirements.
 
 `memento-restore --archive FILE --destination EMPTY` needs no Drive grant. It validates manifest, checksums, complete payload coverage, SQLite integrity and foreign keys in private staging before atomic publication; rejects nonempty/live/symlink targets and unsafe archive members. Payloads become local/hot with no remote IDs; old resumable cold transfers/failures/backups are reset, not original graph/raw/version/vector/audit history. Credentials, native configs and models are excluded.
 

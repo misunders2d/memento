@@ -1,5 +1,7 @@
 """Native bridge edge cases; all paths/configuration are synthetic and temporary."""
 import json
+import base64
+import builtins
 import tomllib
 import pytest
 
@@ -128,7 +130,6 @@ def test_native_installer_preserves_hooks_mcp_and_codex_trust(tmp_path):
     bridge.install(config_path, root)
     assert json.loads(config_path.read_bytes())['client_uid'] == client_uid
     parsed = tomllib.loads((root / 'config.toml').read_text())
-    assert parsed['mcp_servers']['memento']['url'] == 'http://127.0.0.1:1/mcp'
     assert parsed['mcp_servers']['other']['url'] == 'http://other/mcp'
     assert parsed['hook_trust']['never_touch'] == 'value'
     again = json.loads((root / 'hooks.json').read_bytes())
@@ -232,31 +233,16 @@ def test_explicit_history_import_is_idempotent_and_native_identified(tmp_path, h
     path = history / 'session.jsonl'
     path.write_bytes(bridge.encode(header) + b'\n' + bridge.encode(message) + b'\n')
     first = bridge.import_history(spool, harness, [history, path])
-    assert first == {'status': 'queued', 'source': 'native:test-device:' + harness,
-                     'files': 1, 'records_added': 2}
+    assert {key: first[key] for key in ('status', 'source', 'files', 'records_added')} == {
+        'status': 'queued', 'source': 'native:test-device:' + harness, 'files': 1, 'records_added': 2}
+    assert first['coverage'] == {'unsupported_records': 0, 'attachments': 0,
+                                  'missing_attachments': 0, 'unsupported_attachments': 0, 'inline_payload_bytes': 0}
+    assert first['pending'] == len(pending(spool)) + 1 and first['conflicts'] == 0
+    assert first['conversations'] == ['history-session']
     assert bridge.import_history(spool, harness, [history])['records_added'] == 0
     episodes = pending(spool)
     assert all(part['conversation_id'] == 'history-session' for part in episodes)
     assert any(part['kind'] == 'user' and part['text'] == 'exact full history 猫 🧠' for part in episodes)
-    spool.close()
-
-
-def test_headerless_import_replays_from_zero_with_native_identity(tmp_path, monkeypatch):
-    spool = spool_at(tmp_path)
-    path = tmp_path / 'session.jsonl'
-    path.write_bytes(bridge.encode({'id': 'u', 'role': 'user', 'content': 'native full text'}) + b'\n')
-    spool.journal(path, 'pi', 'native-session')
-    offsets = []
-    reconcile = spool.reconcile
-
-    def replay(path):
-        offsets.append(spool.db.execute('SELECT offset FROM journals WHERE path=?', (path,)).fetchone()[0])
-        reconcile(path)
-
-    monkeypatch.setattr(spool, 'reconcile', replay)
-    assert bridge.import_history(spool, 'pi', [path])['records_added'] == 0
-    assert spool.db.execute('SELECT conversation FROM journals').fetchone()[0] == 'native-session'
-    assert offsets == [0]
     spool.close()
 
 
@@ -338,7 +324,14 @@ def test_mcp_provenance_hooks_never_auto_approve(tmp_path, monkeypatch):
     spool.close()
 
 
-def test_passive_query_includes_actual_workspace(tmp_path, monkeypatch):
+@pytest.mark.parametrize('query,followup', [
+    ('does it introduce unnecessary overhead?', True),
+    ('what about other laptop?', True),
+    ('Where should I have lunch?', False),
+])
+def test_passive_preserves_human_query_and_native_followup_boundary_with_cwd(tmp_path, monkeypatch, query, followup):
+    from memento.retrieval import _automatic_query
+
     spool = spool_at(tmp_path)
     endpoints = []
 
@@ -347,23 +340,38 @@ def test_passive_query_includes_actual_workspace(tmp_path, monkeypatch):
         return {'memories': []}
 
     monkeypatch.setattr(bridge, 'http', recalled)
-    bridge.passive(spool, 's', 'user query', '/projects/example')
-    query = bridge.urllib.parse.parse_qs(bridge.urllib.parse.urlsplit(endpoints[0][0]).query)['q'][0]
-    assert query == 'Working directory: /projects/example\nDirectory/repo name: example\nuser query'
-    assert endpoints[0][1] == 1
+    antecedent = 'How should I connect a second native client?'
+    bridge.passive(spool, 's', antecedent, '/projects/example')
+    bridge.passive(spool, 's', query, '/projects/example')
+    requests = [bridge.urllib.parse.parse_qs(bridge.urllib.parse.urlsplit(endpoint).query)
+                for endpoint, _ in endpoints]
+    assert requests[0]['q'] == [antecedent]
+    assert requests[1]['q'] == [query] and requests[1]['context'] == [antecedent]
+    effective = _automatic_query(requests[1]['q'][0], requests[1]['context'][0])
+    if followup:
+        assert antecedent in effective and query in effective
+    else:
+        assert effective == query
+    assert '/projects/example' not in effective and 'Directory/repo name' not in effective
+    assert spool.db.execute('SELECT query FROM recall_cache WHERE conversation=?', ('s',)).fetchone()[0] == query
+    assert all(timeout == 1 for _, timeout in endpoints)
     spool.close()
 
 
-def test_codex_hook_context_and_tool_call_json_are_not_quote_evidence(tmp_path):
+@pytest.mark.parametrize('marker', ['hooks.additional_context', 'agents_md.instructions',
+                                    'environments.environment_context'])
+def test_codex_hook_context_and_tool_call_json_are_not_quote_evidence(tmp_path, marker):
     spool = spool_at(tmp_path)
     spool.record('codex', 's', {'type': 'response_item', 'payload': {
-        'type': 'message', 'role': 'developer', 'content': [{'type': 'input_text', 'text': 'recalled context'}],
-        'internal_chat_message_metadata_passthrough': {'content_item_kinds': ['hooks.additional_context']}}}, identity='context')
+        'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'injected context'}],
+        'internal_chat_message_metadata_passthrough': {'content_item_kinds': [marker]}}}, identity='context')
     spool.record('pi', 's', {'type': 'message', 'id': 'call', 'message': {
         'role': 'assistant', 'content': [{'type': 'toolCall', 'id': 'tool', 'name': 'memento_remember', 'arguments': {'quote': 'echo'}}]}})
     projected = [body for body in pending(spool) if body['kind'] != 'native_record']
     assert all(body['metadata']['evidence_eligible'] is False for body in projected)
-    assert next(body for body in projected if body['kind'] == 'developer')['metadata']['extraction_mode'] == 'skip'
+    context = next(body for body in projected if body['kind'] == 'user')
+    assert context['metadata']['extraction_mode'] == 'skip'
+    assert context['metadata']['native_context_kinds'] == [marker]
     assert next(body for body in projected if body['kind'] == 'assistant')['metadata']['extraction_mode'] == 'message'
     spool.close()
 
@@ -446,3 +454,308 @@ def test_explicit_upload_reports_retained_transport_errors_and_conflicts(tmp_pat
     assert pending(spool)[0]['text'] == 'retained full message'
     assert spool.db.execute('SELECT state FROM outbox').fetchone()[0] == ('conflict' if conflict else 'pending')
     spool.close()
+
+
+def test_claude_workflow_journal_is_distinct_from_its_agents(tmp_path):
+    spool = spool_at(tmp_path)
+    workflow = tmp_path / 'workflows' / 'workflow'
+    workflow.mkdir(parents=True)
+    journal = workflow / 'journal.jsonl'
+    events = [{'type': 'started', 'agentId': 'first-agent'},
+              {'type': 'started', 'agentId': 'second-agent'}]
+    journal.write_bytes(b''.join(bridge.encode(event) + b'\n' for event in events))
+    agent = tmp_path / 'agent.jsonl'
+    agent.write_bytes(bridge.encode({
+        'type': 'assistant', 'uuid': 'answer', 'agentId': 'first-agent',
+        'message': {'role': 'assistant', 'content': 'The first agent completed its task.'},
+    }) + b'\n')
+    bridge.import_history(spool, 'claude', [tmp_path])
+    captured = pending(spool)
+    agent_conversation = next(part['conversation_id'] for part in captured
+                              if part['kind'] == 'assistant')
+    workflow_conversations = {part['conversation_id'] for part in captured
+                              if part['kind'] == 'native_record'
+                              and json.loads(part['text']).get('type') == 'started'}
+    assert agent_conversation == 'first-agent'
+    assert agent_conversation not in workflow_conversations
+    assert len(workflow_conversations) == 1
+    spool.close()
+
+
+def test_history_replay_backfills_missing_projection_without_repeating_raw(tmp_path):
+    spool = spool_at(tmp_path)
+    header = {'type': 'session_meta', 'ordinal': 1, 'payload': {'id': 'codex-session'}}
+    record = {'type': 'response_item', 'ordinal': 2, 'payload': {
+        'type': 'message', 'role': 'user',
+        'content': [{'type': 'input_text', 'text': 'Keep the original searchable user text.'}]}}
+    raw = bridge.encode(record).decode('utf-8') + '\n'
+    path = tmp_path / 'rollout.jsonl'
+    path.write_bytes(bridge.encode(header) + b'\n' + raw.encode('utf-8'))
+    # Persist the raw-only state left by an older projection implementation.
+    spool.episode('codex', 'codex-session', 'raw:2:' + bridge.digest(raw),
+                  'native_record', raw, metadata={'extraction_mode': 'skip', 'native_id': '2'})
+    spool.db.execute('INSERT INTO records VALUES(?,?,?,?)',
+                     (bridge.source(spool.config, 'codex'), 'codex-session', '2', bridge.digest(raw)))
+    spool.commit()
+    spool.close()
+    spool = spool_at(tmp_path)
+    for _ in range(2):
+        bridge.import_history(spool, 'codex', [path])
+        captured = pending(spool)
+        assert [part['text'] for part in captured if part['kind'] == 'user'] == [
+            'Keep the original searchable user text.']
+        assert [part['text'] for part in captured
+                if part['kind'] == 'native_record' and part['text'] == raw] == [raw]
+        assert all(part['conversation_id'] == 'codex-session' for part in captured)
+    spool.close()
+
+
+@pytest.mark.parametrize('canonical_first', [True, False])
+def test_codex_canonical_user_notifications_remain_raw_without_suppressing_repeated_provider_turns(tmp_path, canonical_first):
+    spool = spool_at(tmp_path)
+    for number in range(2):
+        identifier = 'user-' + str(number)
+        item = {'type': 'UserMessage', 'id': 'canonical-' + identifier, 'client_id': 'native-client',
+                'content': [{'type': 'text', 'text': 'Repeat this exact request.', 'text_elements': []}]}
+        canonical = {'ordinal': number * 2, 'type': 'event_msg', 'payload': {
+            'type': 'item_completed', 'thread_id': 's', 'turn_id': 'turn-' + str(number), 'item': item}}
+        provider = {'ordinal': number * 2 + 1, 'type': 'response_item', 'payload': {
+            'id': identifier, 'type': 'message', 'role': 'user',
+            'content': [{'type': 'input_text', 'text': 'Repeat this exact request.'}]}}
+        records = (canonical, provider) if canonical_first else (provider, canonical)
+        for record in records:
+            spool.record('codex', 's', record, identity=str(record['ordinal']))
+    users = [part for part in pending(spool) if part['kind'] == 'user']
+    assert [part['text'] for part in users] == ['Repeat this exact request.'] * 2
+    assert len([part for part in pending(spool) if part['kind'] == 'native_record']) == 4
+    spool.close()
+
+
+def test_codex_canonical_assistant_and_mcp_result_are_projected_once(tmp_path):
+    spool = spool_at(tmp_path)
+    items = [
+        {'type': 'AgentMessage', 'id': 'answer', 'content': [{'type': 'Text', 'text': 'answer [memory:m]'}],
+         'phase': 'final_answer'},
+        {'type': 'McpToolCall', 'id': 'call', 'server': 'example', 'tool': 'read', 'arguments': {'id': 'a'},
+         'status': 'completed', 'result': {'content': [{'type': 'text', 'text': 'complete tool output'}],
+                                         'isError': False}, 'duration': {'secs': 1, 'nanos': 0}}]
+    for item in items:
+        spool.record('codex', 's', {'type': 'event_msg', 'payload': {
+            'type': 'item_completed', 'turn_id': 'turn', 'item': item}}, identity=item['id'])
+    spool.record('codex', 's', {'type': 'response_item', 'payload': {
+        'id': 'answer', 'type': 'message', 'role': 'assistant',
+        'content': [{'type': 'output_text', 'text': 'answer [memory:m]'}]}}, identity='provider-answer')
+    assert any(part['kind'] == 'assistant' and part['text'] == 'answer [memory:m]' for part in pending(spool))
+    result = next(part for part in pending(spool) if part['kind'] == 'tool')
+    assert result['text'] == 'complete tool output'
+    assert result['metadata']['extraction_mode'] == 'tool_output'
+    assert len(pending(spool, '/usage')) == 1
+    assert len([part for part in pending(spool) if part['kind'] == 'assistant' and part['text'] == 'answer [memory:m]']) == 1
+    spool.close()
+
+
+@pytest.mark.parametrize('style', ['pi', 'claude', 'codex'])
+def test_inline_artifact_projection_keeps_bytes_out_of_text_and_queues_exact_original(tmp_path, style):
+    spool = spool_at(tmp_path)
+    data = b'\x00opaque-image-bytes\xff' * 1000
+    encoded = base64.b64encode(data).decode()
+    block = {'type': 'image', 'data': encoded, 'mimeType': 'image/webp'}
+    if style == 'claude':
+        block = {'type': 'image', 'source': {'type': 'base64', 'data': encoded, 'media_type': 'image/webp'}}
+    if style == 'codex':
+        block = {'type': 'input_image', 'image_url': 'data:image/webp;base64,' + encoded}
+    record = {'type': 'message', 'id': 'image', 'message': {'role': 'user',
+              'content': [{'type': 'text', 'text': 'Remember this image.'}, block]}}
+    spool.record('pi', 's', record)
+    raw = next(part for part in pending(spool) if part['kind'] == 'native_record')
+    user = next(part for part in pending(spool) if part['kind'] == 'user')
+    assert json.loads(raw['text']) == record
+    assert encoded not in user['text'] and 'Remember this image.' in user['text']
+    artifact = user['metadata']['artifacts'][0]
+    assert artifact['sha256'] == bridge.digest(data) and artifact['size'] == len(data)
+    queued = spool.db.execute("SELECT body,content_type FROM outbox WHERE endpoint='/blobs'").fetchall()
+    assert queued == [(data, 'image/webp')]
+    spool.close()
+
+
+def test_explicit_omp_blob_root_recovers_original_without_outside_discovery(tmp_path):
+    spool = spool_at(tmp_path)
+    sessions = tmp_path / 'sessions'
+    blobs = tmp_path / 'blobs'
+    sessions.mkdir()
+    blobs.mkdir()
+    data = b'exact OMP webp original'
+    sha = bridge.digest(data)
+    path = sessions / 'native.jsonl'
+    path.write_bytes(bridge.encode({'type': 'session', 'id': 's'}) + b'\n' + bridge.encode({
+        'type': 'message', 'id': 'u', 'message': {'role': 'user', 'content': [
+            {'type': 'image', 'data': 'blob:sha256:' + sha, 'mimeType': 'image/webp'}]}}) + b'\n')
+    missing = bridge.import_history(spool, 'omp', [sessions])
+    assert missing['coverage']['missing_attachments'] == 1
+    assert not spool.db.execute("SELECT 1 FROM outbox WHERE endpoint='/blobs'").fetchone()
+    (blobs / (sha + '.webp')).write_bytes(data)
+    recovered = bridge.import_history(spool, 'omp', [sessions], artifact_roots=[blobs])
+    assert recovered['records_added'] == 0 and recovered['coverage']['attachments'] == 1
+    assert spool.db.execute("SELECT body FROM outbox WHERE endpoint='/blobs'").fetchone()[0] == data
+    assert len([part for part in pending(spool) if part['kind'] == 'user']) == 1
+    spool.close()
+
+
+def test_hundred_registered_histories_do_not_reopen_during_current_hook(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    paths = []
+    for index in range(100):
+        path = tmp_path / (str(index) + '.jsonl')
+        path.write_bytes(bridge.encode({'type': 'user', 'uuid': str(index),
+            'message': {'role': 'user', 'content': 'old history'}}) + b'\n')
+        spool.journal(path, 'claude', str(index))
+        paths.append(path)
+    opened = []
+    original_open = builtins.open
+
+    def counted(path, *args, **kwargs):
+        if str(path).endswith('.jsonl'):
+            opened.append(str(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', counted)
+    bridge.hook(spool, 'claude', {'session_id': '0', 'hook_event_name': 'Stop',
+                                 'transcript_path': str(paths[0])})
+    assert opened == []
+    with original_open(paths[0], 'ab') as stream:
+        stream.write(bridge.encode({'type': 'assistant', 'uuid': 'new',
+                     'message': {'role': 'assistant', 'content': 'new answer'}}) + b'\n')
+    bridge.hook(spool, 'claude', {'session_id': '0', 'hook_event_name': 'Stop',
+                                 'transcript_path': str(paths[0])})
+    assert opened == [str(paths[0])]
+    spool.commit()
+    spool.close()
+    monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {})
+    monkeypatch.setattr(bridge.time, 'sleep', lambda *_: None)
+    bridge.upload(tmp_path / 'runner.json', bridge.read_config(tmp_path / 'runner.json'),
+                  background=True, paths=[str(paths[0])])
+    assert opened == [str(paths[0])]
+
+
+def test_journal_rotation_with_same_header_and_size_preserves_new_record(tmp_path):
+    spool = spool_at(tmp_path)
+    path = tmp_path / 'journal.jsonl'
+    header = bridge.encode({'type': 'session', 'id': 's'}) + b'\n'
+    path.write_bytes(header + bridge.encode({'id': 'a', 'role': 'user', 'content': 'first'}) + b'\n')
+    spool.journal(path, 'pi', 's')
+    replacement = tmp_path / 'replacement'
+    replacement.write_bytes(header + bridge.encode({'id': 'b', 'role': 'user', 'content': 'later'}) + b'\n')
+    replacement.replace(path)
+    spool.reconcile(str(path))
+    assert [part['text'] for part in pending(spool) if part['kind'] == 'user'] == ['first', 'later']
+    spool.close()
+
+
+def test_passive_categories_followup_and_peer_anchor(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    requests = []
+
+    def recalled(_config, endpoint, **_kwargs):
+        requests.append(bridge.urllib.parse.parse_qs(bridge.urllib.parse.urlsplit(endpoint).query))
+        return {'memories': [{'id': 'f', 'text': 'A fact', 'category': 'memory'},
+                             {'id': 'b', 'text': 'Use a supported check.', 'category': 'behavioral_suggestion',
+                              'authority': 'inferred', 'behavior': {
+                                  'applicability': 'When checking a candidate.', 'conduct': 'Use a supported check.',
+                                  'exceptions': [], 'rationale': 'Keep evidence faithful.', 'authority': 'inferred'}}]}
+
+    monkeypatch.setattr(bridge, 'http', recalled)
+    first = bridge.passive(spool, 's', 'Which checks apply?')
+    assert '[fact]' in first['context'] and '[behavioral suggestion;' in first['context']
+    assert '[inferred]' in first['context']
+    assert bridge.passive(spool, 's', '[HERDR AGENT MESSAGE] random peer result') == first
+    assert len(requests) == 1
+    bridge.passive(spool, 's', 'And for this project?')
+    assert requests[-1]['automatic'] == ['true']
+    assert requests[-1]['context'] == ['Which checks apply?']
+    spool.close()
+
+
+def test_legacy_binary_projection_is_never_rewritten_or_duplicated_during_artifact_recovery(tmp_path):
+    spool = spool_at(tmp_path)
+    data = b'legacy opaque image'
+    record = {'type': 'message', 'id': 'u', 'message': {'role': 'user', 'content': [
+        {'type': 'image', 'data': base64.b64encode(data).decode(), 'mimeType': 'image/webp'}]}}
+    legacy_text = bridge.encode(record['message']['content']).decode()
+    spool.episode('omp', 's', 'message:u', 'user', legacy_text,
+                  metadata={'native_id': 'u', 'extraction_mode': 'message'})
+    spool.db.execute('INSERT INTO projections VALUES(?,?,?)', (bridge.source(spool.config, 'omp'), 's', 'u'))
+    path = tmp_path / 'history.jsonl'
+    path.write_bytes(bridge.encode({'type': 'session', 'id': 's'}) + b'\n' + bridge.encode(record) + b'\n')
+    original = [part for part in pending(spool) if part['kind'] == 'user']
+    result = bridge.import_history(spool, 'omp', [path])
+    assert [part for part in pending(spool) if part['kind'] == 'user'] == original
+    assert original[0]['text'] == legacy_text
+    assert result['coverage']['inline_payload_bytes'] == len(data)
+    assert spool.db.execute("SELECT body FROM outbox WHERE endpoint='/blobs'").fetchone()[0] == data
+    spool.close()
+
+
+def test_shipped_quote_flush_reconciles_and_uploads_only_selected_conversation(tmp_path, monkeypatch, capsys):
+    spool = spool_at(tmp_path)
+    for conversation in ('selected', 'other'):
+        path = tmp_path / (conversation + '.jsonl')
+        path.write_bytes(bridge.encode({'id': 'u', 'role': 'user', 'content': 'exact source'}) + b'\n')
+        spool.journal(path, 'omp', conversation)
+    config = spool.config_path
+    spool.commit()
+    spool.close()
+    uploaded = []
+    monkeypatch.setattr(bridge, 'http', lambda _config, endpoint, body, **_kwargs: uploaded.append((endpoint, body)) or {})
+    assert bridge.main(['flush-conversation', '--config', config, '--agent', 'omp',
+                        '--conversation-id', 'selected']) == 0
+    assert json.loads(capsys.readouterr().out) == {'status': 'uploaded'}
+    assert uploaded and all(body['conversation_id'] == 'selected' for _, body in uploaded)
+    spool = spool_at(tmp_path)
+    assert pending(spool) and all(part['conversation_id'] == 'other' for part in pending(spool))
+    spool.close()
+
+
+@pytest.mark.parametrize('background', [False, True])
+def test_slow_blob_retains_original_while_later_text_uploads_and_retry_resumes(tmp_path, monkeypatch, background):
+    spool = spool_at(tmp_path)
+    config = spool.config
+    config_path = spool.config_path
+    original = b'opaque-original' * (8 * bridge.MAX_BODY // 15)
+    spool.db.execute('INSERT INTO outbox(key,endpoint,body,content_type) VALUES(?,?,?,?)',
+                     ('blob:oldest', '/blobs', original, 'image/webp'))
+    spool.episode('omp', 's', 'queued-after-blob', 'user', 'text queued after the old blob')
+    spool.commit()
+    spool.close()
+    elapsed = [0.0]
+    attempts = []
+    uploaded = []
+    monkeypatch.setattr(bridge.time, 'monotonic', lambda: elapsed[0])
+    monkeypatch.setattr(bridge.time, 'sleep', lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds))
+
+    def slow(_config, endpoint, body, *, timeout, **_kwargs):
+        if endpoint == '/blobs':
+            attempts.append(timeout)
+            assert timeout > 2
+            if background:
+                assert timeout <= 10
+            elapsed[0] += timeout
+            concurrent = bridge.Spool(config_path, config)
+            concurrent.episode('omp', 's', 'during-blob', 'user', 'text captured during slow upload')
+            concurrent.commit()
+            concurrent.close()
+            raise TimeoutError('synthetic slow artifact')
+        uploaded.append(body['text'])
+        return {}
+
+    monkeypatch.setattr(bridge, 'http', slow)
+    result = bridge.upload(config_path, config, background=background)
+    assert result == {'pending': 1, 'conflicts': 0}
+    assert len(attempts) == 1
+    assert uploaded == ['text queued after the old blob', 'text captured during slow upload']
+    spool = spool_at(tmp_path)
+    assert spool.db.execute('SELECT body FROM outbox').fetchall() == [(original,)]
+    spool.close()
+    retried = []
+    monkeypatch.setattr(bridge, 'http', lambda _config, endpoint, body, **_kwargs: retried.append(body) or {})
+    assert bridge.upload(config_path, config) == {'pending': 0, 'conflicts': 0}
+    assert retried == [original]

@@ -1,5 +1,10 @@
 """SQLite schema initialization for a fresh database."""
 
+_EPISODES_TEXT_INDEX = """CREATE TRIGGER episodes_text_index AFTER INSERT ON episodes
+    WHEN NEW.kind NOT IN ('native_record','native_live_record','native_hook')
+    AND coalesce(json_extract(NEW.metadata,'$.extraction_mode'),'message')<>'skip'
+    BEGIN INSERT INTO episodes_fts(rowid,text) VALUES (NEW.seq,NEW.text); END"""
+
 _SCHEMA = (
     """CREATE TABLE episodes (
            seq INTEGER PRIMARY KEY CHECK(seq > 0),
@@ -12,6 +17,8 @@ _SCHEMA = (
            occurred_at TEXT,
            metadata TEXT NOT NULL,
            captured_at TEXT NOT NULL,
+           text_runs TEXT,
+           text_sha256 TEXT,
            UNIQUE(source, event_id)
        ) STRICT""",
     'CREATE INDEX episodes_conversation ON episodes(source, conversation_id)',
@@ -29,9 +36,7 @@ _SCHEMA = (
        WHEN EXISTS (SELECT 1 FROM episodes WHERE seq = NEW.seq OR id = NEW.id
                     OR (source = NEW.source AND event_id = NEW.event_id))
        BEGIN SELECT RAISE(ABORT, 'episodes are immutable'); END""",
-    """CREATE TRIGGER episodes_index AFTER INSERT ON episodes BEGIN
-           INSERT INTO episodes_fts(rowid, text) VALUES (NEW.seq, NEW.text);
-       END""",
+    _EPISODES_TEXT_INDEX,
     """CREATE TABLE graph_commits (
        id TEXT PRIMARY KEY, command_id TEXT UNIQUE NOT NULL,
        request TEXT NOT NULL, result TEXT NOT NULL,
@@ -238,3 +243,28 @@ def initialize(db):
         db.execute(f"""CREATE TRIGGER {table}_no_replace BEFORE INSERT ON {table}
             WHEN EXISTS (SELECT 1 FROM {table} WHERE {predicate})
             BEGIN SELECT RAISE(ABORT, 'graph history is immutable'); END""")
+
+
+def upgrade_episode_fts(db):
+    """Caller owns the transaction; keep raw native records out of derived FTS.
+
+    The canonical filtered trigger is also the migration marker. Both its
+    publication and removal of legacy terms roll back together after interruption.
+    No evidence table or portable database format changes.
+    """
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name='episodes_text_index'").fetchone():
+        return
+    db.execute('''INSERT INTO episodes_fts(episodes_fts,rowid,text)
+        SELECT 'delete',seq,text FROM episodes
+        WHERE kind IN ('native_record','native_live_record','native_hook')
+        OR coalesce(json_extract(metadata,'$.extraction_mode'),'message')='skip' ''')
+    db.execute('DROP TRIGGER IF EXISTS episodes_index')
+    db.execute(_EPISODES_TEXT_INDEX)
+
+
+def upgrade_raw_text(db):
+    """Only physical columns: existing immutable source text is never rewritten."""
+    columns = {row[1] for row in db.execute('PRAGMA table_info(episodes)')}
+    for column in ('text_runs', 'text_sha256'):
+        if column not in columns:
+            db.execute(f'ALTER TABLE episodes ADD COLUMN {column} TEXT')

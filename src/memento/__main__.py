@@ -5,18 +5,20 @@ from pathlib import Path
 
 
 
-def main():
-    if sys.argv[1:2] == ['agent']:
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] and argv[0] in ('agent', 'setup', 'tick', 'compaction', 'drive-connect',
+                               'import-history', 'upload', 'status', 'media', 'export', 'restore', '--config'):
         from .runner import main as runner_main
-        return runner_main(sys.argv[1:])
+        return runner_main(argv)
     parser = argparse.ArgumentParser(
         description='Memento immutable evidence service',
-        epilog='Connect a native harness: memento agent add {pi,omp,claude,codex}')
+        epilog='Native operations: memento setup|agent|import-history|upload|status|media|export|restore')
     parser.add_argument('--data-dir', type=Path,
                         default=Path(os.environ.get('MEMENTO_DATA_DIR', './data')))
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     import uvicorn
     from .api import create_app
 

@@ -87,7 +87,7 @@ def test_immutability_including_replace_and_search_consistency(tmp_path):
                         "INSERT INTO episodes SELECT * FROM episodes WHERE true ON CONFLICT(id) DO UPDATE SET text='changed'",
                         """INSERT OR REPLACE INTO episodes
                            SELECT seq, id || 'new', source || 'new', event_id, conversation_id,
-                                  kind, text, occurred_at, metadata, captured_at FROM episodes"""]:
+                                  kind, text, occurred_at, metadata, captured_at, text_runs, text_sha256 FROM episodes"""]:
                 with pytest.raises(sqlite3.IntegrityError, match='immutable'):
                     db.execute(sql)
                 db.rollback()
@@ -104,6 +104,48 @@ def test_reopen_preserves_evidence_and_single_writer(tmp_path):
         assert client.get(f'/episodes/{episode_id}').json()['text'] == evidence()['text']
         assert [e['id'] for e in client.get('/episodes/search', params={'q': 'launch'}).json()['episodes']] == [episode_id]
         assert client.get('/episodes/does-not-exist').status_code == 404
+
+
+@pytest.mark.parametrize('kind', ['native_record', 'native_live_record', 'native_hook'])
+def test_native_raw_bytes_stay_exact_without_duplicate_fts_index(client, kind):
+    raw = '{"image":"opaqueuniquebinarytoken", "text":"source projection sentence"}'
+    original = client.post('/episodes', json=evidence(event_id='opaque', kind=kind,
+        text=raw, metadata={'extraction_mode': 'skip'})).json()['id']
+    projected = client.post('/episodes', json=evidence(event_id='projection', kind='user',
+        text='source projection sentence', metadata={})).json()['id']
+    assert client.get('/episodes/' + original).json()['text'] == raw
+    assert client.get('/episodes/search', params={'q': 'opaqueuniquebinarytoken'}).json()['episodes'] == []
+    assert [item['id'] for item in client.get('/episodes/search', params={'q': 'projection sentence'}).json()['episodes']] == [projected]
+
+
+def test_legacy_raw_fts_migration_is_transactional_and_restarts_without_redeleting(tmp_path):
+    from memento.schema import upgrade_episode_fts
+    store = Store(tmp_path)
+    try:
+        db = store._db
+        db.execute('DROP TRIGGER episodes_text_index')
+        db.execute('''CREATE TRIGGER episodes_index AFTER INSERT ON episodes BEGIN
+            INSERT INTO episodes_fts(rowid,text) VALUES (NEW.seq,NEW.text); END''')
+        raw, _ = store.capture(evidence(event_id='raw', kind='native_record',
+            text='opaqueuniquebinarytoken', metadata={'extraction_mode': 'skip'}))
+        text, _ = store.capture(evidence(event_id='text', kind='user', text='source projection sentence', metadata={}))
+        assert [item['id'] for item in store.search('opaqueuniquebinarytoken')] == [raw['id']]
+        db.execute('BEGIN IMMEDIATE')
+        upgrade_episode_fts(db)
+        assert store.search('opaqueuniquebinarytoken') == []
+        db.execute('ROLLBACK')
+        assert [item['id'] for item in store.search('opaqueuniquebinarytoken')] == [raw['id']]
+    finally:
+        store.close()
+    for _ in range(2):
+        reopened = Store(tmp_path)
+        try:
+            assert reopened.get(raw['id'])['text'] == 'opaqueuniquebinarytoken'
+            assert reopened.search('opaqueuniquebinarytoken') == []
+            assert [item['id'] for item in reopened.search('projection sentence')] == [text['id']]
+            assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 1
+        finally:
+            reopened.close()
 
 
 @pytest.mark.parametrize('change', [{'text': '\ud800'}, {'metadata': {'bad': '\ud800'}},

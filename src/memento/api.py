@@ -10,20 +10,35 @@ from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from .store import ConflictError, Store
 from .commands import Link, Loop, MediaInput, Remember, Supersede
-from .mcp_server import create_mcp, recall_memories
+from .mcp_server import create_mcp, recall_memories, submit_media
 from .graph import Graph
 from .blobs import BlobStore
 from .artifacts import Artifacts
 from .jobs import LostLease
+from .raw_text import RawTextUnavailable
 
 
 MAX_CAPTURE_BYTES = 1024 * 1024
 MAX_BLOB_BYTES = 1024 * 1024 * 1024
+
+
+class BlobResponse(StreamingResponse):
+    """Release the already-open reader even if the body never starts."""
+
+    def __init__(self, content, reader, **kwargs):
+        self.reader = reader
+        super().__init__(content, **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.reader.__exit__(None, None, None)
 
 
 class BodyLimit:
@@ -178,8 +193,8 @@ def create_app(data_dir: Path) -> FastAPI:
             app.state.processing = Processing(app.state.graph)
             from .admin import serve_admin
             admin = await serve_admin(app.state.graph, data_dir, app.state)
-            app.state.blobs = BlobStore(data_dir / 'blobs')
-            app.state.artifacts = Artifacts(app.state.store, app.state.blobs)
+            app.state.blobs = app.state.store.blobs
+            app.state.artifacts = app.state.store.artifacts
             from .cold_manager import ColdManager
             from .cold_runtime import ColdRuntime
             from .drive_auth import DriveAuthorization, DriveAuthorizationError, requires_reauthorization
@@ -191,7 +206,9 @@ def create_app(data_dir: Path) -> FastAPI:
                     max_importance=float(os.environ.get('MEMENTO_COLD_MAX_IMPORTANCE', '0.75')))
                 runtime = ColdRuntime(manager,
                     after_days=int(os.environ.get('MEMENTO_COLD_AFTER_DAYS', '90')),
-                    min_bytes=int(os.environ.get('MEMENTO_COLD_MIN_BYTES', str(10 * 1024 * 1024))))
+                    min_bytes=int(os.environ.get('MEMENTO_COLD_MIN_BYTES', str(10 * 1024 * 1024))),
+                    cache_bytes=int(os.environ.get('MEMENTO_COLD_CACHE_BYTES', str(1024 * 1024 * 1024))),
+                    cache_ttl_seconds=int(os.environ.get('MEMENTO_COLD_CACHE_TTL_SECONDS', '3600')))
                 return manager, runtime
 
             def install_drive(verified_backend, config, reconnect):
@@ -283,6 +300,14 @@ def create_app(data_dir: Path) -> FastAPI:
     allowed_hosts = [item.strip() for item in os.environ.get('MEMENTO_ALLOWED_HOSTS', '').split(',') if item.strip()]
     mcp_app = create_mcp(app.state).http_app(path='/', stateless_http=True,
         host_origin_protection=True, allowed_hosts=allowed_hosts or None)
+    @app.api_route('/mcp', methods=['GET', 'POST', 'DELETE'], include_in_schema=False)
+    def mcp_redirect(request: Request):
+        # Relative redirects preserve private HTTPS without trusting proxy headers.
+        location = '/mcp/'
+        if request.url.query:
+            location += '?' + request.url.query
+        return Response(status_code=307, headers={'Location': location})
+
     app.mount('/mcp', mcp_app)
 
     @app.exception_handler(RequestValidationError)
@@ -293,6 +318,10 @@ def create_app(data_dir: Path) -> FastAPI:
                   for item in error.errors()]
         return Response(json.dumps({'detail': detail}, ensure_ascii=True),
                         status_code=422, media_type='application/json')
+
+    @app.exception_handler(RawTextUnavailable)
+    async def missing_raw_source(request, error):
+        return Response(json.dumps({'detail': str(error)}), status_code=503, media_type='application/json')
 
     @app.get('/health')
     def health():
@@ -309,6 +338,11 @@ def create_app(data_dir: Path) -> FastAPI:
             raise HTTPException(503, dict(error='Cold archival incomplete',
                 archive_error=cold.last_error, archive_failure_count=cold.sweep_failure_count))
         return {'status': 'ok', 'processing': 'host_runner'}
+
+    @app.get('/status')
+    def status(source: Annotated[str | None, Query(min_length=1, max_length=256)] = None):
+        from .status import operational_status
+        return operational_status(app.state, source)
 
     async def drive_request(request, operation, arguments):
         # Only the local runner relays OAuth results. Browsers never POST these
@@ -373,7 +407,10 @@ def create_app(data_dir: Path) -> FastAPI:
             raise HTTPException(422, str(error)) from error
 
     @app.post('/remember')
-    def remember(command: Remember):
+    def remember(command: Remember | MediaInput, response: Response):
+        if isinstance(command, MediaInput):
+            response.status_code = 202
+            return ingest_media(command)
         return graph_command(app.state.graph.remember, command)
 
     @app.post('/link')
@@ -407,14 +444,27 @@ def create_app(data_dir: Path) -> FastAPI:
 
     @app.get('/blobs/{sha256}')
     def get_blob(sha256: str):
+        reader = None
         try:
-            path = (app.state.cold.fetch(sha256) if app.state.cold is not None
-                    else app.state.blobs.verify(sha256))
+            info = app.state.artifacts.get(sha256)
+            if info is None:
+                raise HTTPException(404, 'Blob not found')
+            if app.state.cold is not None:
+                reader = app.state.cold.reader(sha256)
+                source = reader.__enter__()
+            else:
+                path = app.state.blobs.verify(sha256)
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
         except FileNotFoundError:
             raise HTTPException(404, 'Blob not found') from None
-        info = app.state.artifacts.get(sha256)
+        if reader is not None:
+            async def content():
+                while chunk := await asyncio.to_thread(source.read, 1024 * 1024):
+                    yield chunk
+            return BlobResponse(content(), reader, media_type=info['mime'],
+                headers={'Content-Length': str(info['size']),
+                         'Content-Disposition': f'attachment; filename="{sha256}"'})
         return FileResponse(path, media_type=info['mime'] if info else 'application/octet-stream',
                             filename=sha256)
 
@@ -424,25 +474,29 @@ def create_app(data_dir: Path) -> FastAPI:
                limit: Annotated[int, Query(ge=1, le=100)] = 10,
                scope: Literal['personal', 'professional'] | None = None,
                since: Annotated[AwareDatetime | None, Query()] = None,
-               source: str | None = None):
+               source: str | None = None, automatic: bool = False,
+               context: Annotated[str, Query(max_length=4096)] = ''):
         if q.strip() and since is None and source is None and app.state.retrieval is None:
             raise HTTPException(503, 'Native embedding runtime is disabled')
         try:
             return {'memories': recall_memories(app.state, q, effort, limit, scope=scope,
-                since=since.isoformat() if since is not None else None, source=source)}
+                since=since.isoformat() if since is not None else None, source=source,
+                automatic=automatic, context=context)}
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
 
     @app.post('/media', status_code=202)
     def ingest_media(command: MediaInput):
-        if app.state.media is None:
-            raise HTTPException(503, 'Native embedding runtime is disabled')
         try:
-            if app.state.artifacts.get(command.sha256) is None:
-                raise HTTPException(404, 'Source blob not found')
-            return graph_command(app.state.jobs.submit_media, command)
-        except FileNotFoundError:
-            raise HTTPException(404, 'Source blob not found') from None
+            return submit_media(app.state, command)
+        except (ConflictError, LostLease) as error:
+            raise HTTPException(409, str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(503, str(error)) from error
+        except LookupError as error:
+            raise HTTPException(404, str(error)) from error
+        except (ValueError, UnicodeEncodeError) as error:
+            raise HTTPException(422, str(error)) from error
 
     @app.get('/jobs/{job_id}')
     def get_job(job_id: str):

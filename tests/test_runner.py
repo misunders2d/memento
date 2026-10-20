@@ -12,6 +12,235 @@ import pytest
 from memento import bridge, runner
 
 
+def native_config(path, agent='pi', mode='client'):
+    value = {'uid': os.getuid(), 'client_uid': 'device-' + agent, 'agent': agent, 'preset': agent,
+             'command': [agent], 'mode': mode, 'timezone': 'Etc/UTC',
+             'url': 'http://127.0.0.1:1', 'deadline_seconds': 600}
+    runner.private_write(path, runner.encode(value))
+    return value
+
+
+def test_status_uses_real_bridge_subprocess_without_adding_processing_guard(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv('MEMENTO_PROCESSING', raising=False)
+    config = tmp_path / 'runner.json'
+    value = native_config(config, 'omp')
+    spool = bridge.Spool(config, value)
+    spool.episode('omp', 's', 'u', 'user', 'still queued')
+    spool.commit()
+    spool.close()
+
+    class Service:
+        def __init__(self, _url):
+            pass
+
+        def get(self, endpoint):
+            source = runner.urllib.parse.parse_qs(runner.urllib.parse.urlsplit(endpoint).query)['source'][0]
+            return {'source': source, 'media': {'pending_jobs': int(source.startswith('artifact:'))}}
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    assert runner.main(['status', '--config', str(config)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['local']['pending'] == 1
+    assert result['service']['media']['pending_jobs'] == 0
+    assert result['artifacts_service']['media']['pending_jobs'] == 1
+    assert 'MEMENTO_PROCESSING' not in os.environ
+
+
+def test_quote_save_flushes_real_bridge_subprocess_before_media_submit(tmp_path, monkeypatch, capsys, media_http):
+    monkeypatch.delenv('MEMENTO_PROCESSING', raising=False)
+    url, state = media_http
+    config = tmp_path / 'runner.json'
+    value = {**native_config(config, 'omp'), 'url': url}
+    runner.private_write(config, runner.encode(value))
+    spool = bridge.Spool(config, value)
+    spool.episode('omp', 'conversation', 'u', 'user', 'Exact native request.')
+    spool.commit()
+    spool.close()
+    file = tmp_path / 'original.webp'
+    file.write_bytes(b'original opaque bytes')
+    assert runner.main(['media', 'save', str(file), '--config', str(config), '--scope', 'personal',
+                        '--quote', 'Exact native request.', '--conversation-id', 'conversation']) == 0
+    assert [endpoint for endpoint, _ in state['posts']] == ['/episodes', '/media']
+    assert state['posts'][0][1]['kind'] == 'user'
+    assert state['posts'][0][1]['text'] == 'Exact native request.'
+    assert state['posts'][1][1]['evidence'] == [{'quote': 'Exact native request.'}]
+    assert json.loads(capsys.readouterr().out)['job_id'] == 'job'
+    spool = bridge.Spool(config, value)
+    assert spool.status()['pending'] == 0
+    spool.close()
+
+
+@pytest.mark.parametrize('arguments', [
+    ['setup', '--agent', 'pi'], ['status'], ['upload'], ['media', 'status', 'job'],
+    ['export', '--data-dir', '/private/data', '--output', '/private/archive'],
+    ['restore', '--archive', '/private/archive', '--destination', '/private/empty'],
+    ['--config', '/private/config', 'status'],
+])
+def test_packaged_frontdoor_routes_supported_operations(arguments, monkeypatch):
+    from memento import __main__
+    calls = []
+    monkeypatch.setattr(runner, 'main', lambda argv: calls.append(argv) or 23)
+    assert __main__.main(arguments) == 23
+    assert calls == [arguments]
+
+
+def test_status_selects_harness_config_and_reports_stages_without_claiming_completion(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path))
+    host = runner.default_config()
+    original = native_config(host, mode='server')
+    path = host.parent / 'codex' / 'runner.json'
+    native_config(path, agent='codex')
+    observed = []
+    service_status = {'captured': {'episodes': 7}, 'indexing': {'available': False},
+                      'extraction': {'pending_conversations': 2}, 'consolidation': {'pending_jobs': 1}}
+
+    class Service:
+        def __init__(self, _url):
+            pass
+
+        def get(self, endpoint):
+            observed.append(endpoint)
+            return service_status
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'bridge_command', lambda config, operation, **kw: {
+        'pending': 3, 'conflicts': 0, 'captured_records': 9})
+    assert runner.main(['status', '--agent', 'codex']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['config'] == str(path) and result['mode'] == 'client'
+    assert result['local']['pending'] == 3 and result['service'] == service_status
+    assert result['artifacts_service'] == service_status
+    assert observed == ['/status?source=native%3Adevice-codex%3Acodex',
+                        '/status?source=artifact%3Adevice-codex%3Acodex']
+    assert runner.load_config(host) == original
+
+
+def test_explicit_config_ignores_unrelated_invalid_default(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    host = runner.default_config()
+    host.parent.mkdir(parents=True)
+    host.write_text('invalid unrelated configuration')
+    path = tmp_path / 'private' / 'runner.json'
+    expected = native_config(path, 'claude')
+    args = type('Args', (), {'config': path, 'agent': 'claude'})()
+    assert runner.selected_config(args) == (path, expected)
+
+
+def test_frontdoor_import_reuses_shipped_bridge_and_explicit_artifact_roots(tmp_path, monkeypatch):
+    path = tmp_path / 'runner.json'
+    native_config(path, 'omp')
+    observed = []
+    monkeypatch.setattr(runner.subprocess, 'call', lambda argv: observed.append(argv) or 0)
+    history = tmp_path / 'sessions'
+    blobs = tmp_path / 'blobs'
+    assert runner.main(['import-history', str(history), '--agent', 'omp', '--config', str(path),
+                        '--artifact-root', str(blobs)]) == 0
+    assert observed == [[sys.executable, str(Path(bridge.__file__)), 'import-history', '--config', str(path),
+                         '--agent', 'omp', '--artifact-root', str(blobs), str(history)]]
+
+
+@pytest.fixture
+def media_http():
+    state = {'posts': [], 'bytes': None}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def respond(self, value, content_type='application/json'):
+            body = value if isinstance(value, bytes) else runner.encode(value)
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers['Content-Length']))
+            if self.path == '/blobs':
+                state['bytes'] = body
+                state['mime'] = self.headers['Content-Type']
+                self.respond({'sha256': hashlib.sha256(body).hexdigest(), 'size': len(body)})
+            else:
+                value = json.loads(body)
+                state['posts'].append((self.path, value))
+                self.respond({'id': 'artifact-episode'} if self.path == '/episodes' else {
+                    'job_id': 'job', 'status': 'accepted', 'status_url': '/jobs/job'})
+
+        def do_GET(self):
+            if self.path.startswith('/blobs/'):
+                self.respond(state['bytes'], state['mime'])
+            else:
+                self.respond({'id': 'job', 'kind': 'media', 'state': 'done',
+                              'result': {'id': 'memory', 'blob_url': '/blobs/' + hashlib.sha256(state['bytes']).hexdigest()}})
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield 'http://127.0.0.1:' + str(server.server_port), state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_media_frontdoor_streams_original_and_uses_honest_artifact_provenance(tmp_path, monkeypatch, capsys, media_http):
+    url, state = media_http
+    config = tmp_path / 'runner.json'
+    value = native_config(config, 'omp')
+    runner.private_write(config, runner.encode({**value, 'url': url}))
+    file = tmp_path / 'photo.webp'
+    file.write_bytes(b'\x00original photo\xff' * 1000)
+    arguments = ['--config', str(config)]
+    assert runner.main(arguments + ['media', 'save', str(file), '--scope', 'personal']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert state['bytes'] == file.read_bytes() and state['mime'] == 'image/webp'
+    endpoint, origin = state['posts'][0]
+    assert endpoint == '/episodes' and origin['kind'] == 'artifact'
+    assert origin['source'].startswith('artifact:') and origin['metadata']['extraction_mode'] == 'skip'
+    command = state['posts'][1][1]
+    assert command['evidence'] == [{'episode_id': 'artifact-episode', 'quote': 'Artifact filename: photo.webp'}]
+    assert result['indexing'] == 'done' and result['job_id'] == 'job'
+    output = tmp_path / 'retrieved.webp'
+    assert runner.main(arguments + ['media', 'get', result['sha256'], '--output', str(output)]) == 0
+    assert output.read_bytes() == file.read_bytes() and output.stat().st_mode & 0o077 == 0
+    assert runner.main(arguments + ['media', 'get', result['sha256'], '--output', str(output)]) == 1
+    capsys.readouterr()
+    assert runner.main(arguments + ['media', 'status', 'job']) == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'done'
+
+
+def test_owner_frontdoor_preserves_interactive_export_gate(tmp_path):
+    output = tmp_path / 'archive.tar'
+    assert runner.main(['export', '--data-dir', str(tmp_path), '--output', str(output)]) != 0
+    assert not output.exists()
+
+
+def test_media_quote_flushes_capture_and_distinct_provenance_is_not_a_retry(tmp_path, monkeypatch, capsys, media_http):
+    url, state = media_http
+    config = tmp_path / 'runner.json'
+    value = native_config(config, 'omp')
+    runner.private_write(config, runner.encode({**value, 'url': url}))
+    file = tmp_path / 'photo.webp'
+    file.write_bytes(b'original bytes')
+    flushed = []
+    monkeypatch.setattr(runner, 'bridge_command', lambda *args, **kwargs: flushed.append((args, kwargs)) or {
+        'status': 'uploaded'})
+    identities = []
+    for quote, conversation in (('Exact first request.', 'one'), ('Exact first request.', 'one'),
+                                ('Exact second request.', 'one'), ('Exact first request.', 'two')):
+        assert runner.main(['--config', str(config), 'media', 'save', str(file), '--scope', 'personal',
+                            '--quote', quote, '--conversation-id', conversation]) == 0
+        identities.append(json.loads(capsys.readouterr().out)['command_id'])
+    assert identities[0] == identities[1]
+    assert len(set(identities)) == 3
+    assert len(flushed) == 4 and all(call[0][1] == 'flush-conversation' for call in flushed)
+    assert all(endpoint == '/media' for endpoint, _ in state['posts'])
+    assert state['posts'][0][1]['source'] == 'native:device-omp:omp'
+    assert state['posts'][0][1]['evidence'] == [{'quote': 'Exact first request.'}]
+
+
 def assistant_events(text='{"facts":[]}', **changes):
     message = dict(role='assistant', stopReason='stop', model='native-default',
                    usage={'input': 12, 'output': 3}, content=[{'type': 'text', 'text': text}])
@@ -82,6 +311,10 @@ def test_worker_subprocesses_are_excluded_from_native_capture(monkeypatch):
     assert runner.run_process([sys.executable, '-c',
                                'import os; print(os.environ["MEMENTO_PROCESSING"])']).splitlines() == [b'1']
     assert 'MEMENTO_PROCESSING' not in os.environ
+    monkeypatch.setenv('MEMENTO_PROCESSING', '1')
+    assert runner.run_process([sys.executable, '-c',
+                               'import os; print(os.environ["MEMENTO_PROCESSING"])'],
+                              processing=False).splitlines() == [b'1']
 
 
 def test_heartbeat_renews_all_claimed_work_and_marks_lost():
@@ -423,7 +656,7 @@ def update_installation(tmp_path, monkeypatch, client_release_http):
             protected.append(target)
         spool = bridge.Spool(config_path, config)
         spool.queue('/episodes', {'event_id': 'pending-event', 'text': 'durable raw capture'})
-        spool.db.execute('INSERT INTO journals VALUES(?,?,?,?,?)',
+        spool.db.execute('INSERT INTO journals(path,harness,conversation,offset,prefix) VALUES(?,?,?,?,?)',
                          ('/native/history', harness, 'conversation', 123, 'cursor-prefix'))
         spool.commit()
         spool.close()

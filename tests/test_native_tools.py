@@ -156,6 +156,18 @@ def test_empty_world_change_time_does_not_invent_a_timestamp(tool_state):
     asyncio.run(scenario())
 
 
+def test_mcp_redirect_preserves_private_https_behind_tls_proxy(tmp_path, monkeypatch):
+    from urllib.parse import urljoin
+
+    monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
+    with TestClient(create_app(tmp_path), base_url='http://backend', follow_redirects=False) as client:
+        response = client.post('/mcp?transport=streamable', headers={
+            'Host': 'memory.example', 'X-Forwarded-Proto': 'https'})
+    assert response.status_code == 307
+    assert urljoin('https://memory.example/mcp', response.headers['location']) == (
+        'https://memory.example/mcp/?transport=streamable')
+
+
 def test_http_does_not_accept_native_empty_date_sentinels(tmp_path, monkeypatch):
     monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
     with TestClient(create_app(tmp_path)) as client:
@@ -200,6 +212,12 @@ export default async function(api) {
     ["optional_filters", "memento_recall", {query:"", effort:"", limit:3, scope:"", since:"", source:""}],
     ["optional_save_dates", "memento_remember", {command:{...command, valid_from:"", valid_to:"",
       evidence:[{episode_id:"", quote:"Exact source fact"}]}}],
+    ["media_reference", "memento_remember", {command:{why:command.why, evidence:command.evidence,
+      sha256:"a".repeat(64), kind:"image", filename:"original.webp", scope:["personal"]}}],
+    ["media_binary_rejected", "memento_remember", {command:{why:command.why, evidence:command.evidence,
+      sha256:"a".repeat(64), kind:"image", filename:"original.webp", scope:["personal"], data:"opaque-base64"}}],
+    ["media_without_evidence", "memento_remember", {command:{why:command.why,
+      sha256:"a".repeat(64), kind:"image", filename:"original.webp", scope:["personal"]}}],
     ["optional_change_date", "memento_supersede", {command:{why:command.why, old:"memory",
       new:{type:"knowledge", text:command.text, scope:command.scope}, evidence:command.evidence,
       kind:"refinement", valid_at:""}}],
@@ -232,5 +250,6 @@ export default async function(api) {
     assert result.returncode == 0, result.stderr
     assert json.loads(output.read_text()) == {
         'recorded_personal': True, 'recorded_all': True, 'optional_filters': True,
+        'media_reference': True, 'media_binary_rejected': False, 'media_without_evidence': False,
         'optional_save_dates': True, 'optional_change_date': True, 'valid_date': True,
         'invalid_date': False, 'invalid_scope': False, 'required_text': False, 'required_quote': False}

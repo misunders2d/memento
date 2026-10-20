@@ -1,0 +1,79 @@
+"""Read-only operational counts; observing status never schedules processing."""
+
+import time
+
+from .extraction import ACTIVE_CANDIDATE_SQL
+
+
+def operational_status(state, source=None):
+    with state.store._mutex:
+        db = state.store._db
+        captured = dict(episodes=db.execute(
+            'SELECT count(*) FROM episodes WHERE (? IS NULL OR source=?)', (source, source)).fetchone()[0],
+            conversations=db.execute('''SELECT count(*) FROM (
+                SELECT source,conversation_id FROM episodes WHERE (? IS NULL OR source=?)
+                GROUP BY source,conversation_id)''', (source, source)).fetchone()[0])
+        raw_storage = dict(db.execute('''SELECT
+            coalesce(sum(text_runs IS NULL),0) AS inline_raw_episodes,
+            coalesce(sum(CASE WHEN text_runs IS NULL THEN length(CAST(text AS BLOB)) ELSE 0 END),0) AS inline_raw_bytes,
+            coalesce(sum(text_runs IS NOT NULL),0) AS offloaded_raw_episodes
+            FROM episodes WHERE kind IN ('native_record','native_live_record','native_hook')
+            AND json_extract(metadata,'$.extraction_mode')='skip'
+            AND (? IS NULL OR source=?)''', (source, source)).fetchone())
+        objects = db.execute('''SELECT count(*) AS objects,coalesce(sum(size),0) AS bytes,
+            coalesce(sum(remote_id IS NULL),0) AS local_objects,
+            coalesce(sum(CASE WHEN remote_id IS NULL THEN size ELSE 0 END),0) AS local_bytes,
+            coalesce(sum(remote_id IS NOT NULL),0) AS remote_objects,
+            coalesce(sum(CASE WHEN remote_id IS NOT NULL THEN size ELSE 0 END),0) AS remote_bytes
+            FROM blobs''').fetchone()
+        artifact_storage = dict(scope='global',
+            registered=dict(objects=objects['objects'], bytes=objects['bytes']),
+            local_only=dict(objects=objects['local_objects'], bytes=objects['local_bytes']),
+            verified_remote=dict(objects=objects['remote_objects'], bytes=objects['remote_bytes']))
+
+        def jobs(kind):
+            # A consolidation can contain several origins; count the job for
+            # every source it actually cites rather than inventing an owner.
+            origin = "json_extract(j.payload,'$.source')=?" if kind == 'extract' else (
+                '''EXISTS (SELECT 1 FROM json_each(j.payload,'$.candidate_ids') c
+                    JOIN graph_evidence g ON g.target=c.value
+                    JOIN episodes e ON e.id=g.episode_id WHERE e.source=?)''' if kind == 'consolidate' else
+                '''EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
+                    WHERE g.target=j.id AND e.source=?)''')
+            rows = db.execute(f'''SELECT state,error,count(*) AS count FROM jobs j
+                WHERE kind=? AND (? IS NULL OR {origin}) GROUP BY state,error''',
+                (kind, source, source)).fetchall()
+            result = dict(available=True, pending_jobs=0, leased_jobs=0, completed_jobs=0,
+                          failed_jobs=0, retrying_jobs=0)
+            fields = dict(pending='pending_jobs', leased='leased_jobs', done='completed_jobs', failed='failed_jobs')
+            for row in rows:
+                result[fields[row['state']]] += row['count']
+                if row['state'] == 'pending' and row['error'] is not None:
+                    result['retrying_jobs'] += row['count']
+            return result
+
+        extraction = jobs('extract')
+        extraction['pending_conversations'] = db.execute('''SELECT count(*) FROM processing_progress
+            WHERE latest_seq>seq AND (? IS NULL OR source=?)''', (source, source)).fetchone()[0]
+        extraction['progress'] = [dict(row) for row in db.execute('''SELECT source,conversation_id,
+            seq AS cursor,offset,compact_through,latest_seq FROM processing_progress
+            WHERE (? IS NULL OR source=?) ORDER BY source,conversation_id''', (source, source))]
+        consolidation, media = jobs('consolidate'), jobs('media')
+        pending = db.execute(f'''SELECT count(*) AS pending_candidates,
+            coalesce(sum(NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id
+                AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id)
+                AND (d.decision='review' OR d.next_review_at>?))),0) AS ready_candidates
+            FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}
+            AND (? IS NULL OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
+                WHERE g.target=c.id AND e.source=?))''', (time.time(), source, source)).fetchone()
+        consolidation.update(dict(pending))
+    indexing = (state.retrieval.status(source=source) if state.retrieval is not None else
+                dict(available=False, reason='embedding_runtime_disabled'))
+    cold = state.cold_runtime
+    return dict(source=source, captured=captured, raw_storage=raw_storage, artifact_storage=artifact_storage,
+                indexing=indexing, extraction=extraction,
+                consolidation=consolidation, media=media,
+                drive=dict(connected=state.cold is not None,
+                           reauthorization_required=state.drive_reauthorization_required,
+                           archive_failure_count=cold.sweep_failure_count if cold is not None else None,
+                           archive_error=cold.last_error if cold is not None else None))

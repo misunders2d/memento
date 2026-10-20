@@ -16,6 +16,7 @@ from pathlib import Path
 import sqlite_vec
 
 from .blobs import BlobStore
+from .raw_text import runs
 
 _FORMAT = 'memento-portable'
 _VERSION = 1
@@ -73,6 +74,14 @@ def _registered(db):
     for (payload,) in db.execute("SELECT payload FROM jobs WHERE kind='media'"):
         if json.loads(payload).get('sha256') not in result:
             raise ValueError('Media job references an unregistered blob')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(episodes)')}
+    if 'text_runs' in columns:
+        for references, full_sha in db.execute('SELECT text_runs,text_sha256 FROM episodes WHERE text_runs IS NOT NULL'):
+            if not isinstance(full_sha, str) or not _DIGEST.fullmatch(full_sha):
+                raise ValueError('Invalid raw text checksum')
+            for _, sha256, length in runs(references):
+                if sha256 not in result or result[sha256]['size'] != length:
+                    raise ValueError('Raw source references an unregistered or incorrectly sized blob')
     return result
 
 

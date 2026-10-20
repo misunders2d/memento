@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
@@ -21,6 +22,10 @@ _PROTECTION = '''SELECT 1 FROM node_versions n
         SELECT node_id FROM media_files WHERE sha256={sha}
         UNION SELECT node_id FROM segments WHERE artifact_sha256={sha} OR source_sha256={sha})'''
 
+_MEDIA_REFERENCE = '''EXISTS (SELECT 1 FROM media_files WHERE sha256={sha})
+    OR EXISTS (SELECT 1 FROM segments WHERE artifact_sha256={sha} OR source_sha256={sha})
+    OR EXISTS (SELECT 1 FROM jobs WHERE kind='media' AND json_extract(payload,'$.sha256')={sha})'''
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -35,10 +40,28 @@ class ColdManager:
         self.data_dir = data_dir
         self.max_importance = max_importance
         self._mutex = RLock()
+        self._readers = {}
+        self.store.artifact_reader = self.reader
 
     def _protected(self, sha256):
         return self.store._db.execute(_PROTECTION.format(sha='?') + ' LIMIT 1',
             (self.max_importance, sha256, sha256, sha256)).fetchone() is not None
+
+    def _in_use(self, sha256):
+        return self._readers.get(sha256, 0) > 0 or self.store._db.execute('''SELECT 1 FROM jobs
+            WHERE kind='media' AND state IN ('pending','leased')
+            AND json_extract(payload,'$.sha256')=? LIMIT 1''', (sha256,)).fetchone() is not None
+
+    def _evict(self, sha256, remote_id):
+        # Caller holds the writer lock, fencing job admission and HTTP readers.
+        if self._in_use(sha256):
+            return False
+        path = self.blobs.path(sha256)
+        path.unlink(missing_ok=True)
+        if path.parent.exists():
+            self.blobs._sync(path.parent)
+        self._phase(sha256, 'evicted', remote_id)
+        return True
 
     def _phase(self, sha256, phase, remote_id):
         db = self.store._db
@@ -61,17 +84,12 @@ class ColdManager:
             if info is None:
                 raise ValueError('Unknown registered artifact')
             path = self.blobs.path(sha256)
-            if not path.exists() and info['tier'] == 'cold':
+            if info['tier'] == 'cold':
                 with self.store._mutex:
-                    self._phase(sha256, 'evicted', info['remote_id'])
+                    self._evict(sha256, info['remote_id'])
                 return info
-            with self.store._mutex:
-                if self._protected(sha256):
-                    raise ValueError('Pinned or high-importance artifact must remain hot')
             remote = self._copy(info)
             with self.store._mutex:
-                if self._protected(sha256):
-                    raise ValueError('Artifact became protected; both copies retained')
                 db = self.store._db
                 db.execute('BEGIN IMMEDIATE')
                 try:
@@ -86,9 +104,7 @@ class ColdManager:
                     raise
                 # The FULL-synchronous reference commit precedes removal. A crash
                 # before here leaves two copies; after here the verified cold copy remains.
-                path.unlink(missing_ok=True)
-                self.blobs._sync(path.parent)
-                self._phase(sha256, 'evicted', remote.id)
+                self._evict(sha256, remote.id)
             return self.artifacts.get(sha256)
 
     def _copy(self, info, *, purpose='archive'):
@@ -114,33 +130,89 @@ class ColdManager:
 
     def fetch(self, sha256):
         try:
-            return self.blobs.verify(sha256)
+            path = self.blobs.verify(sha256)
+            os.utime(path, None)
+            return path
         except (FileNotFoundError, OSError):
             pass
         with self._mutex:
             path = self.blobs.path(sha256)
             try:
-                return self.blobs.verify(sha256)
+                path = self.blobs.verify(sha256)
+                os.utime(path, None)
+                return path
             except (FileNotFoundError, OSError):
                 info = self.artifacts.get(sha256)
                 if info is None or not info['remote_id']:
                     raise
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.backend.download(info['remote_id'], path, sha256)
-            return self.blobs.verify(sha256)
+            path = self.blobs.verify(sha256)
+            os.utime(path, None)
+            return path
+
+    @contextmanager
+    def reader(self, sha256):
+        """Keep an exact-byte HTTP read alive while the cache is trimmed."""
+        source = None
+        with self.store._mutex:
+            self._readers[sha256] = self._readers.get(sha256, 0) + 1
+        try:
+            # Registration fences eviction. Hashing/downloading/opening can
+            # now happen outside the database writer lock, even for huge files.
+            source = self.fetch(sha256).open('rb')
+            yield source
+        finally:
+            if source is not None:
+                source.close()
+            with self.store._mutex:
+                remaining = self._readers[sha256] - 1
+                if remaining:
+                    self._readers[sha256] = remaining
+                else:
+                    del self._readers[sha256]
+
+    def trim_cache(self, *, max_bytes=1024 * 1024 * 1024, ttl_seconds=3600):
+        if max_bytes < 0 or ttl_seconds < 0:
+            raise ValueError('Invalid cold-cache limits')
+        with self._mutex:
+            with self.store._mutex:
+                rows = self.store._db.execute("SELECT sha256,remote_id FROM blobs WHERE tier='cold'").fetchall()
+            cached = []
+            for row in rows:
+                try:
+                    info = self.blobs.path(row['sha256']).stat()
+                except FileNotFoundError:
+                    continue
+                cached.append((info.st_mtime, info.st_size, row['sha256'], row['remote_id']))
+            total = sum(item[1] for item in cached)
+            evicted = []
+            cutoff = time.time() - ttl_seconds
+            for modified, size, sha256, remote_id in sorted(cached):
+                if modified > cutoff and total <= max_bytes:
+                    continue
+                with self.store._mutex:
+                    if self._evict(sha256, remote_id):
+                        total -= size
+                        evicted.append(sha256)
+            return dict(bytes=total, evicted=evicted)
 
     def sweep(self, *, after_days=90, min_bytes=10 * 1024 * 1024, limit=10):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=after_days)).isoformat()
         protection = _PROTECTION.format(sha='b.sha256')
+        media = _MEDIA_REFERENCE.format(sha='b.sha256')
         with self.store._mutex:
             rows = self.store._db.execute(f'''SELECT b.sha256 FROM blobs b
                 LEFT JOIN cold_transfers t ON t.sha256=b.sha256
                 LEFT JOIN cold_failures f ON f.sha256=b.sha256
-                WHERE ((b.tier='hot' AND b.created_at<? AND b.size>=?)
-                   OR t.status IN ('copying','verified','committed'))
-                AND coalesce(f.next_attempt,0)<=? AND NOT EXISTS ({protection})
+                WHERE ((b.tier='hot' AND (b.size>=?
+                    OR b.mime LIKE 'image/%' OR b.mime LIKE 'audio/%' OR b.mime LIKE 'video/%'
+                    OR b.mime IN ('application/pdf','application/x-memento-raw-run') OR ({media})
+                    OR (b.created_at<? AND NOT EXISTS ({protection}))))
+                   OR (b.tier='hot' AND t.status IN ('copying','verified','committed')))
+                AND coalesce(f.next_attempt,0)<=?
                 ORDER BY coalesce(f.attempts,0),b.created_at,b.sha256 LIMIT ?''',
-                (cutoff, min_bytes, time.time(), self.max_importance, limit)).fetchall()
+                (min_bytes, cutoff, self.max_importance, time.time(), limit)).fetchall()
         promoted = []
         for row in rows:
             try:
@@ -156,10 +228,10 @@ class ColdManager:
                         error=excluded.error,next_attempt=excluded.next_attempt''',
                         (row['sha256'], attempts, type(error).__name__, retry_at))
         with self.store._mutex:
-            failures = self.store._db.execute(f'''SELECT count(*) FROM cold_failures f
+            failures = self.store._db.execute('''SELECT count(*) FROM cold_failures f
                 JOIN blobs b ON b.sha256=f.sha256
-                WHERE b.tier='hot' AND NOT EXISTS ({protection})''', (self.max_importance,)).fetchone()[0]
-        return dict(promoted=promoted, failure_count=failures)
+                WHERE b.tier='hot' ''').fetchone()[0]
+        return dict(promoted=promoted, failure_count=failures, batch_full=len(rows) == limit)
 
     def backup(self):
         with self._mutex:

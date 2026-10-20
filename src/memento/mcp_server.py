@@ -5,7 +5,7 @@ from pydantic import AwareDatetime, BeforeValidator
 from fastmcp import FastMCP
 from fastmcp.tools.base import ToolResult
 
-from .commands import Link, Loop, Remember, Supersede
+from .commands import Link, Loop, MediaInput, Remember, Supersede
 
 
 def _empty_as_none(value):
@@ -27,7 +27,7 @@ _OptionalScope = Annotated[Literal['personal', 'professional', ''] | None, Befor
 
 
 def recall_memories(state, query='', effort='normal', limit=10, *, scope=None,
-                    since=None, source=None):
+                    since=None, source=None, automatic=False, context=''):
     """Keep ordinary semantic recall separate from bounded raw activity search."""
     if effort not in ('cheap', 'normal', 'deep') or not 1 <= limit <= 100 or scope not in (None, 'personal', 'professional'):
         raise ValueError('Invalid effort, limit or scope')
@@ -36,6 +36,9 @@ def recall_memories(state, query='', effort='normal', limit=10, *, scope=None,
     if query.strip() and since is None and source is None:
         if state.retrieval is None:
             raise ValueError('Native embedding runtime is disabled')
+        if automatic or context:
+            return state.retrieval.recall(query, effort, limit, scope=scope,
+                                          automatic=automatic, context=context)
         return state.retrieval.recall(query, effort, limit, scope=scope)
     # Raw evidence has no personal/professional labels. Do not infer a label
     # from an assertion that happens to cite one part of a conversation.
@@ -45,6 +48,15 @@ def recall_memories(state, query='', effort='normal', limit=10, *, scope=None,
                  text=row['excerpt'], score=0.0, source_url='/episodes/' + row['id'],
                  match='keyword' if query.strip() else 'activity')
             for row in state.store.search(query, limit, source=source, since=since)]
+
+
+def submit_media(state, command):
+    """Share the same checked reference-only save between HTTP and MCP."""
+    if state.media is None:
+        raise RuntimeError('Native embedding runtime is disabled')
+    if state.artifacts.get(command.sha256) is None:
+        raise LookupError('Source blob not found')
+    return state.jobs.submit_media(**command.arguments())
 
 
 def create_mcp(state):
@@ -61,7 +73,10 @@ def create_mcp(state):
     def recall(query: str = '', effort: _OptionalString = 'normal', limit: int = 10,
                scope: _OptionalScope = None,
                since: _OptionalDate = None, source: _OptionalString = None) -> ToolResult:
-        """Recall memories, or omit query for recent activity; since/source filter raw evidence."""
+        """Recall memories, or omit query for recent activity; since/source filter raw evidence.
+
+        When choosing how to carry out a task and automatic context is insufficient, consult relevant prior experiences.
+        """
         memories = recall_memories(state, query, effort or 'normal', limit, scope=scope,
             since=since.isoformat() if since is not None else None, source=source)
         lines = [f"{item['id']} | {item['type']} | "
@@ -71,8 +86,10 @@ def create_mcp(state):
                           structured_content={'memories': memories})
 
     @mcp.tool
-    def remember(command: Annotated[Remember, BeforeValidator(_omit_empty_fields)]) -> dict:
-        """Explicitly save a typed assertion supported by exact episode quotes."""
+    def remember(command: Annotated[Remember | MediaInput, BeforeValidator(_omit_empty_fields)]) -> dict:
+        """Save an exact-quote assertion or queue an uploaded media reference; never send base64 bytes."""
+        if isinstance(command, MediaInput):
+            return submit_media(state, command)
         return state.graph.remember(**command.arguments())
 
     @mcp.tool

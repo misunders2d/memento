@@ -7,11 +7,13 @@ from threading import Event, Thread
 
 
 class ColdRuntime:
-    def __init__(self, manager, *, after_days=90, min_bytes=10 * 1024 * 1024):
-        if after_days < 1 or min_bytes < 1:
+    def __init__(self, manager, *, after_days=90, min_bytes=10 * 1024 * 1024,
+                 cache_bytes=1024 * 1024 * 1024, cache_ttl_seconds=3600):
+        if after_days < 1 or min_bytes < 1 or cache_bytes < 0 or cache_ttl_seconds < 0:
             raise ValueError('Invalid cold-storage retention schedule')
         self.manager = manager
         self.after_days, self.min_bytes = after_days, min_bytes
+        self.cache_bytes, self.cache_ttl_seconds = cache_bytes, cache_ttl_seconds
         self.stop = Event()
         self.thread = None
         self.last_error = None
@@ -29,12 +31,15 @@ class ColdRuntime:
         if time.monotonic() >= self.next_sweep:
             try:
                 result = self.manager.sweep(after_days=self.after_days, min_bytes=self.min_bytes)
+                self.manager.trim_cache(max_bytes=self.cache_bytes, ttl_seconds=self.cache_ttl_seconds)
                 self.sweep_failure_count = result['failure_count']
                 self.last_error = 'PendingArchives' if self.sweep_failure_count else None
-                self.next_sweep = time.monotonic() + (60 if self.sweep_failure_count else 3600)
+                self.next_sweep = time.monotonic() + (0 if result['batch_full'] else 60)
+                return result['batch_full']
             except Exception as error:
                 self.last_error = self._failed('sweep', error)
                 self.next_sweep = time.monotonic() + 60
+        return False
 
     def start(self):
         if self.thread is not None:
@@ -43,8 +48,8 @@ class ColdRuntime:
             if hasattr(os, 'setpriority'):
                 os.setpriority(os.PRIO_PROCESS, 0, 10)
             while not self.stop.is_set():
-                self.run_once()
-                self.stop.wait(60)
+                if not self.run_once():
+                    self.stop.wait(60)
         self.thread = Thread(target=run, name='memento-cold', daemon=True)
         self.thread.start()
 

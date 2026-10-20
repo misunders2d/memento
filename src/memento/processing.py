@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import uuid4
 
-from .consolidation import Consolidator, INSTRUCTION as CONSOLIDATE_INSTRUCTION, Plan
-from .extraction import BatchDrafts, Extractor, INSTRUCTION as EXTRACT_INSTRUCTION, VERSION
+from .consolidation import Consolidator, INSTRUCTION as CONSOLIDATE_INSTRUCTION, Plan, VERSION as CONSOLIDATE_VERSION
+from .extraction import BatchDrafts, Extractor, INSTRUCTION as EXTRACT_INSTRUCTION, VERSION, source_text_ranges
 from .jobs import Job, LostLease, Queue
 
 
@@ -57,26 +57,33 @@ class Processing:
             next_seq, next_offset = group['cursor'], 0
             stopped = False
             for row in rows:
-                start = group['offset'] if row['seq'] == partial_seq else 0
+                offset = group['offset'] if row['seq'] == partial_seq else 0
                 tool = json.loads(row['metadata']).get('extraction_mode') == 'tool_output' or row['kind'] == 'tool'
-                while True:
-                    end = len(row['text']) if tool else min(len(row['text']), start + 12000)
-                    projected = min(end - start, 2000) if tool else end - start
-                    if len(windows) == 64 or characters + projected > 48000:
-                        # Consume ignored rows too, but never move past the first unfinished row.
-                        next_seq = db.execute('''SELECT coalesce(max(seq),0) FROM episodes
-                            WHERE source=? AND conversation_id=? AND seq<?''',
-                            (group['source'], group['conversation_id'], row['seq'])).fetchone()[0]
-                        next_offset, stopped = start, True
+                regions = source_text_ranges(row['text'])
+                for left, right in regions:
+                    if right < offset or right == offset and right != 0:
+                        continue
+                    start = max(left, offset)
+                    while True:
+                        end = right if tool else min(right, start + 12000)
+                        projected = min(end - start, 2000) if tool else end - start
+                        if len(windows) == 64 or characters + projected > 48000:
+                            # Consume ignored rows too, but never move past the first unfinished row.
+                            next_seq = db.execute('''SELECT coalesce(max(seq),0) FROM episodes
+                                WHERE source=? AND conversation_id=? AND seq<?''',
+                                (group['source'], group['conversation_id'], row['seq'])).fetchone()[0]
+                            next_offset, stopped = start, True
+                            break
+                        windows.append(dict(id=f"{row['id']}:{start}", episode_id=row['id'], start=start, end=end))
+                        characters += projected
+                        if end == right:
+                            break
+                        start = max(left, end - 1000)
+                    if stopped:
                         break
-                    windows.append(dict(id=f"{row['id']}:{start}", episode_id=row['id'], start=start, end=end))
-                    characters += projected
-                    if end == len(row['text']):
-                        next_seq, next_offset = row['seq'], 0
-                        break
-                    start = end - 1000
                 if stopped:
                     break
+                next_seq, next_offset = row['seq'], 0
             else:
                 # No eligible evidence remains inside this immutable capture boundary.
                 next_seq, next_offset = through, 0
@@ -125,7 +132,7 @@ class Processing:
             from .importance import refresh
             refresh(self.store, now)
             return False
-        payload = dict(version='consolidate-v2', night=night, candidate_ids=[item['id'] for item in candidates],
+        payload = dict(version=CONSOLIDATE_VERSION, night=night, candidate_ids=[item['id'] for item in candidates],
                        next_cursor=max(item['position'] for item in candidates))
         key = ('consolidate/manual/' + uuid4().hex) if force else (
             'consolidate/' + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest())

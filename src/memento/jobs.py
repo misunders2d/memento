@@ -57,8 +57,14 @@ class Queue:
     def submit_media(self, **command):
         request = dict(op='queue_media', input=command)
         def apply(commit):
-            job_id = self._insert('media/' + command['command_id'], 'media', command)
-            self.graph._evidence(job_id, 1, command['evidence'])
+            resolved = self.graph._resolve_evidence(command)
+            resolved['scope'] = self.graph._scope('media', resolved['scope'])
+            # Resolve conversation-local quotes while accepting the command,
+            # before later messages could change which episode is selected.
+            resolved.pop('source', None)
+            resolved.pop('conversation_id', None)
+            job_id = self._insert('media/' + command['command_id'], 'media', resolved)
+            self.graph._evidence(job_id, 1, resolved['evidence'])
             return dict(job_id=job_id, status='accepted', status_url='/jobs/' + job_id)
         return self.graph._command(command['command_id'], command['actor'], command['why'], request, apply)
 

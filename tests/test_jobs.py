@@ -82,3 +82,39 @@ def test_failed_work_does_not_starve_later_input_or_disclose_error_body(tmp_path
         assert graph.history(result['result']['id'])[0]['text'] == 'keep the original image'
     finally:
         store.close()
+
+
+def test_media_quote_only_provenance_is_resolved_once_before_worker_runs(tmp_path):
+    store, graph, queue, command = setup_queue(tmp_path)
+    try:
+        repeated, _ = store.capture(dict(source='test', event_id='repeated', conversation_id='c',
+            kind='user', text='save this image then save this image', occurred_at=None, metadata={}))
+        command = dict(command, source='test', conversation_id='c',
+                       evidence=[dict(quote='save this image', occurrence=1)])
+        accepted = queue.submit_media(**command)
+        store.capture(dict(source='test', event_id='later', conversation_id='c', kind='user',
+            text='save this image', occurred_at=None, metadata={}))
+        assert queue.submit_media(**command) == accepted
+        job = queue.claim(['media'])
+        assert 'source' not in job.payload and 'conversation_id' not in job.payload
+        assert job.payload['evidence'] == [dict(episode_id=repeated['id'], quote='save this image', occurrence=1)]
+        span = store._db.execute('SELECT episode_id,start,end,quote FROM graph_evidence WHERE target=?',
+                                 (accepted['job_id'],)).fetchone()
+        assert dict(span) == dict(episode_id=repeated['id'], start=21, end=36, quote='save this image')
+        with pytest.raises(ConflictError):
+            queue.submit_media(**dict(command, evidence=[dict(quote='save this image', occurrence=0)]))
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('change', [dict(evidence=[dict(quote='not in this conversation')]),
+                                    dict(scope=['personal', 'professional'])])
+def test_media_invalid_quote_or_scope_leaves_no_accepted_job(tmp_path, change):
+    store, graph, queue, command = setup_queue(tmp_path)
+    try:
+        command.update(source='test', conversation_id='c')
+        with pytest.raises(ValueError):
+            queue.submit_media(**dict(command, **change))
+        assert store._db.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0
+    finally:
+        store.close()

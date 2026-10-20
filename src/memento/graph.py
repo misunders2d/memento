@@ -15,6 +15,57 @@ RELATIONS = frozenset(('belongs_to', 'follows_up_on', 'works_in', 'decided_by',
                       'supersedes', 'mentions', 'part_of', 'caused_by', 'owned_by', 'related_to'))
 
 
+def behavior_ground_truth(episode, start=None, end=None):
+    """A user envelope is not sufficient authority for pasted peer/tool instructions."""
+    metadata = episode.get('metadata', {})
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    text = episode.get('text', '')
+    pasted, depth, opened = [], 0, None
+    for tag in re.finditer(r'<(/?)pasted_content\b[^>]*>', text, re.I):
+        if not tag.group(1):
+            if depth == 0:
+                opened = tag.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                pasted.append((opened, tag.end()))
+    if depth:
+        pasted.append((opened, len(text)))
+    visible, cursor = [], 0
+    for left, right in pasted:
+        visible.append(text[cursor:left])
+        cursor = right
+    visible.append(text[cursor:])
+    own_text = ''.join(visible)
+    eligible = (episode.get('kind') == 'user' and metadata.get('evidence_eligible', True) is not False
+        and metadata.get('extraction_mode', 'message') == 'message'
+        and bool(own_text.strip())
+        and re.search(r'\[\s*(?:HERDR\s+)?AGENT MESSAGE\s*\]|'
+                      r'Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)|'
+                      r'<(?:system-reminder|collaboration[^>]*|tool_result)\b', own_text, re.I) is None)
+    if not eligible or start is None:
+        return eligible
+    if any(start < right and (end if end is not None else len(text)) > left for left, right in pasted):
+        return False
+    # Fenced examples and Markdown quotations are source data, even in a user
+    # message. The model still decides whether an ordinary incident is causal.
+    prefix = text[:start]
+    for left, right in reversed(pasted):
+        if left < start:
+            prefix = prefix[:left] + prefix[min(right, start):]
+    if len(re.findall(r'^\s*(?:```|~~~)', prefix, re.M)) % 2:
+        return False
+    line_start = text.rfind('\n', 0, start) + 1
+    if text[line_start:start].lstrip().startswith('>'):
+        return False
+    quote = text[start:end].strip()
+    if quote.startswith(('```', '~~~', '>')):
+        return False
+    return True
+
+
 NODE_SUMMARY = ('n.id,n.version,n.type,substr(n.text,1,240) AS text,n.state,'
                 'n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,'
                 '(SELECT c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id '
@@ -38,6 +89,30 @@ class Graph:
         if row is None:
             raise ValueError(f'Unknown node: {node_id}')
         return dict(row)
+
+    def _behavior(self, node_id):
+        """Read immutable creation metadata, independent of later citation/attach versions.
+
+        One primary-key node lookup and one commit are sufficient. The existing
+        consolidation result maps actions to newly created/replacement identities;
+        evidence and ordinary assertion history remain in their original tables.
+        """
+        row = self.store._db.execute('''SELECT g.request,g.result FROM node_versions n
+            JOIN graph_commits g ON g.id=n.commit_id WHERE n.id=? AND n.version=1''',
+            (node_id,)).fetchone()
+        if row is None:
+            return None
+        command = json.loads(row['request']).get('command', {})
+        if command.get('op') != 'consolidate':
+            return None
+        results = json.loads(row['result']).get('results', {})
+        for action in command.get('output', {}).get('actions', []):
+            result = results.get(action.get('candidate_id'), {})
+            target = result.get('superseded_by') or result.get('id')
+            if (target == node_id and action.get('operation') in ('remember', 'supersede')
+                    and action.get('type') == 'experience' and action.get('behavior')):
+                return action['behavior']
+        return None
 
     def _resolve_evidence(self, request):
         sources = []
@@ -70,13 +145,16 @@ class Graph:
         db = self.store._db
         seen = set()
         for source in sources:
-            row = db.execute('SELECT text,source,event_id FROM episodes WHERE id=?', (source['episode_id'],)).fetchone()
+            row = db.execute('SELECT text,source,event_id,text_runs FROM episodes WHERE id=?',
+                             (source['episode_id'],)).fetchone()
             if row is None:
                 raise ValueError('Unknown source episode')
             if db.execute('SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1',
                           (row['source'], row['event_id'])).fetchone():
                 raise ConflictError('This evidence was excluded from active memory by a human decision')
             text, quote = row['text'], source['quote']
+            if row['text_runs'] is not None:
+                raise ValueError('Offloaded raw source is not assertion evidence; cite the message projection')
             if not isinstance(quote, str) or not quote:
                 raise ValueError('Evidence quote must be a nonempty string')
             matches = []
@@ -227,6 +305,18 @@ class Graph:
 
     def history(self, node_id):
         with self.store._mutex:
+            raw = self.store._db.execute('SELECT * FROM episodes WHERE id=?', (node_id,)).fetchone()
+            blocked = raw is not None and self.store._db.execute(
+                'SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1',
+                (raw['source'], raw['event_id'])).fetchone() is not None
+        if raw is not None:
+            episode = self.store.hydrate_episode(raw)
+            return [dict(episode, version=1, type='raw_episode', state='raw', confirmed=False,
+                actor=episode['source'], why='Immutable captured evidence',
+                recorded_at=episode['captured_at'], recorded_until=None, valid_from=None, valid_to=None,
+                forgotten=blocked, evidence=[dict(episode_id=node_id, start=0, end=len(episode['text']),
+                                                  quote=episode['text'])])]
+        with self.store._mutex:
             rows = self.store._db.execute('''WITH RECURSIVE lineage(id) AS (
                 SELECT id FROM node_versions WHERE id=?
                 UNION SELECT CASE WHEN e.src=l.id THEN e.dst ELSE e.src END
@@ -249,22 +339,18 @@ class Graph:
                     FROM candidates p JOIN extraction_runs r ON r.id=p.run_id
                     JOIN graph_commits c ON c.id=r.commit_id WHERE p.id=?''', (node_id,)).fetchall()
             if not rows:
-                episode = self.store.get(node_id)
-                if episode is None:
-                    return []
-                blocked = self.store._db.execute('SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1',
-                    (episode['source'], episode['event_id'])).fetchone() is not None
-                return [dict(episode, version=1, type='raw_episode', state='raw', confirmed=False,
-                    actor=episode['source'], why='Immutable captured evidence',
-                    recorded_at=episode['captured_at'], recorded_until=None, valid_from=None, valid_to=None,
-                    forgotten=blocked, evidence=[dict(episode_id=node_id, start=0, end=len(episode['text']),
-                                                      quote=episode['text'])])]
+                return []
             result = []
             previous_text = ''
             for row in rows:
                 item = dict(row)
                 if 'scope' in item:
                     item['scope'] = json.loads(item['scope'])
+                if item.get('type') == 'experience':
+                    behavior = self._behavior(item['id'])
+                    if behavior:
+                        item.update(behavior=behavior, authority=behavior['authority'],
+                                    category='behavioral_suggestion')
                 item['forgotten'] = self.store._db.execute(
                     'SELECT 1 FROM forgotten_targets WHERE target=?', (item['id'],)).fetchone() is not None
                 item['evidence'] = [dict(e) for e in self.store._db.execute(
@@ -471,10 +557,14 @@ class Graph:
             FROM graph_evidence g WHERE g.target=? AND g.version=? ORDER BY g.episode_id,g.start LIMIT 5''',
             (node_id, version)).fetchall()
         from .loops import current
-        return dict(evidence=[dict(row) for row in sources],
+        result = dict(evidence=[dict(row) for row in sources],
                     change_count=change['change_count'],
                     last_change={key: change[key] for key in ('recorded_at', 'actor', 'why')},
                     loop=current(self, node_id))
+        behavior = self._behavior(node_id)
+        if behavior:
+            result.update(behavior=behavior, authority=behavior['authority'], category='behavioral_suggestion')
+        return result
 
     def _forget_preview(self, target):
         from .forgetting import preview

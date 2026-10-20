@@ -1,6 +1,7 @@
 """SQLite evidence storage. This boundary has no model calls or derived memories."""
 
 import fcntl
+import hashlib
 import json
 import os
 import stat
@@ -11,7 +12,10 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from .schema import initialize
+from .schema import initialize, upgrade_episode_fts, upgrade_raw_text
+from .blobs import BlobStore
+from .artifacts import Artifacts
+from .raw_text import KINDS as RAW_KINDS, MIME as RAW_MIME, elide, hydrate
 
 
 class ConflictError(Exception):
@@ -63,6 +67,18 @@ class Store:
                     raise
             elif version != 1:
                 raise RuntimeError(f'Unsupported database schema version: {version}')
+            else:
+                self._db.execute('BEGIN IMMEDIATE')
+                try:
+                    upgrade_episode_fts(self._db)
+                    upgrade_raw_text(self._db)
+                    self._db.execute('COMMIT')
+                except BaseException:
+                    self._db.execute('ROLLBACK')
+                    raise
+            self.blobs = BlobStore(data_dir / 'blobs')
+            self.artifacts = Artifacts(self, self.blobs)
+            self.artifact_reader = self.blobs.open
         except BaseException:
             self.close()
             raise
@@ -89,6 +105,8 @@ class Store:
             return None
         episode = dict(row)
         episode.pop('seq', None)
+        episode.pop('text_runs', None)
+        episode.pop('text_sha256', None)
         episode['metadata'] = json.loads(episode['metadata'])
         return episode
 
@@ -96,6 +114,27 @@ class Store:
         fields = dict(payload)
         fields['metadata'] = json.dumps(fields['metadata'], ensure_ascii=False,
                                        sort_keys=True, separators=(',', ':'), allow_nan=False)
+        original = fields['text']
+
+        def same(old):
+            text_matches = (hashlib.sha256(original.encode('utf-8')).hexdigest() == old['text_sha256']
+                            if old['text_sha256'] else old['text'] == original)
+            return text_matches and all(old[key] == value for key, value in fields.items() if key != 'text')
+
+        def accepted(row):
+            return dict(self._episode(row), text=original)
+
+        with self._mutex:
+            old = self._db.execute('SELECT * FROM episodes WHERE source=? AND event_id=?',
+                                   (fields['source'], fields['event_id'])).fetchone()
+        if old is not None:
+            if not same(old):
+                raise ConflictError('Event identifier already contains different evidence')
+            return accepted(old), False
+        skeleton, references, full_sha, artifacts = (original, None, None, [])
+        if fields['kind'] in RAW_KINDS and payload['metadata'].get('extraction_mode') == 'skip':
+            # BlobStore fsyncs content before any SQLite reference is committed.
+            skeleton, references, full_sha, artifacts = elide(original, self.blobs)
         with self._mutex:
             self._db.execute('BEGIN IMMEDIATE')
             try:
@@ -104,17 +143,21 @@ class Store:
                     (fields['source'], fields['event_id']),
                 ).fetchone()
                 if old is not None:
-                    if any(old[key] != value for key, value in fields.items()):
+                    if not same(old):
                         raise ConflictError('Event identifier already contains different evidence')
                     self._db.execute('COMMIT')
-                    return self._episode(old), False
+                    return accepted(old), False
+                for info in artifacts:
+                    self.artifacts.register(info, RAW_MIME)
+                fields.update(text=skeleton, text_runs=references, text_sha256=full_sha)
                 fields['id'] = uuid4().hex
                 fields['captured_at'] = datetime.now(timezone.utc).isoformat()
                 inserted = self._db.execute(
                     """INSERT INTO episodes
-                    (id, source, event_id, conversation_id, kind, text, occurred_at, metadata, captured_at)
+                    (id, source, event_id, conversation_id, kind, text, occurred_at, metadata, captured_at,
+                     text_runs, text_sha256)
                     VALUES (:id, :source, :event_id, :conversation_id, :kind, :text,
-                            :occurred_at, :metadata, :captured_at)""", fields,
+                            :occurred_at, :metadata, :captured_at, :text_runs, :text_sha256)""", fields,
                 )
                 self._db.execute('''INSERT INTO processing_progress
                     (source,conversation_id,latest_seq,latest_at) VALUES (?,?,?,?)
@@ -123,7 +166,7 @@ class Store:
                     (fields['source'], fields['conversation_id'], inserted.lastrowid, fields['captured_at']))
                 # The FTS trigger and evidence insert commit together, before acknowledgement.
                 self._db.execute('COMMIT')
-                return self._episode(fields), True
+                return accepted(fields), True
             except BaseException:
                 if self._db.in_transaction:
                     self._db.execute('ROLLBACK')
@@ -131,9 +174,16 @@ class Store:
 
     def get(self, episode_id: str) -> dict | None:
         with self._mutex:
-            return self._episode(self._db.execute(
+            row = self._db.execute(
                 'SELECT * FROM episodes WHERE id=?', (episode_id,),
-            ).fetchone())
+            ).fetchone()
+        return self.hydrate_episode(row)
+
+    def hydrate_episode(self, row):
+        episode = self._episode(row)
+        if episode is not None and row['text_runs'] is not None:
+            episode['text'] = hydrate(row['text'], row['text_runs'], row['text_sha256'], self.artifact_reader)
+        return episode
 
     def search(self, query: str | None = None, limit: int = 20,
                conversation_id: str | None = None, source: str | None = None,

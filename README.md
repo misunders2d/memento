@@ -9,6 +9,7 @@ Memento gives your native AI agents a shared, private memory—with receipts. St
 - **Works where you already work.** Native integrations for Pi, OMP, Claude Code and Codex; no replacement chat app.
 - **Recall without a ritual.** Relevant memories are injected automatically. MCP tools handle explicit saves, corrections, history and open loops.
 - **Evidence, not unexplained assertions.** Memories retain source quotes and offsets. Candidates are visibly unconfirmed before promotion; corrections keep version history.
+- **Learn from experience.** Supported experiences can become reusable behavioral suggestions, with conditions, reasons and exceptions. Your current instructions take precedence.
 - **One memory across your devices.** A private central service, with capture clients on your other machines. Each origin keeps its own stable identity.
 - **Your storage, your boundaries.** Local Linux storage and local embeddings. Optional Google Drive cold storage and manual backups use a dedicated app-accessible folder, not access to your whole Drive.
 - **Portable, not trapped.** Export one complete private archive with original history, memories, vectors and stored artifacts; import it into an empty installation without a Drive grant.
@@ -22,6 +23,10 @@ Extraction and consolidation use your **existing native CLI login and default mo
 ![Memento architecture: native capture and automatic recall, separate service identity, evidence-backed candidates, nightly consolidation and optional Drive storage](docs/images/architecture.svg)
 
 Raw history and inferred memory are separate. Extraction runs after native compaction or 30 minutes of conversation inactivity. Supported candidates are available to recall before promotion. Consolidation runs during the configured **02:00–07:00 local-time window**; it is not an exact 02:00 cron job.
+
+The same consolidation step can turn an experience into a general lesson. These suggestions become available automatically, with their original evidence and an explicit distinction between a stated preference and an inferred lesson. Relevant later corrections can revise or narrow a lesson through the existing correction history. A temporary exception wins for the current task; lasting updates use the normal processing schedule.
+
+Automatic context has a small shared budget for memories and behavioral suggestions. It can legitimately be empty. Broad explicit `recall` remains available when the injected context is insufficient.
 
 This is a private memory backend, not a public dashboard, a Google sign-in website, a whole-Drive indexer or a guarantee that every model inference is true. The public website is a separate static product/policy site.
 
@@ -184,6 +189,8 @@ tailscale serve --bg 8765
 
 Tailnet HTTPS must be enabled and ACLs must restrict access to your devices. The API's published listener remains loopback-only. MCP host protection stays enabled; the endpoint is `/mcp/`.
 
+Clients use the canonical `/mcp/` URL. Existing `/mcp` URLs receive a relative HTTP 307 redirect, preserving the request method, query string and private HTTPS origin without trusting forwarded headers.
+
 On a client device, download `/runner` from `https://YOUR_MACHINE.YOUR_TAILNET.ts.net`, then run `memento agent add HARNESS --url https://YOUR_MACHINE.YOUR_TAILNET.ts.net`. No client timezone is needed. Do not disable TLS verification or use a public reverse proxy as a shortcut.
 
 ## 4. Prove memory actually works
@@ -303,13 +310,46 @@ A definitive revoked/expired grant leaves the service available for reconnection
 Finish the native first-test sequence **before** importing history. Import on each origin device using that device's private config and stable identity. Select actual local paths explicitly; there is no automatic history discovery.
 
 ```sh
-CFG="${XDG_CONFIG_HOME:-$HOME/.config}/memento/runner.json"
-BRIDGE="$(dirname "$CFG")/bridge.py"
-python3 "$BRIDGE" import-history /path/to/history --config "$CFG" --agent pi
-python3 "$BRIDGE" upload --config "$CFG"
+memento import-history /path/to/history --agent pi
+memento upload --agent pi
+memento status --agent pi
 ```
 
-Use `--agent omp`, `claude` or `codex` and the matching harness config for other histories. Directories recurse over `*.jsonl`; only complete JSONL records are queued. Repeating an import with the same origin identity/event content is idempotent. Explicit upload drains until empty or transport failure, reports JSON `pending`/`conflicts` counts and exits nonzero if either remains. Native background upload has a bounded runtime and retries durably.
+Use `--agent omp`, `claude` or `codex` for other histories. A matching default config is reused; otherwise the command selects that harness's config. Keep using `--config PATH` for a custom installation. Directories recurse over `*.jsonl`; only complete JSONL records are queued. Repeating an import with the same origin identity/event content is idempotent. Explicit upload drains until empty or transport failure, reports JSON `pending`/`conflicts` counts and exits nonzero if either remains. Native background upload has a bounded runtime and retries durably. A large attachment on a slow connection may need explicit `memento upload`; its retries do not block later text uploads.
+
+Large imports checkpoint complete records and journal cursors together, releasing the capture-spool writer lock between batches and files. Their `records_added` count excludes concurrent live capture. Claude workflow journals retain their own conversation identity rather than being attributed to the first agent they mention. Referenced artifacts outside the selected histories require an explicit `--artifact-root DIR`; missing or unsupported material is reported. For OMP's native blob references, include its blob directory:
+
+```sh
+memento import-history "$HOME/.omp/agent/sessions" --agent omp \
+  --artifact-root "$HOME/.omp/agent/blobs"
+memento upload --agent omp
+```
+
+Import reports the selected conversation IDs and queues a processing boundary after their captured records. Once uploaded, the processor can extract that history even if those conversations remain active. Consolidation still follows its normal nightly schedule.
+
+Raw-record and message-projection deduplication are independent: replay can add missing supported message projections without duplicating preserved raw records. Native attachment import supports objects up to **32 MiB** each; larger or unsupported attachments are reported in coverage rather than silently counted as imported. The original native record remains preserved.
+
+Large opaque runs of at least 64 KiB in newly captured skipped native records use the existing artifact store, keeping binary text out of SQLite and text processing. Explicit source/history reads reconstruct and verify the exact original text; a missing or corrupt artifact produces an error. To support an assertion, cite the message projection with its exact quote and offsets; offloaded raw JSON is available for inspection and export but cannot be assertion evidence. Existing inline evidence remains supported. Identical runs share storage, but different native chunk boundaries can prevent reuse. Existing inline records are retained without a bulk rewrite; status reports the remaining inline raw bytes.
+
+### Read progress without guessing
+
+`memento status --agent HARNESS` separates the local capture/upload queue from service processing. It reports captured episodes and conversations, indexing units and failures, extraction backlog, consolidation candidates and jobs, media jobs and Drive state. `service` contains the harness's native-source counts; `artifacts_service` separately covers explicit file saves made without a conversation quote. Disabled or unreachable stages are reported as unavailable. Zero consolidation jobs does not mean completion: candidates can be waiting for the nightly window. The counters do not prove the native processor is online.
+
+For each conversation, `extraction.progress` reports its processed `cursor`, partial `offset`, `compact_through` boundary and `latest_seq`. After upload reports zero pending records and conflicts, retain the imported conversations' boundaries to track a finite batch: a later cursor at or beyond a retained boundary means that prefix has been extracted, even if new live work remains. Indexing and candidate disposition are separate stages.
+
+Each service response also labels `artifact_storage` as global: registered, local-only and verified-remote object/byte counts cover the whole instance. A verified remote object can still have a local cached copy. These counts show storage progress, not which objects are currently eligible or queued.
+
+### Save and retrieve a file
+
+```sh
+memento media save /path/to/image.png --agent pi --scope personal
+memento media status JOB_ID --agent pi
+memento media get SHA256 --agent pi --output /private/original.png
+```
+
+Save streams files up to **1 GiB** through the existing blob interface and submits a media job. Keep the returned job ID and SHA; submission is not completed indexing. For a retry, reuse the returned command ID with the identical command. Retrieval verifies the checksum and refuses to overwrite an existing file.
+
+An agent can attach an exact native quote with `--quote TEXT --conversation-id ID`. Otherwise the save records the file's identity as artifact evidence; it does not invent a user statement. Use `--kind image|audio|video|document` or `--mime MIME` when the file's type cannot be inferred. The existing `remember` MCP tool also accepts an already-uploaded media reference and evidence; binary bytes belong in the file upload, not tool arguments.
 
 ## MCP and memory semantics
 
@@ -341,7 +381,15 @@ docker compose exec memory /app/.venv/bin/memento-admin --data-dir /data backup
 
 `approve PROPOSAL_ID --why REASON`, `reject PROPOSAL_ID --why REASON` and `forget ID --why REASON` are operator actions. Forget removes active memory and suppresses re-extraction; **it does not erase raw history, artifacts or existing backups**. Restoring an old backup can restore forgotten content.
 
-There is **no automatic database backup**. The backup command requests and verifies a manual Drive snapshot. Cold archiving defaults to unpinned artifacts, importance ≤0.75, age ≥90 days and size ≥10 MiB; overrides are `MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS`, `MEMENTO_COLD_MIN_BYTES`. A newly connected installation may have no eligible cold data.
+There is **no automatic database backup**. The backup command requests and verifies a manual Drive snapshot.
+
+When Drive is connected, media and payloads of at least **10 MiB** are eligible for prompt upload, including newly saved images below that size. Pinning or memory importance does not prevent their verified remote storage. Other unprotected artifacts remain eligible after 90 days. The existing overrides are `MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS` and `MEMENTO_COLD_MIN_BYTES`.
+
+Offloaded opaque native runs are also promptly eligible. Complete portable archives include these original-source artifacts along with other registered payloads; restoration needs no Drive grant.
+
+The existing Drive worker continues through full bounded batches without a fixed pause between them. Exhausted work and failed transfers retain the normal wait and retry backoff.
+
+Local copies are removed only after remote verification. Pending media work and active downloads retain the bytes they need. Fetched copies use a **1 GiB / one-hour** cache by default, checked every minute; protected in-use copies can temporarily exceed the limit. Configure `MEMENTO_COLD_CACHE_BYTES` and `MEMENTO_COLD_CACHE_TTL_SECONDS` to change those limits. Upload failures retain local data for retry.
 
 On a separate recovery host, the intended service owner uses a human-provided private connection:
 
@@ -358,6 +406,8 @@ Drive copies are **plaintext**, and retained versions consume quota. Protect loc
 ### Complete portable export and import
 
 The service owner can export a **single self-contained plaintext archive**. It includes a consistent database snapshot (raw history, graph versions, evidence, loops and vectors) and every registered artifact, including cold-only files downloaded and verified for the archive. Missing or corrupt payloads abort export. Credentials, native configs and model caches are excluded; raw history can itself contain sensitive text.
+
+The supported frontdoor is `memento export --data-dir DIR --output NEW_ARCHIVE`, run on the service host as its owner, and `memento restore --archive FILE --destination EMPTY` on the destination. These delegate to the existing owner administration and restore commands; the downloaded client runner does not contain another archive engine. Export retains its interactive human confirmation.
 
 Import only archives you exported and kept private. Checksums detect corruption; they do not authenticate an archive against a malicious author.
 

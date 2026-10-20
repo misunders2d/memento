@@ -19,6 +19,7 @@ import http.server
 import ipaddress
 import json
 import math
+import mimetypes
 import os
 from pathlib import Path
 import selectors
@@ -67,13 +68,15 @@ def decode(raw):
     return json.loads(raw, parse_constant=reject_constant)
 
 
-def run_process(argv, payload=b'', *, timeout=600, limit=MAX_OUTPUT, cwd=None, cancelled=None):
+def run_process(argv, payload=b'', *, timeout=600, limit=MAX_OUTPUT, cwd=None, cancelled=None,
+                processing=True):
     """Bound pipes and lifetime, including descendants retaining a pipe after exit."""
     deadline = time.monotonic() + timeout
     output = bytearray()
+    environment = {**os.environ, **({'MEMENTO_PROCESSING': '1'} if processing else {})}
     process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, cwd=cwd, start_new_session=True,
-                               env={**os.environ, 'MEMENTO_PROCESSING': '1'})
+                               env=environment)
     try:
         with selectors.DefaultSelector() as selector:
             os.set_blocking(process.stdout.fileno(), False)
@@ -241,6 +244,67 @@ class Service:
             return result
         except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as exc:
             raise RunnerError('service_rejected') from exc
+
+    def get(self, path):
+        result = decode(self.download(path))
+        if not isinstance(result, dict):
+            raise RunnerError('service_rejected')
+        return result
+
+    def upload(self, path, mime):
+        """Stream the original file through the existing raw-byte endpoint."""
+        try:
+            with path.open('rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not path.is_file() or info.st_size > 1024 * MAX_BODY:
+                    raise ValueError('unsupported file')
+                expected = hashlib.file_digest(stream, 'sha256').hexdigest()
+                stream.seek(0)
+                request = urllib.request.Request(self.base_url + '/blobs', data=stream,
+                    headers={'Content-Type': mime, 'Content-Length': str(info.st_size)}, method='POST')
+                with self.opener.open(request, timeout=self.timeout) as response:
+                    result = decode(response.read(MAX_OUTPUT + 1))
+            if result.get('sha256') != expected or result.get('size') != info.st_size:
+                raise ValueError('uploaded file changed or verification failed')
+            return result
+        except (OSError, ValueError, TypeError, AttributeError, urllib.error.URLError,
+                http.client.HTTPException) as exc:
+            raise RunnerError('artifact upload failed; original file retained; retry the same command') from exc
+
+    def retrieve(self, sha256, destination):
+        if not re_digest(sha256):
+            raise RunnerError('artifact must be identified by its SHA-256 digest')
+        destination = destination.expanduser().absolute()
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temporary = tempfile.mkstemp(prefix='.memento-artifact-', dir=destination.parent)
+        try:
+            digest = hashlib.sha256()
+            size = 0
+            with os.fdopen(fd, 'wb') as stream:
+                request = urllib.request.Request(self.base_url + '/blobs/' + sha256)
+                with self.opener.open(request, timeout=self.timeout) as response:
+                    while chunk := response.read(MAX_BODY):
+                        size += len(chunk)
+                        if size > 1024 * MAX_BODY:
+                            raise ValueError('artifact exceeds supported size')
+                        digest.update(chunk)
+                        stream.write(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if digest.hexdigest() != sha256:
+                raise ValueError('artifact integrity mismatch')
+            # link never overwrites another file, including a raced symlink.
+            os.link(temporary, destination)
+            return {'sha256': sha256, 'size': size, 'output': str(destination)}
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as exc:
+            raise RunnerError('artifact retrieval failed; choose a new output path and retry') from exc
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+
+
+def re_digest(value):
+    return isinstance(value, str) and len(value) == 64 and all(char in '0123456789abcdef' for char in value)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -705,12 +769,121 @@ def release_files(raw):
 
 def integration_config(args):
     """Match agent add's config selection without creating or retargeting it."""
+    if args.config:
+        return args.config.expanduser().absolute(), None
     host_path = default_config()
     host = load_config(host_path) if host_path.exists() else None
     path = (args.config.expanduser().absolute() if args.config else
             host_path if host and host['preset'] == args.agent else
             host_path.parent / args.agent / 'runner.json')
     return path, host
+
+
+def selected_config(args):
+    path = (integration_config(args)[0] if getattr(args, 'agent', None) else
+            (args.config or default_config()).expanduser().absolute())
+    config = load_config(path)
+    if getattr(args, 'agent', None) and config['preset'] != args.agent:
+        raise RunnerError('selected config belongs to another harness; choose its --agent or --config')
+    return path, config
+
+
+def bridge_command(config_path, operation, extra=(), *, capture=False):
+    installed = config_path.parent / 'bridge.py'
+    bridge_path = installed if installed.is_file() else Path(__file__).with_name('bridge.py')
+    if not bridge_path.is_file():
+        raise RunnerError('native bridge is unavailable; run memento agent add for this harness')
+    argv = [sys.executable, str(bridge_path), operation, '--config', str(config_path), *extra]
+    if capture:
+        return decode(run_process(argv, timeout=30, processing=False))
+    return subprocess.call(argv)
+
+
+def operation_status(args):
+    path, config = selected_config(args)
+    local = bridge_command(path, 'status', capture=True)
+    result = {'config': str(path), 'harness': config['preset'], 'mode': config['mode'], 'local': local}
+    service = Service(config['url'])
+    for field, origin in (('service', 'native'), ('artifacts_service', 'artifact')):
+        try:
+            result[field] = service.get('/status?' + urllib.parse.urlencode(
+                {'source': origin + ':' + config['client_uid'] + ':' + config['preset']}))
+        except RunnerError:
+            result[field] = {'available': False, 'error': 'service_unavailable',
+                             'action': 'Check the configured private service, then retry memento status.'}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if any(result[field].get('available') is False for field in ('service', 'artifacts_service')) or local['conflicts'] else 0
+
+
+def media_save(args):
+    config_path, config = selected_config(args)
+    if args.quote is not None and (not args.conversation_id or not args.quote.strip()):
+        raise RunnerError('--quote requires a nonempty exact quote and --conversation-id')
+    if args.conversation_id and args.quote is None:
+        raise RunnerError('--conversation-id requires its exact --quote')
+    service = Service(config['url'])
+    path = args.file.expanduser().absolute()
+    mime = args.mime or mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+    kind = args.kind or ('document' if mime == 'application/pdf' else mime.split('/')[0])
+    if kind not in ('image', 'audio', 'video', 'document'):
+        raise RunnerError('unsupported media type; provide a supported image, audio, video or PDF file')
+    if args.quote is not None:
+        try:
+            bridge_command(config_path, 'flush-conversation',
+                           ['--agent', config['preset'], '--conversation-id', args.conversation_id], capture=True)
+        except RunnerError as exc:
+            raise RunnerError('current conversation capture is pending; run memento upload with the same config, then retry media save') from exc
+    artifact = service.upload(path, mime)
+    # A stable explicit retry ID can resume submission after upload. The default
+    # also makes repeated saves of the same file/scope on this client idempotent.
+    ident = args.command_id or 'artifact:' + hashlib.sha256(encode(
+        [config['client_uid'], config['preset'], artifact['sha256'], path.name, args.scope,
+         kind, mime, args.quote, args.conversation_id])).hexdigest()
+    command = {'command_id': ident, 'actor': 'cli:' + config['client_uid'],
+               'why': 'Explicit artifact save through the supported Memento command.',
+               'sha256': artifact['sha256'], 'kind': kind, 'filename': path.name, 'scope': args.scope}
+    if args.quote is not None:
+        command.update(source='native:' + config['client_uid'] + ':' + config['preset'],
+                       conversation_id=args.conversation_id, evidence=[{'quote': args.quote}])
+    else:
+        origin = 'artifact:' + config['client_uid'] + ':' + config['preset']
+        quote = 'Artifact filename: ' + path.name
+        episode = service.post('/episodes', {'source': origin, 'event_id': ident,
+            'conversation_id': 'artifact:' + ident, 'kind': 'artifact', 'text': quote,
+            'metadata': {'origin': 'explicit_media_save', 'artifact': {
+                'sha256': artifact['sha256'], 'filename': path.name, 'kind': kind,
+                'mime': mime, 'size': artifact['size']}, 'extraction_mode': 'skip'}})
+        command['evidence'] = [{'episode_id': episode['id'], 'quote': quote}]
+    result = service.post('/media', command)
+    try:
+        status = service.get('/jobs/' + urllib.parse.quote(result['job_id'], safe=''))
+    except RunnerError:
+        status = {'state': 'unknown'}
+    print(json.dumps({**result, 'sha256': artifact['sha256'], 'blob_url': '/blobs/' + artifact['sha256'],
+                      'command_id': ident, 'indexing': status.get('state', 'unknown'),
+                      'job': status}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def owner_command(operation, arguments):
+    """Retain the installed owner console, terminal confirmation and archive engine."""
+    if __package__:
+        argv = [sys.executable, '-m', 'memento.' + ('admin' if operation == 'export' else 'restore')]
+    else:
+        command = shutil.which('memento-admin' if operation == 'export' else 'memento-restore')
+        if command is None:
+            raise RunnerError('owner export/restore requires the installed Memento package on the service host')
+        argv = [command]
+    if operation == 'export':
+        # The owner's existing parser expects its global --data-dir before export.
+        owner = argparse.ArgumentParser(prog='memento export')
+        owner.add_argument('--data-dir', required=True)
+        owner.add_argument('--output', required=True)
+        args = owner.parse_args(arguments)
+        argv += ['--data-dir', args.data_dir, 'export', '--output', args.output]
+    else:
+        argv += arguments
+    return subprocess.call(argv)
 
 
 def update_agent(args):
@@ -811,6 +984,13 @@ def load_config(path):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] and argv[0] in ('export', 'restore'):
+        try:
+            return owner_command(argv[0], argv[1:])
+        except RunnerError as exc:
+            print('memento: ' + str(exc), file=sys.stderr)
+            return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path)
     sub = parser.add_subparsers(dest='operation', required=True)
@@ -842,6 +1022,35 @@ def main(argv=None):
                         help='reuse a specific private installation config')
     update.add_argument('--native-config-dir', type=Path,
                         help='selected harness config root used during isolated installation')
+    history = sub.add_parser('import-history', help='queue explicitly selected origin-device histories')
+    history.add_argument('paths', type=Path, nargs='+')
+    history.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex'), required=True)
+    history.add_argument('--artifact-root', type=Path, action='append', default=[],
+                         help='explicit additional root for referenced native attachments')
+    history.add_argument('--config', type=Path, default=argparse.SUPPRESS)
+    for name, description in (('upload', 'drain the durable capture outbox; retry after an outage'),
+                              ('status', 'show local capture and service processing stages')):
+        operation = sub.add_parser(name, help=description)
+        operation.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex'))
+        operation.add_argument('--config', type=Path, default=argparse.SUPPRESS)
+    media = sub.add_parser('media', help='save an original artifact, inspect indexing, or retrieve original bytes')
+    media_actions = media.add_subparsers(dest='media_operation', required=True)
+    save = media_actions.add_parser('save')
+    save.add_argument('file', type=Path)
+    save.add_argument('--scope', choices=('personal', 'professional'), action='append', required=True)
+    save.add_argument('--kind', choices=('image', 'audio', 'video', 'document'))
+    save.add_argument('--mime')
+    save.add_argument('--quote', help='optional verbatim quote from the current native conversation')
+    save.add_argument('--conversation-id', help='current native conversation for --quote; no episode ID needed')
+    save.add_argument('--command-id', help='reuse only for an identical retry')
+    get = media_actions.add_parser('get')
+    get.add_argument('sha256')
+    get.add_argument('--output', type=Path, required=True, help='new output file, never overwritten')
+    job = media_actions.add_parser('status')
+    job.add_argument('job_id')
+    for operation in (save, get, job):
+        operation.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex'))
+        operation.add_argument('--config', type=Path, default=argparse.SUPPRESS)
     poll = sub.add_parser('tick', help='drain all due work, attempting each ID once')
     poll.add_argument('--consolidate-now', action='store_true',
                       help='run consolidation now for a first test, outside the nightly window')
@@ -858,6 +1067,26 @@ def main(argv=None):
         if args.operation == 'agent':
             (update_agent if args.agent_operation == 'update' else add_agent)(args)
             return 0
+        if args.operation == 'status':
+            return operation_status(args)
+        if args.operation in ('import-history', 'upload'):
+            path, config = selected_config(args)
+            extra = []
+            if args.operation == 'import-history':
+                extra = ['--agent', args.agent]
+                for root in args.artifact_root:
+                    extra += ['--artifact-root', str(root.expanduser().absolute())]
+                extra += [str(path.expanduser().absolute()) for path in args.paths]
+            return bridge_command(path, args.operation, extra)
+        if args.operation == 'media':
+            if args.media_operation == 'save':
+                return media_save(args)
+            _, config = selected_config(args)
+            service = Service(config['url'])
+            result = (service.retrieve(args.sha256, args.output) if args.media_operation == 'get' else
+                      service.get('/jobs/' + urllib.parse.quote(args.job_id, safe='')))
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1 if result.get('state') == 'failed' else 0
         args.config = args.config or default_config()
         if args.operation == 'setup':
             setup(args)

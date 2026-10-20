@@ -175,6 +175,35 @@ def test_huge_original_tool_output_projects_only_first_2000_once(tmp_path, kind,
         store.close()
 
 
+def test_legacy_serialized_image_payload_is_skipped_without_losing_exact_text_offsets(tmp_path):
+    store = Store(tmp_path)
+    try:
+        graph = Graph(store)
+        processing = Processing(graph)
+        caption = 'The release checklist is cobalt, with exact Unicode 😀 evidence.'
+        raw = json.dumps([{'type': 'image', 'source': {'type': 'base64',
+            'media_type': 'image/png', 'data': 'Z' * (1024 * 1024)}},
+            {'type': 'text', 'text': caption}], ensure_ascii=False)
+        episode, _ = store.capture(dict(source='legacy-image', event_id='image', conversation_id='c',
+            kind='user', text=raw, occurred_at=None, metadata={'extraction_mode': 'message'}))
+        args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc).replace(hour=12))
+        task = processing.claim(**args, compaction=dict(source='legacy-image', conversation_id='c'))['work'][0]
+        windows = task['input']['windows']
+        assert len(windows) == 2 and sum(len(window['text']) for window in windows) < 400
+        assert all('Z' * 256 not in window['text'] for window in windows)
+        outputs = []
+        for window in windows:
+            candidate = draft('caption', 'memory', 'knowledge', caption, caption) if caption in window['text'] else None
+            outputs.append(dict(id=window['id'], candidates=[candidate] if candidate else []))
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(windows=outputs))
+        evidence = store._db.execute('SELECT start,end,quote FROM graph_evidence').fetchone()
+        assert raw[evidence['start']:evidence['end']] == caption
+        assert store.get(episode['id'])['text'] == raw
+        assert processing.claim(**args)['work'] == []
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize('message_size', [32, 1000])
 def test_interleaved_skip_envelopes_pack_eligible_messages_with_exact_coverage(tmp_path, message_size):
     store = Store(tmp_path)
