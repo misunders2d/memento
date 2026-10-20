@@ -12,7 +12,7 @@ Memento gives your native AI agents a shared, private memory—with receipts. St
 - **Learn from experience.** Supported experiences can become reusable behavioral suggestions, with conditions, reasons and exceptions. Your current instructions take precedence.
 - **One memory across your devices.** A private central service, with capture clients on your other machines. Each origin keeps its own stable identity.
 - **Your storage, your boundaries.** Local Linux storage and local embeddings. Optional Google Drive cold storage and manual backups use a dedicated app-accessible folder, not access to your whole Drive.
-- **Portable, not trapped.** Export one complete private archive with original history, memories, vectors and stored artifacts; import it into an empty installation without a Drive grant.
+- **Take your memories with you.** Export the database and any files still stored only locally. Files already on Drive stay there; their references move with the database.
 
 Extraction and consolidation use your **existing native CLI login and default model**, not a new paid model API key. Those calls still consume model usage and follow your provider's terms; “local storage” does not mean no conversation content ever reaches a model provider.
 
@@ -389,7 +389,7 @@ There is **no automatic database backup**. The backup command requests and verif
 
 When Drive is connected, media and payloads of at least **10 MiB** are eligible for prompt upload, including newly saved images below that size. Pinning or memory importance does not prevent their verified remote storage. Other unprotected artifacts remain eligible after 90 days. The existing overrides are `MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS` and `MEMENTO_COLD_MIN_BYTES`.
 
-Offloaded opaque native runs are also promptly eligible. Complete portable archives include these original-source artifacts along with other registered payloads; restoration needs no Drive grant.
+Offloaded opaque native runs are also promptly eligible. Database exports preserve their existing Drive references and include their bytes only when they have no verified remote copy.
 
 The existing Drive worker continues through full bounded batches without a fixed pause between them. Exhausted work and failed transfers retain the normal wait and retry backoff.
 
@@ -407,15 +407,17 @@ The first command lists verified backups. The second restores the database and a
 
 Drive copies are **plaintext**, and retained versions consume quota. Protect local disks, private configs, model-provider accounts and backups according to your threat model.
 
-### Complete portable export and import
+### Database export and host migration
 
-The service owner can export a **single self-contained plaintext archive**. It includes a consistent database snapshot (raw history, graph versions, evidence, loops and vectors) and every registered artifact, including cold-only files downloaded and verified for the archive. Missing or corrupt payloads abort export. Credentials, native configs and model caches are excluded; raw history can itself contain sensitive text.
+The service owner can export a **single private database archive**. It includes a consistent database snapshot (raw history, graph versions, evidence, loops and vectors), preserves existing Drive references, and includes bytes only for files without a verified remote copy. Files already on Drive stay there: export does not download or repack them, even when a cached local copy exists. Missing or corrupt local-only files abort export. Credentials, native configs and model caches are excluded; raw history can itself contain sensitive text.
+
+The archive records the original Drive account, folder and public client ID, without tokens or client secrets. Restore reports that connection identity; reconnect the original binding to read referenced files. Export and database restoration need no active Drive connection. An archive with remote references is not an offline copy of those files. `memento status` reports local-only payload bytes separately from verified remote bytes.
 
 The supported frontdoor is `memento export --data-dir DIR --output NEW_ARCHIVE`, run on the service host as its owner, and `memento restore --archive FILE --destination EMPTY` on the destination. These delegate to the existing owner administration and restore commands; the downloaded client runner does not contain another archive engine. Export retains its interactive human confirmation.
 
 Import only archives you exported and kept private. Checksums detect corruption; they do not authenticate an archive against a malicious author.
 
-Keep output and staging on persistent storage, **not the container's `/tmp` tmpfs**. Allow space for the database snapshot, complete archive and largest payload:
+Keep output and staging on persistent storage, **not the container's `/tmp` tmpfs**. Allow space for the database snapshot, resulting archive and largest local-only payload:
 
 ```sh
 docker compose exec memory mkdir -p -m 0700 /data/exports
@@ -426,6 +428,8 @@ docker compose cp memory:/data/exports/memento.tar /private/memento.tar
 
 Export requires a human terminal confirmation of the exact private destination and never overwrites an existing file. The archive is mode `0600`; its parent must be owner-private. Verify the copied file's checksum against the in-volume file before removing that in-volume copy. There is no bulk-export HTTP or MCP endpoint.
 
+Ctrl+C exits the waiting command but does not cancel the server export; it finishes or fails and cleans its staging. A forcibly stopped service can leave a `.memento-export-*` staging directory; remove only that export's directory after its producer has stopped.
+
 For a non-container destination, run as its intended service owner:
 
 ```sh
@@ -433,7 +437,7 @@ uv run memento-restore --archive /private/memento.tar \
   --destination /private/empty-memento
 ```
 
-Import verifies checksums, SQLite integrity and the complete payload set before publishing. Nonempty/live or symlink destinations, missing files, extra members and unsafe archives are refused without partial publication. Restored payloads are all local/hot; old remote IDs and resumable cold-transfer, failure and backup records are reset. Original memory/evidence/version IDs, vectors and immutable audit history remain intact. Optional Drive authorization must be provisioned separately.
+Import verifies checksums, SQLite integrity and the exact required local-file set before publishing. Nonempty/live or symlink destinations, missing files, extra members and unsafe archives are refused without partial publication. Existing remote IDs remain intact; included files are restored locally, and remote references are marked for retrieval after the original Drive binding is reconnected. Host-specific transfer, failure and backup records are reset. Original memory/evidence/version IDs, vectors and immutable audit history remain intact. Restore retains non-secret binding metadata and refuses a different account, folder or client during connection setup. The normal service-host `memento-drive configure --data-dir RESTORED_DIR ...` and one-link flow use that binding automatically. If using standalone `memento-drive connect`, also pass `--data-dir RESTORED_DIR`; the credential file may live elsewhere and does not identify the instance. Older version-1 self-contained archives remain restorable with their previous behavior: all payloads local, old remote IDs cleared.
 
 **Fresh Compose host: import before the first `up`.** Prepare empty `./data` with the normal service ownership above. Make the archive mount readable by UID/GID `10001:10001`, mode `0600`, without moving OAuth tokens. Import into a child directory so publication stays atomic on the data volume:
 

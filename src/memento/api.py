@@ -263,7 +263,7 @@ def create_app(data_dir: Path) -> FastAPI:
             if drive.exists() or drive.is_symlink():
                 from .cold import DriveColdStore
                 try:
-                    backend = await asyncio.to_thread(DriveColdStore.from_file, drive)
+                    backend = await asyncio.to_thread(DriveColdStore.from_file, drive, data_dir=data_dir)
                 except Exception as error:
                     if not requires_reauthorization(error):
                         raise

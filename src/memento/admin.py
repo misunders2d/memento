@@ -91,7 +91,7 @@ def main():
     commands = parser.add_subparsers(dest='operation', required=True)
     commands.add_parser('list')
     commands.add_parser('backup')
-    export = commands.add_parser('export', help='Export all evidence and payloads as a private plaintext archive')
+    export = commands.add_parser('export', help='Export database, Drive references and local-only payloads privately')
     export.add_argument('--output', type=Path, required=True, help='New file in an owner-private directory')
     for operation in ('approve', 'reject'):
         command = commands.add_parser(operation)
@@ -109,7 +109,7 @@ def main():
             parser.error('Plaintext archive export requires an interactive human terminal')
         output = args.output.absolute()
         expected = f'export private archive to {output}'
-        if input(f'This plaintext file contains ALL private memory. Type {expected!r} to confirm: ') != expected:
+        if input(f'This plaintext archive contains private memory and Drive references; remote files stay on Drive. Type {expected!r} to confirm: ') != expected:
             parser.exit(1, 'Not confirmed; nothing changed.\n')
         request['output'] = str(output)
     elif args.operation not in ('list', 'backup'):

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from .cold import DriveColdStore
-from .drive_connect import SCOPES, _publish, load_connection
+from .drive_connect import SCOPES, _publish, load_connection, check_binding
 
 _AUTH_URI = 'https://accounts.google.com/o/oauth2/v2/auth'
 _TOKEN_URI = 'https://oauth2.googleapis.com/token'
@@ -120,7 +120,7 @@ def _load_bindings(data_dir: Path) -> _Binding:
         if connection.exists() or connection.is_symlink():
             # Reuse the private connection's credential/scope/binding validation.
             _read_private(connection)
-            previous = load_connection(connection)
+            previous = load_connection(connection, data_dir=data_dir)
             client = dict(client_id=previous.get('client_id'),
                           client_secret=previous.get('client_secret'),
                           auth_uri=_AUTH_URI, token_uri=previous.get('token_uri', _TOKEN_URI))
@@ -131,6 +131,10 @@ def _load_bindings(data_dir: Path) -> _Binding:
         raise DriveAuthorizationError(503)
     if any(not bindings[0].matches(other) for other in bindings[1:]):
         raise DriveAuthorizationError(409)
+    try:
+        check_binding(data_dir, bindings[0].client['client_id'], bindings[0].account, bindings[0].folder_id)
+    except (ValueError, OSError):
+        raise DriveAuthorizationError(409) from None
     return bindings[0]
 
 
@@ -149,6 +153,10 @@ def configure_client(client_json: Path, account: str, folder_id: str, data_dir: 
         raise
     except Exception:
         raise DriveAuthorizationError(400) from None
+    try:
+        check_binding(data_dir, binding.client['client_id'], binding.account, binding.folder_id)
+    except (ValueError, OSError):
+        raise DriveAuthorizationError(409) from None
     if any((data_dir / name).exists() or (data_dir / name).is_symlink()
            for name in ('drive-client.json', 'drive-oauth.json')):
         if not binding.matches(_load_bindings(data_dir)):

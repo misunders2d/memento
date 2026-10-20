@@ -16,15 +16,21 @@ from memento.blobs import BlobStore
 from memento.graph import Graph
 from memento.portable import export_archive, import_archive
 from memento.store import Store
+from memento.drive_connect import SCOPES, _publish
+
+DRIVE = dict(client_id='synthetic-client', account='owner@example.test', folder_id='original_folder')
 
 
 class ReadOnlyColdFiles:
-    """A synthetic cold backend; exporting must never call upload or source fetch."""
+    """Export must never touch even an available remote backend."""
     def __init__(self, root):
         self.root = root
 
     def download(self, object_id, destination, sha256):
-        shutil.copyfile(self.root / object_id, destination)
+        pytest.fail('Migration export must not download Drive payloads')
+
+    def upload(self, *args, **kwargs):
+        pytest.fail('Migration export must not upload Drive payloads')
 
 
 def _rows(db, table):
@@ -84,7 +90,9 @@ def portable(tmp_path):
     db.execute('''INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts,owner,lease_until)
                   VALUES ('queued','media/queued','media',?,'leased',0,1,'old-owner',123)''',
                (json.dumps({'sha256': sha}),))
-    (data / 'drive-oauth.json').write_text('DO NOT EXPORT DRIVE CREDENTIALS')
+    _publish(data / 'drive-oauth.json', dict(type='authorized_user', client_id=DRIVE['client_id'],
+        client_secret='DO NOT EXPORT DRIVE CREDENTIALS', refresh_token='DO NOT EXPORT REFRESH TOKEN',
+        scopes=SCOPES, memento=dict(account=DRIVE['account'], folder_id=DRIVE['folder_id'])))
     (data / 'native-client.json').write_text('DO NOT EXPORT NATIVE IDENTITY')
     (data / 'models').mkdir()
     (data / 'models' / 'cache').write_text('DO NOT EXPORT MODEL CACHE')
@@ -97,20 +105,23 @@ def portable(tmp_path):
         store.close()
 
 
-def test_mixed_hot_cold_roundtrip_is_complete_readonly_and_grant_independent(portable, tmp_path):
+def test_mixed_hot_cold_roundtrip_retains_drive_references_without_downloads(portable, tmp_path):
     p = portable
     before = _database_content(p.store._db)
     source_files = {name: hashlib.sha256((p.data / name).read_bytes()).hexdigest()
                     for name in ('memory.sqlite', 'memory.sqlite-wal')}
     result = export_archive(p.data, p.archive, cold=p.cold)
     assert result['complete'] and result['blob_count'] == 2
+    assert result['version'] == 2 and not result['self_contained'] and result['remote_reference_count'] == 1
     assert stat.S_IMODE(p.archive.stat().st_mode) == 0o600
     assert _database_content(p.store._db) == before
     assert {name: hashlib.sha256((p.data / name).read_bytes()).hexdigest() for name in source_files} == source_files
     assert not p.blobs.path(p.infos[1]['sha256']).exists()
     with tarfile.open(p.archive) as archive:
-        assert set(archive.getnames()) == {'manifest.json', 'memory.sqlite', *(
-            f"blobs/{info['sha256'][:2]}/{info['sha256'][2:]}" for info in p.infos)}
+        local = p.infos[0]['sha256']
+        assert set(archive.getnames()) == {'manifest.json', 'memory.sqlite', f'blobs/{local[:2]}/{local[2:]}'}
+        assert json.load(archive.extractfile('manifest.json'))['drive'] == DRIVE
+    assert b'DO NOT EXPORT' not in p.archive.read_bytes()
     # Take the source and backend out of the restore path entirely.
     shutil.rmtree(p.remote)
     destination = tmp_path / 'new-instance'
@@ -124,13 +135,19 @@ def test_mixed_hot_cold_roundtrip_is_complete_readonly_and_grant_independent(por
                 assert actual[table] == rows, table
         for table in ('cold_transfers', 'cold_failures', 'backups'):
             assert actual[table] == []
-        assert all(row[0] == 'hot' and row[1] is None for row in recovered._db.execute('SELECT tier,remote_id FROM blobs'))
+        assert {row['sha256']: (row['tier'], row['remote_id']) for row in recovered._db.execute('SELECT * FROM blobs')} == {
+            p.infos[0]['sha256']: ('hot', None), p.infos[1]['sha256']: ('cold', 'old-object')}
         assert recovered.get(p.episode['id']) == p.episode
         assert Graph(recovered).history(p.node['id']) == p.graph.history(p.node['id'])
-        for info, content in zip(p.infos, p.contents):
+        for info, content in zip(p.infos[:1], p.contents[:1]):
             path = BlobStore(destination / 'blobs').verify(info['sha256'])
             assert path.read_bytes() == content
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert not BlobStore(destination / 'blobs').path(p.infos[1]['sha256']).exists()
+        assert json.loads((destination / 'drive-binding.json').read_text()) == DRIVE
+        assert stat.S_IMODE((destination / 'drive-binding.json').stat().st_mode) == 0o600
+        reexported = export_archive(destination, tmp_path / 'again.tar')
+        assert reexported['drive'] == DRIVE and reexported['remote_reference_count'] == 1
         hits = recovered._db.execute('''SELECT rowid FROM memory_vectors
             WHERE embedding MATCH ? AND k=1''', (p.vector,)).fetchall()
         assert [tuple(row) for row in hits] == [(1,)]
@@ -139,7 +156,7 @@ def test_mixed_hot_cold_roundtrip_is_complete_readonly_and_grant_independent(por
         recovered.close()
 
 
-@pytest.mark.parametrize('damage', ['missing-hot', 'corrupt-hot', 'missing-cold', 'corrupt-cold', 'no-backend'])
+@pytest.mark.parametrize('damage', ['missing-hot', 'corrupt-hot'])
 def test_export_refuses_any_payload_gap_without_publication(portable, tmp_path, damage):
     p = portable
     before = _database_content(p.store._db)
@@ -147,15 +164,84 @@ def test_export_refuses_any_payload_gap_without_publication(portable, tmp_path, 
         p.blobs.path(p.infos[0]['sha256']).unlink()
     elif damage == 'corrupt-hot':
         p.blobs.path(p.infos[0]['sha256']).write_bytes(b'corrupt')
-    elif damage == 'missing-cold':
-        (p.remote / 'old-object').unlink()
-    elif damage == 'corrupt-cold':
-        (p.remote / 'old-object').write_bytes(b'corrupt')
     with pytest.raises((ValueError, OSError)):
-        export_archive(p.data, p.archive, cold=None if damage == 'no-backend' else p.cold)
+        export_archive(p.data, p.archive, cold=p.cold)
     assert not p.archive.exists()
     assert _database_content(p.store._db) == before
     assert not list(tmp_path.glob('.memento-export-*'))
+
+
+def test_terabyte_remote_references_and_cached_remote_bytes_are_not_copied(portable, tmp_path):
+    p = portable
+    p.store._db.execute('UPDATE blobs SET size=? WHERE remote_id IS NOT NULL', (4 * 1024**4,))
+    cached = p.store.artifacts.register(p.blobs.put(io.BytesIO(b'cached remote copy')))
+    p.store._db.execute("UPDATE blobs SET remote_id='cached-object' WHERE sha256=?", (cached['sha256'],))
+    local = p.store.artifacts.register(p.blobs.put(io.BytesIO(b'L' * 3072)))
+    # Keep exactly one NULL-reference payload, including an unexpected cold tier.
+    p.store._db.execute("UPDATE blobs SET remote_id='also-verified' WHERE sha256=?", (p.infos[0]['sha256'],))
+    p.store._db.execute("UPDATE blobs SET tier='cold' WHERE sha256=?", (local['sha256'],))
+    result = export_archive(p.data, p.archive, cold=p.cold)
+    assert result['remote_reference_count'] == 3 and result['included_blob_count'] == 1
+    with tarfile.open(p.archive) as archive:
+        assert set(archive.getnames()) == {'manifest.json', 'memory.sqlite',
+                                         f"blobs/{local['sha256'][:2]}/{local['sha256'][2:]}"}
+    destination = tmp_path / 'restored-huge-refs'
+    restored = import_archive(p.archive, destination)
+    assert not restored['self_contained'] and restored['drive'] == DRIVE
+    db = sqlite3.connect(destination / 'memory.sqlite')
+    try:
+        assert db.execute('SELECT size,remote_id,tier FROM blobs WHERE sha256=?', (p.infos[1]['sha256'],)).fetchone() == (
+            4 * 1024**4, 'old-object', 'cold')
+        assert db.execute('SELECT remote_id,tier FROM blobs WHERE sha256=?', (cached['sha256'],)).fetchone() == ('cached-object', 'cold')
+        assert db.execute('SELECT remote_id,tier FROM blobs WHERE sha256=?', (local['sha256'],)).fetchone() == (None, 'hot')
+    finally:
+        db.close()
+    assert BlobStore(destination / 'blobs').verify(local['sha256']).read_bytes() == b'L' * 3072
+    assert not BlobStore(destination / 'blobs').path(cached['sha256']).exists()
+
+
+@pytest.mark.parametrize('binding', ['missing', 'ambiguous'])
+def test_remote_references_require_unambiguous_original_binding(portable, binding):
+    p = portable
+    if binding == 'missing':
+        (p.data / 'drive-oauth.json').unlink()
+    else:
+        _publish(p.data / 'drive-binding.json', dict(DRIVE, folder_id='different_folder'))
+    with pytest.raises(ValueError):
+        export_archive(p.data, p.archive, cold=p.cold)
+    assert not p.archive.exists()
+
+
+def test_independent_v1_full_archive_remains_locally_restorable(portable, tmp_path):
+    p = portable
+    snapshot = tmp_path / 'legacy.sqlite'
+    target = sqlite3.connect(snapshot)
+    try:
+        p.store._db.backup(target)
+        target.execute('PRAGMA journal_mode=DELETE')
+    finally:
+        target.close()
+    payloads = {'memory.sqlite': snapshot.read_bytes()}
+    payloads.update({f"blobs/{info['sha256'][:2]}/{info['sha256'][2:]}": content
+                     for info, content in zip(p.infos, p.contents)})
+    manifest = dict(format='memento-portable', version=1, files={
+        name: dict(sha256=hashlib.sha256(content).hexdigest(), size=len(content)) for name, content in payloads.items()})
+    with tarfile.open(p.archive, 'w', format=tarfile.USTAR_FORMAT) as archive:
+        for name, content in [('manifest.json', json.dumps(manifest).encode()), *payloads.items()]:
+            member = tarfile.TarInfo(name)
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+    destination = tmp_path / 'legacy-restored'
+    result = import_archive(p.archive, destination)
+    assert result['version'] == 1 and result['self_contained'] and result['remote_reference_count'] == 0
+    assert not (destination / 'drive-binding.json').exists()
+    db = sqlite3.connect(destination / 'memory.sqlite')
+    try:
+        assert db.execute("SELECT count(*) FROM blobs WHERE tier<>'hot' OR remote_id IS NOT NULL").fetchone()[0] == 0
+    finally:
+        db.close()
+    for info, content in zip(p.infos, p.contents):
+        assert BlobStore(destination / 'blobs').verify(info['sha256']).read_bytes() == content
 
 
 def _rewrite(source, destination, mutation):

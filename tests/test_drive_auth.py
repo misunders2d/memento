@@ -409,6 +409,53 @@ def test_operator_provisioning_rejects_nonprivate_source_and_invalid_folder(tmp_
     assert not data_dir.exists()
 
 
+@pytest.mark.parametrize('field', ['client_id', 'account', 'folder_id'])
+def test_restored_instance_pin_rejects_changed_provisioning_without_publication(tmp_path, field):
+    data = tmp_path / 'restored'
+    pin = dict(client_id='synthetic-original-client', account=ACCOUNT, folder_id=FOLDER)
+    _publish(data / 'drive-binding.json', pin)
+    actual = dict(pin, **{field: 'different-value'})
+    source = tmp_path / 'desktop.json'
+    supplied = desktop()
+    supplied.pop('memento')
+    supplied['installed']['client_id'] = actual['client_id']
+    _publish(source, supplied)
+    assert_error(409, configure_client, source, actual['account'], actual['folder_id'], data)
+    assert [path.name for path in data.iterdir()] == ['drive-binding.json']
+
+
+def test_restored_instance_pin_accepts_original_provisioning(tmp_path):
+    data = tmp_path / 'restored'
+    _publish(data / 'drive-binding.json', dict(client_id='synthetic-original-client',
+        account=ACCOUNT.upper(), folder_id=FOLDER))
+    source = tmp_path / 'desktop.json'
+    _publish(source, desktop())
+    configure_client(source, ACCOUNT, FOLDER, data)
+    assert json.loads((data / 'drive-client.json').read_text()) == desktop()
+
+
+@pytest.mark.parametrize('field', ['client_id', 'account', 'folder_id'])
+def test_restored_pin_also_fences_existing_one_link_bootstrap(tmp_path, oauth, field):
+    manager, state = oauth
+    pin = dict(client_id='synthetic-original-client', account=ACCOUNT, folder_id=FOLDER)
+    _publish(tmp_path / 'drive-binding.json', dict(pin, **{field: 'different-value'}))
+    assert_error(409, manager.begin, 18766)
+    assert state['flows'] == [] and state['requests'] == [] and state['installed'] == []
+
+
+def test_service_startup_checks_restored_pin_before_building_drive_client(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from memento.api import create_app
+    _publish(tmp_path / 'drive-binding.json', dict(client_id='synthetic-original-client',
+        account=ACCOUNT, folder_id='different_folder'))
+    _publish(tmp_path / 'drive-oauth.json', previous_connection())
+    monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
+    monkeypatch.setattr('googleapiclient.discovery.build', lambda *args, **kwargs: pytest.fail('No mismatched activation'))
+    with pytest.raises(ValueError, match='binding'):
+        with TestClient(create_app(tmp_path)):
+            pytest.fail('Mismatched Drive binding must not activate')
+
+
 @pytest.mark.parametrize('error_code,expected', [('invalid_grant', True), ('invalid_rapt', True),
                                                 ('invalid_client', False), ('server_error', False)])
 def test_only_typed_structured_definitive_refresh_rejection_requires_reauthorization(error_code, expected):
@@ -428,7 +475,7 @@ def test_stale_grant_startup_then_fresh_consent_activates_drive(tmp_path, oauth,
     _, state = oauth
     _publish(tmp_path / 'drive-oauth.json', previous_connection())
 
-    def stale_connection(cls, path):
+    def stale_connection(cls, path, *, data_dir=None):
         raise RefreshError('synthetic-private-provider-description', {'error': 'invalid_grant'})
 
     monkeypatch.setattr(DriveColdStore, 'from_file', classmethod(stale_connection))
@@ -464,7 +511,7 @@ def test_explicit_reconnect_preserves_working_grant_until_verified(tmp_path, oau
     _publish(path, previous_connection())
     original = path.read_bytes()
     old_backend = DriveColdStore(FOLDER, ACCOUNT, service=build('drive', 'v3'))
-    monkeypatch.setattr(DriveColdStore, 'from_file', classmethod(lambda cls, path: old_backend))
+    monkeypatch.setattr(DriveColdStore, 'from_file', classmethod(lambda cls, path, **kwargs: old_backend))
     monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
     if outcome == 'cleanup_error':
         def failed_close():

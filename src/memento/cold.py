@@ -49,11 +49,11 @@ class DriveColdStore:
         self._verify_folder(service, self.folder_id)
 
     @classmethod
-    def from_file(cls, path: Path):
+    def from_file(cls, path: Path, *, data_dir=None):
+        from .drive_connect import SCOPES, load_connection
+        config = load_connection(path, data_dir=data_dir)
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
-        from .drive_connect import SCOPES, load_connection
-        config = load_connection(path)
         credentials = Credentials.from_authorized_user_info(config, scopes=SCOPES)
         service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
         try:

@@ -270,18 +270,24 @@ def test_legacy_inline_raw_quote_evidence_remains_supported(storage, monkeypatch
     assert source['quote'] == quote
 
 
-def test_complete_portable_roundtrip_includes_evicted_raw_runs(storage, tmp_path):
+def test_portable_roundtrip_retains_evicted_raw_references_until_original_backend_reconnects(storage, tmp_path):
     store, graph, manager = storage
     text = 'raw Ω\r\n' + OPAQUE
     record, _ = store.capture(episode(text))
     assert len(manager.sweep()['promoted']) == 1
+    from memento.drive_connect import _publish
+    _publish(manager.data_dir / 'drive-binding.json', dict(client_id='fixture-client',
+        account='owner@example.test', folder_id='fixture_folder'))
     archive = tmp_path / 'complete.tar'
     result = export_archive(manager.data_dir, archive, cold=manager)
-    assert result['blob_count'] == 1
+    assert result['blob_count'] == 1 and result['remote_reference_count'] == 1 and not result['self_contained']
     restored = tmp_path / 'restored'
     import_archive(archive, restored)
     recovered = Store(restored)
     try:
+        with pytest.raises(RawTextUnavailable):
+            recovered.get(record['id'])
+        ColdManager(recovered.artifacts, manager.backend, restored)
         assert recovered.get(record['id'])['text'] == text
         assert Graph(recovered).history(record['id'])[0]['text'] == text
     finally:

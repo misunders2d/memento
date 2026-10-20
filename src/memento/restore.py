@@ -9,11 +9,11 @@ from .cold_manager import ColdManager
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Restore a complete portable archive or personal Drive backup')
+    parser = argparse.ArgumentParser(description='Restore a migration archive or personal Drive backup')
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--connection', type=Path,
                         help='Memento private drive-oauth.json (Drive restore mode only)')
-    source.add_argument('--archive', type=Path, help='Self-contained owner-exported portable archive; no Drive grant needed')
+    source.add_argument('--archive', type=Path, help='Owner archive; restore offline, then reconnect original Drive binding for remote files')
     parser.add_argument('--backup-id')
     parser.add_argument('--destination', type=Path)
     parser.add_argument('--allow-incomplete', action='store_true',

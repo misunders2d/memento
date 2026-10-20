@@ -1,4 +1,4 @@
-"""Owner-only, self-contained plaintext archives; never a remote backup or API route."""
+"""Owner-only database migration archives retaining verified Drive references."""
 
 import hashlib
 import io
@@ -17,9 +17,10 @@ import sqlite_vec
 
 from .blobs import BlobStore
 from .raw_text import runs
+from .drive_connect import public_binding, read_binding, check_binding, _publish
 
 _FORMAT = 'memento-portable'
-_VERSION = 1
+_VERSION = 2
 _MAX_MANIFEST = 64 * 1024 * 1024
 _DIGEST = re.compile(r'[0-9a-f]{64}')
 
@@ -91,6 +92,31 @@ def _file_metadata(path):
                     sha256=hashlib.file_digest(source, 'sha256').hexdigest())
 
 
+def _remote_count(blobs):
+    remote = [info['remote_id'] for info in blobs.values() if info['remote_id'] is not None]
+    if any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', value) for value in remote):
+        raise ValueError('Invalid registered Drive reference')
+    return len(remote)
+
+
+def _export_binding(data_dir):
+    pin = read_binding(data_dir)
+    if any((data_dir / name).exists() or (data_dir / name).is_symlink()
+           for name in ('drive-client.json', 'drive-oauth.json')):
+        from .drive_auth import _load_bindings, DriveAuthorizationError
+        try:
+            binding = _load_bindings(data_dir)
+        except DriveAuthorizationError:
+            raise ValueError('Original Drive binding is unavailable or conflicts') from None
+        value = public_binding(dict(client_id=binding.client['client_id'], account=binding.account,
+                                    folder_id=binding.folder_id))
+        check_binding(data_dir, **value)
+        return value
+    if pin is None:
+        raise ValueError('Drive references require the original connection binding')
+    return pin
+
+
 def _copy_verified(source, destination, expected):
     digest = hashlib.sha256()
     size = 0
@@ -117,7 +143,7 @@ def _add(archive, name, path, size):
 
 
 def export_archive(data_dir: Path, output: Path, *, cold=None):
-    """Read-only SQLite/WAL snapshot plus verified hot/cold bytes, without uploads.
+    """Snapshot plus local-only bytes; verified Drive objects are never downloaded.
 
     The administration socket supplies the owner boundary. The caller must not
     expose this function on the agent HTTP/MCP surface.
@@ -128,8 +154,7 @@ def export_archive(data_dir: Path, output: Path, *, cold=None):
     _private_directory(output.parent)
     if os.path.lexists(output):
         raise ValueError('Archive output must not already exist')
-    # Serialize against eviction, not ordinary evidence capture. Downloads go
-    # only into staging, never through fetch(), which changes source hot storage.
+    # Fence eviction of snapshot-local bytes while ordinary capture continues.
     with cold._mutex if cold is not None else nullcontext():
         with tempfile.TemporaryDirectory(prefix='.memento-export-', dir=output.parent) as name:
             stage = Path(name)
@@ -149,10 +174,13 @@ def export_archive(data_dir: Path, output: Path, *, cold=None):
                 blobs = _registered(db)
             finally:
                 db.close()
+            remote_count = _remote_count(blobs)
+            drive = _export_binding(data_dir) if remote_count else None
+            local = {sha: info for sha, info in blobs.items() if info['remote_id'] is None}
             files = {'memory.sqlite': _file_metadata(snapshot)}
             files.update({f'blobs/{sha[:2]}/{sha[2:]}': dict(sha256=sha, size=info['size'])
-                          for sha, info in sorted(blobs.items())})
-            manifest = json.dumps(dict(format=_FORMAT, version=_VERSION, files=files),
+                          for sha, info in sorted(local.items())})
+            manifest = json.dumps(dict(format=_FORMAT, version=_VERSION, files=files, drive=drive),
                                   sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
             if len(manifest) > _MAX_MANIFEST:
                 raise ValueError('Portable manifest exceeds the supported 64 MiB limit')
@@ -165,21 +193,13 @@ def export_archive(data_dir: Path, output: Path, *, cold=None):
                     archive.addfile(header, io.BytesIO(manifest))
                     _add(archive, 'memory.sqlite', snapshot, files['memory.sqlite']['size'])
                     payload = stage / 'payload'
-                    for sha256, info in sorted(blobs.items()):
+                    for sha256, info in sorted(local.items()):
                         hot = data_dir / 'blobs' / sha256[:2] / sha256[2:]
-                        if os.path.lexists(hot):
-                            _plain_path(hot)
-                            if not stat.S_ISREG(hot.stat().st_mode):
-                                raise ValueError('Blob payload must be a regular file')
-                            with hot.open('rb') as source:
-                                _copy_verified(source, payload, dict(sha256=sha256, size=info['size']))
-                        else:
-                            if cold is None or not info['remote_id']:
-                                raise ValueError(f'Referenced blob is unavailable: {sha256}')
-                            cold.backend.download(info['remote_id'], payload, sha256)
-                            payload.chmod(0o600)
-                            if _file_metadata(payload) != dict(sha256=sha256, size=info['size']):
-                                raise ValueError(f'Cold blob checksum or size mismatch: {sha256}')
+                        _plain_path(hot)
+                        if not stat.S_ISREG(hot.stat().st_mode):
+                            raise ValueError('Blob payload must be a regular file')
+                        with hot.open('rb') as source:
+                            _copy_verified(source, payload, dict(sha256=sha256, size=info['size']))
                         _add(archive, f'blobs/{sha256[:2]}/{sha256[2:]}', payload, info['size'])
                         payload.unlink()
                 stream.flush()
@@ -187,7 +207,9 @@ def export_archive(data_dir: Path, output: Path, *, cold=None):
             # Hard-link publication is atomic and never overwrites another file.
             os.link(packed, output)
             BlobStore._sync(output.parent)
-    return dict(path=str(output), format=_FORMAT, version=_VERSION, blob_count=len(blobs), complete=True)
+    return dict(path=str(output), format=_FORMAT, version=_VERSION, blob_count=len(blobs), complete=True,
+                included_blob_count=len(local), remote_reference_count=remote_count,
+                self_contained=not remote_count, drive=drive)
 
 
 def _unique_object(pairs):
@@ -207,10 +229,14 @@ def _manifest(archive, member):
         raise ValueError('Expected a regular versioned portable manifest first')
     with archive.extractfile(member) as source:
         value = json.load(source, object_pairs_hook=_unique_object)
-    if (not isinstance(value, dict) or set(value) != {'format', 'version', 'files'}
-            or value['format'] != _FORMAT or type(value['version']) is not int
-            or value['version'] != _VERSION or not isinstance(value['files'], dict)):
+    if (not isinstance(value, dict)
+            or value.get('format') != _FORMAT or type(value.get('version')) is not int
+            or value['version'] not in (1, 2) or not isinstance(value.get('files'), dict)
+            or set(value) != ({'format', 'version', 'files'} if value['version'] == 1 else
+                              {'format', 'version', 'files', 'drive'})):
         raise ValueError('Unsupported portable archive manifest')
+    if value['version'] == 2 and value['drive'] is not None:
+        value['drive'] = public_binding(value['drive'])
     files = value['files']
     if 'memory.sqlite' not in files:
         raise ValueError('Portable archive database is missing')
@@ -223,7 +249,7 @@ def _manifest(archive, member):
             raise ValueError('Invalid archive payload metadata')
         if name.startswith('blobs/') and name.replace('blobs/', '', 1).replace('/', '') != info['sha256']:
             raise ValueError('Blob path differs from its checksum')
-    return files
+    return value
 
 
 def _destination(destination):
@@ -238,7 +264,7 @@ def _destination(destination):
 
 
 def import_archive(archive_path: Path, destination: Path):
-    """Validate in private staging, then atomically publish a locally usable instance."""
+    """Validate in private staging, preserving external references for reconnect."""
     archive_path = _plain_path(archive_path)
     destination, original = _destination(destination)
     info = archive_path.stat()
@@ -248,7 +274,8 @@ def import_archive(archive_path: Path, destination: Path):
     try:
         with archive_path.open('rb') as stream:
             with tarfile.open(fileobj=stream, mode='r:') as archive:
-                files = _manifest(archive, archive.next())
+                manifest = _manifest(archive, archive.next())
+                files = manifest['files']
                 seen = set()
                 while (member := archive.next()) is not None:
                     if (member.name in seen or member.name not in files or member.type != tarfile.REGTYPE
@@ -277,17 +304,26 @@ def import_archive(archive_path: Path, destination: Path):
         db = _connect(stage / 'memory.sqlite')
         try:
             blobs = _registered(db)
-            expected = {'memory.sqlite', *(f'blobs/{sha[:2]}/{sha[2:]}' for sha in blobs)}
+            version = manifest['version']
+            remote_count = _remote_count(blobs) if version == 2 else 0
+            drive = manifest.get('drive')
+            if bool(remote_count) != (drive is not None):
+                raise ValueError('Drive reference binding differs from the database')
+            local = {sha: info for sha, info in blobs.items() if version == 1 or info['remote_id'] is None}
+            expected = {'memory.sqlite', *(f'blobs/{sha[:2]}/{sha[2:]}' for sha in local)}
             if set(files) != expected:
                 raise ValueError('Portable archive differs from the complete registered blob set')
-            for sha256, blob in blobs.items():
+            for sha256, blob in local.items():
                 if files[f'blobs/{sha256[:2]}/{sha256[2:]}']['size'] != blob['size']:
                     raise ValueError('Database and archive blob sizes differ')
             # These are host-specific mutable transfer/scheduling records, not
             # immutable graph/evidence history. Never resume an old Drive upload
             # or retry an old host's backup after connecting a different account.
             with db:
-                db.execute("UPDATE blobs SET tier='hot',remote_id=NULL")
+                if version == 1:
+                    db.execute("UPDATE blobs SET tier='hot',remote_id=NULL")
+                else:
+                    db.execute("UPDATE blobs SET tier=CASE WHEN remote_id IS NULL THEN 'hot' ELSE 'cold' END")
                 db.execute('DELETE FROM cold_transfers')
                 db.execute('DELETE FROM cold_failures')
                 db.execute('DELETE FROM backups')
@@ -297,6 +333,8 @@ def import_archive(archive_path: Path, destination: Path):
                 raise ValueError('Imported database integrity check failed')
         finally:
             db.close()
+        if drive is not None:
+            _publish(stage / 'drive-binding.json', drive)
         (stage / 'blobs').mkdir(mode=0o700, exist_ok=True)
         for directory, _, names in os.walk(stage):
             for name in names:
@@ -308,10 +346,12 @@ def import_archive(archive_path: Path, destination: Path):
             raise ValueError('Restore destination changed during validation')
         os.replace(stage, destination)
         BlobStore._sync(destination.parent)
-        return dict(path=str(destination / 'memory.sqlite'), format=_FORMAT, version=_VERSION,
+        return dict(path=str(destination / 'memory.sqlite'), format=_FORMAT, version=version,
                     blob_count=len(blobs), complete=True,
-                    rebased=['blobs.tier=hot', 'blobs.remote_id=NULL',
-                             'cold_transfers', 'cold_failures', 'backups'])
+                    included_blob_count=len(local), remote_reference_count=remote_count,
+                    self_contained=not remote_count, drive=drive,
+                    rebased=(['blobs.tier=hot', 'blobs.remote_id=NULL'] if version == 1 else ['blobs.tier']) +
+                            ['cold_transfers', 'cold_failures', 'backups'])
     finally:
         if stage.exists():
             shutil.rmtree(stage)

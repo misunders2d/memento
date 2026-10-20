@@ -44,6 +44,43 @@ def test_connection_rejects_missing_binding_and_broader_scope(tmp_path):
         load_connection(path)
 
 
+@pytest.mark.parametrize('field', ['client_id', 'account', 'folder_id'])
+def test_restored_pin_rejects_direct_connect_and_startup_before_network(tmp_path, oauth, monkeypatch, field):
+    client, state = oauth
+    instance = tmp_path / 'instance'
+    pin = dict(client_id='synthetic-client', account=ACCOUNT, folder_id='original_folder')
+    _publish(instance / 'drive-binding.json', pin)
+    actual = dict(pin, **{field: 'different-value'})
+    client.write_text(json.dumps(dict(installed=dict(client_id=actual['client_id']))))
+    output = tmp_path / 'external' / 'grant.json'
+    with pytest.raises(ValueError, match='binding'):
+        connect(client, actual['account'], output, no_browser=True, folder_id=actual['folder_id'], data_dir=instance)
+    assert state['authorized'] == state['created'] == 0 and not output.exists()
+    config = connection()
+    config['client_id'] = actual['client_id']
+    config['memento'] = {key: actual[key] for key in ('account', 'folder_id')}
+    _publish(output, config)
+    original = output.read_bytes()
+    monkeypatch.setattr('googleapiclient.discovery.build', lambda *args, **kwargs: pytest.fail('pin checked before network'))
+    with pytest.raises(ValueError, match='binding'):
+        DriveColdStore.from_file(output, data_dir=instance)
+    assert output.read_bytes() == original
+
+
+def test_restored_pin_reuses_original_folder_and_uses_explicit_instance_context(tmp_path, oauth):
+    client, state = oauth
+    instance = tmp_path / 'instance'
+    pin = dict(client_id='synthetic-client', account=ACCOUNT.upper(), folder_id='original_folder')
+    _publish(instance / 'drive-binding.json', pin)
+    output = tmp_path / 'external' / 'grant.json'
+    # A credential file's parent is not the restored instance.
+    _publish(output.parent / 'drive-binding.json', dict(pin, folder_id='unrelated_folder'))
+    connect(client, ACCOUNT, output, no_browser=True, data_dir=instance)
+    assert state['authorized'] == 1 and state['created'] == 0
+    assert load_connection(output, data_dir=instance)['memento']['folder_id'] == 'original_folder'
+    assert (instance / 'drive-binding.json').read_text() == json.dumps(pin, ensure_ascii=True) + '\n'
+
+
 @pytest.fixture
 def oauth(tmp_path, monkeypatch):
     flow_module = pytest.importorskip('google_auth_oauthlib.flow')

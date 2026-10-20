@@ -11,8 +11,7 @@ from pathlib import Path
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
 
-def load_connection(path: Path) -> dict:
-    """Read only the declared private connection, never ambient Google credentials."""
+def _private_json(path: Path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'r', encoding='utf-8') as source:
         permissions = os.fstat(source.fileno())
@@ -20,6 +19,43 @@ def load_connection(path: Path) -> dict:
                 or permissions.st_uid not in (0, os.getuid())):
             raise ValueError('Drive connection must be an owner-private regular file (0600)')
         config = json.load(source)
+    return config
+
+
+def public_binding(value):
+    """Only the original app/account/folder identity, never credential material."""
+    if not isinstance(value, dict) or set(value) != {'client_id', 'account', 'folder_id'}:
+        raise ValueError('Invalid public Drive binding')
+    for key, limit in (('client_id', 4096), ('account', 320)):
+        text = value[key]
+        if (not isinstance(text, str) or not text.strip() or text != text.strip()
+                or len(text) > limit or any(ord(char) < 32 for char in text)):
+            raise ValueError('Invalid public Drive binding')
+    from .cold import DriveColdStore
+    DriveColdStore._id(value['folder_id'])
+    return dict(value)
+
+
+def read_binding(data_dir):
+    if data_dir is None:
+        return None
+    path = Path(data_dir) / 'drive-binding.json'
+    return public_binding(_private_json(path)) if path.exists() or path.is_symlink() else None
+
+
+def check_binding(data_dir, client_id, account, folder_id):
+    expected = read_binding(data_dir)
+    if expected is not None:
+        actual = public_binding(dict(client_id=client_id, account=account, folder_id=folder_id))
+        if (actual['client_id'] != expected['client_id'] or actual['folder_id'] != expected['folder_id']
+                or actual['account'].casefold() != expected['account'].casefold()):
+            raise ValueError('Drive binding differs from the restored instance')
+    return expected
+
+
+def load_connection(path: Path, *, data_dir=None) -> dict:
+    """Read only the declared private connection, never ambient Google credentials."""
+    config = _private_json(path)
     if not isinstance(config, dict) or config.get('type') != 'authorized_user':
         raise ValueError('Drive connection requires authorized-user credentials')
     if config.get('scopes') != SCOPES:
@@ -30,6 +66,7 @@ def load_connection(path: Path) -> dict:
         raise ValueError('Drive connection requires its verified account and dedicated folder')
     from .cold import DriveColdStore
     DriveColdStore._id(metadata['folder_id'])
+    check_binding(data_dir, config.get('client_id'), metadata['account'], metadata['folder_id'])
     return config
 
 
@@ -55,7 +92,7 @@ def _publish(path: Path, config: dict):
 
 
 def connect(client_json: Path, account: str, output: Path, *, no_browser=False, port=8766,
-            folder_id: str | None = None):
+            folder_id: str | None = None, data_dir=None):
     """Obtain a fresh explicit grant, retaining or explicitly recovering its folder."""
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
@@ -66,7 +103,7 @@ def connect(client_json: Path, account: str, output: Path, *, no_browser=False, 
         raise ValueError('An explicit account and valid loopback port are required')
     if folder_id is not None:
         folder_id = DriveColdStore._id(folder_id)
-    previous = load_connection(output) if output.exists() or output.is_symlink() else None
+    previous = load_connection(output, data_dir=data_dir) if output.exists() or output.is_symlink() else None
     if previous and previous['memento']['account'].casefold() != account.casefold():
         raise ValueError('Reconnect must use the previously verified account')
     if previous and folder_id is not None and folder_id != previous['memento']['folder_id']:
@@ -77,6 +114,10 @@ def connect(client_json: Path, account: str, output: Path, *, no_browser=False, 
         raise ValueError('Use a dedicated Google Desktop app OAuth client JSON')
     if previous and previous.get('client_id') != client_config['installed'].get('client_id'):
         raise ValueError('Reconnect must use the original OAuth client to retain folder access')
+    pin = read_binding(data_dir)
+    if folder_id is None and pin is not None:
+        folder_id = pin['folder_id']
+    check_binding(data_dir, client_config['installed'].get('client_id'), account, folder_id)
     flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES,
                                                autogenerate_code_verifier=True)
     credentials = flow.run_local_server(host='127.0.0.1', port=port,
@@ -110,6 +151,7 @@ def main():
     command.add_argument('--account', required=True, help='Exact Google account email; verified before saving')
     command.add_argument('--output', type=Path, required=True, help='Connection file; use DATA_DIR/drive-oauth.json')
     command.add_argument('--folder-id', help='Reuse an existing app-accessible Memento folder; never create a replacement')
+    command.add_argument('--data-dir', type=Path, help='Restored instance whose original Drive binding must be retained')
     command.add_argument('--no-browser', action='store_true', help='Print the official loopback consent URL; use an SSH tunnel when remote')
     command.add_argument('--port', type=int, default=8766, help='Loopback callback port, also forwarded by an SSH tunnel (default: 8766)')
     configure = subcommands.add_parser('configure',
@@ -126,7 +168,7 @@ def main():
             configure_client(args.client_json, args.account, args.folder_id, args.data_dir)
         else:
             connect(args.client_json, args.account, args.output, no_browser=args.no_browser,
-                    port=args.port, folder_id=args.folder_id)
+                    port=args.port, folder_id=args.folder_id, data_dir=args.data_dir)
     except Exception as error:
         # OAuth exceptions can contain tokens or callback codes. Never echo them.
         print(f'Drive connection failed ({type(error).__name__}); connection setup did not complete.', file=sys.stderr)
