@@ -906,6 +906,44 @@ def test_codex_canonical_assistant_and_mcp_result_are_projected_once(tmp_path):
     spool.close()
 
 
+def test_codex_assistant_realtime_transcript_is_exact_and_replays_once(tmp_path):
+    spool = spool_at(tmp_path)
+    timestamp = '2026-10-20T12:34:56.789Z'
+    text = '  Spoken answer: café.\nKeep this exact ending.  '
+    payload = {'id': 'spoken-answer', 'realtime_session_id': 'voice-session',
+               'type': 'transcript_segment', 'role': 'assistant', 'text': text}
+    raw_only = [
+        {**payload, 'id': 'spoken-user', 'role': 'user'},
+        {**payload, 'id': 'empty', 'text': ''},
+        {**payload, 'id': 'invalid-text', 'text': ['not a transcript']},
+        {key: value for key, value in payload.items() if key != 'text'},
+        {**payload, 'id': ''}, {**payload, 'id': 7},
+        {key: value for key, value in payload.items() if key != 'id'},
+        {**payload, 'id': 'other-role', 'role': 'tool'},
+        {'id': 'started', 'type': 'realtime_session_started', 'realtime_session_id': 'voice-session'},
+        {'id': 'closed', 'type': 'realtime_session_closed', 'outcome': 'completed'},
+        {**payload, 'id': 'other-type', 'type': 'unknown_realtime_item'}, None,
+    ]
+    records = [{'timestamp': timestamp, 'ordinal': index, 'type': 'realtime_item', 'payload': item}
+               for index, item in enumerate([payload, payload, *raw_only], 1)]
+    lines = [json.dumps(record, ensure_ascii=False) + '\n' for record in records]
+    journal = tmp_path / 'voice.jsonl'
+    journal.write_text(''.join(lines), encoding='utf-8')
+    spool.journal(journal, 'codex', 'conversation')
+    captured = pending(spool)
+    messages = [part for part in captured if part['kind'] != 'native_record']
+    assert len(messages) == 1
+    assert (messages[0]['source'], messages[0]['conversation_id'], messages[0]['kind'],
+            messages[0]['occurred_at'], messages[0]['text']) == (
+                'native:test-device:codex', 'conversation', 'assistant', timestamp, text)
+    assert messages[0]['metadata']['native_id'] == '1'
+    assert messages[0]['metadata']['extraction_mode'] == 'message'
+    assert [part['text'] for part in captured if part['kind'] == 'native_record'] == lines
+    spool.reconcile(str(journal.resolve()), force=True)
+    assert pending(spool) == captured
+    spool.close()
+
+
 @pytest.mark.parametrize('style', ['pi', 'claude', 'codex'])
 def test_inline_artifact_projection_keeps_bytes_out_of_text_and_queues_exact_original(tmp_path, style):
     spool = spool_at(tmp_path)

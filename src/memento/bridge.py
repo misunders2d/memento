@@ -125,6 +125,12 @@ def codex_message(record):
         return None
     if record.get('type') == 'response_item':
         return payload
+    if record.get('type') == 'realtime_item':
+        if (payload.get('type') == 'transcript_segment' and payload.get('role') == 'assistant'
+                and isinstance(payload.get('id'), str) and payload['id']
+                and isinstance(payload.get('text'), str) and payload['text']):
+            return {**payload, 'type': 'message', 'content': payload['text']}
+        return None
     if record.get('type') != 'event_msg' or payload.get('type') != 'item_completed':
         return None  # Legacy agent_message notifications also repeat provider output.
     item = payload.get('item')
