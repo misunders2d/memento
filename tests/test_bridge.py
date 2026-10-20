@@ -2,6 +2,8 @@
 import json
 import base64
 import builtins
+import io
+from http.client import BadStatusLine
 import tomllib
 import pytest
 
@@ -451,7 +453,9 @@ def test_large_legacy_outbox_upload_selects_in_bounded_work_and_preserves_priori
 
     monkeypatch.setattr(bridge, 'Spool', open_spool)
     monkeypatch.setattr(bridge, 'http', transport)
-    assert bridge.upload(config_path, config) == {'pending': 99998, 'conflicts': 1}
+    result = bridge.upload(config_path, config)
+    assert {key: result[key] for key in ('pending', 'conflicts')} == {'pending': 99998, 'conflicts': 1}
+    assert result['error']['category'] == 'network'
     assert attempted == ['Queued text 3.', 'Queued text 4.']
     assert len(selection_work) == 2 and max(selection_work) <= 1000
     spool = real_spool(config_path, config)
@@ -493,27 +497,60 @@ def test_upload_drain_and_background_bound_preserve_pending_work(tmp_path, monke
     spool.close()
 
 
-@pytest.mark.parametrize('conflict', [False, True])
+@pytest.mark.parametrize('failure,category,http_status', [
+    ('network', 'network', None), ('http_protocol', 'network', None), ('timeout', 'timeout', None),
+    ('wrapped_timeout', 'timeout', None), ('http', 'http', 503),
+    ('conflict', 'http', 409), ('validation', 'validation', None), ('lock', 'lock', None)])
 def test_explicit_upload_reports_retained_transport_errors_and_conflicts(tmp_path, monkeypatch,
-                                                                       capsys, conflict):
+                                                                       capsys, failure, category, http_status):
     spool = spool_at(tmp_path)
-    spool.episode('pi', 's', 'u', 'user', 'retained full message')
+    private = 'private-transcript-credential-response-marker'
+    text = 'retained full message ' + private
+    spool.episode('pi', 's', 'u', 'user', text)
     spool.commit()
     spool.close()
 
     def rejected(*args, **kwargs):
-        if conflict:
-            raise bridge.urllib.error.HTTPError('http://localhost/episodes', 409, 'conflict', {}, None)
-        raise OSError('offline')
+        if http_status:
+            raise bridge.urllib.error.HTTPError('https://' + private + '/episodes', http_status,
+                private, {'Authorization': private}, io.BytesIO(private.encode()))
+        if failure == 'lock':
+            return {}
+        if failure == 'wrapped_timeout':
+            raise bridge.urllib.error.URLError(TimeoutError(private))
+        if failure == 'http_protocol':
+            raise BadStatusLine(private)
+        raise {'network': OSError, 'timeout': TimeoutError, 'validation': ValueError}[failure](private)
 
     monkeypatch.setattr(bridge, 'http', rejected)
-    assert bridge.main(['upload', '--config', str(tmp_path / 'runner.json')]) == 1
-    assert json.loads(capsys.readouterr().out) == {
+    blocker = bridge.sqlite3.connect(tmp_path / 'runner.bridge.sqlite3') if failure == 'lock' else None
+    try:
+        if blocker is not None:
+            blocker.execute('BEGIN IMMEDIATE')
+        assert bridge.main(['upload', '--config', str(tmp_path / 'runner.json')]) == 1
+    finally:
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+    output = capsys.readouterr()
+    result = json.loads(output.out)
+    conflict = failure == 'conflict'
+    assert {key: result[key] for key in ('pending', 'conflicts')} == {
         'pending': 0 if conflict else 1, 'conflicts': 1 if conflict else 0}
+    assert result['error']['category'] == category
+    assert result['error'].get('http_status') == http_status
+    if failure != 'lock':
+        assert result['error']['outbox_id'] == 1
+    assert 'retry the same upload' in result['error']['action']
+    assert private not in output.out + output.err
     spool = spool_at(tmp_path)
-    assert pending(spool)[0]['text'] == 'retained full message'
+    assert pending(spool)[0]['text'] == text
     assert spool.db.execute('SELECT state FROM outbox').fetchone()[0] == ('conflict' if conflict else 'pending')
     spool.close()
+    if not conflict:
+        monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {})
+        assert bridge.main(['upload', '--config', str(tmp_path / 'runner.json')]) == 0
+        assert json.loads(capsys.readouterr().out) == {'pending': 0, 'conflicts': 0}
 
 
 def test_claude_workflow_journal_is_distinct_from_its_agents(tmp_path):
@@ -809,7 +846,8 @@ def test_slow_blob_retains_original_while_later_text_uploads_and_retry_resumes(t
 
     monkeypatch.setattr(bridge, 'http', slow)
     result = bridge.upload(config_path, config, background=background)
-    assert result == {'pending': 1, 'conflicts': 0}
+    assert {key: result[key] for key in ('pending', 'conflicts')} == {'pending': 1, 'conflicts': 0}
+    assert result['error']['category'] == 'timeout'
     assert len(attempts) == 1
     assert uploaded == ['text queued after the old blob', 'text captured during slow upload']
     spool = spool_at(tmp_path)

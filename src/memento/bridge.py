@@ -18,6 +18,7 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+from http.client import HTTPException
 import json
 import mimetypes
 import os
@@ -89,6 +90,23 @@ def http(config, endpoint, body=None, timeout=1, *, content_type=None):
     if len(raw) > 4 * MAX_BODY:
         raise ValueError('response too large')
     return json.loads(raw)
+
+
+def upload_error(error):
+    """Fixed diagnostics only: exception messages and HTTP bodies can be private."""
+    if isinstance(error, urllib.error.HTTPError):
+        result = {'category': 'http', 'http_status': error.code}
+    elif isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError)
+                                            and isinstance(error.reason, TimeoutError)):
+        result = {'category': 'timeout'}
+    elif isinstance(error, sqlite3.Error) and getattr(error, 'sqlite_errorcode', 0) & 255 in (
+            sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        result = {'category': 'lock'}
+    else:
+        result = {'category': 'network' if isinstance(error, (OSError, HTTPException)) else 'validation'}
+    result['action'] = ('Check the reported failure and configured service, then retry the same upload. '
+                        'Queued captures are retained.')
+    return result
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -565,6 +583,7 @@ def upload(config_path, config, *, background=False, paths=()):
             deadline = time.monotonic() + 20 if background else None
             stopped = False
             failed_blobs = set()
+            failure = None
             # Re-read only complete lines during native asynchronous journal flushes.
             for attempt in range(4 if background else 1):
                 spool.reconcile_all(paths if background else None)
@@ -588,6 +607,7 @@ def upload(config_path, config, *, background=False, paths=()):
                         http(config, endpoint, raw if content_type else json.loads(raw), timeout=timeout,
                              **({'content_type': content_type} if content_type else {}))
                     except urllib.error.HTTPError as exc:
+                        failure = {**upload_error(exc), 'outbox_id': identifier}
                         if exc.code == 409:
                             # Immutable collisions remain visible, never acknowledged/deleted.
                             spool.db.execute("UPDATE outbox SET state='conflict' WHERE id=?", (identifier,))
@@ -598,7 +618,8 @@ def upload(config_path, config, *, background=False, paths=()):
                             continue
                         stopped = True
                         break
-                    except (OSError, ValueError):
+                    except (OSError, ValueError, HTTPException) as exc:
+                        failure = {**upload_error(exc), 'outbox_id': identifier}
                         if content_type:
                             failed_blobs.add(identifier)
                             continue
@@ -611,7 +632,8 @@ def upload(config_path, config, *, background=False, paths=()):
                 if background and attempt < 3 and time.monotonic() < deadline:
                     time.sleep(.5)
             counts = dict(spool.db.execute('SELECT state,count(*) FROM outbox GROUP BY state'))
-            return {'pending': counts.get('pending', 0), 'conflicts': counts.get('conflict', 0)}
+            return {'pending': counts.get('pending', 0), 'conflicts': counts.get('conflict', 0),
+                    **({'error': failure} if failure else {})}
         finally:
             spool.close()
 
@@ -1056,7 +1078,7 @@ def main(argv=None):
         if result:
             print(json.dumps(result, ensure_ascii=False))
         return 0
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, HTTPException) as exc:
         # Never leak transcripts, query text, native config, credentials or URL errors.
         if args.operation == 'install':
             print('{"status":"error","error":"native_install_failed"}')
@@ -1065,7 +1087,13 @@ def main(argv=None):
             print('{"status":"error","error":"history_import_failed"}')
             return 1
         if args.operation == 'upload':
-            print('{"status":"error","error":"upload_failed"}')
+            counts = {'pending': None, 'conflicts': None}
+            with contextlib.suppress(OSError, ValueError, sqlite3.Error):
+                uri = Path(args.config).resolve().with_suffix('.bridge.sqlite3').as_uri() + '?mode=ro'
+                with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=.1)) as db:
+                    states = dict(db.execute('SELECT state,count(*) FROM outbox GROUP BY state'))
+                    counts = {'pending': states.get('pending', 0), 'conflicts': states.get('conflict', 0)}
+            print(json.dumps({'status': 'error', **counts, 'error': upload_error(exc)}))
             return 1
         if args.operation == 'flush-conversation':
             print('{"status":"error","error":"capture_pending","action":"Run memento upload, then retry the same media save."}')
