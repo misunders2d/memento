@@ -465,6 +465,62 @@ def test_index_status_counts_current_units_failures_and_unprepared_sources(retri
     assert r.status(source='other')['total'] == 0
 
 
+@pytest.mark.parametrize('legacy_byte_length', [False, True])
+def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monkeypatch, legacy_byte_length):
+    if not legacy_byte_length and sqlite3.sqlite_version_info < (3, 43, 0):
+        pytest.skip('Native octet_length requires SQLite 3.43; fallback is covered separately')
+    if legacy_byte_length:
+        monkeypatch.setattr('memento.status.sqlite3.sqlite_version_info', (3, 42, 0))
+    r = retrieval
+    raw = 'Exact synthetic Ω\x00 evidence.'
+    r.store._db.executemany('''INSERT INTO episodes
+        (seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at,text_runs)
+        VALUES (?,?, 'selected',?,'conversation',?,?,?,'2026-10-21T00:00:00Z',?)''', [
+        (1, 'inline', 'inline', 'native_record', raw, '{"extraction_mode":"skip"}', None),
+        (2, 'offloaded', 'offloaded', 'native_record', 'raw stub', '{"extraction_mode":"skip"}', '[]'),
+        (3, 'message', 'message', 'user', 'Genuine synthetic user evidence.', '{}', None),
+    ])
+    state = SimpleNamespace(store=r.store, retrieval=r, cold_runtime=None, cold=None,
+                            drive_reauthorization_required=False)
+    snapshot = r.store.read_snapshot
+    work = []
+
+    @contextmanager
+    def measured_snapshot():
+        with snapshot() as reader:
+            ticks = []
+            reader.set_progress_handler(lambda: ticks.append(1) or 0, 100)
+            if legacy_byte_length:
+                reader.set_authorizer(lambda action, first, second, *_:
+                    sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_FUNCTION and second == 'octet_length'
+                    else sqlite3.SQLITE_OK)
+            yield reader
+            work.append(len(ticks))
+
+    monkeypatch.setattr(r.store, 'read_snapshot', measured_snapshot)
+    before = {source: operational_status(state, source) for source in ('selected', 'absent')}
+    baseline_work = work.copy()
+    assert before['selected']['captured'] == dict(episodes=3, conversations=1)
+    assert before['selected']['raw_storage'] == dict(inline_raw_episodes=1,
+        inline_raw_bytes=len(raw.encode('utf-8')), offloaded_raw_episodes=1)
+    assert before['selected']['indexing']['unprepared_episodes'] == 1
+    r.store._db.execute('BEGIN')
+    try:
+        r.store._db.executemany('''INSERT INTO episodes
+            (seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at)
+            VALUES (?,?, 'unrelated',?,'history','native_record',?,
+                '{"extraction_mode":"skip"}','2026-10-21T00:00:00Z')''',
+            ((i, f'e{i}', f'v{i}', 'Unrelated synthetic history.' * 256) for i in range(4, 2004)))
+        r.store._db.execute('COMMIT')
+    except BaseException:
+        r.store._db.execute('ROLLBACK')
+        raise
+    for position, source in enumerate(('selected', 'absent')):
+        assert operational_status(state, source) == before[source]
+        # Count VM work, not wall time: unrelated large rows must not be visited.
+        assert work[-1] <= baseline_work[position] + 1
+
+
 def test_index_status_counts_real_vectors_without_repeated_per_unit_probes(retrieval, monkeypatch):
     r = retrieval
     total, prepared, vector_count = 2056, 2048, 1536

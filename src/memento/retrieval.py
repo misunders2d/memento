@@ -730,12 +730,12 @@ class Retrieval:
                     coalesce(sum(NOT indexed AND NOT failed),0) AS pending,
                     coalesce(sum(NOT indexed AND failed),0) AS failed FROM states''',
                 (source, source, source)).fetchone()
-        unprepared = db.execute('''SELECT count(*) FROM episodes e
-                WHERE (? IS NULL OR e.source=?)
-                AND coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip'
+        unprepared = db.execute(f'''SELECT count(*) FROM episodes e
+                WHERE {'e.source=? AND' if source is not None else ''}
+                coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip'
                 AND NOT EXISTS (SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id)
                 AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)''',
-                (source, source)).fetchone()[0]
+                (source,) if source is not None else ()).fetchone()[0]
         return dict(available=True, **dict(row), unprepared_episodes=unprepared,
                     error=type(self.index_error).__name__ if self.index_error else None)
 
