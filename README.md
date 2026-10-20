@@ -244,6 +244,8 @@ python3 "$HOME/.local/share/memento/runner.py" drive-connect --url "$URL"
 
 With no explicit URL, use the correct harness's `--config PATH`; the default is `runner.json`. An already-connected service exits successfully without another link or credential lookup. If a Google link is printed, keep the helper running while the human opens that official link **on the same device**, selects the intended account and explicitly approves `drive.file`.
 
+For an explicit fresh authorization while already connected, add `--reconnect`. It retains the working grant until the human approves a verified replacement for the same original account, Desktop client and folder; denial or failed verification leaves the connection unchanged.
+
 The runner receives the Desktop client's loopback callback. The service alone exchanges the code, verifies the original account and owned, untrashed, app-accessible folder, saves a private connection and activates it. **Only verified activation and a successful helper exit mean connected.** No Web OAuth client, public callback, SSH forwarding or token-file transfer is needed for this normal flow. HTTP is accepted only for loopback development; remote use requires private HTTPS.
 
 If authorization is unavailable, that error is **not a consent link**. Provision the original binding as below, then retry. Cancelling a pending helper makes a best-effort cancellation; links expire after ten minutes and cannot be replayed. Wrong accounts, inaccessible folders or broader grants do not install a connection.

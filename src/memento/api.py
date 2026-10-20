@@ -3,6 +3,7 @@ import base64
 import hashlib
 import asyncio
 import os
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
@@ -141,6 +142,7 @@ class CitationInput(WorkInput):
 
 class DriveBeginInput(WorkInput):
     callback_port: int = Field(ge=1, le=65535)
+    reconnect: bool = False
 
 
 class DriveFinishInput(WorkInput):
@@ -192,10 +194,25 @@ def create_app(data_dir: Path) -> FastAPI:
                     min_bytes=int(os.environ.get('MEMENTO_COLD_MIN_BYTES', str(10 * 1024 * 1024))))
                 return manager, runtime
 
-            def install_drive(verified_backend, config):
+            def install_drive(verified_backend, config, reconnect):
                 nonlocal backend, cold_runtime
                 if app.state.cold is not None:
-                    raise DriveAuthorizationError(409, 'Drive is already connected')
+                    if not reconnect:
+                        raise DriveAuthorizationError(409, 'Drive is already connected')
+                    manager = app.state.cold
+                    with manager._mutex:
+                        _publish(drive, config)
+                        previous, manager.backend = manager.backend, verified_backend
+                        backend = verified_backend
+                    # The verified replacement is active; retiring the old HTTP
+                    # client must not turn success into a closed new connection.
+                    try:
+                        previous.close()
+                    except Exception as error:
+                        logging.getLogger(__name__).warning(
+                            'Retired Drive connection cleanup failed (%s)', type(error).__name__)
+                    app.state.drive_reauthorization_required = False
+                    return
                 manager, runtime = prepare_drive(verified_backend)
                 _publish(drive, config)
                 app.state.cold, app.state.cold_runtime = manager, runtime
@@ -310,7 +327,7 @@ def create_app(data_dir: Path) -> FastAPI:
     @app.post('/drive/connect/begin')
     async def begin_drive(value: DriveBeginInput, request: Request, response: Response):
         response.headers['Cache-Control'] = 'no-store'
-        if app.state.cold is not None:
+        if app.state.cold is not None and not value.reconnect:
             raise HTTPException(409, 'Drive is already connected')
         return await drive_request(request, app.state.drive_authorization.begin, value.arguments())
 
@@ -491,9 +508,11 @@ Google Drive is optional and service-wide, not a separate grant for each agent.
 Native setup, a healthy API, the public website and Google branding do not mean
 Drive is connected. Complete these steps when the human requests Drive:
 1. On the human's browser device run runner.py drive-connect --url SERVICE_ORIGIN.
-   An already-connected service needs no new credential lookup. If a Google
-   link is printed, keep the helper running, let the human approve drive.file,
-   and await verified success. Only an unavailable-authorization error sends
+   An already-connected service needs no new credential lookup.
+   For explicitly requested fresh consent while connected, add --reconnect;
+   the existing grant stays active until its same-binding replacement verifies.
+   If a Google link is printed, keep the helper running, let the human approve
+   drive.file, and await verified success. Only an unavailable-authorization error sends
    you to the provisioning steps below; never present that error as a link.
 2. On the SERVICE HOST, the service owner provisions the original Desktop
    client, intended account and existing app-created folder with:

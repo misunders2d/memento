@@ -115,7 +115,7 @@ def oauth(tmp_path, monkeypatch):
         def close(self):
             state['closed'] += 1
 
-    def install(backend, config):
+    def install(backend, config, reconnect):
         assert backend.folder_id == FOLDER
         state['installed'].append((backend, config))
 
@@ -263,7 +263,7 @@ def test_mutex_allows_only_one_pending_flow(oauth):
 def test_failed_install_is_not_success_and_closes_verified_backend(tmp_path, oauth):
     _, state = oauth
 
-    def fail_install(backend, config):
+    def fail_install(backend, config, reconnect):
         raise RuntimeError('synthetic-new-refresh must not escape')
 
     manager = DriveAuthorization(tmp_path, fail_install)
@@ -451,3 +451,45 @@ def test_stale_grant_startup_then_fresh_consent_activates_drive(tmp_path, oauth,
         assert saved['memento'] == dict(account=ACCOUNT, folder_id=FOLDER)
         assert 'synthetic-new-refresh' not in finished.text
     assert state['closed'] == 1 and state['created'] == 0
+
+
+@pytest.mark.parametrize('outcome', ['denied', 'wrong_account', 'success', 'cleanup_error'])
+def test_explicit_reconnect_preserves_working_grant_until_verified(tmp_path, oauth, monkeypatch, outcome):
+    from fastapi.testclient import TestClient
+    from googleapiclient.discovery import build
+    from memento.api import create_app
+
+    _, state = oauth
+    path = tmp_path / 'drive-oauth.json'
+    _publish(path, previous_connection())
+    original = path.read_bytes()
+    old_backend = DriveColdStore(FOLDER, ACCOUNT, service=build('drive', 'v3'))
+    monkeypatch.setattr(DriveColdStore, 'from_file', classmethod(lambda cls, path: old_backend))
+    monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
+    if outcome == 'cleanup_error':
+        def failed_close():
+            raise RuntimeError('synthetic-private-cleanup-diagnostic')
+        monkeypatch.setattr(old_backend, 'close', failed_close)
+    with TestClient(create_app(tmp_path)) as client:
+        begun = client.post('/drive/connect/begin', json={'callback_port': 18766, 'reconnect': True})
+        assert begun.status_code == 200
+        assert client.get('/health').status_code == 200 and path.read_bytes() == original
+        result = {'state': begun.json()['state']}
+        if outcome == 'denied':
+            result['error'] = 'access_denied'
+        else:
+            result['code'] = 'synthetic-code'
+            if outcome == 'wrong_account':
+                state['account'] = 'wrong@example.test'
+        finished = client.post('/drive/connect/finish', json=result)
+        assert client.get('/health').status_code == 200
+        if outcome in ('denied', 'wrong_account'):
+            assert finished.status_code == 400 and path.read_bytes() == original
+        else:
+            assert finished.status_code == 200 and finished.json() == {'status': 'connected'}
+            saved = json.loads(path.read_text())
+            assert saved['refresh_token'] == 'synthetic-new-refresh'
+            assert saved['client_id'] == previous_connection()['client_id']
+            assert saved['memento'] == previous_connection()['memento']
+            assert path.stat().st_mode & 0o777 == 0o600
+        assert state['created'] == 0

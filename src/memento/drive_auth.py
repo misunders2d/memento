@@ -67,6 +67,7 @@ class _Pending:
     state: str
     deadline: float
     binding: _Binding = field(repr=False)
+    reconnect: bool
 
 
 def _read_private(path: Path) -> dict:
@@ -168,7 +169,7 @@ def _close_after_failure(resource):
 
 
 class DriveAuthorization:
-    def __init__(self, data_dir: Path, install: Callable[[DriveColdStore, dict], None],
+    def __init__(self, data_dir: Path, install: Callable[[DriveColdStore, dict, bool], None],
                  *, clock=time.monotonic):
         self._data_dir = Path(data_dir)
         self._install = install
@@ -185,11 +186,12 @@ class DriveAuthorization:
             except Exception:
                 raise DriveAuthorizationError(502) from None
 
-    def begin(self, callback_port: int) -> dict:
+    def begin(self, callback_port: int, reconnect: bool = False) -> dict:
         with self._lock:
             if self._closed:
                 raise DriveAuthorizationError(503)
-            if type(callback_port) is not int or not 1 <= callback_port <= 65535:
+            if (type(callback_port) is not int or not 1 <= callback_port <= 65535
+                    or type(reconnect) is not bool):
                 raise DriveAuthorizationError(400)
             if self._pending is not None:
                 if self._clock() < self._pending.deadline:
@@ -217,7 +219,7 @@ class DriveAuthorization:
                     prompt='consent', login_hint=binding.account, include_granted_scopes='false')
                 if returned_state != state:
                     raise DriveAuthorizationError(502)
-                self._pending = _Pending(flow, state, self._clock() + _TTL, binding)
+                self._pending = _Pending(flow, state, self._clock() + _TTL, binding, reconnect)
                 return dict(authorization_url=url, state=state, expires_in=_TTL)
             except Exception:
                 if flow is not None:
@@ -282,7 +284,7 @@ class DriveAuthorization:
                 # An operator may have replaced or removed a binding during consent/network I/O.
                 self._check_binding(pending.binding)
                 try:
-                    self._install(backend, config)
+                    self._install(backend, config, pending.reconnect)
                 except DriveAuthorizationError:
                     raise
                 except Exception:

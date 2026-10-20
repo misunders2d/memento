@@ -250,7 +250,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 
-def connect_drive(service, *, port=0, timeout=600):
+def connect_drive(service, *, port=0, timeout=600, reconnect=False):
     """Relay one human-approved Google callback to the private service."""
     failure = 'Drive connection failed'
     already_connected = 'Google Drive is already connected.'
@@ -377,9 +377,10 @@ def connect_drive(service, *, port=0, timeout=600):
         with Listener(('127.0.0.1', port), Callback) as listener:
             listener.timeout = .1
             try:
-                response = post('/drive/connect/begin', {'callback_port': listener.server_port})
+                response = post('/drive/connect/begin', {
+                    'callback_port': listener.server_port, 'reconnect': reconnect})
             except RunnerError:
-                if failure == already_connected:
+                if failure == already_connected and not reconnect:
                     print(already_connected, flush=True)
                     return
                 raise
@@ -850,6 +851,8 @@ def main(argv=None):
     drive = sub.add_parser('drive-connect', help='connect Google Drive with human browser consent')
     drive.add_argument('--url', help='private service URL; defaults to the existing runner config')
     drive.add_argument('--port', type=int, default=0, help='IPv4 loopback callback port (default: automatic)')
+    drive.add_argument('--reconnect', action='store_true',
+                       help='request fresh consent for the original account and folder; keep the working grant until verified')
     args = parser.parse_args(argv)
     try:
         if args.operation == 'agent':
@@ -861,7 +864,7 @@ def main(argv=None):
             return 0
         if args.operation == 'drive-connect':
             url = args.url if args.url is not None else load_config(args.config.expanduser())['url']
-            connect_drive(Service(url), port=args.port)
+            connect_drive(Service(url), port=args.port, reconnect=args.reconnect)
             return 0
         config = load_config(args.config.expanduser())
         compaction = None

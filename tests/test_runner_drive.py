@@ -84,6 +84,9 @@ class SyntheticDrive:
                     status, result = 404, {'detail': 'unexpected model-work endpoint'}
                 if self.path == '/drive/connect/begin' and owner.begin_error is not None:
                     status, result = owner.begin_error
+                elif (self.path == '/drive/connect/begin' and owner.installed
+                      and not value.get('reconnect', False)):
+                    status, result = 409, {'detail': 'Drive is already connected'}
                 elif self.path == '/drive/connect/finish' and owner.finish_error is not None:
                     status, result = owner.finish_error
                 if owner.redirect_begin and self.path == '/drive/connect/begin':
@@ -412,4 +415,28 @@ def test_cli_connect_works_without_model_discovery_or_work(drive, mode, tmp_path
         assert outcome == {'status': 0} and drive.installed
     finally:
         thread.join(3)
+    assert_closed(drive.port)
+
+
+@pytest.mark.parametrize('denied', [False, True])
+def test_reconnect_cli_waits_for_fresh_consent_instead_of_shortcutting(drive, capsys, denied):
+    drive.installed = True
+    result = {}
+    thread = threading.Thread(target=lambda: result.update(
+        exit=runner.main(['drive-connect', '--url', drive.url, '--reconnect'])), daemon=True)
+    thread.start()
+    try:
+        assert drive.begun.wait(2) and thread.is_alive()
+        pairs = [('state', drive.state), ('error', 'access_denied')] if denied else None
+        status, _, _ = drive.callback(pairs)
+        thread.join(3)
+        assert not thread.is_alive()
+        assert status == (400 if denied else 200)
+        assert result['exit'] == (1 if denied else 0)
+        assert drive.installed
+        output = capsys.readouterr()
+        assert 'https://accounts.google.com/' in output.out
+        assert 'already connected' not in output.out
+    finally:
+        thread.join(4)
     assert_closed(drive.port)

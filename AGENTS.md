@@ -137,6 +137,8 @@ The service alone exchanges the code, verifies the exact account and owned/untra
 
 An already-connected service exits successfully without another consent link. Cancelling the pending helper with Ctrl-C makes a best-effort state-bound cancellation so a new attempt need not wait for expiry. The helper reports rejected, expired, pending/conflicting and unavailable authorization without echoing provider response bodies or credentials; cancellation never replaces the original account/client/folder binding.
 
+If the human explicitly requests fresh consent while already connected, run the same command with `--reconnect`. This keeps the working grant active until the service verifies and installs the replacement for the exact original binding. Denial, expiry or failed verification does not disconnect the existing grant. Closing the retired local HTTP client does not revoke the old Google refresh token.
+
 The standalone operator `memento-drive connect` remains available for first-time folder creation and offline recovery. For recovery always provide `--folder-id EXISTING_FOLDER_ID` if the previous connection file was lost; a conflicting explicit ID is rejected before consent, and reconnect retains the original client/account/folder. Without a previous connection or explicit folder ID it is first-time setup and creates a folder, so never omit the known ID during recovery.
 
 Default cold archive eligibility remains unpinned, importance <=0.75, age >=90 days, size >=10 MiB (`MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS`, `MEMENTO_COLD_MIN_BYTES`).
