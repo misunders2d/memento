@@ -687,17 +687,21 @@ class Retrieval:
         """Exact current index-unit counts; unchunked episodes are reported separately."""
         with self.store._mutex:
             db = self.store._db
-            row = db.execute(f'''WITH units AS (
+            # Probe vector metadata once, rather than repeating a virtual-table
+            # row lookup for every unit and aggregate expression under the mutex.
+            row = db.execute(f'''WITH indexed_units AS MATERIALIZED (
+                SELECT i.target,i.kind,i.version FROM memory_vectors v
+                JOIN vector_items i ON i.seq=v.rowid WHERE v.current=1),
+                units AS (
                 SELECT a.* FROM ({_RECALL_ELIGIBLE}) a WHERE ? IS NULL
                 OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
                     WHERE g.target=a.rank_target AND e.source=?)
                 OR (a.kind='episode' AND EXISTS (SELECT 1 FROM episode_chunks x
                     JOIN episodes e ON e.id=x.episode_id WHERE x.id=a.id AND e.source=?))),
-                states AS (SELECT a.*,
-                    EXISTS (SELECT 1 FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
-                        WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version AND v.current=1) AS indexed,
+                states AS (SELECT a.*,i.target IS NOT NULL AS indexed,
                     EXISTS (SELECT 1 FROM index_failures f WHERE f.target=a.id
-                        AND f.version=a.version AND f.resolved=0) AS failed FROM units a)
+                        AND f.version=a.version AND f.resolved=0) AS failed FROM units a
+                    LEFT JOIN indexed_units i ON i.target=a.id AND i.kind=a.kind AND i.version=a.version)
                 SELECT count(*) AS total,coalesce(sum(indexed),0) AS indexed,
                     coalesce(sum(NOT indexed AND NOT failed),0) AS pending,
                     coalesce(sum(NOT indexed AND failed),0) AS failed FROM states''',

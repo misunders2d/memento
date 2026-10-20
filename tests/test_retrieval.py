@@ -356,6 +356,49 @@ def test_index_status_counts_current_units_failures_and_unprepared_sources(retri
     assert r.status(source='other')['total'] == 0
 
 
+def test_index_status_counts_real_vectors_without_repeated_per_unit_probes(retrieval):
+    r = retrieval
+    total, prepared, vector_count = 2056, 2048, 1536
+    vector = np.zeros(768, np.float32).tobytes()
+    db = r.store._db
+    db.execute('BEGIN')
+    try:
+        db.executemany('''INSERT INTO episodes
+            (seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at)
+            VALUES (?,?,?,?,?,'user','Synthetic progress evidence.','{}','2026-10-20T00:00:00+00:00')''',
+            ((i, f'e{i}', 'bulk' if i <= prepared else 'other', f'event{i}', 'conversation')
+             for i in range(1, total + 1)))
+        db.executemany('INSERT INTO episode_chunks VALUES (?,?,0,28)',
+                       ((f'x{i}', f'e{i}') for i in range(1, prepared + 1)))
+        db.executemany("INSERT INTO vector_items VALUES (?,?,'episode',1)",
+                       ((i, f'x{i}') for i in range(1, vector_count + 1)))
+        db.executemany('INSERT INTO memory_vectors(rowid,embedding,current) VALUES (?,?,?)',
+                       ((i, vector, i % 13 != 0) for i in range(1, vector_count + 1)))
+        db.executemany('INSERT INTO index_failures VALUES (?,1,1,\'ValueError\',0,?)',
+                       ((f'x{i}', int(i % 11 == 0)) for i in range(7, prepared + 1, 7)))
+        db.execute('COMMIT')
+    except BaseException:
+        db.execute('ROLLBACK')
+        raise
+
+    indexed = {i for i in range(1, vector_count + 1) if i % 13 != 0}
+    failed = {i for i in range(7, prepared + 1, 7) if i % 11 != 0} - indexed
+    probes = []
+    db.set_trace_callback(lambda sql: probes.append(1) if sql.startswith('--')
+                          and 'memory_vectors_rowids' in sql and 'WHERE rowid = ?' in sql else None)
+    try:
+        status = r.status(source='bulk')
+    finally:
+        db.set_trace_callback(None)
+    assert status == dict(available=True, total=prepared, indexed=len(indexed), failed=len(failed),
+                         pending=prepared - len(indexed) - len(failed), unprepared_episodes=0, error=None)
+    # A status observation must not perform several sqlite-vec point probes for
+    # every indexed passage while holding the capture mutex.
+    assert len(probes) <= prepared
+    assert r.status(source='other') == dict(available=True, total=0, indexed=0, pending=0, failed=0,
+                                          unprepared_episodes=8, error=None)
+
+
 def test_legacy_serialized_media_never_sends_binary_to_passage_tokenizer(retrieval):
     r = retrieval
     caption = 'The original cobalt checklist image remains available.'
