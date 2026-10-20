@@ -11,6 +11,7 @@ Memento gives your native AI agents a shared, private memory—with receipts. St
 - **Evidence, not unexplained assertions.** Memories retain source quotes and offsets. Candidates are visibly unconfirmed before promotion; corrections keep version history.
 - **One memory across your devices.** A private central service, with capture clients on your other machines. Each origin keeps its own stable identity.
 - **Your storage, your boundaries.** Local Linux storage and local embeddings. Optional Google Drive cold storage and manual backups use a dedicated app-accessible folder, not access to your whole Drive.
+- **Portable, not trapped.** Export one complete private archive with original history, memories, vectors and stored artifacts; import it into an empty installation without a Drive grant.
 
 Extraction and consolidation use your **existing native CLI login and default model**, not a new paid model API key. Those calls still consume model usage and follow your provider's terms; “local storage” does not mean no conversation content ever reaches a model provider.
 
@@ -63,6 +64,8 @@ curl --fail http://127.0.0.1:8765/health
 ```
 
 Wait for healthy real-model startup; the first download can take time. Inspect `docker compose logs memory` if startup fails. Model cache persists under `/data/models`. **Do not disable embeddings to declare installation successful.**
+
+Text stays literal even when it contains model control-token spellings; real image and audio inputs still use the native multimodal processor. On the first upgrade, Memento re-encodes only previously indexed text containing those spellings, preserving raw history, vector IDs and ordinary text/media vectors. Failed text units become due again, but remain failures until the normal indexer actually encodes them successfully.
 
 Default deployment properties:
 
@@ -155,6 +158,19 @@ Choose `pi`, `omp`, `claude` or `codex`. The existing harness config or default 
 There is no new daemon, registry, dependency or per-message work added by this command. It reuses the shipped native installer and does not restart active agents. Without the command link, `python3 ~/.local/share/memento/runner.py agent add HARNESS --url "$URL"` is equivalent. Keep each device's own config and stable generated `client_uid`; do not copy configs or histories to pretend they came from another origin.
 
 **Start new native sessions after installation.** Do not silently restart an active user-owned agent. The existing native profile, model selection and login remain the source of truth.
+
+### Explicit client updates and offline operation
+
+```sh
+memento agent update claude
+```
+
+Choose the installed harness and reuse any custom `--config` and `--native-config-dir`. The command pulls a validated code bundle from the **existing configured service**, preserves identity, role, queued captures, native settings and timers, and keeps the same standalone runner/command path. It never installs another daemon, checks for updates per message, changes a login or restarts an active session.
+
+Downloads are fully validated before replacing code. Each file is replaced atomically, with the standalone runner last; this is **not a whole-installation transaction**. If interrupted during replacement, rerun the command when connected to complete it. Use native reload or a fresh session to load new code. If a release changes hook or MCP definitions, rerun `memento agent add HARNESS`; native trust remains a human decision.
+
+If the service is unavailable, capture remains in the client's durable outbox and retries on a later native lifecycle hook or explicit `bridge.py upload`. An idle client has no retry daemon. Automatic recall is bounded and fails open with a warning; a same-query cache up to five minutes old may be used with that warning. Explicit memory saves fail instead of pretending to succeed and are not queued as mutations. Retry an identical uncertain command with its original command ID.
+
 
 ### Private access from another machine
 
@@ -336,6 +352,55 @@ uv run --extra drive memento-restore --connection /private/drive-oauth.json \
 The first command lists verified backups. The second restores the database and available hot artifacts to an **empty private directory**. Incomplete snapshots are refused unless the operator deliberately supplies `--allow-incomplete`; inspect the gap manifest. Keep the original Desktop client securely off-box so the human can re-consent after disk loss. Restore correct data/credential ownership before starting Compose.
 
 Drive copies are **plaintext**, and retained versions consume quota. Protect local disks, private configs, model-provider accounts and backups according to your threat model.
+
+### Complete portable export and import
+
+The service owner can export a **single self-contained plaintext archive**. It includes a consistent database snapshot (raw history, graph versions, evidence, loops and vectors) and every registered artifact, including cold-only files downloaded and verified for the archive. Missing or corrupt payloads abort export. Credentials, native configs and model caches are excluded; raw history can itself contain sensitive text.
+
+Import only archives you exported and kept private. Checksums detect corruption; they do not authenticate an archive against a malicious author.
+
+Keep output and staging on persistent storage, **not the container's `/tmp` tmpfs**. Allow space for the database snapshot, complete archive and largest payload:
+
+```sh
+docker compose exec memory mkdir -p -m 0700 /data/exports
+docker compose exec memory /app/.venv/bin/memento-admin --data-dir /data \
+  export --output /data/exports/memento.tar
+docker compose cp memory:/data/exports/memento.tar /private/memento.tar
+```
+
+Export requires a human terminal confirmation of the exact private destination and never overwrites an existing file. The archive is mode `0600`; its parent must be owner-private. Verify the copied file's checksum against the in-volume file before removing that in-volume copy. There is no bulk-export HTTP or MCP endpoint.
+
+For a non-container destination, run as its intended service owner:
+
+```sh
+uv run memento-restore --archive /private/memento.tar \
+  --destination /private/empty-memento
+```
+
+Import verifies checksums, SQLite integrity and the complete payload set before publishing. Nonempty/live or symlink destinations, missing files, extra members and unsafe archives are refused without partial publication. Restored payloads are all local/hot; old remote IDs and resumable cold-transfer, failure and backup records are reset. Original memory/evidence/version IDs, vectors and immutable audit history remain intact. Optional Drive authorization must be provisioned separately.
+
+**Fresh Compose host: import before the first `up`.** Prepare empty `./data` with the normal service ownership above. Make the archive mount readable by UID/GID `10001:10001`, mode `0600`, without moving OAuth tokens. Import into a child directory so publication stays atomic on the data volume:
+
+```sh
+docker compose run --rm --no-deps \
+  --entrypoint /app/.venv/bin/memento-restore \
+  -v /private/memento.tar:/import/memento.tar:ro \
+  memory --archive /import/memento.tar --destination /data/instance
+```
+
+Then create `compose.imported.yaml` on that new host:
+
+```yaml
+services:
+  memory:
+    volumes:
+      - ./data/instance:/data
+```
+
+Set `COMPOSE_FILE=compose.yaml:compose.imported.yaml` in that host's `.env`, preserve any other required overrides, and only then run `docker compose up --build -d`. Keep using this mount configuration. An already-started instance has database/model files and is not an empty restore target. Model caches are not exported: first startup downloads the real pinned model and requires network access and any applicable Hugging Face approval. This Compose example uses a bind mount, not a named-volume subpath.
+
+This is a **point-in-time move, not synchronization**. Before the final export, disable the old host's Memento Tailscale Serve route, stop its processing timer and wait for any running tick to finish; close native sessions on that host too so loopback clients cannot upload. Remote clients then retain new captures in their durable outboxes. Keep the old service running only for its owner export socket, then stop it before enabling the new instance and repointing clients. Never leave both instances accepting writes. Repoint each existing client with `memento agent add HARNESS --url NEW_PRIVATE_URL`, retaining its own config/identity; queued captures then upload to the new host. Configure exactly one processor there. If using Drive, reconnect with the original Desktop client, account and folder. Do not copy client identities or grants between machines.
+
 
 ## Troubleshooting
 

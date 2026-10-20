@@ -26,6 +26,8 @@ Wait for healthy real-model startup; first download needs network, disk space an
 
 The default uses one CPU thread per inference lane: foreground recall can run alongside one background encoder without waiting for a whole long document or oversubscribing the two-CPU quota. Mutable model preprocessing remains serialized; float32 precision, prompts, revision and dimensions are unchanged. Keep `OMP_NUM_THREADS=1` under this resource budget; raising it can cause automatic recall to miss its deadline during indexing.
 
+Explicit text is tokenized literally, including model control-token spellings; image/audio preprocessing remains native. A one-time text-encoding upgrade re-encodes only affected legacy text vectors without changing raw history, vector IDs or ordinary text/media vectors. It makes affected failed units due again; only successful normal indexing resolves those failure records. Passage chunking uses the same literal-token mode under the shared preprocessing lock.
+
 Shutdown finishes the current indexing unit, commits completed vectors and leaves the rest pending instead of draining a whole batch before exit. Restart resumes that unfinished work.
 
 Publication stays loopback-only; never expose this unauthenticated API publicly. On the server, set `MEMENTO_ALLOWED_HOSTS=<machine>.<tailnet>.ts.net` in `.env`, recreate the memory container with `docker compose up -d` to apply the environment, then run `tailscale serve --bg 8765` (tailnet HTTPS enabled). Serve proxies to the unchanged loopback listener; tailnet ACLs must restrict access to your devices. MCP host protection stays enabled; `/mcp/` is the endpoint. On each laptop, ask the native agent to connect using `https://<machine>.<tailnet>.ts.net/connect`; that private guide is the canonical client bootstrap instruction. The agent must have neither sudo nor Docker-daemon access when human-review isolation matters.
@@ -106,6 +108,13 @@ Only complete JSONL records are queued; directories recurse over `*.jsonl`. Repe
 
 Explicit `upload` drains until empty or a transport error, prints JSON `pending`/`conflicts` counts, and exits nonzero if either remains. Native background upload retains its bounded runtime.
 
+### Explicit native updates and outages
+
+Use `memento agent update HARNESS` with the same custom `--config`/`--native-config-dir` used for installation. It validates the entire private-service code bundle before replacing files, preserves config/client UID/role/outbox/native settings/timers and never restarts active sessions or discovers a model. Publication is atomic per file, standalone runner last; after interruption rerun when connected to finish. There is no rollback journal, automatic updater or per-message update request. Load through native reload or a fresh session; use `agent add` if hook/MCP definitions change, retaining human trust prompts.
+
+Offline capture stays queued until another native lifecycle hook or explicit upload retries it. An idle client has no retry daemon. Bounded automatic recall warns and continues without fresh context (same-query cache may be used for five minutes with a warning); explicit saves fail closed and are not queued as mutations.
+
+
 ### Drive, human administration and recovery
 
 Drive is optional and integral when enabled: install `--extra drive` outside Docker (image includes it). Human prerequisite: enable Google Drive API in a dedicated project, create a **Desktop app** OAuth client, and explicitly consent to only `drive.file`. For an External consent screen set publishing status **In production**: Testing refresh tokens expire after seven days. Do not use ambient Google credentials or broaden scopes. First-time operator setup creates a dedicated app-accessible folder; normal reconnection verifies the exact account and reuses that folder. Manually created folders are not automatically app-accessible.
@@ -144,3 +153,13 @@ uv run --extra drive memento-restore --connection /private/drive-oauth.json
 uv run --extra drive memento-restore --connection /private/drive-oauth.json --backup-id ID --destination /private/empty-recovery
 ```
 The first lists verified backups; the second restores database plus available hot artifacts to an empty private directory. Incomplete snapshots are refused unless explicitly adding `--allow-incomplete`; inspect the gap manifest. Keep the original Desktop OAuth client securely off-box; after disk loss re-consent that same client to recover app-scoped access. Drive copies are plaintext, retained versions consume quota, and local data/credential ownership must be restored before starting Compose.
+
+### Complete portable archive and host migration
+
+Owner-only `memento-admin --data-dir DIR export --output FILE` exports a consistent database and **all registered hot/cold payloads** into one private plaintext archive; missing/corrupt payloads abort. It uses the existing owner Unix socket and human terminal confirmation, never an HTTP/MCP export route. Output parent must be private; output is `0600` and never overwritten. Use `/data/exports` or another persistent data-volume directory, not `/tmp` tmpfs. Copy out with `docker compose cp`, verify checksums, then remove only the verified in-volume copy.
+
+`memento-restore --archive FILE --destination EMPTY` needs no Drive grant. It validates manifest, checksums, complete payload coverage, SQLite integrity and foreign keys in private staging before atomic publication; rejects nonempty/live/symlink targets and unsafe archive members. Payloads become local/hot with no remote IDs; old resumable cold transfers/failures/backups are reset, not original graph/raw/version/vector/audit history. Credentials, native configs and models are excluded.
+
+For fresh Compose recovery, **import before first startup**, as service UID, into `/data/instance` on the empty data volume using `docker compose run --rm --no-deps --entrypoint /app/.venv/bin/memento-restore -v /private/memento.tar:/import/memento.tar:ro memory --archive /import/memento.tar --destination /data/instance`. The archive must be privately readable by UID 10001. Then use a persistent Compose override mounting `./data/instance:/data` before `up`; the README contains the exact override. Do not restore over a started instance or atomically rename the mounted `/data` root.
+
+Migration is a point-in-time move, not sync: before the final export disable the old host's Memento Serve route, stop its processor timer and wait for any running tick, and close its native sessions to stop loopback uploads. Remote clients spool durably. Keep the old service running for owner export, then stop it before enabling the new instance/repointing clients; never accept writes on both. Retain client identities so queued captures upload to the new host, configure one processor, and separately reconnect optional Drive with the original client/account/folder. Another-server deployment still requires explicit authorization.

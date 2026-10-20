@@ -47,3 +47,23 @@ def test_dense_multibyte_passages_keep_the_tail_within_the_token_budget():
 def test_a_character_larger_than_the_token_budget_fails_instead_of_looping():
     with pytest.raises(ValueError, match='Unicode character'):
         chunks('😀', byte_tokenizer, size=2, overlap=0)
+
+
+def test_literal_control_strings_cannot_bypass_the_passage_token_budget():
+    tokenizers = pytest.importorskip('tokenizers')
+    transformers = pytest.importorskip('transformers')
+    text = '<|image|> <eos> ' * 40
+    vocab = {'[UNK]': 0, **{char: i + 1 for i, char in enumerate(sorted(set(text)))}}
+    backend = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab, unk_token='[UNK]'))
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Split('', behavior='isolated')
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token='[UNK]', additional_special_tokens=['<|image|>', '<eos>'])
+    passages = chunks(text, tokenizer, size=32, overlap=4)
+    covered = set()
+    for passage in passages:
+        assert passage.text == text[passage.start:passage.end]
+        ids = tokenizer(passage.text, add_special_tokens=False, split_special_tokens=True)['input_ids']
+        assert len(ids) <= 32
+        assert not set(ids) & set(tokenizer.all_special_ids)
+        covered.update(range(passage.start, passage.end))
+    assert all(i in covered for i, char in enumerate(text) if not char.isspace())

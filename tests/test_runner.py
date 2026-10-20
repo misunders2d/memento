@@ -1,11 +1,15 @@
 import json
+import base64
+import hashlib
+import http.server
 import os
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 
-from memento import runner
+from memento import bridge, runner
 
 
 def assistant_events(text='{"facts":[]}', **changes):
@@ -332,3 +336,194 @@ def test_systemd_values_do_not_expand_percent_or_environment():
     assert runner.unit_arg('/tmp/a %h $HOME "x"') == '"/tmp/a %%h $$HOME \\"x\\""'
     with pytest.raises(runner.RunnerError):
         runner.unit_arg('/tmp/a\nExecStart=bad')
+
+
+@pytest.fixture
+def client_release_http():
+    files = {}
+    source = Path(runner.__file__).parent
+    for name in runner.RELEASE_FILES:
+        content = (source / name).read_bytes()
+        files[name] = {'content': base64.b64encode(content).decode(),
+                       'sha256': hashlib.sha256(content).hexdigest()}
+    state = {'body': runner.encode({'format': 1, 'files': files}), 'status': 200, 'extra_length': 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.0'
+
+        def do_GET(self):
+            assert self.path == '/client-release'
+            self.send_response(state['status'])
+            self.send_header('Content-Length', str(len(state['body']) + state['extra_length']))
+            self.end_headers()
+            self.wfile.write(state['body'])
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield state, f'http://127.0.0.1:{server.server_port}'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.fixture
+def update_installation(tmp_path, monkeypatch, client_release_http):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('updates must not inspect models, install hooks, start sessions or change timers')
+
+    monkeypatch.setattr(runner, 'run_process', forbidden)
+    monkeypatch.setattr(runner, 'check_cli', forbidden)
+    monkeypatch.setattr(runner, 'install_native', forbidden)
+
+    def create(harness='pi', mode='client', alternate=False):
+        config_path = runner.default_config()
+        if alternate:
+            host = {'uid': os.getuid(), 'client_uid': 'host-identity', 'agent': 'claude',
+                    'preset': 'claude', 'command': ['claude'], 'mode': 'server', 'timezone': 'Etc/UTC',
+                    'url': 'http://127.0.0.1:1', 'deadline_seconds': 600}
+            runner.private_write(config_path, runner.encode(host))
+            config_path = config_path.parent / harness / 'runner.json'
+        config = {'uid': os.getuid(), 'client_uid': 'stable-device-identity', 'agent': harness,
+                  'preset': harness, 'command': ['/existing/native'], 'mode': mode,
+                  'timezone': 'Europe/Berlin', 'url': client_release_http[1], 'deadline_seconds': 321,
+                  'unrelated': {'private': 'do not rewrite'}}
+        runner.private_write(config_path, runner.encode(config) + b'\n')
+        bridge_path = config_path.parent / 'bridge.py'
+        runner.private_write(bridge_path, b'#!/usr/bin/env python3\n# previous bridge\n')
+        root = tmp_path / 'native'
+        root.mkdir()
+        protected = [config_path]
+        if alternate:
+            protected.append(runner.default_config())
+        targets = {bridge_path: 'bridge.py'}
+        if harness in ('pi', 'omp'):
+            extension = root / 'extensions/memento'
+            extension.mkdir(parents=True)
+            for filename, source in (('index.ts', 'native_' + harness + '.ts'),
+                                     ('native_shared.ts', 'native_shared.ts')):
+                target = extension / filename
+                runner.private_write(target, b'// previous extension\n')
+                targets[target] = source
+            integration = extension / 'memento-config.json'
+            runner.private_write(integration, runner.encode(
+                {'config': str(config_path), 'bridge': str(bridge_path), 'python': sys.executable}))
+            protected.append(integration)
+        for filename in ('settings.json', 'hooks.json', 'config.toml', 'claude.json'):
+            target = root / filename
+            runner.private_write(target, b'private native login/model/hook/trust settings\n')
+            protected.append(target)
+        spool = bridge.Spool(config_path, config)
+        spool.queue('/episodes', {'event_id': 'pending-event', 'text': 'durable raw capture'})
+        spool.db.execute('INSERT INTO journals VALUES(?,?,?,?,?)',
+                         ('/native/history', harness, 'conversation', 123, 'cursor-prefix'))
+        spool.commit()
+        spool.close()
+        protected.append(spool.path)
+        units = tmp_path / 'units'
+        for filename in ('memento-runner.service', 'memento-runner.timer'):
+            target = units / filename
+            runner.private_write(target, b'Existing ExecStart/timer must not change\n')
+            protected.append(target)
+        standalone = tmp_path / '.local/share/memento/runner.py'
+        runner.private_write(standalone, b'#!/usr/bin/env python3\n# previous standalone runner\n')
+        standalone.chmod(0o700)
+        targets[standalone] = 'runner.py'
+        command = tmp_path / '.local/bin/memento'
+        command.parent.mkdir(parents=True)
+        command.symlink_to(standalone)
+        before = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in protected}
+        argv = ['agent', 'update', harness, '--native-config-dir', str(root)]
+        return config_path, targets, before, argv, command
+
+    return create
+
+
+@pytest.mark.parametrize('harness', ['pi', 'omp', 'claude', 'codex'])
+@pytest.mark.parametrize('mode', ['client', 'server'])
+def test_agent_update_preserves_identity_outbox_settings_units_and_executable(
+        update_installation, client_release_http, harness, mode):
+    config, targets, protected, argv, command = update_installation(harness, mode)
+    expected = runner.release_files(client_release_http[0]['body'])
+    package_before = Path(runner.__file__).read_bytes()
+    for _ in range(2):
+        assert runner.main(argv) == 0
+        for path, name in targets.items():
+            assert path.read_bytes() == expected[name]
+        assert {path: (path.read_bytes(), path.stat().st_mode & 0o777)
+                for path in protected} == protected
+        assert command.is_symlink()
+        assert command.resolve().stat().st_mode & 0o777 == 0o700
+        assert Path(runner.__file__).read_bytes() == package_before
+
+
+def test_agent_update_uses_existing_harness_config_without_retargeting(update_installation):
+    _, _, protected, argv, _ = update_installation('omp', alternate=True)
+    assert runner.main(argv) == 0
+    assert {path: (path.read_bytes(), path.stat().st_mode & 0o777)
+            for path in protected} == protected
+
+
+@pytest.mark.parametrize('failure', ['unavailable', 'truncated', 'hash', 'syntax', 'missing'])
+def test_agent_update_rejects_failed_release_before_replacing_code(
+        update_installation, client_release_http, failure):
+    _, targets, protected, argv, _ = update_installation()
+    old = {path: path.read_bytes() for path in targets}
+    state = client_release_http[0]
+    if failure == 'unavailable':
+        state['status'] = 503
+    elif failure == 'truncated':
+        state['extra_length'] = 100
+    else:
+        bundle = runner.decode(state['body'])
+        if failure == 'missing':
+            del bundle['files']['native_omp.ts']
+        elif failure == 'hash':
+            bundle['files']['native_shared.ts']['sha256'] = '0' * 64
+        else:
+            invalid = b'def broken(:\n'
+            bundle['files']['bridge.py'] = {'content': base64.b64encode(invalid).decode(),
+                                           'sha256': hashlib.sha256(invalid).hexdigest()}
+        state['body'] = runner.encode(bundle)
+    assert runner.main(argv) == 1
+    assert {path: path.read_bytes() for path in targets} == old
+    assert {path: (path.read_bytes(), path.stat().st_mode & 0o777)
+            for path in protected} == protected
+
+
+@pytest.mark.parametrize('interruption', [OSError, KeyboardInterrupt])
+def test_agent_update_interruption_retains_private_data_and_retry_completes(
+        update_installation, client_release_http, monkeypatch, interruption):
+    _, targets, protected, argv, command = update_installation()
+    previous_runner = command.resolve().read_bytes()
+    publish = runner.private_write
+    calls = 0
+
+    def interrupted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise interruption()
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(runner, 'private_write', interrupted)
+    assert runner.main(argv) == (130 if interruption is KeyboardInterrupt else 1)
+    assert command.resolve().read_bytes() == previous_runner
+    assert {path: (path.read_bytes(), path.stat().st_mode & 0o777)
+            for path in protected} == protected
+    monkeypatch.setattr(runner, 'private_write', publish)
+    assert runner.main(argv) == 0
+    expected = runner.release_files(client_release_http[0]['body'])
+    assert {path: path.read_bytes() for path in targets} == {
+        path: expected[name] for path, name in targets.items()}
+    assert {path: (path.read_bytes(), path.stat().st_mode & 0o777)
+            for path in protected} == protected
+    assert command.resolve().stat().st_mode & 0o777 == 0o700

@@ -406,3 +406,48 @@ def test_shutdown_commits_completed_vectors_and_leaves_the_rest_indexable(retrie
         pass
     assert {hit['id'] for hit in resumed.recall('unmatchedword', effort='cheap')} == set(targets)
     resumed.health()
+
+
+def test_legacy_control_token_vectors_upgrade_once_without_changing_history(retrieval, monkeypatch):
+    r = retrieval
+    ordinary, _ = assertion(r, 'ordinary archive decision')
+    literal, evidence = assertion(r, 'Document the literal <eos> spelling.')
+    index(r, ordinary, .8)
+    index(r, literal, .7)
+    db = r.store._db
+    history = r.graph.history(literal)
+    rows = {row['target']: dict(row) for row in db.execute(
+        'SELECT i.target,i.seq,v.embedding FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq')}
+    r.prepare_episodes()
+    failed = db.execute('SELECT id FROM episode_chunks WHERE episode_id=?',
+                       (evidence[0]['episode_id'],)).fetchone()[0]
+    db.execute('INSERT INTO index_failures VALUES (?,1,8,?,1e20,0)', (failed, 'ValueError'))
+    db.execute('ALTER TABLE vector_model DROP COLUMN text_encoding')
+    r.model.tokenizer.all_special_tokens = ['<eos>', '<|image|>']
+
+    def encode(model, texts):
+        vectors = np.zeros((len(texts), 768), np.float32)
+        vectors[:, 0] = 1
+        return vectors
+
+    monkeypatch.setattr('memento.retrieval.embed_texts', encode)
+    upgraded = Retrieval(r.graph, model=r.model)
+    assert upgraded.recall('unmatchedword', effort='cheap')[0]['id'] == literal
+    assert r.graph.history(literal) == history
+    after = {row['target']: dict(row) for row in db.execute(
+        'SELECT i.target,i.seq,v.embedding FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq')}
+    assert after[ordinary] == rows[ordinary]
+    assert after[literal]['seq'] == rows[literal]['seq']
+    assert after[literal]['embedding'] != rows[literal]['embedding']
+    failure = db.execute('SELECT * FROM index_failures WHERE target=?', (failed,)).fetchone()
+    assert (failure['attempts'], failure['next_attempt'], failure['resolved']) == (8, 0, 0)
+    assert upgraded.index_pending(limit=1) == 1
+    assert db.execute('SELECT resolved FROM index_failures WHERE target=?', (failed,)).fetchone()[0] == 1
+    upgraded.health()
+
+    def unexpected_reencode(*args):
+        raise AssertionError('completed literal-text migration must not repeat')
+
+    monkeypatch.setattr('memento.retrieval.embed_texts', unexpected_reencode)
+    restarted = Retrieval(r.graph, model=r.model)
+    assert restarted.recall('unmatchedword', effort='cheap')[0]['id'] == literal

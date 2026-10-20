@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import base64
+import fcntl
+import hashlib
 import hmac
 import http.client
 import http.server
@@ -212,10 +215,13 @@ class Service:
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
                 raw = response.read(MAX_OUTPUT + 1)
+                length = response.headers.get('Content-Length')
+                if length is not None and int(length) != len(raw):
+                    raise ValueError('incomplete download')
             if not raw or len(raw) > MAX_OUTPUT:
                 raise ValueError('invalid download')
             return raw
-        except (OSError, ValueError, urllib.error.URLError) as exc:
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as exc:
             raise RunnerError('service_rejected') from exc
 
     def post(self, path, value):
@@ -548,16 +554,22 @@ def default_config():
     return Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'memento' / 'runner.json'
 
 
-def private_write(path, data):
+def private_write(path, data, *, mode=0o600):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix='.memento-', dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as stream:
+            os.fchmod(stream.fileno(), mode)
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temporary)
@@ -664,13 +676,90 @@ def setup(args):
           + args.url.rstrip('/') + '/connect')
     return config_path
 
-def add_agent(args):
-    """Connect one native harness without changing its processing role."""
+RELEASE_FILES = ('runner.py', 'bridge.py', 'native_pi.ts', 'native_omp.ts', 'native_shared.ts')
+
+
+def release_files(raw):
+    """Reject incomplete/corrupt bundles before touching any installed code."""
+    try:
+        bundle = decode(raw)
+        if bundle['format'] != 1 or set(bundle['files']) != set(RELEASE_FILES):
+            raise ValueError('unsupported release')
+        files = {}
+        for name in RELEASE_FILES:
+            entry = bundle['files'][name]
+            content = base64.b64decode(entry['content'], validate=True)
+            if (not content or len(content) > MAX_OUTPUT
+                    or hashlib.sha256(content).hexdigest() != entry['sha256']):
+                raise ValueError('invalid release file')
+            content.decode('utf-8')
+            if name.endswith('.py'):
+                compile(content, name, 'exec')
+            files[name] = content
+        return files
+    except (ValueError, KeyError, TypeError, SyntaxError, UnicodeError) as exc:
+        raise RunnerError('invalid client release') from exc
+
+
+
+def integration_config(args):
+    """Match agent add's config selection without creating or retargeting it."""
     host_path = default_config()
     host = load_config(host_path) if host_path.exists() else None
-    config_path = (args.config.expanduser().absolute() if args.config else
-                   host_path if host and host['preset'] == args.agent else
-                   host_path.parent / args.agent / 'runner.json')
+    path = (args.config.expanduser().absolute() if args.config else
+            host_path if host and host['preset'] == args.agent else
+            host_path.parent / args.agent / 'runner.json')
+    return path, host
+
+
+def update_agent(args):
+    """Validate the whole release, then atomically replace each installed file."""
+    config_path, _ = integration_config(args)
+    config = load_config(config_path)
+    if config['preset'] != args.agent:
+        raise RunnerError('selected config belongs to another harness; choose a separate --config')
+    standalone = Path.home() / '.local/share/memento/runner.py'
+    lock_path = (standalone.parent if standalone.exists() else config_path.parent) / '.memento-update.lock'
+    with lock_path.open('a+b') as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Validate every asset before touching installed code. Keep native settings
+        # and loader paths stable; rerunning completes an interrupted cutover.
+        files = release_files(Service(config['url']).download('/client-release'))
+        targets = [(config_path.parent / 'bridge.py', 'bridge.py')]
+        if args.agent in ('pi', 'omp'):
+            root = (args.native_config_dir.expanduser().absolute() if args.native_config_dir else
+                    Path.home() / ('.pi' if args.agent == 'pi' else '.omp') / 'agent')
+            extension = root / 'extensions' / 'memento'
+            integration = decode((extension / 'memento-config.json').read_bytes())
+            if Path(integration['config']).resolve() != config_path.resolve():
+                raise RunnerError('native integration belongs to another config')
+            if Path(integration['bridge']).resolve() != targets[0][0].resolve():
+                raise RunnerError('native integration uses another bridge')
+            targets += [(extension / 'index.ts', 'native_' + args.agent + '.ts'),
+                        (extension / 'native_shared.ts', 'native_shared.ts')]
+        # Publish the stable standalone command last, never the package/repo module.
+        if standalone.exists():
+            targets.append((standalone, 'runner.py'))
+        modes = []
+        for target, name in targets:
+            if target.is_symlink() or not target.is_file():
+                raise RunnerError('installed code must be a regular file; run agent add first')
+            info = target.stat()
+            if info.st_uid != os.getuid():
+                raise RunnerError('installed code must belong to this host user')
+            modes.append((info.st_mode & 0o777) | (0o100 if name == 'runner.py' else 0))
+        for (target, name), mode in zip(targets, modes):
+            private_write(target, files[name], mode=mode)
+    print(f"Memento {args.agent} integration updated; {config['mode']} mode and private identity retained.")
+    print('Use native reload or a fresh session to load updated code; active sessions were not restarted.')
+    print('If a release changes hook or MCP definitions, rerun agent add for this harness.')
+    return config_path
+
+
+def add_agent(args):
+    """Connect one native harness without changing its processing role."""
+    config_path, host = integration_config(args)
     previous = load_config(config_path) if config_path.exists() else None
     if previous and previous['preset'] != args.agent:
         raise RunnerError('selected config belongs to another harness; choose a separate --config')
@@ -746,6 +835,12 @@ def main(argv=None):
     add.add_argument('--url', help='private service URL; defaults to the existing connection')
     add.add_argument('--native-config-dir', type=Path,
                      help='override selected harness config root for isolated setup')
+    update = actions.add_parser('update', help='pull a complete integration release without changing configuration')
+    update.add_argument('agent', choices=('pi', 'omp', 'claude', 'codex'))
+    update.add_argument('--config', type=Path, default=argparse.SUPPRESS,
+                        help='reuse a specific private installation config')
+    update.add_argument('--native-config-dir', type=Path,
+                        help='selected harness config root used during isolated installation')
     poll = sub.add_parser('tick', help='drain all due work, attempting each ID once')
     poll.add_argument('--consolidate-now', action='store_true',
                       help='run consolidation now for a first test, outside the nightly window')
@@ -758,7 +853,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.operation == 'agent':
-            add_agent(args)
+            (update_agent if args.agent_operation == 'update' else add_agent)(args)
             return 0
         args.config = args.config or default_config()
         if args.operation == 'setup':

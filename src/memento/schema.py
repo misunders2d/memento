@@ -64,7 +64,8 @@ _SCHEMA = (
     'CREATE INDEX edge_dst ON edge_versions(dst,rel)',
     """CREATE TABLE vector_model (
        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-       model_id TEXT NOT NULL, revision TEXT NOT NULL, dimensions INTEGER NOT NULL) STRICT""",
+       model_id TEXT NOT NULL, revision TEXT NOT NULL, dimensions INTEGER NOT NULL,
+       text_encoding INTEGER NOT NULL DEFAULT 0 CHECK(text_encoding IN (0,1))) STRICT""",
     """CREATE TABLE vector_items (
        seq INTEGER PRIMARY KEY, target TEXT NOT NULL, kind TEXT NOT NULL,
        version INTEGER NOT NULL, UNIQUE(target,kind,version)) STRICT""",

@@ -1,4 +1,6 @@
 import json
+import base64
+import hashlib
 import asyncio
 import os
 from contextlib import asynccontextmanager
@@ -468,6 +470,23 @@ from which you fetched this guide, not the public product website.
    alone is not a connected result. Report any actual permission/reload blocker
    precisely instead of claiming success.
 
+Durable client updates are explicit, never automatic:
+Run: memento agent update HARNESS
+Use the same --config PATH and --native-config-dir PATH if installation used
+custom locations. Update reads the exact existing private service URL; it has no
+--url option and never retargets the installation. It preserves private config,
+client identity, client/server role, outbox/cursors, native settings and timers.
+The whole runner/bridge/extension bundle is validated before any replacement.
+Each file is published atomically, with the standalone runner last. This is not
+a single whole-installation transaction: rerun update after an interruption to
+finish the cutover. A failed download leaves installed code unchanged.
+The existing standalone runner path and its command symlink stay the same.
+Update never discovers models, changes logins, activates timers or restarts an
+active session. Use supported native reload or a fresh session to load new code;
+Codex hook trust remains a human decision. With no command link, use:
+python3 ~/.local/share/memento/runner.py agent update HARNESS
+If a release changes hook or MCP definitions, rerun agent add for that harness.
+
 Google Drive is optional and service-wide, not a separate grant for each agent.
 Native setup, a healthy API, the public website and Google branding do not mean
 Drive is connected. Complete these steps when the human requests Drive:
@@ -502,6 +521,17 @@ Drive is connected. Complete these steps when the human requests Drive:
     def bridge_source():
         return FileResponse(Path(__file__).with_name('bridge.py'), media_type='text/x-python',
                             filename='memento-bridge.py')
+
+    @app.get('/client-release')
+    def client_release():
+        # Same private service/TLS boundary as /runner; no credentials or data.
+        files = {}
+        for name in ('runner.py', 'bridge.py', 'native_pi.ts', 'native_omp.ts', 'native_shared.ts'):
+            content = Path(__file__).with_name(name).read_bytes()
+            files[name] = {'content': base64.b64encode(content).decode('ascii'),
+                           'sha256': hashlib.sha256(content).hexdigest()}
+        return Response(json.dumps({'format': 1, 'files': files}), media_type='application/json',
+                        headers={'Cache-Control': 'no-store'})
 
     @app.get('/integrations/{agent}')
     def native_extension(agent: Literal['pi', 'omp', 'shared']):

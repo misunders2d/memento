@@ -35,6 +35,10 @@ async def serve_admin(graph, data_dir: Path, services):
                 if services.cold is None:
                     raise ValueError('Drive cold storage is not configured')
                 result = await asyncio.to_thread(services.cold.backup)
+            elif request['operation'] == 'export':
+                from .portable import export_archive
+                result = await asyncio.to_thread(export_archive, data_dir, Path(request['output']),
+                                                 cold=services.cold)
             elif request['operation'] in ('approve', 'reject'):
                 result = await asyncio.to_thread(graph._decide_review,
                     command_id=request['command_id'], actor=f'human:uid:{uid}',
@@ -74,19 +78,21 @@ def _request(data_dir, request):
         client.settimeout(30)
         client.connect(str(data_dir / 'admin.sock'))
         client.sendall(json.dumps(request).encode() + b'\n')
-        if request['operation'] == 'backup':
-            # A verified snapshot and Drive upload may exceed the decision timeout.
+        if request['operation'] in ('backup', 'export'):
+            # Verified snapshots, downloads and uploads may exceed decision timeouts.
             client.settimeout(None)
         with client.makefile('rb') as response:
             return json.loads(response.readline(4 * 1024 * 1024))
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Human-only Memento review console')
+    parser = argparse.ArgumentParser(description='Human-only Memento review and portable export console')
     parser.add_argument('--data-dir', type=Path, required=True)
     commands = parser.add_subparsers(dest='operation', required=True)
     commands.add_parser('list')
     commands.add_parser('backup')
+    export = commands.add_parser('export', help='Export all evidence and payloads as a private plaintext archive')
+    export.add_argument('--output', type=Path, required=True, help='New file in an owner-private directory')
     for operation in ('approve', 'reject'):
         command = commands.add_parser(operation)
         command.add_argument('proposal_id')
@@ -98,7 +104,15 @@ def main():
     forget.add_argument('--command-id', default=None)
     args = parser.parse_args()
     request = {'operation': args.operation}
-    if args.operation not in ('list', 'backup'):
+    if args.operation == 'export':
+        if not sys.stdin.isatty():
+            parser.error('Plaintext archive export requires an interactive human terminal')
+        output = args.output.absolute()
+        expected = f'export private archive to {output}'
+        if input(f'This plaintext file contains ALL private memory. Type {expected!r} to confirm: ') != expected:
+            parser.exit(1, 'Not confirmed; nothing changed.\n')
+        request['output'] = str(output)
+    elif args.operation not in ('list', 'backup'):
         if not sys.stdin.isatty():
             parser.error('Administrative decisions require an interactive human terminal')
         if args.operation == 'forget':

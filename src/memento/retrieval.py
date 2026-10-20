@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from threading import Event, RLock, Thread
@@ -57,16 +58,59 @@ class Retrieval:
             db = self.store._db
             db.execute('BEGIN IMMEDIATE')
             try:
+                if 'text_encoding' not in {column['name'] for column in db.execute('PRAGMA table_info(vector_model)')}:
+                    db.execute('ALTER TABLE vector_model ADD COLUMN text_encoding INTEGER NOT NULL DEFAULT 0')
                 old = db.execute('SELECT model_id,revision,dimensions FROM vector_model').fetchone()
                 signature = (MODEL_ID, MODEL_REVISION, EMBED_DIM)
                 if old is None:
-                    db.execute('INSERT INTO vector_model VALUES (1,?,?,?)', signature)
+                    db.execute('''INSERT INTO vector_model(singleton,model_id,revision,dimensions,text_encoding)
+                        VALUES (1,?,?,?,1)''', signature)
                 elif tuple(old) != signature:
                     raise RuntimeError('Embedding model differs from the index; explicit reindex required')
+                if db.execute('SELECT text_encoding FROM vector_model').fetchone()[0] == 0:
+                    self._upgrade_text_encoding()
+                    db.execute('UPDATE vector_model SET text_encoding=1')
                 db.execute('COMMIT')
             except BaseException:
                 db.execute('ROLLBACK')
                 raise
+
+    def _upgrade_text_encoding(self):
+        """Re-encode legacy control-token text once; keep all raw data and vector IDs."""
+        db = self.store._db
+        tokens = getattr(self.model.tokenizer, 'all_special_tokens', ())
+        if not tokens:
+            return
+        special = re.compile('|'.join(re.escape(token) for token in tokens))
+        rows = db.execute('''SELECT i.seq,CASE i.kind
+            WHEN 'node' THEN n.text WHEN 'candidate' THEN c.text
+            WHEN 'episode' THEN substr(e.text,x.start+1,x.end-x.start)
+            WHEN 'segment' THEN s.text END AS text
+            FROM vector_items i
+            LEFT JOIN node_versions n ON i.kind='node' AND n.id=i.target AND n.version=i.version
+            LEFT JOIN candidates c ON i.kind='candidate' AND c.id=i.target
+            LEFT JOIN episode_chunks x ON i.kind='episode' AND x.id=i.target
+            LEFT JOIN episodes e ON e.id=x.episode_id
+            LEFT JOIN segments s ON i.kind='segment' AND s.id=i.target
+            WHERE i.kind<>'segment' OR s.modality='text' ''').fetchall()
+        for row in rows:
+            if row['text'] is not None and special.search(row['text']):
+                vector = embed_texts(self.model, ['title: none | text: ' + row['text']])[0]
+                if not np.isfinite(vector).all() or not np.isclose(np.linalg.norm(vector), 1, atol=0.001):
+                    raise ValueError('Invalid literal-text migration embedding')
+                db.execute('UPDATE memory_vectors SET embedding=? WHERE rowid=?', (vector.tobytes(), row['seq']))
+        # Retry the fixed failure class now, but only the normal worker may resolve it.
+        for failure in db.execute('SELECT target,version FROM index_failures WHERE resolved=0').fetchall():
+            row = db.execute(f'''WITH indexable AS ({_INDEXABLE})
+                SELECT * FROM indexable WHERE id=? AND version=?''', tuple(failure)).fetchone()
+            if row is None:
+                continue
+            text = row['text']
+            if row['kind'] == 'episode':
+                text = db.execute('SELECT substr(text,?,?) FROM episodes WHERE id=?',
+                    (row['start'] + 1, row['end'] - row['start'], row['episode_id'])).fetchone()[0]
+            if special.search(text):
+                db.execute('UPDATE index_failures SET next_attempt=0 WHERE target=? AND version=?', tuple(failure))
 
     def prepare_episodes(self, limit=2):
         with self.store._mutex:

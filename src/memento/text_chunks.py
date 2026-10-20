@@ -16,7 +16,7 @@ def chunks(text: str, tokenizer, size: int = 128, overlap: int = 16) -> list[Tex
     if not text.strip():
         return []
     offsets = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True,
-                        truncation=False)['offset_mapping']
+                        truncation=False, split_special_tokens=True)['offset_mapping']
     if not offsets:
         return [TextChunk(0, len(text), text)]
     out = []

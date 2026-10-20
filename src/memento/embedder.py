@@ -24,6 +24,24 @@ IMAGE_BATCH = 4
 AUDIO_BATCH = 2
 
 
+def _literal_text_processor(backbone):
+    """Keep ST's preprocessing, but never interpret plain text as media markup."""
+    native = backbone._call_multimodal_processor
+
+    def process(modality, processor_inputs, modality_kwargs, common_kwargs):
+        if modality != 'text':
+            return native(modality, processor_inputs, modality_kwargs, common_kwargs)
+        # Called under tokenization_lock, also held by the passage chunker.
+        # The native media path keeps the tokenizer's default special-token mode.
+        kwargs = {**modality_kwargs['text'], **common_kwargs, 'split_special_tokens': True}
+        features = backbone.tokenizer(processor_inputs['text'], **kwargs)
+        for name in backbone.processor.unused_input_names:
+            features.pop(name, None)
+        return features
+
+    return process
+
+
 def load_model(model_id: str, revision: str, *, text_only: bool) -> SentenceTransformer:
     import torch
     # One CPU thread in each of the bounded foreground/background lanes avoids
@@ -47,8 +65,14 @@ def load_model(model_id: str, revision: str, *, text_only: bool) -> SentenceTran
     # its vectors drift from an fp32 index); the model card forbids float16.
     # Text-only query vectors are bit-identical to full-model query vectors (verified).
     config_kwargs = {"vision_config": None, "audio_config": None} if text_only else None
-    return _CPUModel(model_id, revision=revision, device="cpu",
-                     model_kwargs={"dtype": torch.float32}, config_kwargs=config_kwargs).eval()
+    model = _CPUModel(model_id, revision=revision, device="cpu",
+                      model_kwargs={"dtype": torch.float32}, config_kwargs=config_kwargs).eval()
+    backbone = model[0]
+    # Chat auto-conversion bypasses text dispatch. Keep explicit modalities explicit;
+    # the pinned model's text/image/audio tensors and vectors are identical either way.
+    backbone.modality_config.pop('message', None)
+    backbone._call_multimodal_processor = _literal_text_processor(backbone)
+    return model
 
 
 def _unit_rows(v: np.ndarray) -> np.ndarray:
