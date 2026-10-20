@@ -342,6 +342,29 @@ def test_automatic_keeps_factual_candidates_but_not_unconsolidated_experiences(r
     assert result[0]['confirmed'] is False and result[0]['tier'] == 'candidate'
 
 
+@pytest.mark.parametrize('tier', ['candidate', 'durable'])
+@pytest.mark.parametrize('type,eligible', [('knowledge', True), ('decision', True), ('experience', False)])
+def test_personal_factual_control_type_preserves_evidence_and_automatic_eligibility(retrieval, tier, type, eligible):
+    from memory_acceptance import FACTUAL_SCOPE_CASES
+    r = retrieval
+    text = next(case['text'] for case in FACTUAL_SCOPE_CASES if case['id'] == 'personal_fact')
+    if tier == 'candidate':
+        target, _ = candidate(r, text, type=type, scope=['personal'])
+        r._put(target, 'candidate', 1, np.eye(1, 768, dtype=np.float32)[0])
+    else:
+        target, _ = assertion(r, text, type=type, scope=['personal'])
+        index(r, target, .99)
+    explicit = next(hit for hit in r.recall('Where is the spare house key?', scope='personal') if hit['id'] == target)
+    evidence = explicit['evidence'][0]
+    raw = r.store.get(evidence['episode_id'])
+    assert raw['text'][evidence['start']:evidence['end']] == text
+    automatic = r.recall('Where is the spare house key?', automatic=True, scope='personal')
+    assert [hit['id'] for hit in automatic] == ([target] if eligible else [])
+    if eligible:
+        assert automatic[0]['scope'] == ['personal']
+        assert automatic[0]['evidence'][0]['episode_id'] == raw['id']
+
+
 def test_index_status_counts_current_units_failures_and_unprepared_sources(retrieval):
     r = retrieval
     ready, _ = assertion(r, 'The cobalt release checklist is approved.')
@@ -467,7 +490,7 @@ def test_one_invalid_embedding_does_not_block_other_assertions(retrieval, monkey
     assert r.store._db.execute('SELECT resolved FROM index_failures WHERE target=?', (bad,)).fetchone()[0] == 0
 
 
-def candidate(r, text, *, type='knowledge', kind='memory'):
+def candidate(r, text, *, type='knowledge', kind='memory', scope=None):
     key = uuid4().hex
     episode, _ = r.store.capture(dict(source='candidate-fixture', event_id=key, conversation_id='c',
         kind='user', text=text, occurred_at='2000-01-01T00:00:00+00:00', metadata={}))
@@ -477,7 +500,7 @@ def candidate(r, text, *, type='knowledge', kind='memory'):
             (key, commit, episode['id'], 'extract-v1', 'fixture-model', '[]', '[]', datetime.now(timezone.utc).isoformat()))
         r.store._db.execute('INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
             (target, key, kind, type, text, 'Explicit source candidate', None, None, .8,
-             None, None, json.dumps(['professional'])))
+             None, None, json.dumps(scope or ['professional'])))
         r.graph._evidence(target, 1, [dict(episode_id=episode['id'], quote=text)])
         return dict(id=target)
     r.graph._command(key, 'fixture', 'Create provenance-backed candidate fixture', dict(op='extract-fixture'), create)

@@ -1,7 +1,7 @@
 """Bounded opt-in real-model/native acceptance; never part of the ordinary suite.
 
-Run ``python tests/memory_acceptance.py --help``. All generated evidence lives in
-an isolated temporary service. No native installation, timer, consent or live
+Run ``python tests/memory_acceptance.py --help``. Generated evidence stays in
+isolated temporary work; factual-scope needs no service. No installation, timer, consent or live
 configuration is changed. Native generation uses the selected CLI's own login.
 """
 
@@ -85,6 +85,84 @@ NATIVE_TRANSFER_QUERIES = [
     dict(**{key: value for key, value in PROJECT_QUERIES[0].items() if key != 'expected'},
          expected_applicable=False),
 ]
+
+
+# Frozen before native generation. The first case reproduces a subject in the
+# source context outside a compact numerical quote; no private source is copied.
+FACTUAL_SCOPE_CASES = [
+    dict(id='qualified_product', kind='tool', text=(
+        'Retrieved tracker issue.\nProject: Juniper Archive\nRelease: 4.2\n'
+        'The archive constraints below apply only to signed offline snapshots. '
+        'Online snapshots use a different policy that is not specified here.\n'
+        'Issue description: Each archive chunk contains at most 50 records and '
+        'at most 4 MiB of encoded payload.'),
+        required=['juniper archive', '4.2', 'signed', 'offline', '50', '4 mib'], forbidden=[]),
+    dict(id='missing_subject', kind='tool', text=(
+        'Archive chunks contain at most 50 records and at most 4 MiB of encoded payload. '
+        'No product, release or snapshot condition is identified in this result.'),
+        required=['50', '4 mib'], forbidden=['juniper', '4.2', 'signed', 'offline']),
+    dict(id='personal_fact', kind='user', text='I keep my spare house key in the blue tin.',
+        required=['spare', 'key', 'blue tin'], forbidden=['juniper', '4.2', 'signed', 'offline']),
+]
+
+
+def factual_scope_report(output):
+    from memento.extraction import BatchDrafts, MEMORY_TYPES, source_span
+    drafts = BatchDrafts.model_validate(output)
+    windows = {item.id: item for item in drafts.windows}
+    if len(drafts.windows) != len(FACTUAL_SCOPE_CASES) or set(windows) != {case['id'] for case in FACTUAL_SCOPE_CASES}:
+        raise ValueError('candidate_window_coverage_invalid')
+    cases = []
+    for case in FACTUAL_SCOPE_CASES:
+        facts = []
+        for candidate in windows[case['id']].candidates:
+            start, end = source_span(case['text'], candidate.quote, candidate.occurrence)
+            if candidate.kind == 'memory':
+                if candidate.type not in MEMORY_TYPES:
+                    raise ValueError('candidate_memory_type_invalid')
+                facts.append(dict(type=candidate.type, text=candidate.text, scope=candidate.scope,
+                                  quote=candidate.quote, start=start, end=end))
+        # The unnamed case checks invention, not extraction yield. Both factual
+        # controls require knowledge/decision: incidents without consolidated
+        # behavior are intentionally ineligible for automatic recall.
+        complete = case['id'] == 'missing_subject' or any(
+            all(term in fact['text'].casefold() for term in case['required'])
+            and (case['id'] != 'personal_fact' or fact['scope'] == ['personal'])
+            and fact['type'] in ('knowledge', 'decision')
+            for fact in facts)
+        invented = any(term in candidate.text.casefold() for term in case['forbidden']
+                       for candidate in windows[case['id']].candidates)
+        cases.append(dict(id=case['id'], facts=facts, abstained=not windows[case['id']].candidates, retained_scope=complete,
+                          invented_fixture_context=invented, passed=complete and not invented))
+    return dict(cases=cases, passed=all(case['passed'] for case in cases))
+
+
+def factual_scope(agent, report):
+    """One native extraction batch, using the unchanged tool-free safety adapter."""
+    from memento.extraction import INSTRUCTION, BatchDrafts
+    from memento.runner import check_cli, encode, parse_result, preset_flags, run_process
+    windows = [dict(id=case['id'], episode_id=case['id'], source='synthetic-factual-scope',
+                    kind=case['kind'], start=0, end=len(case['text']), text=case['text'])
+               for case in FACTUAL_SCOPE_CASES]
+    payload = dict(instruction=INSTRUCTION, input=dict(windows=windows), schema=BatchDrafts.model_json_schema())
+    report.update(frozen_cases=FACTUAL_SCOPE_CASES, task=payload, native_agent=agent,
+                  requested_model='native default', requested_effort='native default',
+                  comparison='Single post-change batch; historical failure is not a paired comparison')
+    with tempfile.TemporaryDirectory(prefix='memento-factual-scope-') as directory:
+        argv = check_cli([agent], agent) + preset_flags(agent, directory)
+        report['argv'] = argv
+        started = time.monotonic()
+        raw = run_process(argv, encode(payload), timeout=300, cwd=directory)
+        report.update(elapsed_seconds=time.monotonic() - started,
+                      native_events=[json.loads(line) for line in raw.splitlines() if line.strip()])
+        output, model, usage = parse_result(raw, agent)
+    report.update(output=output, reported_model=model, usage=usage)
+    message = next(event['message'] for event in reversed(report['native_events'])
+                   if event.get('type') == 'message_end' and event.get('message', {}).get('role') == 'assistant')
+    report['reported_effort'] = message.get('thinkingLevel')
+    report.update(factual_scope_report(output))
+    if not report['passed']:
+        raise RuntimeError('Native factual-scope controls failed; inspect exact output and evidence')
 
 
 def calibration_report(documents, queries, scores, *, fixed_threshold=None):
@@ -500,7 +578,7 @@ def learning(service, agent, report, *, directory, store, retrieval=None,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['calibrate', 'learning'])
+    parser.add_argument('mode', choices=['calibrate', 'learning', 'factual-scope'])
     parser.add_argument('--agent', choices=['pi', 'omp'], default='pi')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--calibrate', action='store_true', help='Reuse the isolated service model for frozen calibration first')
@@ -518,6 +596,8 @@ def main():
             from memento.embedder import load_model
             from memento.retrieval import MODEL_ID, MODEL_REVISION
             report['calibration'] = calibrate(load_model(MODEL_ID, MODEL_REVISION, text_only=False))
+        elif args.mode == 'factual-scope':
+            factual_scope(args.agent, report)
         else:
             import uvicorn
             from memento.api import create_app

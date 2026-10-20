@@ -25,6 +25,54 @@ def drafts():
         draft('link2', 'relation', 'related_to', 'Связано с Mellanni', 'Связи: Сергей → Mellanni; Memory → Mellanni.', 'project', 'org')]
 
 
+@pytest.mark.parametrize('defect', [None, 'abstain', 'personal_experience', 'personal_decision',
+    'subject', 'version', 'condition', 'record_limit', 'byte_limit', 'qualified_experience',
+    'invented_subject', 'personal_key', 'personal_location', 'personal_scope', 'invalid_type', 'quote'])
+def test_frozen_native_factual_scope_controls_detect_loss_and_invention(defect):
+    from memory_acceptance import FACTUAL_SCOPE_CASES, factual_scope_report
+    texts = [
+        'Juniper Archive 4.2 limits signed offline snapshots to 50 records and 4 MiB per archive chunk.',
+        'Archive chunks contain at most 50 records and at most 4 MiB of encoded payload.',
+        'The user keeps their spare house key in the blue tin.',
+    ]
+    output = dict(windows=[])
+    for case, text in zip(FACTUAL_SCOPE_CASES, texts):
+        candidate = draft(case['id'], 'memory', 'knowledge', text, case['text'])
+        if case['id'] == 'personal_fact':
+            candidate['scope'] = ['personal']
+        output['windows'].append(dict(id=case['id'], candidates=[candidate]))
+    if defect in ('subject', 'version', 'condition', 'record_limit', 'byte_limit'):
+        remove = dict(subject='Juniper Archive', version='4.2', condition='signed offline',
+                      record_limit='50', byte_limit='4 MiB')[defect]
+        output['windows'][0]['candidates'][0]['text'] = texts[0].replace(remove, '')
+    elif defect == 'abstain':
+        output['windows'][1]['candidates'] = []
+    elif defect in ('personal_experience', 'personal_decision'):
+        output['windows'][2]['candidates'][0]['type'] = defect.removeprefix('personal_')
+    elif defect == 'qualified_experience':
+        output['windows'][0]['candidates'][0]['type'] = 'experience'
+    elif defect == 'invented_subject':
+        output['windows'][1]['candidates'][0]['text'] = 'Juniper Archive: ' + texts[1]
+    elif defect in ('personal_key', 'personal_location'):
+        output['windows'][2]['candidates'][0]['text'] = texts[2].replace(
+            'key' if defect == 'personal_key' else 'blue tin', '')
+    elif defect == 'personal_scope':
+        output['windows'][2]['candidates'][0]['scope'] = ['professional']
+    elif defect == 'invalid_type':
+        output['windows'][2]['candidates'][0]['type'] = 'fact'
+        with pytest.raises(ValueError, match='candidate_memory_type_invalid'):
+            factual_scope_report(output)
+        return
+    elif defect == 'quote':
+        output['windows'][0]['candidates'][0]['quote'] = 'Invented evidence'
+        with pytest.raises(ValueError, match='candidate_quote_not_in_source'):
+            factual_scope_report(output)
+        return
+    result = factual_scope_report(output)
+    assert result['passed'] is (defect in (None, 'abstain', 'personal_decision'))
+    assert len(result['cases']) == 3
+
+
 @pytest.fixture
 def extraction(tmp_path):
     store = Store(tmp_path)
