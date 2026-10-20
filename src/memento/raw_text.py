@@ -7,7 +7,7 @@ import re
 
 MIME = 'application/x-memento-raw-run'
 KINDS = ('native_record', 'native_live_record', 'native_hook')
-OPAQUE = re.compile(r'[A-Za-z0-9+/]{65536,}={0,2}')
+OPAQUE = re.compile(r'([A-Za-z0-9+/]+)={0,2}')
 _SHA = re.compile(r'[0-9a-f]{64}')
 
 
@@ -34,6 +34,8 @@ def elide(text, blobs):
     skeleton, references, artifacts = [], [], []
     cursor = 0
     for match in OPAQUE.finditer(text):
+        if match.end(1) - match.start(1) < 65536:
+            continue
         info = blobs.put(io.BytesIO(match.group().encode('ascii')))
         skeleton.append(text[cursor:match.start()])
         references.append([match.start(), info['sha256'], match.end() - match.start()])

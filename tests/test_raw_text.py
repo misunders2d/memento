@@ -6,6 +6,8 @@ import hashlib
 import json
 import re
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,6 +40,57 @@ def storage(tmp_path):
         yield store, Graph(store), manager
     finally:
         store.close()
+
+
+def test_subthreshold_raw_runs_capture_and_retry_complete_within_subprocess_deadline(tmp_path):
+    text = json.dumps({'type': 'native_record', 'content': ['A' * (60 * 1024)] * 4})
+    script = '''
+import json
+from pathlib import Path
+import sys
+from memento.store import Store
+payload = json.load(sys.stdin)
+store = Store(Path(sys.argv[1]))
+try:
+    captured, created = store.capture(payload)
+    assert created and store.get(captured['id'])['text'] == payload['text']
+    assert store.capture(payload) == (captured, False)
+    row = store._db.execute('SELECT text,text_runs,text_sha256 FROM episodes').fetchone()
+    assert tuple(row) == (payload['text'], None, None)
+    assert store._db.execute('SELECT count(*) FROM blobs').fetchone()[0] == 0
+    print(json.dumps({'bytes': len(payload['text'].encode()), 'inline': True, 'lossless_retry': True}))
+finally:
+    store.close()
+'''
+    result = subprocess.run([sys.executable, '-c', script, str(tmp_path / 'store')],
+                            input=json.dumps(episode(text)), text=True, capture_output=True,
+                            check=True, timeout=5)
+    assert json.loads(result.stdout) == {'bytes': 245814, 'inline': True, 'lossless_retry': True}
+
+
+@pytest.mark.parametrize('alphabet_length,padding', [
+    (65535, ''), (65535, '='), (65535, '=='), (65536, ''), (65536, '='),
+    (65536, '=='), (65536, '==='), (65537, '==')])
+def test_raw_run_threshold_excludes_padding_and_preserves_exact_unicode_offsets(storage, alphabet_length, padding):
+    store, _, _ = storage
+    prefix, suffix = 'Ω😀\r\n[', ']\r\noriginal end'
+    alphabet = 'A' * (alphabet_length - 2) + '+/'
+    text = prefix + alphabet + padding + suffix
+    payload = episode(text)
+    captured, _ = store.capture(payload)
+    row = store._db.execute('SELECT text,text_runs,text_sha256 FROM episodes').fetchone()
+    if alphabet_length < 65536:
+        assert tuple(row) == (text, None, None)
+        assert store._db.execute('SELECT count(*) FROM blobs').fetchone()[0] == 0
+    else:
+        offloaded = alphabet + padding[:2]
+        sha = hashlib.sha256(offloaded.encode('ascii')).hexdigest()
+        assert runs(row['text_runs']) == [[len(prefix), sha, len(offloaded)]]
+        assert row['text'] == prefix + padding[2:] + suffix
+        assert row['text_sha256'] == hashlib.sha256(text.encode('utf-8')).hexdigest()
+        assert store.blobs.path(sha).read_bytes() == offloaded.encode('ascii')
+    assert store.get(captured['id'])['text'] == text
+    assert store.capture(payload) == (captured, False)
 
 
 def test_two_envelopes_share_exact_run_and_reconstruct_original_unicode(storage):
