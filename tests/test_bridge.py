@@ -3,7 +3,10 @@ import json
 import base64
 import builtins
 import io
+import http.server
 from http.client import BadStatusLine
+import threading
+import time
 import tomllib
 import pytest
 
@@ -810,6 +813,61 @@ def test_shipped_quote_flush_reconciles_and_uploads_only_selected_conversation(t
     spool = spool_at(tmp_path)
     assert pending(spool) and all(part['conversation_id'] == 'other' for part in pending(spool))
     spool.close()
+
+
+def test_slow_http_capture_is_retained_by_background_then_explicit_retry_acknowledges_same_event(tmp_path):
+    from memento.store import Store
+
+    store = Store(tmp_path / 'service')
+    accepted = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            assert self.path == '/episodes'
+            payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            episode, created = store.capture(payload)
+            accepted.append((episode['id'], created))
+            time.sleep(2.1)
+            try:
+                body = bridge.encode({'id': episode['id']})
+                self.send_response(201 if created else 200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass  # The background caller has already timed out.
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .05}, daemon=True)
+    thread.start()
+    try:
+        spool = spool_at(tmp_path, url=f'http://127.0.0.1:{server.server_port}')
+        config, config_path = spool.config, spool.config_path
+        spool.episode('omp', 'conversation', 'stable-event', 'user', 'Synthetic slow capture. ' * 6000)
+        spool.commit()
+        original = pending(spool)
+        spool.close()
+        result = bridge.upload(config_path, config, background=True)
+        assert result['pending'] == 1 and result['conflicts'] == 0
+        assert result['error']['category'] == 'timeout'
+        spool = bridge.Spool(config_path, config)
+        assert pending(spool) == original
+        spool.close()
+        started = time.monotonic()
+        assert bridge.upload(config_path, config) == {'pending': 0, 'conflicts': 0}
+        assert time.monotonic() - started >= 2
+        assert len(accepted) == 2 and accepted[0][0] == accepted[1][0]
+        assert [created for _, created in accepted] == [True, False]
+        assert store._db.execute('SELECT count(*) FROM episodes').fetchone()[0] == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        store.close()
 
 
 @pytest.mark.parametrize('background', [False, True])

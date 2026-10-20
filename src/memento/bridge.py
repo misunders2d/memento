@@ -598,7 +598,7 @@ def upload(config_path, config, *, background=False, paths=()):
                         break
                     identifier, endpoint, raw, content_type = row
                     try:
-                        timeout = min(60, 2 + len(raw) / MAX_BODY) if content_type else 2
+                        timeout = min(60, 2 + len(raw) / MAX_BODY) if content_type else (2 if background else 15)
                         if deadline is not None:
                             remaining = max(.1, deadline - time.monotonic())
                             # Reserve time for text queued during a failed blob

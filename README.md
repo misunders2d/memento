@@ -319,6 +319,8 @@ Use `--agent omp`, `claude` or `codex` for other histories. A matching default c
 
 An unsuccessful upload also reports a sanitized `error` category (`timeout`, `http`, `network`, `validation` or `lock`), with an HTTP status and local outbox ID when available. The result excludes message contents, credentials and server response bodies. Keep the result when investigating; a healthy service alone does not explain an upload failure. Address the reported cause, then retry the same upload without importing again. Conflicts require investigation; retrying does not overwrite the existing event.
 
+Explicit text uploads allow up to 15 seconds per request, matching other foreground commands, so a busy service can finish acknowledging a record. Background hooks keep their two-second text timeout and bounded total runtime.
+
 Large imports checkpoint complete records and journal cursors together, releasing the capture-spool writer lock between batches and files. Their `records_added` count excludes concurrent live capture. Claude workflow journals retain their own conversation identity rather than being attributed to the first agent they mention. Referenced artifacts outside the selected histories require an explicit `--artifact-root DIR`; missing or unsupported material is reported. For OMP's native blob references, include its blob directory:
 
 ```sh
