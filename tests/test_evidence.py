@@ -250,4 +250,4 @@ def test_recent_activity_without_query_uses_source_instants_and_bounded_raw_exce
     assert all('metadata' not in hit and 'scope' not in hit for hit in hits)
     assert len(response.content) < 6000
     assert len(client.get(f"/episodes/{ids['undated']}").json()['text']) > 4000
-    assert client.get('/recall', params=dict(params, scope='personal')).json() == {'memories': []}
+    assert client.get('/recall', params=dict(params, scope='personal')).json()['memories'] == []

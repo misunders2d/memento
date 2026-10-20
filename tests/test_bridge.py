@@ -170,6 +170,106 @@ def test_healthy_empty_recall_is_not_reported_as_unavailable(tmp_path, monkeypat
     spool.close()
 
 
+@pytest.mark.parametrize('installed,offered', [
+    (None, 'b' * 64), ('unknown', 'b' * 64), ('a' * 64, 'a' * 64),
+    ('a' * 64, None), ('a' * 64, 123), ('a' * 64, 'B' * 64),
+    ('a' * 64, 'b' * 63), ('a' * 64, 'b' * 65), ('a' * 64, 'b' * 64 + '\n'),
+])
+def test_client_notice_skips_matching_unknown_or_malformed_revisions(tmp_path, monkeypatch, installed, offered):
+    spool = spool_at(tmp_path)
+    monkeypatch.setattr(bridge, 'CLIENT_REVISION', installed)
+    monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: {'memories': [], 'client_revision': offered})
+    assert bridge.passive(spool, 'session', 'ordinary request') == {'context': '', 'shown': []}
+    assert spool.db.execute('SELECT count(*) FROM recall_cache WHERE conversation=?',
+                            (bridge._UPDATE_NOTICE_KEY,)).fetchone()[0] == 0
+    spool.close()
+
+
+def test_client_notice_is_local_once_per_offered_revision_and_never_memory_cache(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    monkeypatch.setattr(bridge, 'CLIENT_REVISION', 'a' * 64)
+    response = {'memories': [{'id': 'fact', 'text': 'A useful supported synthetic fact.'}],
+                'client_revision': 'b' * 64, 'update_command': 'arbitrary-server-command'}
+    calls = []
+    def recall(*args, **kwargs):
+        calls.append(args[1])
+        return response
+    monkeypatch.setattr(bridge, 'http', recall)
+    first = bridge.passive(spool, 'first-session', 'ordinary request')
+    notice = first['update_notice']
+    assert 'memento agent update claude --config ' in notice and spool.config_path in notice
+    assert '--native-config-dir' in notice and 'When asked' in notice
+    assert 'arbitrary-server-command' not in notice and 'newer' not in notice
+    assert notice not in first['context'] and first['shown'] == ['fact']
+    assert spool.db.execute('SELECT context FROM recall_cache WHERE conversation=?',
+                            ('first-session',)).fetchone()[0] == first['context']
+    spool.commit()
+    config_path, config = spool.config_path, spool.config
+    spool.close()
+    spool = bridge.Spool(config_path, config)
+    assert 'update_notice' not in bridge.passive(spool, 'second-session', 'other request')
+    response['client_revision'] = 'c' * 64
+    assert 'update_notice' in bridge.passive(spool, 'second-session', 'another request')
+    assert 'update_notice' not in bridge.passive(spool, 'third-session', 'third request')
+    assert len(calls) == 4 and all(path.startswith('/recall?') for path in calls)
+    assert spool.db.execute('SELECT count(*) FROM recall_cache WHERE conversation=?',
+                            (bridge._UPDATE_NOTICE_KEY,)).fetchone()[0] == 1
+    spool.close()
+
+
+@pytest.mark.parametrize('failure', ['outage', 'error_body', 'malformed_body'])
+def test_failed_recall_does_not_consume_or_replay_update_notice(tmp_path, monkeypatch, failure):
+    spool = spool_at(tmp_path)
+    monkeypatch.setattr(bridge, 'CLIENT_REVISION', 'a' * 64)
+    response = {'memories': [{'id': 'fact', 'text': 'Supported cached evidence.'}], 'client_revision': 'b' * 64}
+    def recall(*_args, **_kwargs):
+        if failure == 'outage':
+            raise OSError('unavailable')
+        return {**response, 'error': 'unavailable'} if failure == 'error_body' else []
+    monkeypatch.setattr(bridge, 'http', recall)
+    failed = bridge.passive(spool, 's', 'ordinary request')
+    assert failed['error'] == 'recall_unavailable' and 'update_notice' not in failed
+    monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: response)
+    success = bridge.passive(spool, 's', 'ordinary request')
+    assert success['update_notice'] and success['shown'] == ['fact']
+    def outage(*_args, **_kwargs):
+        raise OSError('unavailable')
+    monkeypatch.setattr(bridge, 'http', outage)
+    cached = bridge.passive(spool, 's', 'ordinary request')
+    assert cached == {'context': success['context'], 'shown': ['fact'], 'error': 'recall_unavailable'}
+    spool.close()
+
+
+def test_client_notice_claim_is_atomic_across_native_sessions(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    spool = spool_at(tmp_path)
+    path, config = spool.config_path, spool.config
+    spool.close()
+    monkeypatch.setattr(bridge, 'CLIENT_REVISION', 'a' * 64)
+    monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: {'memories': [], 'client_revision': 'b' * 64})
+    def recall(index):
+        local = bridge.Spool(path, config)
+        try:
+            result = bridge.passive(local, 'session-' + str(index), 'ordinary request')
+            local.commit()
+            return result
+        finally:
+            local.close()
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        results = list(workers.map(recall, range(4)))
+    assert sum('update_notice' in result for result in results) == 1
+    assert all(result['context'] == '' and result['shown'] == [] for result in results)
+
+
+def test_client_notice_that_cannot_fit_is_not_consumed(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    monkeypatch.setattr(bridge, 'CLIENT_REVISION', 'a' * 64)
+    monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: {'memories': [], 'client_revision': 'b' * 64})
+    assert 'update_notice' not in bridge.passive(spool, 's', 'ordinary request', budget=1, notice_in_context=True)
+    assert bridge.passive(spool, 's', 'ordinary request', notice_in_context=True)['update_notice']
+    spool.close()
+
+
 def test_tool_fragment_cap_applies_once_per_original_output(tmp_path):
     spool = spool_at(tmp_path)
     text = '🧠' * 400000
@@ -287,17 +387,18 @@ def test_quote_only_native_save_flushes_only_current_conversation(tmp_path, monk
         'tool': 'remember', 'arguments': {'command': {
             'type': 'knowledge', 'text': 'saved fact', 'scope': ['personal'],
             'evidence': [{'quote': 'exact current quote'}], 'source': 'wrong', 'conversation_id': 'wrong'}}})
-    assert [endpoint for endpoint, _ in calls] == ['/episodes', '/episodes', '/remember']
+    assert [endpoint for endpoint, _ in calls] == ['/episodes', '/remember']
     assert all(body['conversation_id'] == 'current' for _, body in calls)
     assert calls[-1][1]['source'] == 'native:test-device:pi'
     assert calls[-1][1]['evidence'] == [{'quote': 'exact current quote'}]
-    assert [body['conversation_id'] for body in pending(spool)] == ['other']
+    assert [(body['conversation_id'], body['kind']) for body in pending(spool)] == [
+        ('other', 'user'), ('current', 'native_record')]
     spool.close()
 
 
 def test_quote_only_native_save_fails_closed_when_capture_cannot_upload(tmp_path, monkeypatch):
     spool = spool_at(tmp_path)
-    spool.episode('pi', 's', 'user', 'user', 'quote')
+    spool.record('pi', 's', {'id': 'user', 'type': 'message', 'message': {'role': 'user', 'content': 'quote'}})
     calls = []
 
     def offline(config, endpoint, body=None, timeout=1):
@@ -309,7 +410,158 @@ def test_quote_only_native_save_fails_closed_when_capture_cannot_upload(tmp_path
         bridge.native(spool, {'harness': 'pi', 'session_id': 's', 'action': 'tool',
             'tool': 'remember', 'arguments': {'command': {'evidence': [{'quote': 'quote'}]}}})
     assert calls == ['/episodes']
-    assert len(pending(spool)) == 1
+    assert len(pending(spool)) == 2
+    spool.close()
+
+
+def test_quote_flush_ignores_large_backlog_and_uses_latest_eligible_projection(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    unrelated = bridge.encode({'source': 'other-device', 'conversation_id': 'other', 'text': 'unrelated'})
+    spool.db.executemany('INSERT INTO outbox(key,endpoint,body) VALUES(?,?,?)',
+                        ((f'backlog:{index}', '/episodes', unrelated) for index in range(100000)))
+    quote = 'Exact 猫 quote\nwith "punctuation".'
+    for identity, role in (('old', 'user'), ('new', 'assistant')):
+        spool.record('pi', 'current', {'id': identity, 'type': 'message',
+                                     'message': {'role': role, 'content': quote}})
+    newest = json.loads(spool.db.execute('SELECT body FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0])
+    # A raw revision is newer than the matching assistant projection, but does
+    # not emit a second message. Record insertion order must not select "old".
+    spool.record('pi', 'current', {'id': 'old', 'type': 'message',
+                                 'message': {'role': 'user', 'content': quote + ' revised native snapshot'}})
+    spool.record('pi', 'current', {'id': 'echo', 'type': 'message', 'message': {
+        'role': 'assistant', 'content': [{'type': 'toolCall', 'name': 'remember', 'arguments': {'quote': quote}}]}})
+    spool.commit()
+    before = spool.db.execute('SELECT count(*) FROM outbox').fetchone()[0]
+    work = 0
+
+    def bounded_work():
+        nonlocal work
+        work += 1
+        return work > 2000
+
+    uploaded = []
+
+    def accepted(_config, endpoint, body, **_kwargs):
+        assert endpoint == '/episodes' and not spool.db.in_transaction
+        # No selection cursor/read transaction may prevent a concurrent writer.
+        with bridge.sqlite3.connect(spool.path, timeout=.1) as other:
+            other.execute('UPDATE outbox SET state=state WHERE id=1')
+        uploaded.append(body)
+        return {'id': 'actual-ack-id'}
+
+    monkeypatch.setattr(bridge, 'http', accepted)
+    spool.db.set_progress_handler(bounded_work, 100)
+    result = bridge.flush_conversation(spool, 'pi', 'current', [quote])
+    spool.db.set_progress_handler(None, 0)
+    assert uploaded == [newest]
+    assert result == {'status': 'uploaded', 'evidence': [{
+        'quote_index': 0, 'event_id': newest['event_id'], 'episode_id': 'actual-ack-id'}], 'unmatched_quotes': []}
+    assert spool.db.execute('SELECT count(*) FROM outbox').fetchone()[0] == before - 1
+    assert work <= 2000
+    spool.close()
+
+
+def test_quote_flush_finds_all_message_chunks_and_codex_mcp_result_keys(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    monkeypatch.setattr(bridge, 'MAX_BODY', 1024)
+    spool.record('codex', 'current', {'type': 'response_item', 'payload': {
+        'type': 'message', 'role': 'assistant',
+        'content': [{'type': 'output_text', 'text': 'First exact quote.' + 'abcdefghij' * 500 + 'Last exact quote.'}]}},
+        identity='chunked')
+    chunks = [body for body in pending(spool) if body['kind'] == 'assistant']
+    assert len(chunks) > 2
+    spool.record('codex', 'current', {'type': 'event_msg', 'payload': {
+        'type': 'item_completed', 'item': {'type': 'McpToolCall', 'id': 'mcp-item',
+            'server': 'example', 'tool': 'lookup', 'arguments': {},
+            'result': {'content': [{'type': 'text', 'text': 'Actual MCP result evidence.'}]}}}}, identity='mcp')
+    result_body = next(body for body in pending(spool) if body['kind'] == 'tool')
+    # Exact full chunks distinguish the later fragment from the first fragment.
+    quotes = [chunks[0]['text'], chunks[-1]['text'], result_body['text']]
+    uploaded = []
+    monkeypatch.setattr(bridge, 'http', lambda _config, _endpoint, body, **_kwargs:
+                        uploaded.append(body) or {'id': body['event_id']})
+    result = bridge.flush_conversation(spool, 'codex', 'current', quotes)
+    assert result['status'] == 'uploaded' and not result['unmatched_quotes']
+    assert len(result['evidence']) == 3
+    assert result['evidence'][-1]['event_id'] == result_body['event_id']
+    assert any(body['event_id'] == chunks[-1]['event_id'] for body in uploaded)
+    assert all(body['kind'] in ('assistant', 'tool') and body['metadata'].get('evidence_eligible', True)
+               for body in uploaded)
+    spool.close()
+
+
+def test_quote_flush_does_not_claim_unmatched_or_embedded_tool_output_is_uploaded(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    spool.record('claude', 'current', {'type': 'user', 'uuid': 'result', 'message': {'role': 'user', 'content': [
+        {'type': 'tool_result', 'tool_use_id': 't', 'content': 'Embedded tool evidence.'}]}})
+    spool.record('codex', 'current', {'type': 'response_item', 'payload': {
+        'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Injected context.'}],
+        'internal_chat_message_metadata_passthrough': {'content_item_kinds': ['agents_md.instructions']}}},
+        identity='injected')
+    monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: pytest.fail('No eligible pending message matched'))
+    for harness, quote in (('claude', 'Embedded tool evidence.'), ('codex', 'Injected context.')):
+        assert bridge.flush_conversation(spool, harness, 'current', [quote]) == {
+            'status': 'not_found', 'evidence': [], 'unmatched_quotes': [0]}
+    assert len(pending(spool)) == 4
+    spool.close()
+
+
+@pytest.mark.parametrize('harness', ['pi', 'omp', 'claude', 'codex'])
+@pytest.mark.parametrize('tool', ['remember', 'link', 'supersede'])
+def test_mutation_callers_flush_only_unresolved_quotes_without_permission_changes(tmp_path, monkeypatch, harness, tool):
+    spool = spool_at(tmp_path)
+    flushed = []
+    monkeypatch.setattr(bridge, 'flush_conversation', lambda _spool, _harness, _conversation, quotes:
+                        flushed.append(quotes))
+
+    def accepted(_config, endpoint, body, **_kwargs):
+        assert endpoint == '/' + tool and not spool.db.in_transaction
+        return {'id': 'saved'}
+
+    monkeypatch.setattr(bridge, 'http', accepted)
+    command = {'source': bridge.source(spool.config, harness), 'conversation_id': 'current',
+               'evidence': [{'episode_id': 'already-remote', 'quote': 'Remote quote.'}, {'quote': 'Pending quote.'}]}
+    for evidence in (command['evidence'], command['evidence'][:1]):
+        command['evidence'] = evidence
+        flushed.clear()
+        if harness in ('pi', 'omp'):
+            result = bridge.native(spool, {'harness': harness, 'session_id': 'current', 'action': 'tool',
+                'entries': [{'id': 'u', 'role': 'user', 'content': 'Unrelated pending capture.'}],
+                'tool': tool, 'arguments': {'command': command}})
+            assert result == {'id': 'saved'}
+        else:
+            result = bridge.hook(spool, harness, {'hook_event_name': 'PreToolUse', 'session_id': 'current',
+                'tool_name': 'mcp__memento__' + tool, 'tool_use_id': 'call', 'tool_input': {'command': command}})
+            if harness == 'codex':
+                assert result == {}
+            else:
+                assert 'permissionDecision' not in result['hookSpecificOutput']
+                assert result['hookSpecificOutput']['updatedInput']['command']['evidence'] == evidence
+        assert flushed == ([['Pending quote.']] if len(evidence) == 2 else [])
+    spool.close()
+
+
+@pytest.mark.parametrize('failure', ['conflict', 'timeout'])
+def test_quote_flush_failure_retains_exact_projection_and_does_not_save(tmp_path, monkeypatch, failure):
+    spool = spool_at(tmp_path)
+    spool.record('pi', 'current', {'id': 'u', 'role': 'user', 'content': 'Exact pending evidence.'})
+    before = spool.db.execute('SELECT id,body FROM outbox ORDER BY id').fetchall()
+    calls = []
+
+    def failed(_config, endpoint, _body, **_kwargs):
+        calls.append(endpoint)
+        if failure == 'conflict':
+            raise bridge.urllib.error.HTTPError('http://private.invalid', 409, 'private', {}, None)
+        raise TimeoutError('private transport details')
+
+    monkeypatch.setattr(bridge, 'http', failed)
+    with pytest.raises((bridge.urllib.error.HTTPError, TimeoutError)):
+        bridge.native(spool, {'harness': 'pi', 'session_id': 'current', 'action': 'tool',
+            'tool': 'remember', 'arguments': {'evidence': [{'quote': 'Exact pending evidence.'}]}})
+    assert calls == ['/episodes']
+    assert spool.db.execute('SELECT id,body FROM outbox ORDER BY id').fetchall() == before
+    assert spool.db.execute('SELECT state FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0] == (
+        'conflict' if failure == 'conflict' else 'pending')
     spool.close()
 
 
@@ -812,6 +1064,34 @@ def test_shipped_quote_flush_reconciles_and_uploads_only_selected_conversation(t
     assert uploaded and all(body['conversation_id'] == 'selected' for _, body in uploaded)
     spool = spool_at(tmp_path)
     assert pending(spool) and all(part['conversation_id'] == 'other' for part in pending(spool))
+    spool.close()
+
+
+def test_shipped_flush_repeatable_quotes_reports_only_actual_acknowledgements(tmp_path, monkeypatch, capsys):
+    spool = spool_at(tmp_path)
+    path = tmp_path / 'current.jsonl'
+    path.write_bytes(bridge.encode({'id': 'first', 'role': 'user', 'content': 'First exact request.'}) + b'\n')
+    spool.journal(path, 'omp', 'current')
+    config = spool.config_path
+    spool.commit()
+    spool.close()
+    with path.open('ab') as stream:
+        stream.write(bridge.encode({'id': 'second', 'role': 'assistant', 'content': 'Second exact statement.'}) + b'\n')
+    uploaded = []
+    monkeypatch.setattr(bridge, 'http', lambda _config, endpoint, body, **_kwargs:
+                        uploaded.append((endpoint, body)) or {'id': 'ack-' + str(len(uploaded))})
+    args = ['flush-conversation', '--config', config, '--agent', 'omp', '--conversation-id', 'current',
+            '--quote', 'First exact request.', '--quote', 'Second exact statement.', '--quote', 'Absent locally.']
+    assert bridge.main(args) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        'status': 'partial', 'evidence': [
+            {'quote_index': index, 'event_id': body['event_id'], 'episode_id': 'ack-' + str(index + 1)}
+            for index, (_, body) in enumerate(uploaded)], 'unmatched_quotes': [2]}
+    assert [body['kind'] for _, body in uploaded] == ['user', 'assistant']
+    assert bridge.main(args) == 0
+    assert json.loads(capsys.readouterr().out) == {'status': 'not_found', 'evidence': [], 'unmatched_quotes': [0, 1, 2]}
+    spool = spool_at(tmp_path)
+    assert [body['kind'] for body in pending(spool)] == ['native_record', 'native_record']
     spool.close()
 
 

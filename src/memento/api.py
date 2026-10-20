@@ -27,6 +27,22 @@ MAX_CAPTURE_BYTES = 1024 * 1024
 MAX_BLOB_BYTES = 1024 * 1024 * 1024
 
 
+def client_release_assets():
+    """Fingerprint source assets before stamping the served bridge identity."""
+    files = {name: Path(__file__).with_name(name).read_bytes() for name in
+             ('runner.py', 'bridge.py', 'native_pi.ts', 'native_omp.ts', 'native_shared.ts')}
+    hashes = {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}
+    revision = hashlib.sha256(json.dumps(hashes, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    marker = b'CLIENT_REVISION = None'
+    if files['bridge.py'].count(marker) != 1:
+        raise RuntimeError('Client bridge revision marker is missing or ambiguous')
+    files['bridge.py'] = files['bridge.py'].replace(marker, ('CLIENT_REVISION = ' + repr(revision)).encode())
+    release = {'format': 1, 'revision': revision, 'files': {
+        name: {'content': base64.b64encode(content).decode('ascii'),
+               'sha256': hashlib.sha256(content).hexdigest()} for name, content in files.items()}}
+    return revision, files['bridge.py'], json.dumps(release)
+
+
 class BlobResponse(StreamingResponse):
     """Release the already-open reader even if the body never starts."""
 
@@ -173,6 +189,9 @@ class DriveFinishInput(WorkInput):
 
 
 def create_app(data_dir: Path) -> FastAPI:
+    # One immutable bundle per service process; native turns never read/hash files.
+    client_revision, served_bridge, served_release = client_release_assets()
+
     @asynccontextmanager
     async def lifespan(app):
         app.state.store = Store(data_dir)
@@ -479,7 +498,7 @@ def create_app(data_dir: Path) -> FastAPI:
         if q.strip() and since is None and source is None and app.state.retrieval is None:
             raise HTTPException(503, 'Native embedding runtime is disabled')
         try:
-            return {'memories': recall_memories(app.state, q, effort, limit, scope=scope,
+            return {'client_revision': client_revision, 'memories': recall_memories(app.state, q, effort, limit, scope=scope,
                 since=since.isoformat() if since is not None else None, source=source,
                 automatic=automatic, context=context)}
         except ValueError as error:
@@ -542,6 +561,9 @@ from which you fetched this guide, not the public product website.
    precisely instead of claiming success.
 
 Durable client updates are explicit, never automatic:
+Updated clients can report a different available client bundle once through an
+existing recall request. The notice never installs code or restarts a session.
+Older clients need an explicit update first before they can display notices.
 Run: memento agent update HARNESS
 Use the same --config PATH and --native-config-dir PATH if installation used
 custom locations. Update reads the exact existing private service URL; it has no
@@ -592,18 +614,13 @@ Drive is connected. Complete these steps when the human requests Drive:
 
     @app.get('/bridge')
     def bridge_source():
-        return FileResponse(Path(__file__).with_name('bridge.py'), media_type='text/x-python',
-                            filename='memento-bridge.py')
+        return Response(served_bridge, media_type='text/x-python', headers={
+            'Cache-Control': 'no-store', 'Content-Disposition': 'attachment; filename="memento-bridge.py"'})
 
     @app.get('/client-release')
     def client_release():
         # Same private service/TLS boundary as /runner; no credentials or data.
-        files = {}
-        for name in ('runner.py', 'bridge.py', 'native_pi.ts', 'native_omp.ts', 'native_shared.ts'):
-            content = Path(__file__).with_name(name).read_bytes()
-            files[name] = {'content': base64.b64encode(content).decode('ascii'),
-                           'sha256': hashlib.sha256(content).hexdigest()}
-        return Response(json.dumps({'format': 1, 'files': files}), media_type='application/json',
+        return Response(served_release, media_type='application/json',
                         headers={'Cache-Control': 'no-store'})
 
     @app.get('/integrations/{agent}')

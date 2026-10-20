@@ -179,6 +179,51 @@ def test_http_does_not_accept_native_empty_date_sentinels(tmp_path, monkeypatch)
         assert result.status_code == 422
 
 
+def test_client_bundle_stamp_matches_recall_bridge_and_old_updater_contract(tmp_path, monkeypatch):
+    from memento import api, runner
+    monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
+    app = create_app(tmp_path)
+    with TestClient(app) as client:
+        response = client.get('/client-release')
+        revision = response.json()['revision']
+        # The existing updater accepts the additive metadata and validates the
+        # actual served bytes, carrying the stamp through an old updater too.
+        files = runner.release_files(response.content)
+        served = client.get('/bridge')
+        assert served.content == files['bridge.py']
+        namespace = {'__name__': 'isolated_stamped_bridge'}
+        exec(compile(files['bridge.py'], 'isolated_stamped_bridge.py', 'exec'), namespace)
+        assert namespace['CLIENT_REVISION'] == revision
+        assert namespace['CLIENT_REVISION'] is not None
+        assert client.get('/recall').json() == {'memories': [], 'client_revision': revision}
+        assert served.headers['cache-control'] == 'no-store'
+        # Requests reuse the built bundle, without another read/hash pass.
+        monkeypatch.setattr(api, 'client_release_assets', lambda: pytest.fail('bundle rebuilt during request'))
+        assert client.get('/client-release').content == response.content
+        assert client.get('/bridge').content == served.content
+        assert client.get('/recall').json()['client_revision'] == revision
+
+
+def test_client_bundle_identity_tracks_each_original_asset_only(tmp_path, monkeypatch):
+    from pathlib import Path
+    from memento import api, runner
+    source = Path(api.__file__).parent
+    for name in runner.RELEASE_FILES:
+        (tmp_path / name).write_bytes((source / name).read_bytes())
+    monkeypatch.setattr(api, '__file__', str(tmp_path / 'api.py'))
+    revision, bridge_bytes, release = api.client_release_assets()
+    assert api.client_release_assets() == (revision, bridge_bytes, release)
+    (tmp_path / 'api.py').write_text('Server-only changes are not client assets.')
+    assert api.client_release_assets()[0] == revision
+    for name in runner.RELEASE_FILES:
+        path = tmp_path / name
+        original = path.read_bytes()
+        path.write_bytes(original + b'\n')
+        assert api.client_release_assets()[0] != revision
+        path.write_bytes(original)
+    assert api.client_release_assets()[0] == revision
+
+
 def test_official_omp_validator_accepts_recorded_omissions_and_rejects_invalid_data(tmp_path):
     import json
     import os

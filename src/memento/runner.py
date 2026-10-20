@@ -830,7 +830,8 @@ def media_save(args):
     if args.quote is not None:
         try:
             bridge_command(config_path, 'flush-conversation',
-                           ['--agent', config['preset'], '--conversation-id', args.conversation_id], capture=True)
+                           ['--agent', config['preset'], '--conversation-id', args.conversation_id,
+                            '--quote', args.quote], capture=True)
         except RunnerError as exc:
             raise RunnerError('current conversation capture is pending; run memento upload with the same config, then retry media save') from exc
     artifact = service.upload(path, mime)

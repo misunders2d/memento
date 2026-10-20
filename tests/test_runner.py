@@ -53,7 +53,8 @@ def test_quote_save_flushes_real_bridge_subprocess_before_media_submit(tmp_path,
     value = {**native_config(config, 'omp'), 'url': url}
     runner.private_write(config, runner.encode(value))
     spool = bridge.Spool(config, value)
-    spool.episode('omp', 'conversation', 'u', 'user', 'Exact native request.')
+    spool.record('omp', 'conversation', {'id': 'u', 'type': 'message',
+                                       'message': {'role': 'user', 'content': 'Exact native request.'}})
     spool.commit()
     spool.close()
     file = tmp_path / 'original.webp'
@@ -66,7 +67,8 @@ def test_quote_save_flushes_real_bridge_subprocess_before_media_submit(tmp_path,
     assert state['posts'][1][1]['evidence'] == [{'quote': 'Exact native request.'}]
     assert json.loads(capsys.readouterr().out)['job_id'] == 'job'
     spool = bridge.Spool(config, value)
-    assert spool.status()['pending'] == 0
+    assert spool.status()['pending'] == 1
+    assert json.loads(spool.db.execute('SELECT body FROM outbox').fetchone()[0])['kind'] == 'native_record'
     spool.close()
 
 
@@ -236,6 +238,10 @@ def test_media_quote_flushes_capture_and_distinct_provenance_is_not_a_retry(tmp_
     assert identities[0] == identities[1]
     assert len(set(identities)) == 3
     assert len(flushed) == 4 and all(call[0][1] == 'flush-conversation' for call in flushed)
+    assert [call[0][2] for call in flushed] == [
+        ['--agent', 'omp', '--conversation-id', conversation, '--quote', quote]
+        for quote, conversation in (('Exact first request.', 'one'), ('Exact first request.', 'one'),
+                                    ('Exact second request.', 'one'), ('Exact first request.', 'two'))]
     assert all(endpoint == '/media' for endpoint, _ in state['posts'])
     assert state['posts'][0][1]['source'] == 'native:device-omp:omp'
     assert state['posts'][0][1]['evidence'] == [{'quote': 'Exact first request.'}]
@@ -573,13 +579,9 @@ def test_systemd_values_do_not_expand_percent_or_environment():
 
 @pytest.fixture
 def client_release_http():
-    files = {}
-    source = Path(runner.__file__).parent
-    for name in runner.RELEASE_FILES:
-        content = (source / name).read_bytes()
-        files[name] = {'content': base64.b64encode(content).decode(),
-                       'sha256': hashlib.sha256(content).hexdigest()}
-    state = {'body': runner.encode({'format': 1, 'files': files}), 'status': 200, 'extra_length': 0}
+    from memento.api import client_release_assets
+    _, _, release = client_release_assets()
+    state = {'body': release.encode(), 'status': 200, 'extra_length': 0}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.0'

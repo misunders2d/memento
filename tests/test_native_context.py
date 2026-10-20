@@ -71,3 +71,94 @@ def test_a_suggestion_that_cannot_fit_all_exceptions_is_omitted_without_losing_f
     assert memory['behavior']['conduct'] not in result['context']
     assert fact['text'] in result['context']
     assert len(result['context'].encode('utf-8')) <= bridge.CONTEXT_BYTES
+
+
+@pytest.mark.parametrize('harness', ['pi', 'omp', 'claude', 'codex'])
+@pytest.mark.parametrize('empty', [False, True])
+def test_client_notice_reaches_request_context_without_memory_or_journal_persistence(spool, monkeypatch, harness, empty):
+    spool.config['preset'] = harness
+    monkeypatch.setattr(bridge, 'CLIENT_REVISION', 'a' * 64)
+    memories = [] if empty else [{'id': 'fact-id', 'text': 'Useful synthetic evidence. ' + '猫' * 2000}]
+    monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: {'memories': memories, 'client_revision': 'b' * 64})
+    if harness in ('pi', 'omp'):
+        result = bridge.native(spool, dict(harness=harness, session_id='s', action='recall', query='Ordinary request.'))
+        notice = result['update_notice']
+        context = '\n'.join(part for part in (notice, result['context']) if part)
+    else:
+        result = bridge.hook(spool, harness, dict(session_id='s', hook_event_name='UserPromptSubmit', prompt='Ordinary request.'))
+        context = result['hookSpecificOutput']['additionalContext']
+    assert 'Memento client notice (not memory evidence)' in context
+    assert 'memento agent update ' + harness + ' --config ' in context
+    assert spool.config_path in context and '--native-config-dir' in context
+    assert len(context.encode('utf-8')) <= bridge.CONTEXT_BYTES
+    cached = spool.db.execute('SELECT context,shown FROM recall_cache WHERE conversation=?', ('s',)).fetchone()
+    assert 'Memento client notice' not in cached[0]
+    assert ('fact-id' in cached[1]) is not empty
+    assert all('Memento client notice' not in bytes(raw).decode('utf-8')
+               for (raw,) in spool.db.execute('SELECT body FROM outbox'))
+
+
+@pytest.mark.parametrize('harness', ['claude', 'codex'])
+def test_notice_budget_preserves_complete_behavior_conditions_or_omits_suggestion(spool, monkeypatch, harness):
+    spool.config['preset'] = harness
+    monkeypatch.setattr(bridge, 'CLIENT_REVISION', 'a' * 64)
+    memory = suggestion(rationale='Long optional rationale. ' * 200)
+    monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: {'memories': [memory], 'client_revision': 'b' * 64})
+    result = bridge.hook(spool, harness, dict(session_id='s', hook_event_name='UserPromptSubmit', prompt='Ordinary request.'))
+    context = result['hookSpecificOutput']['additionalContext']
+    assert 'Memento client notice' in context
+    if '[memory:behavior-id]' in context:
+        assert memory['behavior']['applicability'] in context
+        assert memory['behavior']['conduct'] in context
+        assert all(exception in context for exception in memory['behavior']['exceptions'])
+    else:
+        assert memory['behavior']['conduct'] not in context
+    assert len(context.encode('utf-8')) <= bridge.CONTEXT_BYTES
+
+
+@pytest.mark.parametrize('harness', ['pi', 'omp'])
+def test_native_shared_notice_reaches_headless_context_and_warning_surface(tmp_path, harness):
+    import json
+    import os
+    from pathlib import Path
+    import shutil
+    import subprocess
+    import sys
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Native shared callback check requires Node with TypeScript stripping')
+    version = subprocess.run([node, '--version'], capture_output=True, text=True, timeout=5)
+    if int(version.stdout.lstrip('v').split('.')[0]) < 23:
+        pytest.skip('Native shared callback check requires Node >=23')
+    notice = 'Memento client notice (not memory evidence): different bundle; update only when asked.'
+    fake_bridge = tmp_path / 'fake_bridge.py'
+    fake_bridge.write_text('import json,sys\nrequest=json.load(sys.stdin)\n'
+        + 'print(json.dumps({"context":"","shown":[],"update_notice":' + repr(notice)
+        + '} if request.get("action")=="recall" else {}))\n')
+    observer = tmp_path / 'observer.mjs'
+    source = Path(bridge.__file__).with_name('native_shared.ts')
+    observer.write_text('import {installNative} from ' + json.dumps(source.as_uri()) + ';\n' + '''
+const handlers = new Map();
+const api = {on: (name, callback) => handlers.set(name, callback), registerFlag: () => {},
+  getFlag: () => process.env.MEMENTO_CONFIG, registerTool: () => {}};
+const Type = new Proxy({}, {get: () => () => ({})});
+installNative(api, Type, process.env.TEST_HARNESS);
+const ctx = {cwd: process.cwd(), sessionManager: {
+  getSessionId: () => "synthetic-session", getSessionFile: () => undefined, getEntries: () => []}};
+await handlers.get("session_start")({}, ctx);
+await handlers.get("before_agent_start")({prompt:"Ordinary synthetic request.", messages:[]}, ctx);
+const result = handlers.get("context")({messages:[]}, ctx);
+await handlers.get("session_shutdown")({}, ctx);
+console.log(JSON.stringify(result));
+''')
+    environment = {**os.environ, 'MEMENTO_CONFIG': str(tmp_path / 'runner.json'),
+        'MEMENTO_BRIDGE': str(fake_bridge), 'MEMENTO_PYTHON': sys.executable, 'TEST_HARNESS': harness}
+    environment.pop('MEMENTO_PROCESSING', None)
+    result = subprocess.run([node, str(observer)], capture_output=True, text=True,
+                            env=environment, cwd=tmp_path, timeout=10)
+    assert result.returncode == 0, result.stderr
+    injected = json.loads(result.stdout)['messages'][-1]
+    assert injected['content'][0]['text'] == notice
+    assert len(injected['content'][0]['text'].encode('utf-8')) <= bridge.CONTEXT_BYTES
+    assert result.stderr.count(notice) == 1
+    assert not list(tmp_path.glob('*.jsonl'))

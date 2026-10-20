@@ -244,11 +244,13 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
     if (!query || !loader) return;
     try {
       const result = await bridge(loader, { ...envelope("recall", ctx), query }, 1500);
+      if (typeof result.update_notice === "string" && result.update_notice) console.error(result.update_notice);
       if (epoch !== generation || recallEpoch !== recallGeneration) return;
       if (result.error) warnRecall(); else recallWarned = false;
       // The bridge budgets framing and complete conditional suggestions
       // together. A second tail slice could discard a suggestion's exceptions.
-      const source = typeof result.context === "string" ? result.context : "";
+      const source = [typeof result.update_notice === "string" ? result.update_notice : "",
+                      typeof result.context === "string" ? result.context : ""].filter(Boolean).join("\n");
       cache = Buffer.byteLength(source, "utf8") <= 1500 ? source : "";
       shown = Array.isArray(result.shown) ? result.shown.filter((id: unknown): id is string =>
         typeof id === "string" && cache.includes(id)) : [];
