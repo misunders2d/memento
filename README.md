@@ -341,6 +341,8 @@ Large opaque runs of at least 64 KiB in newly captured skipped native records us
 
 Extraction, consolidation and media include `errors` grouped by pending/failed state and safe category, such as `invalid_output` or `cli_failed`; unfamiliar stored values become `unknown_error`. These are last recorded failure classifications, not diagnoses or proof that a retry is running. Leased and completed jobs are excluded.
 
+The first service start after upgrading builds a status index once. Large histories can delay readiness while existing records are scanned; clients keep captures queued. The index adds database and backup space, and its temporary sort shares the service's memory limit. Subsequent starts reuse it.
+
 For each conversation, `extraction.progress` reports its processed `cursor`, partial `offset`, `compact_through` boundary and `latest_seq`. After upload reports zero pending records and conflicts, retain the imported conversations' boundaries to track a finite batch: a later cursor at or beyond a retained boundary means that prefix has been extracted, even if new live work remains. Indexing and candidate disposition are separate stages.
 
 Each service response also labels `artifact_storage` as global: registered, local-only and verified-remote object/byte counts cover the whole instance. A verified remote object can still have a local cached copy. These counts show storage progress, not which objects are currently eligible or queued.

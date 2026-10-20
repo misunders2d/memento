@@ -465,12 +465,7 @@ def test_index_status_counts_current_units_failures_and_unprepared_sources(retri
     assert r.status(source='other')['total'] == 0
 
 
-@pytest.mark.parametrize('legacy_byte_length', [False, True])
-def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monkeypatch, legacy_byte_length):
-    if not legacy_byte_length and sqlite3.sqlite_version_info < (3, 43, 0):
-        pytest.skip('Native octet_length requires SQLite 3.43; fallback is covered separately')
-    if legacy_byte_length:
-        monkeypatch.setattr('memento.status.sqlite3.sqlite_version_info', (3, 42, 0))
+def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monkeypatch):
     r = retrieval
     raw = 'Exact synthetic Ω\x00 evidence.'
     r.store._db.executemany('''INSERT INTO episodes
@@ -479,38 +474,46 @@ def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monke
         (1, 'inline', 'inline', 'native_record', raw, '{"extraction_mode":"skip"}', None),
         (2, 'offloaded', 'offloaded', 'native_record', 'raw stub', '{"extraction_mode":"skip"}', '[]'),
         (3, 'message', 'message', 'user', 'Genuine synthetic user evidence.', '{}', None),
+        (4, 'raw-default', 'raw-default', 'native_record', 'Raw kind with ordinary metadata.', '{}', None),
+        (5, 'raw-null', 'raw-null', 'native_hook', 'Raw kind with null mode.', '{"extraction_mode":null}', None),
+        (6, 'raw-message', 'raw-message', 'native_record', 'Explicit raw message mode.', '{"extraction_mode":"message"}', None),
+        (7, 'user-skip', 'user-skip', 'user', 'Skipped user kind.', '{"extraction_mode":"skip"}', None),
+        (8, 'live', 'live', 'native_live_record', raw, '{"extraction_mode":"skip"}', None),
+        (9, 'raw-number', 'raw-number', 'native_record', 'Raw kind with numeric mode.', '{"extraction_mode":5}', None),
+        (10, 'raw-array', 'raw-array', 'native_record', 'Raw kind with array mode.', '{"extraction_mode":["skip"]}', None),
+        (11, 'raw-object', 'raw-object', 'native_record', 'Raw kind with object mode.', '{"extraction_mode":{"nested":"skip"}}', None),
+        (12, 'raw-true', 'raw-true', 'native_record', 'Raw kind with true mode.', '{"extraction_mode":true}', None),
+        (13, 'raw-false', 'raw-false', 'native_record', 'Raw kind with false mode.', '{"extraction_mode":false}', None),
     ])
+    r.store._db.execute("INSERT INTO forgotten_sources VALUES ('selected','raw-default','fixture','fixture')")
     state = SimpleNamespace(store=r.store, retrieval=r, cold_runtime=None, cold=None,
                             drive_reauthorization_required=False)
     snapshot = r.store.read_snapshot
-    work = []
+    work, queries = [], []
 
     @contextmanager
     def measured_snapshot():
         with snapshot() as reader:
             ticks = []
             reader.set_progress_handler(lambda: ticks.append(1) or 0, 100)
-            if legacy_byte_length:
-                reader.set_authorizer(lambda action, first, second, *_:
-                    sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_FUNCTION and second == 'octet_length'
-                    else sqlite3.SQLITE_OK)
+            reader.set_trace_callback(queries.append)
             yield reader
             work.append(len(ticks))
 
     monkeypatch.setattr(r.store, 'read_snapshot', measured_snapshot)
     before = {source: operational_status(state, source) for source in ('selected', 'absent')}
     baseline_work = work.copy()
-    assert before['selected']['captured'] == dict(episodes=3, conversations=1)
-    assert before['selected']['raw_storage'] == dict(inline_raw_episodes=1,
-        inline_raw_bytes=len(raw.encode('utf-8')), offloaded_raw_episodes=1)
-    assert before['selected']['indexing']['unprepared_episodes'] == 1
+    assert before['selected']['captured'] == dict(episodes=13, conversations=1)
+    assert before['selected']['raw_storage'] == dict(inline_raw_episodes=2,
+        inline_raw_bytes=2 * len(raw.encode('utf-8')), offloaded_raw_episodes=1)
+    assert before['selected']['indexing']['unprepared_episodes'] == 8
     r.store._db.execute('BEGIN')
     try:
         r.store._db.executemany('''INSERT INTO episodes
             (seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at)
             VALUES (?,?, 'unrelated',?,'history','native_record',?,
                 '{"extraction_mode":"skip"}','2026-10-21T00:00:00Z')''',
-            ((i, f'e{i}', f'v{i}', 'Unrelated synthetic history.' * 256) for i in range(4, 2004)))
+            ((i, f'e{i}', f'v{i}', 'Unrelated synthetic history.' * 256) for i in range(14, 2014)))
         r.store._db.execute('COMMIT')
     except BaseException:
         r.store._db.execute('ROLLBACK')
@@ -519,6 +522,22 @@ def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monke
         assert operational_status(state, source) == before[source]
         # Count VM work, not wall time: unrelated large rows must not be visited.
         assert work[-1] <= baseline_work[position] + 1
+    global_status = operational_status(state)
+    assert global_status['captured']['episodes'] == 2013
+    assert global_status['raw_storage'] == dict(inline_raw_episodes=2002,
+        inline_raw_bytes=2 * len(raw.encode('utf-8')) + 2000 * len('Unrelated synthetic history.' * 256),
+        offloaded_raw_episodes=1)
+    assert global_status['indexing']['unprepared_episodes'] == 8
+    if sqlite3.sqlite_version_info >= (3, 46, 1):
+        # Qualification is for the target runtime; older planners retain exact counts.
+        with snapshot() as reader:
+            page = reader.execute("SELECT rootpage FROM sqlite_schema WHERE name='episodes'").fetchone()[0]
+            for sql in set(queries):
+                if 'AS inline_raw_episodes' not in sql and not sql.startswith('SELECT count(*) FROM episodes e'):
+                    continue
+                plan = list(reader.execute('EXPLAIN ' + sql))
+                table_cursors = {op['p1'] for op in plan if op['opcode'] == 'OpenRead' and op['p2'] == page}
+                assert not any(op['opcode'] == 'Column' and op['p1'] in table_cursors for op in plan), sql
 
 
 def test_index_status_counts_real_vectors_without_repeated_per_unit_probes(retrieval, monkeypatch):

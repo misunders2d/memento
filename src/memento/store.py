@@ -14,7 +14,7 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from .schema import initialize, upgrade_episode_fts, upgrade_raw_text
+from .schema import initialize, upgrade_episode_fts, upgrade_raw_text, upgrade_status_index
 from .blobs import BlobStore
 from .artifacts import Artifacts
 from .raw_text import KINDS as RAW_KINDS, MIME as RAW_MIME, elide, hydrate
@@ -103,6 +103,7 @@ class Store:
                 try:
                     upgrade_episode_fts(self._db)
                     upgrade_raw_text(self._db)
+                    upgrade_status_index(self._db)
                     self._db.execute('COMMIT')
                 except BaseException:
                     self._db.execute('ROLLBACK')

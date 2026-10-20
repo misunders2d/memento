@@ -1,5 +1,14 @@
 """SQLite schema initialization for a fresh database."""
 
+import logging
+import time
+
+# TEXT removes the unused JSON subtype so SQLite 3.46 can substitute this
+# expression from the index; status only distinguishes the string 'skip'.
+_EPISODES_STATUS_INDEX = """CREATE INDEX IF NOT EXISTS episodes_status_cover_v1 ON episodes (
+    source,CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS TEXT),kind,
+    (text_runs IS NULL),length(CAST(text AS BLOB)),id,event_id)"""
+
 _EPISODES_TEXT_INDEX = """CREATE TRIGGER episodes_text_index AFTER INSERT ON episodes
     WHEN NEW.kind NOT IN ('native_record','native_live_record','native_hook')
     AND coalesce(json_extract(NEW.metadata,'$.extraction_mode'),'message')<>'skip'
@@ -236,6 +245,7 @@ _IMMUTABLE_KEYS = {'graph_commits': 'id=NEW.id OR command_id=NEW.command_id',
 def initialize(db):
     for statement in _SCHEMA:
         db.execute(statement)
+    upgrade_status_index(db)
     for table, predicate in _IMMUTABLE_KEYS.items():
         for operation in ("UPDATE", "DELETE"):
             db.execute(f"""CREATE TRIGGER {table}_no_{operation} BEFORE {operation} ON {table}
@@ -268,3 +278,14 @@ def upgrade_raw_text(db):
     for column in ('text_runs', 'text_sha256'):
         if column not in columns:
             db.execute(f'ALTER TABLE episodes ADD COLUMN {column} TEXT')
+
+
+def upgrade_status_index(db):
+    """Caller owns the transaction; raw physical columns must already exist."""
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE type='index' AND name='episodes_status_cover_v1'").fetchone():
+        return
+    log = logging.getLogger(__name__)
+    log.warning('Building episode status index')
+    started = time.perf_counter()
+    db.execute(_EPISODES_STATUS_INDEX)
+    log.warning('Episode status index build completed in %.3f seconds', time.perf_counter() - started)

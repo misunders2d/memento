@@ -1,6 +1,5 @@
 """Read-only operational counts; observing status never schedules processing."""
 
-import sqlite3
 import time
 
 from .extraction import ACTIVE_CANDIDATE_SQL
@@ -17,9 +16,6 @@ def operational_status(state, source=None):
     # A bound equality lets source-specific observations use the existing index.
     source_where = ' WHERE source=?' if source is not None else ''
     source_args = (source,) if source is not None else ()
-    # octet_length reads the stored byte length without loading large text bodies.
-    # Retain the exact byte-count expression on older supported SQLite builds.
-    raw_bytes = 'octet_length(text)' if sqlite3.sqlite_version_info >= (3, 43, 0) else 'length(CAST(text AS BLOB))'
     with state.store.read_snapshot() as db:
         captured = dict(episodes=db.execute(
             'SELECT count(*) FROM episodes' + source_where, source_args).fetchone()[0],
@@ -28,10 +24,11 @@ def operational_status(state, source=None):
                 GROUP BY source,conversation_id)''', source_args).fetchone()[0])
         raw_storage = dict(db.execute(f'''SELECT
             coalesce(sum(text_runs IS NULL),0) AS inline_raw_episodes,
-            coalesce(sum(CASE WHEN text_runs IS NULL THEN {raw_bytes} ELSE 0 END),0) AS inline_raw_bytes,
-            coalesce(sum(text_runs IS NOT NULL),0) AS offloaded_raw_episodes
-            FROM episodes WHERE kind IN ('native_record','native_live_record','native_hook')
-            AND json_extract(metadata,'$.extraction_mode')='skip'
+            coalesce(sum(CASE (text_runs IS NULL) WHEN 1 THEN length(CAST(text AS BLOB)) ELSE 0 END),0) AS inline_raw_bytes,
+            coalesce(sum(NOT (text_runs IS NULL)),0) AS offloaded_raw_episodes
+            FROM episodes INDEXED BY episodes_status_cover_v1
+            WHERE kind IN ('native_record','native_live_record','native_hook')
+            AND CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS TEXT)='skip'
             {'AND source=?' if source is not None else ''}''', source_args).fetchone())
         objects = db.execute('''SELECT count(*) AS objects,coalesce(sum(size),0) AS bytes,
             coalesce(sum(remote_id IS NULL),0) AS local_objects,

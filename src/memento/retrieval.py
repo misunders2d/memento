@@ -732,7 +732,7 @@ class Retrieval:
                 (source, source, source)).fetchone()
         unprepared = db.execute(f'''SELECT count(*) FROM episodes e
                 WHERE {'e.source=? AND' if source is not None else ''}
-                coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip'
+                CAST(coalesce(json_extract(e.metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip'
                 AND NOT EXISTS (SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id)
                 AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)''',
                 (source,) if source is not None else ()).fetchone()[0]

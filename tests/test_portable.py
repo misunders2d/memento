@@ -219,6 +219,7 @@ def test_independent_v1_full_archive_remains_locally_restorable(portable, tmp_pa
     try:
         p.store._db.backup(target)
         target.execute('PRAGMA journal_mode=DELETE')
+        target.execute('DROP INDEX episodes_status_cover_v1')
     finally:
         target.close()
     payloads = {'memory.sqlite': snapshot.read_bytes()}
@@ -242,6 +243,12 @@ def test_independent_v1_full_archive_remains_locally_restorable(portable, tmp_pa
         db.close()
     for info, content in zip(p.infos, p.contents):
         assert BlobStore(destination / 'blobs').verify(info['sha256']).read_bytes() == content
+    recovered = Store(destination)
+    try:
+        assert recovered.get(p.episode['id']) == p.episode
+        assert recovered._db.execute("SELECT 1 FROM sqlite_schema WHERE name='episodes_status_cover_v1'").fetchone()
+    finally:
+        recovered.close()
 
 
 def _rewrite(source, destination, mutation):

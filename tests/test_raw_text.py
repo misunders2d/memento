@@ -301,6 +301,7 @@ def test_old_portable_database_without_physical_columns_restores(tmp_path):
     data = tmp_path / 'old'
     store = Store(data)
     record, _ = store.capture(episode('Legacy inline raw.'))
+    store._db.execute('DROP INDEX episodes_status_cover_v1')
     for column in ('text_runs', 'text_sha256'):
         store._db.execute('ALTER TABLE episodes DROP COLUMN ' + column)
     store.close()
@@ -312,6 +313,7 @@ def test_old_portable_database_without_physical_columns_restores(tmp_path):
     try:
         assert recovered.get(record['id'])['text'] == 'Legacy inline raw.'
         assert {'text_runs', 'text_sha256'} <= {row[1] for row in recovered._db.execute('PRAGMA table_info(episodes)')}
+        assert recovered._db.execute("SELECT 1 FROM sqlite_schema WHERE name='episodes_status_cover_v1'").fetchone()
     finally:
         recovered.close()
 
