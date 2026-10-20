@@ -233,7 +233,8 @@ def test_skip_only_and_trailing_ranges_advance_only_through_compaction_boundary(
                 kind='native_hook', text='Ignored hook', occurred_at=None, metadata={'extraction_mode': 'skip'}))
         processing.compact('skip-fixture', 'c')
         boundary = store._db.execute('SELECT max(seq) FROM episodes').fetchone()[0]
-        args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc).replace(hour=12))
+        # Forcing noon can age later captures past the inactivity threshold.
+        args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc))
         tasks = processing.claim(**args)['work']
         assert len(tasks) == int(eligible)
         later, _ = store.capture(dict(source='skip-fixture', event_id='after-boundary', conversation_id='c',

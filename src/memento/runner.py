@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Standalone host-user runner; only the Python standard library is required.
 
-Download /runner, then run ``python3 runner.py setup --agent pi --timezone Europe/Berlin``.
+Connect a native client with ``memento agent add claude --url PRIVATE_SERVICE_URL``.
+The designated processor uses ``python3 runner.py setup --agent pi --timezone Europe/Berlin``.
 For isolated setup use --no-activate plus temporary --config, --unit-dir and --native-config-dir.
 Scheduling belongs to /work/claim, not this process. No generation credentials are stored.
 """
@@ -585,6 +586,17 @@ def install_native(config_path, config, native_config_dir=None):
     return result
 
 
+def save_native_config(config_path, config, native_config_dir=None):
+    previous = config_path.read_bytes() if config_path.exists() else None
+    private_write(config_path, encode(config) + b'\n')
+    try:
+        return install_native(config_path, config, native_config_dir)
+    except BaseException:
+        if previous is not None:
+            private_write(config_path, previous)
+        raise
+
+
 def setup(args):
     """Write runner config, install native hooks, and return the config path.
 
@@ -637,16 +649,7 @@ def setup(args):
         timer = ('[Unit]\nDescription=Poll Memento due work every fifteen minutes\n\n[Timer]\n'
                  'OnBootSec=2min\nOnUnitInactiveSec=15min\nUnit=memento-runner.service\n\n'
                  '[Install]\nWantedBy=timers.target\n')
-    previous_bytes = config_path.read_bytes() if previous else None
-    private_write(config_path, encode(config) + b'\n')
-    try:
-        native = install_native(config_path, config, args.native_config_dir)
-    except BaseException:
-        # Hooks read this exact path during installation; restore a working
-        # connection if reinstall fails before the replacement is ready.
-        if previous_bytes is not None:
-            private_write(config_path, previous_bytes)
-        raise
+    native = save_native_config(config_path, config, args.native_config_dir)
     if args.client:
         print('Client configured for capture/compaction hooks only; no model work or timer.')
     else:
@@ -660,6 +663,36 @@ def setup(args):
     print('Native setup does not connect Google Drive. For Drive prerequisites and consent: '
           + args.url.rstrip('/') + '/connect')
     return config_path
+
+def add_agent(args):
+    """Connect one native harness without changing its processing role."""
+    host_path = default_config()
+    host = load_config(host_path) if host_path.exists() else None
+    config_path = (args.config.expanduser().absolute() if args.config else
+                   host_path if host and host['preset'] == args.agent else
+                   host_path.parent / args.agent / 'runner.json')
+    previous = load_config(config_path) if config_path.exists() else None
+    if previous and previous['preset'] != args.agent:
+        raise RunnerError('selected config belongs to another harness; choose a separate --config')
+    url = args.url or (previous['url'] if previous else host['url'] if host else None)
+    if url is None:
+        raise RunnerError('no Memento connection configured; pass --url PRIVATE_SERVICE_URL')
+    Service(url)
+    if previous:
+        config = {**previous, 'url': url}
+        native = (install_native(config_path, config, args.native_config_dir)
+                  if url == previous['url'] else
+                  save_native_config(config_path, config, args.native_config_dir))
+        print(f"Memento {args.agent} integration reinstalled; {previous['mode']} mode retained.")
+        print(native.get('notice') or 'Reload native integrations, then verify Memento capture and recall.')
+    else:
+        setup(argparse.Namespace(
+            agent=args.agent, config=config_path, url=url, client=True,
+            timezone=None, custom_preset=None, command_json=None,
+            deadline_seconds=600, native_config_dir=args.native_config_dir))
+    print('Memento config: ' + str(config_path))
+    return config_path
+
 
 
 def load_config(path):
@@ -689,7 +722,7 @@ def load_config(path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=default_config())
+    parser.add_argument('--config', type=Path)
     sub = parser.add_subparsers(dest='operation', required=True)
     install = sub.add_parser('setup', help='write host-user config and a fifteen-minute user timer')
     # Accept --config both before and after setup, without overwriting the global default.
@@ -698,12 +731,21 @@ def main(argv=None):
     install.add_argument('--custom-preset', choices=('pi', 'omp', 'claude', 'codex'))
     install.add_argument('--command-json', help='custom native executable as a one-element JSON argv')
     install.add_argument('--timezone', help='explicit IANA timezone required for server processing')
-    install.add_argument('--client', action='store_true', help='capture/compaction hooks only; no timer or generation')
+    install.set_defaults(client=False)
     install.add_argument('--native-config-dir', type=Path, help='override selected harness config root for isolated setup')
     install.add_argument('--url', default='http://127.0.0.1:8765')
     install.add_argument('--deadline-seconds', type=float, default=600)
     install.add_argument('--unit-dir', type=Path, default=Path.home() / '.config/systemd/user')
     install.add_argument('--no-activate', action='store_true', help='install hooks and artifacts without starting the user timer')
+    agents = sub.add_parser('agent', help='connect native harnesses to Memento')
+    actions = agents.add_subparsers(dest='agent_operation', required=True)
+    add = actions.add_parser('add', help='install capture, automatic recall and memory tools')
+    add.add_argument('agent', choices=('pi', 'omp', 'claude', 'codex'))
+    add.add_argument('--config', type=Path, default=argparse.SUPPRESS,
+                     help='reuse a specific private installation config')
+    add.add_argument('--url', help='private service URL; defaults to the existing connection')
+    add.add_argument('--native-config-dir', type=Path,
+                     help='override selected harness config root for isolated setup')
     poll = sub.add_parser('tick', help='drain all due work, attempting each ID once')
     poll.add_argument('--consolidate-now', action='store_true',
                       help='run consolidation now for a first test, outside the nightly window')
@@ -715,6 +757,10 @@ def main(argv=None):
     drive.add_argument('--port', type=int, default=0, help='IPv4 loopback callback port (default: automatic)')
     args = parser.parse_args(argv)
     try:
+        if args.operation == 'agent':
+            add_agent(args)
+            return 0
+        args.config = args.config or default_config()
         if args.operation == 'setup':
             setup(args)
             return 0

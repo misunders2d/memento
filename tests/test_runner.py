@@ -177,19 +177,6 @@ def test_tick_drains_new_batches_without_cap_and_checks_cli_once(monkeypatch, co
     assert all(claim['consolidate_now'] is consolidate_now for claim in claims)
 
 
-@pytest.mark.parametrize('flags, expected', [([], False), (['--consolidate-now'], True)])
-def test_tick_cli_forwards_explicit_consolidation_override(monkeypatch, flags, expected):
-    config = {'mode': 'server'}
-    calls = []
-    monkeypatch.setattr(runner, 'load_config', lambda path: config)
-
-    def tick(value, compaction, *, consolidate_now):
-        calls.append((value, compaction, consolidate_now))
-        return 0
-
-    monkeypatch.setattr(runner, 'tick', tick)
-    assert runner.main(['tick', *flags]) == 0
-    assert calls == [(config, None, expected)]
 
 
 def test_setup_temporary_locations_never_activate_timer(tmp_path, monkeypatch):
@@ -211,12 +198,13 @@ def test_setup_temporary_locations_never_activate_timer(tmp_path, monkeypatch):
 
 
 def test_setup_persists_distinct_client_identity_across_same_uid_installs(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
     monkeypatch.setattr(runner, 'install_native', lambda *a: {})
     identities = []
     for name in ('first', 'second'):
         config = tmp_path / name / 'runner.json'
-        args = ['setup', '--client', '--agent', 'pi',
-                '--config', str(config)]
+        args = ['agent', 'add', 'pi', '--config', str(config),
+                '--url', 'https://private-service.example']
         assert runner.main(args) == 0
         stored = runner.load_config(config)
         assert stored['uid'] == os.getuid()
@@ -226,30 +214,47 @@ def test_setup_persists_distinct_client_identity_across_same_uid_installs(tmp_pa
     assert identities[0] != identities[1]
 
 
-def test_client_setup_cannot_disable_existing_processing_host(tmp_path, monkeypatch):
+def test_agent_add_reuses_server_role_identity_and_timer(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
     monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
     monkeypatch.setattr(runner, 'install_native', lambda *a: {})
-    config = tmp_path / 'private' / 'runner.json'
+    config = runner.default_config()
     units = tmp_path / 'units'
     assert runner.main(['setup', '--agent', 'pi', '--timezone', 'Europe/Berlin',
                         '--config', str(config), '--unit-dir', str(units), '--no-activate']) == 0
     original = config.read_bytes()
     timer = (units / 'memento-runner.timer').read_bytes()
-    assert runner.main(['setup', '--client', '--agent', 'pi', '--config', str(config),
-                        '--url', 'https://another-private-service.example']) == 1
+    service = (units / 'memento-runner.service').read_bytes()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('agent add must not inspect a model or change the processing timer')
+
+    monkeypatch.setattr(runner, 'check_cli', forbidden)
+    monkeypatch.setattr(runner, 'run_process', forbidden)
+    assert runner.main(['agent', 'add', 'pi']) == 0
     assert config.read_bytes() == original
     assert (units / 'memento-runner.timer').read_bytes() == timer
+    assert (units / 'memento-runner.service').read_bytes() == service
+
+    assert runner.main(['agent', 'add', 'omp']) == 0
+    client = runner.load_config(config.parent / 'omp' / 'runner.json')
+    assert client['mode'] == 'client'
+    assert client['url'] == runner.load_config(config)['url']
+    assert client['client_uid'] != runner.load_config(config)['client_uid']
+    assert config.read_bytes() == original
+    assert runner.main(['agent', 'add', 'omp', '--config', str(config)]) == 1
+    assert config.read_bytes() == original
 
 
 @pytest.mark.parametrize('client', [False, True])
 def test_failed_reinstall_retains_previous_connection_and_identity(tmp_path, monkeypatch, client):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
     monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
     monkeypatch.setattr(runner, 'install_native', lambda *a: {})
     config = tmp_path / 'private' / 'runner.json'
-    args = ['setup', '--agent', 'pi', '--timezone', 'Europe/Berlin', '--config', str(config),
-            '--unit-dir', str(tmp_path / 'units'), '--no-activate']
-    if client:
-        args.append('--client')
+    args = (['agent', 'add', 'pi', '--config', str(config)] if client else
+            ['setup', '--agent', 'pi', '--timezone', 'Europe/Berlin', '--config', str(config),
+             '--unit-dir', str(tmp_path / 'units'), '--no-activate'])
     assert runner.main(args + ['--url', 'https://original-private-service.example']) == 0
     original = config.read_bytes()
 
@@ -264,6 +269,8 @@ def test_failed_reinstall_retains_previous_connection_and_identity(tmp_path, mon
 
 @pytest.mark.parametrize('agent', ['pi', 'omp', 'claude', 'codex'])
 def test_laptop_setup_and_compaction_never_execute_or_claim(tmp_path, monkeypatch, agent):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / '.config'))
     def forbidden(*args, **kwargs):
         pytest.fail('client mode must never execute or inspect a model CLI')
 
@@ -271,10 +278,10 @@ def test_laptop_setup_and_compaction_never_execute_or_claim(tmp_path, monkeypatc
     monkeypatch.setattr(runner, 'run_process', forbidden)
     monkeypatch.setattr(runner, 'install_native', lambda *a: {})
     config = tmp_path / 'runner.json'
-    units = tmp_path / 'units'
-    assert runner.main(['setup', '--client', '--agent', agent,
+    units = tmp_path / '.config' / 'systemd' / 'user'
+    assert runner.main(['agent', 'add', agent,
                         '--url', 'http://memento.owner-tailnet.ts.net',
-                        '--config', str(config), '--unit-dir', str(units)]) == 0
+                        '--config', str(config)]) == 0
     assert runner.load_config(config)['mode'] == 'client'
     assert not units.exists()
     calls = []
@@ -304,6 +311,12 @@ def test_server_setup_requires_timezone_before_native_execution(tmp_path, monkey
     config = tmp_path / 'runner.json'
     assert runner.main(['setup', '--agent', 'pi', '--config', str(config)]) == 1
     assert not config.exists()
+
+
+def test_agent_add_without_connection_does_not_create_a_config(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path))
+    assert runner.main(['agent', 'add', 'claude']) == 1
+    assert not (tmp_path / 'memento').exists()
 
 
 

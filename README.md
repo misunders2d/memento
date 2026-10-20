@@ -124,17 +124,35 @@ Codex capture/import/recall/MCP client integration is available after **human `/
 
 ## 3. Add other harnesses or devices as clients
 
-A client captures conversations and nudges the server after compaction. It does **not** discover a processing model, generate memories or install another processing timer.
+A client captures conversations, retrieves relevant context automatically and nudges the server after compaction. It does **not** discover a processing model, generate memories or install another processing timer.
 
-For OMP on the same host, keep a separate private config:
+Expose the downloaded stdlib runner as a command once on each device:
 
 ```sh
-python3 "$HOME/.local/share/memento/runner.py" \
-  --config "$HOME/.config/memento/omp/runner.json" setup \
-  --client --agent omp --timezone Europe/Berlin --url "$URL"
+install -d -m 0700 "$HOME/.local/share/memento"
+mkdir -p "$HOME/.local/bin"
+curl --fail "$URL/runner" -o "$HOME/.local/share/memento/runner.py"
+chmod 700 "$HOME/.local/share/memento/runner.py"
+ln -s "$HOME/.local/share/memento/runner.py" "$HOME/.local/bin/memento"
 ```
 
-Use the matching harness (`pi`, `omp`, `claude` or `codex`) on each device. Keep each device's own config and stable generated `client_uid`; do not copy configs or histories to pretend they came from another origin.
+Create the symlink only when that command path is unused; reuse an existing link to this runner, and never overwrite another program. The link and the processing timer use the same runner file. If `~/.local/bin` is not on `PATH`, use its full path. An installed Python package also supports `memento agent add`.
+
+Then connect the **selected** harness:
+
+```sh
+memento agent add claude
+```
+
+Choose `pi`, `omp`, `claude` or `codex`. The existing harness config or default `runner.json` supplies the URL; otherwise pass `--url https://YOUR_MACHINE.YOUR_TAILNET.ts.net`. A matching default `runner.json` retains its server/client role and identity; otherwise the config is `${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS/runner.json`. Use `--config PATH` for an existing custom location. Repeating the command reinstalls only that harness and preserves its identity and processing role.
+
+| Harness | Installed integration |
+| --- | --- |
+| Pi / OMP | Native extension for capture, automatic context and six memory tools |
+| Claude Code | Native capture/recall/compaction hooks and Memento MCP definition |
+| Codex | Native hooks and MCP definition; human `/hooks` trust and MCP permissions still required |
+
+There is no new daemon, registry, dependency or per-message work added by this command. It reuses the shipped native installer and does not restart active agents. Without the command link, `python3 ~/.local/share/memento/runner.py agent add HARNESS --url "$URL"` is equivalent. Keep each device's own config and stable generated `client_uid`; do not copy configs or histories to pretend they came from another origin.
 
 **Start new native sessions after installation.** Do not silently restart an active user-owned agent. The existing native profile, model selection and login remain the source of truth.
 
@@ -150,7 +168,7 @@ tailscale serve --bg 8765
 
 Tailnet HTTPS must be enabled and ACLs must restrict access to your devices. The API's published listener remains loopback-only. MCP host protection stays enabled; the endpoint is `/mcp/`.
 
-On a client device, download `/runner` from `https://YOUR_MACHINE.YOUR_TAILNET.ts.net`, then run the client setup above with that HTTPS origin and its real timezone. Do not disable TLS verification or use a public reverse proxy as a shortcut.
+On a client device, download `/runner` from `https://YOUR_MACHINE.YOUR_TAILNET.ts.net`, then run `memento agent add HARNESS --url https://YOUR_MACHINE.YOUR_TAILNET.ts.net`. No client timezone is needed. Do not disable TLS verification or use a public reverse proxy as a shortcut.
 
 ## 4. Prove memory actually works
 

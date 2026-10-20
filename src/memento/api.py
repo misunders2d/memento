@@ -443,17 +443,22 @@ from which you fetched this guide, not the public product website.
 
 1. Identify your native harness: pi, omp, claude, or codex. Keep its existing
    account, login, model selection, unrelated hooks and MCP definitions.
-2. Download /runner from this service into ~/.local/share/memento/runner.py
-   (create its parent directory privately). It needs only Python 3's stdlib.
-3. Reuse an existing Memento config for this harness and service if present.
-   For a new client choose ${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS.json
-   so connecting a second harness does not overwrite the first. Run:
-   python3 ~/.local/share/memento/runner.py setup --client --agent HARNESS --config CONFIG_PATH --url SERVICE_ORIGIN
-   Substitute the harness, private config path and service origin yourself.
-   No timezone, model API key, new model login or processing timer is needed.
-   Never downgrade an existing server config with --client: retain its setup,
-   and reinstall its native definitions with its sibling bridge.py install
-   --config CONFIG_PATH instead. Only one designated server processes memory.
+2. Download /runner into ~/.local/share/memento/runner.py (private parent,
+   executable only by this user). It needs only Python 3's stdlib. Expose it as
+   ~/.local/bin/memento with a symlink to that same runner, not a second copy;
+   the processing timer must keep using the same file after upgrades. Never
+   replace an unrelated existing command. An installed Memento package also
+   supports the agent command. Use the full executable path if not on PATH.
+3. Run: memento agent add HARNESS --url SERVICE_ORIGIN
+   Substitute pi, omp, claude or codex and this private service origin.
+   This installs only that harness's capture, automatic recall and memory tools.
+   A matching default runner.json keeps its role and identity; otherwise the
+   config is ${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS/runner.json.
+   Reinstallation reuses that config. Use --config PATH for an existing custom
+   location. No timezone, model discovery, new login or extra timer is needed.
+   It never creates a server processor or demotes an existing one.
+   Without the command link, use:
+   python3 ~/.local/share/memento/runner.py agent add HARNESS --url SERVICE_ORIGIN
 4. Load the installed native integration using the harness's supported reload
    or a fresh native session. Native trust/permission prompts remain human
    decisions: surface just that approval if required; never grant it yourself
