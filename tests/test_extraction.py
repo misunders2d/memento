@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime, timezone
 
 import pytest
@@ -125,6 +126,127 @@ def test_newer_due_conversation_precedes_imported_backlog_without_reordering_win
             processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
                 output=dict(windows=[dict(id=window['id'], candidates=[])
                                      for window in task['input']['windows']]))
+    finally:
+        store.close()
+
+
+def test_finite_import_prefix_finishes_while_newer_conversation_keeps_growing(tmp_path):
+    store = Store(tmp_path)
+    try:
+        processing = Processing(Graph(store))
+        for conversation in ('skip-only', 'imported-history'):
+            store.capture(dict(source='fairness', event_id=conversation + '-raw', conversation_id=conversation,
+                kind='native_hook', text='Ignored raw envelope.', occurred_at=None, metadata={'extraction_mode': 'skip'}))
+            processing.compact('fairness', conversation)
+        text = '😀' + 'Old source evidence. ' * 3250
+        original, _ = store.capture(dict(source='fairness', event_id='old', conversation_id='imported-history',
+            kind='user', text=text, occurred_at=None, metadata={}))
+        processing.compact('fairness', 'imported-history')
+        boundary = store._db.execute("SELECT compact_through FROM processing_progress WHERE conversation_id='imported-history'").fetchone()[0]
+        newer = []
+
+        def append_live():
+            episode, _ = store.capture(dict(source='fairness', event_id=f'live-{len(newer)}', conversation_id='live',
+                kind='user', text=f'New live evidence {len(newer)}.', occurred_at=None, metadata={}))
+            newer.append(episode['id'])
+            processing.compact('fairness', 'live')
+
+        append_live()
+        args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc).replace(hour=12))
+        attempted, admissions, windows = [], [], []
+        for _ in range(4):
+            task = processing.claim(**args, exclude=attempted)['work'][0]
+            attempted.append(task['id'])
+            batch = task['input']['windows']
+            conversation = store.get(batch[0]['episode_id'])['conversation_id']
+            admissions.append(conversation)
+            assert store._db.execute("""SELECT count(*) FROM (SELECT 1 FROM jobs
+                WHERE kind='extract' AND state IN ('pending','leased')
+                GROUP BY json_extract(payload,'$.source'),json_extract(payload,'$.conversation_id')
+                HAVING count(*)>1)""").fetchone()[0] == 0
+            if conversation == 'imported-history':
+                windows.extend(batch)
+                assert all(window['episode_id'] == original['id']
+                           and window['text'] == text[window['start']:window['end']] for window in batch)
+            else:
+                assert conversation == 'live' and [window['episode_id'] for window in batch] == [newer[-1]]
+            processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+                output=dict(windows=[dict(id=window['id'], candidates=[]) for window in batch]))
+            if conversation == 'live':
+                append_live()
+        assert admissions == ['live', 'imported-history', 'live', 'imported-history']
+        assert windows[0]['start'] == 0 and windows[-1]['end'] == len(text)
+        assert all(right['start'] == left['end'] - 1000 for left, right in zip(windows, windows[1:]))
+        progress = {row['conversation_id']: row for row in store._db.execute('SELECT * FROM processing_progress')}
+        assert progress['imported-history']['seq'] == boundary and progress['imported-history']['offset'] == 0
+        assert progress['skip-only']['seq'] == progress['skip-only']['compact_through']
+        assert progress['live']['seq'] < progress['live']['compact_through']
+    finally:
+        store.close()
+
+
+def test_extraction_admission_order_survives_restart_and_ignores_non_extract_jobs(tmp_path):
+    store = Store(tmp_path)
+    try:
+        processing = Processing(Graph(store))
+        for conversation, text in (('old', 'Old evidence. ' * 6000), ('new', 'New evidence.')):
+            store.capture(dict(source='restart-fairness', event_id=conversation, conversation_id=conversation,
+                kind='user', text=text, occurred_at=None, metadata={}))
+            processing.compact('restart-fairness', conversation)
+        # A completed pre-upgrade extraction has no admission tag.
+        legacy = processing.queue._insert('legacy-extract', 'extract', {})
+        store._db.execute("UPDATE jobs SET state='done' WHERE id=?", (legacy,))
+        processing.queue._insert('unrelated-media-1', 'media', {'order': 'oldest'})
+        store.close()
+        store = Store(tmp_path)
+        processing = Processing(Graph(store))
+        args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc).replace(hour=12))
+        first = processing.claim(**args)['work'][0]
+        assert store.get(first['input']['windows'][0]['episode_id'])['conversation_id'] == 'old'
+        assert json.loads(store._db.execute('SELECT payload FROM jobs WHERE id=?', (first['id'],)).fetchone()[0])['order'] == 'oldest'
+        processing.complete(id=first['id'], owner=first['owner'], agent='fixture',
+            output=dict(windows=[dict(id=window['id'], candidates=[]) for window in first['input']['windows']]))
+        assert store._db.execute("SELECT offset FROM processing_progress WHERE conversation_id='old'").fetchone()[0] > 0
+        processing.queue._insert('unrelated-media-2', 'media', {'order': 'newest'})
+        store.close()
+        store = Store(tmp_path)
+        processing = Processing(Graph(store))
+        second = processing.claim(**args, exclude=[first['id']])['work'][0]
+        assert store.get(second['input']['windows'][0]['episode_id'])['conversation_id'] == 'new'
+        assert json.loads(store._db.execute('SELECT payload FROM jobs WHERE id=?', (second['id'],)).fetchone()[0])['order'] == 'newest'
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('state', ['pending', 'failed'])
+def test_extraction_admission_metadata_preserves_existing_job_identity_and_retry(tmp_path, legacy, state):
+    store = Store(tmp_path)
+    try:
+        processing = Processing(Graph(store))
+        store.capture(dict(source='retry-fairness', event_id='u', conversation_id='c', kind='user',
+            text='Exact pending evidence.', occurred_at=None, metadata={}))
+        processing.compact('retry-fairness', 'c')
+        args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc).replace(hour=12))
+        first = processing.claim(**args)['work'][0]
+        original = store._db.execute('SELECT job_key,payload FROM jobs WHERE id=?', (first['id'],)).fetchone()
+        payload = json.loads(original['payload'])
+        canonical = {key: value for key, value in payload.items() if key != 'order'}
+        assert original['job_key'] == 'extract/' + hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+        if legacy:
+            payload = canonical
+        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        store._db.execute('''UPDATE jobs SET payload=?,state=?,owner=NULL,lease_until=NULL,available_at=0
+            WHERE id=?''', (serialized, state, first['id']))
+        store.close()
+        store = Store(tmp_path)
+        processing = Processing(Graph(store))
+        work = processing.claim(**args)['work']
+        assert [item['id'] for item in work] == ([first['id']] if state == 'pending' else [])
+        after = store._db.execute('SELECT job_key,payload,attempts FROM jobs WHERE id=?', (first['id'],)).fetchone()
+        assert after['job_key'] == original['job_key'] and after['payload'] == serialized
+        assert after['attempts'] == (2 if state == 'pending' else 1)
+        assert store._db.execute("SELECT count(*) FROM jobs WHERE kind='extract'").fetchone()[0] == 1
     finally:
         store.close()
 

@@ -28,9 +28,16 @@ class Processing:
 
     def _enqueue_extract(self, now):
         db = self.store._db
-        groups = db.execute('''SELECT source,conversation_id,latest_seq,latest_at,
-            seq AS cursor,offset,compact_through FROM processing_progress
-            WHERE latest_seq>seq ORDER BY latest_seq DESC''').fetchall()
+        last = db.execute("""SELECT json_extract(payload,'$.order') AS admission_order
+            FROM jobs WHERE kind='extract' ORDER BY rowid DESC LIMIT 1""").fetchone()
+        # Start fresh with recent work; legacy admissions count as newest.
+        order = 'newest' if last is None or last['admission_order'] == 'oldest' else 'oldest'
+        ordering = 'p.latest_seq DESC' if order == 'newest' else '''(
+            SELECT e.seq FROM episodes e WHERE e.source=p.source AND e.conversation_id=p.conversation_id
+                AND e.seq>p.seq ORDER BY e.seq LIMIT 1)'''
+        groups = db.execute(f'''SELECT source,conversation_id,latest_seq,latest_at,
+            seq AS cursor,offset,compact_through FROM processing_progress p
+            WHERE latest_seq>seq ORDER BY {ordering}''').fetchall()
         for group in groups:
             if db.execute('''SELECT 1 FROM jobs WHERE kind='extract' AND state IN ('pending','leased')
                 AND json_extract(payload,'$.source')=? AND json_extract(payload,'$.conversation_id')=? LIMIT 1''',
@@ -96,7 +103,10 @@ class Processing:
             payload = dict(version=VERSION, source=group['source'], conversation_id=group['conversation_id'],
                 windows=windows, next_seq=next_seq, next_offset=next_offset)
             key = 'extract/' + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-            self.queue._insert(key, 'extract', payload)
+            # Admission metadata must not change existing identities or retry payloads.
+            if db.execute('SELECT 1 FROM jobs WHERE job_key=?', (key,)).fetchone():
+                return
+            self.queue._insert(key, 'extract', dict(payload, order=order))
             return
 
     def _enqueue_night(self, now, zone, force=False):
