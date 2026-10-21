@@ -303,6 +303,11 @@ def import_archive(archive_path: Path, destination: Path):
                     raise ValueError('Truncated portable archive padding')
         db = _connect(stage / 'memory.sqlite')
         try:
+            # SQLite releases can round julianday() differently. Rebuild this
+            # derived index only after archive hashes pass, in private staging.
+            if db.execute("""SELECT 1 FROM sqlite_schema WHERE type='index'
+                    AND name='episodes_activity' AND tbl_name='episodes'""").fetchone():
+                db.execute('REINDEX episodes_activity')
             blobs = _registered(db)
             version = manifest['version']
             remote_count = _remote_count(blobs) if version == 2 else 0

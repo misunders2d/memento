@@ -156,6 +156,58 @@ def test_mixed_hot_cold_roundtrip_retains_drive_references_without_downloads(por
         recovered.close()
 
 
+@pytest.mark.parametrize('has_index', [True, False])
+def test_restore_uses_consumer_date_semantics_without_changing_source_rows(portable, tmp_path, monkeypatch, has_index):
+    from memento import portable as module
+    p = portable
+    stamp = '2026-10-20T09:36:35.999859+00:00'
+    native = sqlite3.connect(':memory:')
+    try:
+        consumer_value = native.execute('SELECT julianday(?)', (stamp,)).fetchone()[0]
+        # Observed 3.46.1 and 3.54.0 values differ at this millisecond boundary.
+        producer_value = (2461333.9004166666 if consumer_value != 2461333.9004166666
+                          else 2461333.900416655)
+        def producer_date(value):
+            return producer_value if value == stamp else native.execute('SELECT julianday(?)', (value,)).fetchone()[0]
+        p.store._db.create_function('julianday', 1, producer_date, deterministic=True)
+        episode, _ = p.store.capture(dict(source='synthetic', event_id='boundary', conversation_id='thread',
+            kind='user', text='Synthetic timestamp boundary.', occurred_at=stamp, metadata={}))
+        p.store._db.execute('REINDEX episodes_activity')
+        if not has_index:
+            p.store._db.execute('DROP INDEX episodes_activity')
+        before = _database_content(p.store._db)
+        connect = module._connect
+        def producer_connect(path, **kwargs):
+            db = connect(path, **kwargs)
+            db.create_function('julianday', 1, producer_date, deterministic=True)
+            return db
+        with monkeypatch.context() as patch:
+            patch.setattr(module, '_connect', producer_connect)
+            export_archive(p.data, p.archive, cold=p.cold)
+        digest = hashlib.sha256(p.archive.read_bytes()).hexdigest()
+        destination = tmp_path / 'different-sqlite-runtime'
+        assert import_archive(p.archive, destination)['complete']
+        db = connect(destination / 'memory.sqlite', readonly=True)
+        try:
+            assert db.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+            actual = _database_content(db)
+            for table, rows in before.items():
+                if table not in ('blobs', 'cold_transfers', 'cold_failures', 'backups'):
+                    assert actual[table] == rows, table
+            assert bool(db.execute("SELECT 1 FROM sqlite_schema WHERE type='index' AND name='episodes_activity'").fetchone()) == has_index
+            if has_index:
+                values = db.execute('''SELECT id,julianday(coalesce(occurred_at,captured_at))
+                    FROM episodes INDEXED BY episodes_activity
+                    ORDER BY julianday(coalesce(occurred_at,captured_at)) DESC,seq DESC''').fetchall()
+                assert dict(values)[episode['id']] == consumer_value != producer_value
+        finally:
+            db.close()
+        assert _database_content(p.store._db) == before
+        assert hashlib.sha256(p.archive.read_bytes()).hexdigest() == digest
+    finally:
+        native.close()
+
+
 def test_large_database_header_reaches_strict_reader_without_large_payload_io(portable, tmp_path, monkeypatch):
     """Exercise real export headers and reader admission, not an 8 GiB roundtrip."""
     from memento import portable as module
