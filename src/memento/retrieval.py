@@ -15,7 +15,7 @@ from .graph import Graph, NODE_SUMMARY, ENTITY_TYPES
 from .extraction import ACTIVE_CANDIDATE_SQL, source_text_ranges
 from .text_chunks import TextChunk, chunks
 from .importance import query_key
-from .store import LEGACY_CONTEXT_PREFIX, legacy_native_context
+from .store import GOAL_CONTEXT_PREFIX, LEGACY_CONTEXT_PREFIX, legacy_native_context
 
 MODEL_ID = 'google/embeddinggemma-2'
 MODEL_REVISION = '914f7f89142e33e77833254d9c9b90c3cef7303b'
@@ -438,10 +438,12 @@ class Retrieval:
         # Ordinary episode text is read directly; never hydrate cold/raw data.
         context_only = False
         for episode in self.store._db.execute('''SELECT e.source,e.kind,e.metadata,
-            CASE WHEN e.kind='user' AND e.source GLOB 'native:*:codex' AND substr(e.text,1,?)=?
+            CASE WHEN e.kind='user' AND e.source GLOB 'native:*:codex'
+                 AND (substr(e.text,1,?)=? OR substr(e.text,1,?)=?)
                  THEN e.text END AS text
             FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
-            WHERE g.target=? AND g.version=?''', (len(LEGACY_CONTEXT_PREFIX), LEGACY_CONTEXT_PREFIX, target, version)):
+            WHERE g.target=? AND g.version=?''', (len(LEGACY_CONTEXT_PREFIX), LEGACY_CONTEXT_PREFIX,
+                len(GOAL_CONTEXT_PREFIX), GOAL_CONTEXT_PREFIX, target, version)):
             if (episode['text'] is None
                     or not legacy_native_context(episode['source'], episode['kind'], episode['text'], episode['metadata'])):
                 return False

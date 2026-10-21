@@ -97,7 +97,7 @@ During historical uploads, quote-only native saves and quoted media saves flush 
 
 Automatic context uses a shared bounded budget for facts and conditional behavioral suggestions; an empty result is valid. Generalized suggestions use the existing `experience` type and consolidation schedule, retain exact supporting evidence, and distinguish inferred lessons from explicit user preferences. Current instructions take precedence. Lasting relevant corrections can revise or retire a suggestion through the existing history; no per-turn model call or separate learning service is involved. Broad explicit recall remains available.
 
-Known complete legacy Codex `AGENTS.md` instruction envelopes, with an optional environment-context suffix, are retained as raw history but excluded from extraction and behavioral authority. Existing memories supported only by those envelopes remain explicitly searchable and are omitted from automatic context. The server handles this without re-importing histories or updating clients; genuine prose outside the exact recognized form remains eligible.
+Known complete legacy Codex `AGENTS.md` instruction envelopes (with an optional environment-context suffix) and complete `<codex_internal_context source="goal">` runtime envelopes are retained as raw history but excluded from extraction and behavioral authority. Existing memories supported only by those envelopes remain explicitly searchable and are omitted from automatic context. The server handles this without re-importing histories or updating clients; genuine prose outside the exact recognized form remains eligible.
 
 ### Import histories on each origin device
 

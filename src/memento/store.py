@@ -21,6 +21,7 @@ from .raw_text import KINDS as RAW_KINDS, MIME as RAW_MIME, elide, hydrate
 from .portable import _connect
 
 LEGACY_CONTEXT_PREFIX = '# AGENTS.md instructions'
+GOAL_CONTEXT_PREFIX = '<codex_internal_context source="goal">'
 
 
 class ConflictError(Exception):
@@ -39,6 +40,9 @@ def legacy_native_context(source, kind, text, metadata):
     if (not isinstance(metadata, dict) or 'native_context_kinds' in metadata or 'content_item_kinds' in metadata
             or metadata.get('extraction_mode', 'message') != 'message' or not isinstance(text, str)):
         return False
+    if text.startswith(GOAL_CONTEXT_PREFIX):
+        return (text.rstrip().endswith('</codex_internal_context>')
+                and text.count('<codex_internal_context') == 1 and text.count('</codex_internal_context>') == 1)
     opening = re.match(r'\A' + re.escape(LEGACY_CONTEXT_PREFIX) + r'(?: for [^\r\n]+)?\r?\n[ \t\r\n]*<INSTRUCTIONS>', text)
     if opening is None or text.count('<INSTRUCTIONS>') != 1 or text.count('</INSTRUCTIONS>') != 1:
         return False

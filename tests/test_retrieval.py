@@ -369,10 +369,12 @@ def test_personal_factual_control_type_preserves_evidence_and_automatic_eligibil
 
 
 @pytest.mark.parametrize('tier', ['candidate', 'durable', 'segment'])
-def test_legacy_context_backed_records_are_only_excluded_from_automatic_recall(retrieval, tier):
+@pytest.mark.parametrize('envelope', ['instructions', 'goal'])
+def test_legacy_context_backed_records_are_only_excluded_from_automatic_recall(retrieval, tier, envelope):
     r = retrieval
     text = 'Use concise responses for routine questions.'
-    raw = '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n' + text + '\n</INSTRUCTIONS>'
+    raw = ('<codex_internal_context source="goal">\n' + text + '\n</codex_internal_context>'
+           if envelope == 'goal' else '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n' + text + '\n</INSTRUCTIONS>')
     source = 'native:synthetic-device:codex'
     if tier == 'candidate':
         target, episode = candidate(r, text, source=source, raw=raw)
@@ -399,12 +401,14 @@ def test_legacy_context_backed_records_are_only_excluded_from_automatic_recall(r
 
 
 @pytest.mark.parametrize('tier', ['candidate', 'durable'])
-def test_genuine_evidence_after_five_context_spans_keeps_automatic_eligibility(retrieval, monkeypatch, tier):
+@pytest.mark.parametrize('envelope', ['instructions', 'goal'])
+def test_genuine_evidence_after_five_context_spans_keeps_automatic_eligibility(retrieval, monkeypatch, tier, envelope):
     r = retrieval
     identities = iter(f'{index:032x}' for index in range(1, 20))
     monkeypatch.setattr('memento.store.uuid4', lambda: SimpleNamespace(hex=next(identities)))
     text = 'Use concise responses for routine questions.'
-    raw = '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n' + text + '\n</INSTRUCTIONS>'
+    raw = ('<codex_internal_context source="goal">\n' + text + '\n</codex_internal_context>'
+           if envelope == 'goal' else '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n' + text + '\n</INSTRUCTIONS>')
     source = 'native:synthetic-device:codex'
     target, _ = candidate(r, text, source=source, raw=raw) if tier == 'candidate' else (None, None)
     refs = []
@@ -436,6 +440,9 @@ def test_genuine_evidence_after_five_context_spans_keeps_automatic_eligibility(r
     ('native:synthetic-device:codex', 'user', 'Ordinary source ' + 'x' * 500000),
     ('native:synthetic-device:codex', 'tool', '# AGENTS.md instructions\n' + 'x' * 500000),
     ('native:synthetic-device:pi', 'user', '# AGENTS.md instructions\n' + 'x' * 500000),
+    ('native:synthetic-device:codex', 'tool', '<codex_internal_context source="goal">' + 'x' * 500000),
+    ('native:synthetic-device:pi', 'user', '<codex_internal_context source="goal">' + 'x' * 500000),
+    ('native:synthetic-device:codex', 'user', '<codex_internal_context source="plan">' + 'x' * 500000),
 ])
 def test_automatic_context_check_does_not_copy_obviously_unmatched_large_text(retrieval, monkeypatch, source, kind, text):
     r = retrieval

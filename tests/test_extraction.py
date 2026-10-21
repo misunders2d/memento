@@ -11,6 +11,7 @@ from memento.store import Store
 
 TEXT = '😀 Сергей, Mellanni, Memory. Связи: Сергей → Mellanni; Memory → Mellanni.'
 NATIVE_SOURCE = 'native:synthetic-device:codex'
+GOAL_CONTEXT = '<codex_internal_context source="goal">\n' + TEXT + '\n</codex_internal_context>'
 LEGACY_CONTEXTS = [
     '# AGENTS.md instructions for /workspace/example\n\n<INSTRUCTIONS>\n' + TEXT +
         '\n</INSTRUCTIONS>\n<environment_context>\ncwd: /workspace/example\nshell: bash\n</environment_context>',
@@ -20,6 +21,7 @@ LEGACY_CONTEXTS = [
         '\n</INSTRUCTIONS>\n<environment_context>\ncurrent_date: 2026-01-01\n</environment_context>',
     '# AGENTS.md instructions for /workspace/other\n\n<INSTRUCTIONS>\n' + TEXT +
         '\n</INSTRUCTIONS>\n<environment_context>\nfilesystem: local\n</environment_context>',
+    GOAL_CONTEXT, GOAL_CONTEXT + '\n \t',
 ]
 
 
@@ -308,11 +310,43 @@ def test_legacy_context_predicate_keeps_unmatched_and_genuine_user_messages(chan
     assert not legacy_native_context(source, kind, text, metadata)
 
 
+@pytest.mark.parametrize('change', ['prefix', 'suffix', 'fenced', 'double', 'nested', 'unclosed',
+    'source_plan', 'leading_newline', 'other_harness', 'assistant', 'native_context_kinds', 'content_item_kinds'])
+def test_goal_context_predicate_keeps_unmatched_and_genuine_user_messages(change):
+    from memento.store import legacy_native_context
+    source, kind, metadata, text = NATIVE_SOURCE, 'user', {'extraction_mode': 'message'}, GOAL_CONTEXT
+    if change == 'prefix':
+        text = 'My genuine request.\n' + text
+    elif change == 'suffix':
+        text += '\nRemember my genuine correction.'
+    elif change == 'fenced':
+        text = '```text\n' + text + '\n```'
+    elif change == 'double':
+        text += text
+    elif change == 'nested':
+        text = text.replace(TEXT, '<codex_internal_context source="plan">' + TEXT)
+    elif change == 'unclosed':
+        text = text.replace('</codex_internal_context>', '')
+    elif change == 'source_plan':
+        text = text.replace('source="goal"', 'source="plan"')
+    elif change == 'leading_newline':
+        text = '\n' + text
+    elif change == 'other_harness':
+        source = 'native:synthetic-device:pi'
+    elif change == 'assistant':
+        kind = 'assistant'
+    else:
+        metadata[change] = ['goal.internal_context']
+    assert not legacy_native_context(source, kind, text, metadata)
+
+
 def test_large_repeated_or_incomplete_legacy_delimiters_are_not_context_only():
     from memento.store import legacy_native_context
     prefix = '# AGENTS.md instructions\n\n<INSTRUCTIONS>'
     for text in (prefix + '<INSTRUCTIONS>' * 30000 + '</INSTRUCTIONS>',
-                 prefix + ' ' * 500000, LEGACY_CONTEXTS[0] + '\n' + 'own words ' * 50000):
+                 prefix + ' ' * 500000, LEGACY_CONTEXTS[0] + '\n' + 'own words ' * 50000,
+                 '<codex_internal_context source="goal">' * 30000 + '</codex_internal_context>',
+                 '<codex_internal_context source="goal">' + ' ' * 500000):
         assert not legacy_native_context(NATIVE_SOURCE, 'user', text, {})
 
 
@@ -322,7 +356,7 @@ def test_extraction_filters_more_than_65_legacy_contexts_before_its_window_limit
         processing = Processing(Graph(store))
         for index in range(70):
             store.capture(dict(source=NATIVE_SOURCE, event_id=str(index), conversation_id='c', kind='user',
-                text=LEGACY_CONTEXTS[index % 4], occurred_at=None, metadata={'extraction_mode': 'message'}))
+                text=LEGACY_CONTEXTS[index % len(LEGACY_CONTEXTS)], occurred_at=None, metadata={'extraction_mode': 'message'}))
         genuine, _ = store.capture(dict(source=NATIVE_SOURCE, event_id='genuine', conversation_id='c',
             kind='user', text=TEXT, occurred_at=None, metadata={}))
         work = processing.claim(agent='fixture', timezone_name='UTC',
@@ -340,14 +374,16 @@ def test_extraction_filters_more_than_65_legacy_contexts_before_its_window_limit
 
 @pytest.mark.parametrize('mixed', [False, True])
 @pytest.mark.parametrize('leased', [False, True])
-def test_preexisting_queued_and_leased_context_work_completes_without_losing_real_windows(tmp_path, monkeypatch, mixed, leased):
+@pytest.mark.parametrize('text', [LEGACY_CONTEXTS[0], GOAL_CONTEXT], ids=['instructions', 'goal'])
+def test_preexisting_queued_and_leased_context_work_completes_without_losing_real_windows(
+        tmp_path, monkeypatch, mixed, leased, text):
     from memento.store import legacy_native_context
     store = Store(tmp_path)
     try:
         processing = Processing(Graph(store))
         now = datetime.now(timezone.utc).replace(hour=12)
         context, _ = store.capture(dict(source=NATIVE_SOURCE, event_id='old-context', conversation_id='c',
-            kind='user', text=LEGACY_CONTEXTS[0], occurred_at=None, metadata={}))
+            kind='user', text=text, occurred_at=None, metadata={}))
         genuine = None
         if mixed:
             genuine, _ = store.capture(dict(source=NATIVE_SOURCE, event_id='real-message', conversation_id='c',
@@ -378,7 +414,7 @@ def test_preexisting_queued_and_leased_context_work_completes_without_losing_rea
         assert store._db.execute('SELECT seq=latest_seq FROM processing_progress').fetchone()[0] == 1
         assert store._db.execute('SELECT count(*) FROM candidates').fetchone()[0] == (5 if mixed else 0)
         assert not store._db.execute('SELECT 1 FROM graph_evidence WHERE episode_id=?', (context['id'],)).fetchone()
-        assert store.get(context['id'])['text'] == LEGACY_CONTEXTS[0]
+        assert store.get(context['id'])['text'] == text
         assert processing.claim(agent='fixture', timezone_name='UTC', now=now)['work'] == []
     finally:
         store.close()
