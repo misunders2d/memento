@@ -1,34 +1,87 @@
 # Memento
 
-### Your assistant should remember more than the last chat.
+### Shared memory for the agents you already use.
 
-Memento gives your native AI agents a shared, private memory—with receipts. Stop re-explaining your preferences, projects and decisions every time you start a new conversation. Memento captures the conversation, extracts evidence-backed memories, and automatically brings relevant context into later prompts.
+A decision you explain to Pi on one computer should be useful when you open Claude Code on another.
 
-**Remember the useful things. Keep the original evidence. Change your mind without losing the history.**
+Memento gives **one owner's agents a shared, private memory** across Pi, OMP, Claude Code and Codex. It keeps useful facts, lessons from experience and unfinished obligations connected to their original conversations, so a new session can pick up relevant context.
 
-- **Works where you already work.** Native integrations for Pi, OMP, Claude Code and Codex; no replacement chat app.
-- **Recall without a ritual.** Relevant memories are injected automatically. MCP tools handle explicit saves, corrections, history and open loops.
-- **Evidence, not unexplained assertions.** Memories retain source quotes and offsets. Candidates are visibly unconfirmed before promotion; corrections keep version history.
-- **Learn from experience.** Supported experiences can become reusable behavioral suggestions, with conditions, reasons and exceptions. Your current instructions take precedence.
-- **One memory across your devices.** A private central service, with capture clients on your other machines. Each origin keeps its own stable identity.
-- **Your storage, your boundaries.** Local Linux storage and local embeddings. Optional Google Drive cold storage and manual backups use a dedicated app-accessible folder, not access to your whole Drive.
-- **Take your memories with you.** Export the database and any files still stored only locally. Files already on Drive stay there; their references move with the database.
+**Memories keep their original evidence, and corrections keep their history.**
 
-Extraction and consolidation use your **existing native CLI login and default model**, not a new paid model API key. Those calls still consume model usage and follow your provider's terms; “local storage” does not mean no conversation content ever reaches a model provider.
+Keep using your native agents. There is no new chat app, and processing uses your existing native CLI login and model rather than requiring another model API key.
 
 [Product website](https://memento.bezosapp.uk/) · [Privacy](https://memento.bezosapp.uk/privacy/) · [Terms](https://memento.bezosapp.uk/terms/)
 
+## One owner, several agents, shared context
+
+```mermaid
+flowchart TB
+    accTitle: Shared memory across your agents and devices
+    accDescr: Native agents on two computers capture conversations and retrieve context from one private Memento service. Optional Google Drive holds artifacts and manual backups.
+    L["Laptop<br/>Pi · Codex"] <-->|"Capture / recall"| M["Private memory<br/>Facts · lessons · loops"]
+    W["Other computer<br/>Claude Code · OMP"] <-->|"Capture / recall"| M
+    M --> D["Optional Drive<br/>Files · manual backups"]
+```
+
+Each device contributes its own conversations and can retrieve relevant memories from the same service. This shares context across your agents; each native conversation and device keeps its own identity.
+
+## What carries forward
+
+These fictional examples illustrate the three kinds of continuity:
+
+- **Facts and decisions.** “We chose Tuesday for the release; Friday is the fallback.” A later session can recall the decision and inspect the exact quote, source and history instead of relying on an unexplained summary.
+- **Lessons from experience.** After a supported experience, Memento can retain a conditional lesson such as “For a small fix, check whether the existing path can handle it before adding a dependency.” Suggestions retain their applicability, rationale and exceptions. They can help another agent choose an approach, and later corrections can refine them.
+- **Open obligations.** “I still owe Mira the release checklist.” Ask your agent to list open loops in a later session. Consolidation can combine repeated evidence for the same obligation and close it when newer dated evidence establishes completion or cancellation. Relevant waits on other people count too.
+
+**Your current instructions and repository rules stay authoritative.** Recalled memories and inferred lessons provide context; they do not replace `AGENTS.md`, install skills or grant permission to act. Inferred memories and lessons can be wrong; their evidence is available to check. An agent may need explicit recall when automatic context is insufficient.
+
 ## How it fits together
 
-![Memento architecture: native capture and automatic recall, separate service identity, evidence-backed candidates, nightly consolidation and optional Drive storage](docs/images/architecture.svg)
+The automatic learning path keeps original conversations separate from inferred memory:
 
-Raw history and inferred memory are separate. Extraction runs after native compaction or 30 minutes of conversation inactivity. Supported candidates are available to recall before promotion. Consolidation runs during the configured **02:00–07:00 local-time window**; it is not an exact 02:00 cron job.
+```mermaid
+flowchart TB
+    accTitle: From original conversation to useful context
+    accDescr: Conversations produce unconfirmed candidates. Nightly consolidation can keep, refine or combine them into memories, lessons and loop markers. Relevant recall can return candidates as well as durable memories.
+    H["Conversations"] --> C["Candidates<br/>Unconfirmed"]
+    C --> N["Nightly<br/>consolidation"]
+    N --> M["Memories<br/>Lessons · loops"]
+    C --> R["Relevant recall"]
+    M --> R
+```
 
-The same consolidation step can turn an experience into a general lesson. These suggestions become available automatically, with their original evidence and an explicit distinction between a stated preference and an inferred lesson. Relevant later corrections can revise or narrow a lesson through the existing correction history. A temporary exception wins for the current task; lasting updates use the normal processing schedule.
+Extraction starts after native compaction or conversation inactivity. Candidates remain visibly unconfirmed and can be recalled before promotion; deeper consolidation runs in the configured night window. Learning takes processing time.
 
-Automatic context has a small shared budget for memories and behavioral suggestions. It can legitimately be empty. Broad explicit `recall` remains available when the injected context is insufficient.
+Relevant facts and eligible behavioral suggestions can appear automatically in later prompts, within a small shared context budget. They are labeled distinctly, and the result can legitimately be empty. The six memory tools let an agent explicitly recall, save, connect, correct or inspect memories and manage loop markers.
 
-This is a private memory backend, not a public dashboard, a Google sign-in website, a whole-Drive indexer or a guarantee that every model inference is true. The public website is a separate static product/policy site.
+History retains exact source quotes, dates and changes. **Old conversations keep their original dates:** age affects recall ranking, without deleting memories or making imported history appear new. Age alone never closes a task. Reminder dates can be stored and listed; there is no proactive reminder delivery.
+
+## Bring your history, keep your data
+
+Import selected native histories on their original devices, including supported attachments, and check capture, upload and processing progress separately. If the memory host goes offline while you keep chatting on a laptop, those conversations stay queued on the laptop. When the host returns and you resume chatting, native activity automatically retries the queued history; an explicit upload can retry it too. An idle client has no background retry daemon. Explicit saves report failure rather than pretending to have succeeded and are not queued as mutations.
+
+The private service stores memory on local Linux storage and runs embeddings locally. Extraction and consolidation use the designated native agent's model provider, consume its usage and can send conversation content to that provider. Local storage does not mean entirely local model processing.
+
+Google Drive is optional. It uses a dedicated app-accessible folder for artifacts and manual backups. A migration export carries the database and files that exist only locally; files already on Drive stay there, with their references preserved. You can move the service without downloading and repacking those files.
+
+## Start with your agent
+
+First, an operator sets up **one private service** and **one processing host** using Pi, OMP or Claude Code. Codex can connect as a capture/recall client; server extraction currently stays fail-closed. The setup reference below covers host prerequisites, storage and permissions.
+
+Once that host is ready, give each agent your instance's guide:
+
+> Connect this agent to Memento using `https://YOUR_MACHINE.YOUR_TAILNET.ts.net/connect`.
+
+The agent fetches the guide, installs its native integration and verifies the connection using the existing native login. Native trust/MCP permissions and Google consent remain explicit human steps. Start a fresh native session after installation.
+
+The guide lives on your private service. A headless agent can fetch it through its local shell or HTTP client on the device with access to that service; a public web-browsing service may not reach it. On the service host itself, the loopback guide is `http://127.0.0.1:8765/connect`.
+
+## Setup and reference
+
+The expandable sections retain the full installation, agent and operator instructions.
+
+<details>
+<summary><strong>Set up the private service and connect your agents</strong></summary>
 
 ## Installation map
 
@@ -141,6 +194,7 @@ A client captures conversations, retrieves relevant context automatically and nu
 Expose the downloaded stdlib runner as a command once on each device:
 
 ```sh
+URL=https://YOUR_MACHINE.YOUR_TAILNET.ts.net
 install -d -m 0700 "$HOME/.local/share/memento"
 mkdir -p "$HOME/.local/bin"
 curl --fail "$URL/runner" -o "$HOME/.local/share/memento/runner.py"
@@ -164,7 +218,7 @@ Choose `pi`, `omp`, `claude` or `codex`. The existing harness config or default 
 | Claude Code | Native capture/recall/compaction hooks and Memento MCP definition |
 | Codex | Native hooks and MCP definition; human `/hooks` trust and MCP permissions still required |
 
-There is no new daemon, registry, dependency or per-message work added by this command. It reuses the shipped native installer and does not restart active agents. Without the command link, `python3 ~/.local/share/memento/runner.py agent add HARNESS --url "$URL"` is equivalent. Keep each device's own config and stable generated `client_uid`; do not copy configs or histories to pretend they came from another origin.
+This command reuses the shipped native installer and does not add a daemon or restart active agents. Without the command link, `python3 ~/.local/share/memento/runner.py agent add HARNESS --url "$URL"` is equivalent. Keep each device's own config and stable generated `client_uid`; do not copy configs or histories to pretend they came from another origin.
 
 **Start new native sessions after installation.** Do not silently restart an active user-owned agent. The existing native profile, model selection and login remain the source of truth.
 
@@ -196,6 +250,15 @@ Tailnet HTTPS must be enabled and ACLs must restrict access to your devices. The
 Clients use the canonical `/mcp/` URL. Existing `/mcp` URLs receive a relative HTTP 307 redirect, preserving the request method, query string and private HTTPS origin without trusting forwarded headers.
 
 On a client device, download `/runner` from `https://YOUR_MACHINE.YOUR_TAILNET.ts.net`, then run `memento agent add HARNESS --url https://YOUR_MACHINE.YOUR_TAILNET.ts.net`. No client timezone is needed. Do not disable TLS verification or use a public reverse proxy as a shortcut.
+
+### Technical architecture and trust boundaries
+
+![Memento architecture: native capture and automatic recall, separate service identity, evidence-backed candidates, nightly consolidation and optional Drive storage](docs/images/architecture.svg)
+
+</details>
+
+<details>
+<summary><strong>Verify capture, recall and nightly learning</strong></summary>
 
 ## 4. Prove memory actually works
 
@@ -240,6 +303,106 @@ That flag bypasses **only the consolidation night window**, not extraction eligi
 Leave an evidence-backed candidate pending before 02:00 in the server config's timezone. Keep the host awake and the timer enabled. Observe the normal service journal and memory history after the first completed in-window tick, without running a forced tick or modifying the clock.
 
 The window is **02:00–07:00**, not exactly 02:00. The first in-window claim freezes that night's eligible-candidate boundary; later candidates wait for another night. Processing duration shifts the next tick. Give pending extraction/consolidation time to finish before calling a miss a failure. There is no daytime catch-up for a missed night window.
+
+</details>
+
+<details>
+<summary><strong>Import history, read progress and save files</strong></summary>
+
+## Import existing conversation history
+
+Finish the native first-test sequence **before** importing history. Import on each origin device using that device's private config and stable identity. Select actual local paths explicitly; there is no automatic history discovery.
+
+```sh
+memento import-history /path/to/history --agent pi
+memento upload --agent pi
+memento status --agent pi
+```
+
+Use `--agent omp`, `claude` or `codex` for other histories. A matching default config is reused; otherwise the command selects that harness's config. Keep using `--config PATH` for a custom installation. Directories recurse over `*.jsonl`; only complete JSONL records are queued. Repeating an import with the same origin identity/event content is idempotent. Explicit upload drains until empty or transport failure, reports JSON `pending`/`conflicts` counts and exits nonzero if either remains. Native background upload has a bounded runtime and retries durably. A large attachment on a slow connection may need explicit `memento upload`; its retries do not block later text uploads.
+
+An unsuccessful upload also reports a sanitized `error` category (`timeout`, `http`, `network`, `validation` or `lock`), with an HTTP status and local outbox ID when available. The result excludes message contents, credentials and server response bodies. Keep the result when investigating; a healthy service alone does not explain an upload failure. Address the reported cause, then retry the same upload without importing again. Conflicts require investigation; retrying does not overwrite the existing event.
+
+Explicit text uploads allow up to 15 seconds per request, matching other foreground commands, so a busy service can finish acknowledging a record. Background hooks keep their two-second text timeout and bounded total runtime.
+
+Large imports checkpoint complete records and journal cursors together, releasing the capture-spool writer lock between batches and files. Their `records_added` count excludes concurrent live capture. Claude workflow journals retain their own conversation identity rather than being attributed to the first agent they mention. Referenced artifacts outside the selected histories require an explicit `--artifact-root DIR`; missing or unsupported material is reported. For OMP's native blob references, include its blob directory:
+
+```sh
+memento import-history "$HOME/.omp/agent/sessions" --agent omp \
+  --artifact-root "$HOME/.omp/agent/blobs"
+memento upload --agent omp
+```
+
+Import reports the selected conversation IDs and queues a processing boundary after their captured records. Once uploaded, the processor can extract that history even if those conversations remain active. Consolidation still follows its normal nightly schedule.
+
+Raw-record and message-projection deduplication are independent: replay can add missing supported message projections without duplicating preserved raw records. Native attachment import supports objects up to **32 MiB** each; larger or unsupported attachments are reported in coverage rather than silently counted as imported. The original native record remains preserved.
+
+Large opaque runs of at least 64 KiB in newly captured skipped native records use the existing artifact store, keeping binary text out of SQLite and text processing. Explicit source/history reads reconstruct and verify the exact original text; a missing or corrupt artifact produces an error. To support an assertion, cite the message projection with its exact quote and offsets; offloaded raw JSON is available for inspection and export but cannot be assertion evidence. Existing inline evidence remains supported. Identical runs share storage, but different native chunk boundaries can prevent reuse.
+
+The existing background worker losslessly compresses remaining raw native records inside SQLite, grouping text from the same conversation into small frames. This applies to existing history and later captures without another import or model call. Message projections remain available for extraction and search; original raw text, identifiers, timestamps and evidence are preserved. Source reads transparently reconstruct and verify the original bytes. Status reports remaining inline bytes, compressed records, their original bytes and compressed bytes. Compression frees database pages for reuse; use the owner maintenance command below to return those pages to the filesystem.
+
+### Read progress without guessing
+
+`memento status --agent HARNESS` separates the local capture/upload queue from service processing. It reports captured episodes and conversations, indexing units and failures, extraction backlog, consolidation candidates and jobs, media jobs and Drive state. `service` contains the harness's native-source counts; `artifacts_service` separately covers explicit file saves made without a conversation quote. Disabled or unreachable stages are reported as unavailable. Zero consolidation jobs does not mean completion: candidates can be waiting for the nightly window. The counters do not prove the native processor is online.
+
+Extraction, consolidation and media include `errors` grouped by pending/failed state and safe category, such as `invalid_output` or `cli_failed`; unfamiliar stored values become `unknown_error`. These are last recorded failure classifications, not diagnoses or proof that a retry is running. Leased and completed jobs are excluded.
+
+The first service start after upgrading builds a status index once. Large histories can delay readiness while existing records are scanned; clients keep captures queued. The index adds database and backup space, and its temporary sort shares the service's memory limit. Subsequent starts reuse it.
+
+For each conversation, `extraction.progress` reports its processed `cursor`, partial `offset`, `compact_through` boundary and `latest_seq`. After upload reports zero pending records and conflicts, retain the imported conversations' boundaries to track a finite batch: a later cursor at or beyond a retained boundary means that prefix has been extracted, even if new live work remains. Indexing and candidate disposition are separate stages.
+
+Each service response also labels `artifact_storage` as global: registered, local-only and verified-remote object/byte counts cover the whole instance. A verified remote object can still have a local cached copy. These counts show storage progress, not which objects are currently eligible or queued.
+
+### Save and retrieve a file
+
+```sh
+memento media save /path/to/image.png --agent pi --scope personal
+memento media status JOB_ID --agent pi
+memento media get SHA256 --agent pi --output /private/original.png
+```
+
+Save streams files up to **1 GiB** through the existing blob interface and submits a media job. Keep the returned job ID and SHA; submission is not completed indexing. For a retry, reuse the returned command ID with the identical command. Retrieval verifies the checksum and refuses to overwrite an existing file.
+
+An agent can attach an exact native quote with `--quote TEXT --conversation-id ID`. Otherwise the save records the file's identity as artifact evidence; it does not invent a user statement. Use `--kind image|audio|video|document` or `--mime MIME` when the file's type cannot be inferred. The existing `remember` MCP tool also accepts an already-uploaded media reference and evidence; binary bytes belong in the file upload, not tool arguments.
+
+</details>
+
+<details>
+<summary><strong>Use the six memory tools, corrections, behavior and open loops</strong></summary>
+
+## MCP and memory semantics
+
+The six MCP tools are:
+
+| Tool | Purpose |
+| --- | --- |
+| `recall` | Semantic memory search, or recent/literal raw evidence |
+| `remember` | Explicit evidence-backed save |
+| `link` | Connect memories |
+| `supersede` | Correct, refine or record a world-time change |
+| `history` | Inspect versions, differences, reasons and evidence |
+| `loop` | List/open/close/defer open loops or set an explicit reminder time |
+
+`recall(query, effort="normal", scope=...)` performs semantic retrieval; effort can be `cheap`, `normal` or `deep`. Omit the query for recent raw activity; use aware ISO `since` or `source` for literal raw evidence filtering. Raw history has no inferred personal/professional scope.
+
+Memory age affects ranking, not deletion or availability in normal searches. Recency uses the original supporting messages, with a 90-day half-life and renewal through committed citations; importing old chats does not make them new. Pinned memories and explicit behavioral guidance are exempt from aging. Automatic context shows the original source date when known; that date does not establish whether a past task is still active.
+
+Explicit saves require **nonempty verbatim quotes**, with zero-based `occurrence` for repeats; native hooks resolve current-conversation provenance. Mutations require a stable `command_id`, `actor` and `why`. Reuse a command ID only for an identical retry. Save/replacement scopes are `["personal"]`, `["professional"]` or both. World-time changes require an aware `valid_at`. Native/MCP empty optional strings are treated as omitted; required text and invalid nonempty dates still fail validation. HTTP commands remain strict.
+
+Open loops are markers on ordinary memories. Extraction can suggest a pending obligation or a relevant wait on someone else; these remain visibly unconfirmed until consolidation. Nightly consolidation can combine repeated evidence for the same obligation, decline an incorrect automatic flag, and close an existing obligation when exact, dated evidence establishes its completion or cancellation. Different obligations stay separate. Age and inactivity alone never close a loop, and uncertain or older completion evidence leaves it open. A newer human loop choice makes a stale consolidation plan re-evaluate before applying; genuinely newer evidence can reopen a completed obligation.
+
+To save one explicitly, tell your agent, for example: “Remember this as an open loop: I still need to send Mira the release checklist.” The agent saves the quoted statement with `remember`, then uses `loop` to open its memory ID. Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence.
+
+### Conditional behavioral suggestions
+
+The same consolidation step can turn an experience into a general lesson. These suggestions become available automatically, with their original evidence and an explicit distinction between a stated preference and an inferred lesson. Relevant later corrections can revise or narrow a lesson through the existing correction history. A temporary exception wins for the current task; lasting updates use the normal processing schedule.
+
+Automatic context has a small shared budget for memories and behavioral suggestions. It can legitimately be empty. Broad explicit `recall` remains available when the injected context is insufficient. Suggested behavior remains subordinate to current instructions and repository rules.
+
+</details>
+
+<details>
+<summary><strong>Connect Google Drive with the original account and folder</strong></summary>
 
 ## 5. Optional Google Drive connection
 
@@ -309,84 +472,10 @@ It creates the dedicated folder only for first-time setup. The human/operator in
 
 A definitive revoked/expired grant leaves the service available for reconnection while `/health` reports `503 Drive reauthorization required`. Wrong bindings, malformed private configuration and unrelated startup failures are not silently ignored. Do not revoke a working grant merely to demonstrate that a command runs; persisted-connection reload is not fresh human re-consent.
 
-## Import existing conversation history
+</details>
 
-Finish the native first-test sequence **before** importing history. Import on each origin device using that device's private config and stable identity. Select actual local paths explicitly; there is no automatic history discovery.
-
-```sh
-memento import-history /path/to/history --agent pi
-memento upload --agent pi
-memento status --agent pi
-```
-
-Use `--agent omp`, `claude` or `codex` for other histories. A matching default config is reused; otherwise the command selects that harness's config. Keep using `--config PATH` for a custom installation. Directories recurse over `*.jsonl`; only complete JSONL records are queued. Repeating an import with the same origin identity/event content is idempotent. Explicit upload drains until empty or transport failure, reports JSON `pending`/`conflicts` counts and exits nonzero if either remains. Native background upload has a bounded runtime and retries durably. A large attachment on a slow connection may need explicit `memento upload`; its retries do not block later text uploads.
-
-An unsuccessful upload also reports a sanitized `error` category (`timeout`, `http`, `network`, `validation` or `lock`), with an HTTP status and local outbox ID when available. The result excludes message contents, credentials and server response bodies. Keep the result when investigating; a healthy service alone does not explain an upload failure. Address the reported cause, then retry the same upload without importing again. Conflicts require investigation; retrying does not overwrite the existing event.
-
-Explicit text uploads allow up to 15 seconds per request, matching other foreground commands, so a busy service can finish acknowledging a record. Background hooks keep their two-second text timeout and bounded total runtime.
-
-Large imports checkpoint complete records and journal cursors together, releasing the capture-spool writer lock between batches and files. Their `records_added` count excludes concurrent live capture. Claude workflow journals retain their own conversation identity rather than being attributed to the first agent they mention. Referenced artifacts outside the selected histories require an explicit `--artifact-root DIR`; missing or unsupported material is reported. For OMP's native blob references, include its blob directory:
-
-```sh
-memento import-history "$HOME/.omp/agent/sessions" --agent omp \
-  --artifact-root "$HOME/.omp/agent/blobs"
-memento upload --agent omp
-```
-
-Import reports the selected conversation IDs and queues a processing boundary after their captured records. Once uploaded, the processor can extract that history even if those conversations remain active. Consolidation still follows its normal nightly schedule.
-
-Raw-record and message-projection deduplication are independent: replay can add missing supported message projections without duplicating preserved raw records. Native attachment import supports objects up to **32 MiB** each; larger or unsupported attachments are reported in coverage rather than silently counted as imported. The original native record remains preserved.
-
-Large opaque runs of at least 64 KiB in newly captured skipped native records use the existing artifact store, keeping binary text out of SQLite and text processing. Explicit source/history reads reconstruct and verify the exact original text; a missing or corrupt artifact produces an error. To support an assertion, cite the message projection with its exact quote and offsets; offloaded raw JSON is available for inspection and export but cannot be assertion evidence. Existing inline evidence remains supported. Identical runs share storage, but different native chunk boundaries can prevent reuse.
-
-The existing background worker losslessly compresses remaining raw native records inside SQLite, grouping text from the same conversation into small frames. This applies to existing history and later captures without another import or model call. Message projections remain available for extraction and search; original raw text, identifiers, timestamps and evidence are preserved. Source reads transparently reconstruct and verify the original bytes. Status reports remaining inline bytes, compressed records, their original bytes and compressed bytes. Compression frees database pages for reuse; use the owner maintenance command below to return those pages to the filesystem.
-
-### Read progress without guessing
-
-`memento status --agent HARNESS` separates the local capture/upload queue from service processing. It reports captured episodes and conversations, indexing units and failures, extraction backlog, consolidation candidates and jobs, media jobs and Drive state. `service` contains the harness's native-source counts; `artifacts_service` separately covers explicit file saves made without a conversation quote. Disabled or unreachable stages are reported as unavailable. Zero consolidation jobs does not mean completion: candidates can be waiting for the nightly window. The counters do not prove the native processor is online.
-
-Extraction, consolidation and media include `errors` grouped by pending/failed state and safe category, such as `invalid_output` or `cli_failed`; unfamiliar stored values become `unknown_error`. These are last recorded failure classifications, not diagnoses or proof that a retry is running. Leased and completed jobs are excluded.
-
-The first service start after upgrading builds a status index once. Large histories can delay readiness while existing records are scanned; clients keep captures queued. The index adds database and backup space, and its temporary sort shares the service's memory limit. Subsequent starts reuse it.
-
-For each conversation, `extraction.progress` reports its processed `cursor`, partial `offset`, `compact_through` boundary and `latest_seq`. After upload reports zero pending records and conflicts, retain the imported conversations' boundaries to track a finite batch: a later cursor at or beyond a retained boundary means that prefix has been extracted, even if new live work remains. Indexing and candidate disposition are separate stages.
-
-Each service response also labels `artifact_storage` as global: registered, local-only and verified-remote object/byte counts cover the whole instance. A verified remote object can still have a local cached copy. These counts show storage progress, not which objects are currently eligible or queued.
-
-### Save and retrieve a file
-
-```sh
-memento media save /path/to/image.png --agent pi --scope personal
-memento media status JOB_ID --agent pi
-memento media get SHA256 --agent pi --output /private/original.png
-```
-
-Save streams files up to **1 GiB** through the existing blob interface and submits a media job. Keep the returned job ID and SHA; submission is not completed indexing. For a retry, reuse the returned command ID with the identical command. Retrieval verifies the checksum and refuses to overwrite an existing file.
-
-An agent can attach an exact native quote with `--quote TEXT --conversation-id ID`. Otherwise the save records the file's identity as artifact evidence; it does not invent a user statement. Use `--kind image|audio|video|document` or `--mime MIME` when the file's type cannot be inferred. The existing `remember` MCP tool also accepts an already-uploaded media reference and evidence; binary bytes belong in the file upload, not tool arguments.
-
-## MCP and memory semantics
-
-The six MCP tools are:
-
-| Tool | Purpose |
-| --- | --- |
-| `recall` | Semantic memory search, or recent/literal raw evidence |
-| `remember` | Explicit evidence-backed save |
-| `link` | Connect memories |
-| `supersede` | Correct, refine or record a world-time change |
-| `history` | Inspect versions, differences, reasons and evidence |
-| `loop` | List/open/close/defer open loops or set an explicit reminder time |
-
-`recall(query, effort="normal", scope=...)` performs semantic retrieval; effort can be `cheap`, `normal` or `deep`. Omit the query for recent raw activity; use aware ISO `since` or `source` for literal raw evidence filtering. Raw history has no inferred personal/professional scope.
-
-Memory age affects ranking, not deletion or availability in normal searches. Recency uses the original supporting messages, with a 90-day half-life and renewal through committed citations; importing old chats does not make them new. Pinned memories and explicit behavioral guidance are exempt from aging. Automatic context shows the original source date when known; that date does not establish whether a past task is still active.
-
-Explicit saves require **nonempty verbatim quotes**, with zero-based `occurrence` for repeats; native hooks resolve current-conversation provenance. Mutations require a stable `command_id`, `actor` and `why`. Reuse a command ID only for an identical retry. Save/replacement scopes are `["personal"]`, `["professional"]` or both. World-time changes require an aware `valid_at`. Native/MCP empty optional strings are treated as omitted; required text and invalid nonempty dates still fail validation. HTTP commands remain strict.
-
-Open loops are markers on ordinary memories. Extraction can suggest a pending obligation or a relevant wait on someone else; these remain visibly unconfirmed until consolidation. Nightly consolidation can combine repeated evidence for the same obligation, decline an incorrect automatic flag, and close an existing obligation when exact, dated evidence establishes its completion or cancellation. Different obligations stay separate. Age and inactivity alone never close a loop, and uncertain or older completion evidence leaves it open. A newer human loop choice makes a stale consolidation plan re-evaluate before applying; genuinely newer evidence can reopen a completed obligation.
-
-To save one explicitly, tell your agent, for example: “Remember this as an open loop: I still need to send Mira the release checklist.” The agent saves the quoted statement with `remember`, then uses `loop` to open its memory ID. Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence.
+<details>
+<summary><strong>Owner maintenance, backup, database export and migration</strong></summary>
 
 ## Administration, backup and recovery
 
@@ -411,7 +500,7 @@ This compacts the existing database and checkpoints its WAL. It creates no expor
 
 Once raw frames exist, use a Memento version that supports compressed raw history when serving or restoring this database. Older pre-compression images cannot read those frames. Old archives remain readable by the new version.
 
-When Drive is connected, media and payloads of at least **10 MiB** are eligible for prompt upload, including newly saved images below that size. Pinning or memory importance does not prevent their verified remote storage. Other unprotected artifacts remain eligible after 90 days. The existing overrides are `MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS` and `MEMENTO_COLD_MIN_BYTES`.
+When Drive is connected, saved media of any size and other payloads of at least **10 MiB** are eligible for prompt upload. Pinning or memory importance does not prevent their verified remote storage. Other unprotected artifacts remain eligible after 90 days. The existing overrides are `MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS` and `MEMENTO_COLD_MIN_BYTES`.
 
 Offloaded opaque native runs are also promptly eligible. Database exports preserve their existing Drive references and include their bytes only when they have no verified remote copy.
 
@@ -485,6 +574,10 @@ Set `COMPOSE_FILE=compose.yaml:compose.imported.yaml` in that host's `.env`, pre
 
 This is a **point-in-time move, not synchronization**. Before the final export, disable the old host's Memento Tailscale Serve route, stop its processing timer and wait for any running tick to finish; close native sessions on that host too so loopback clients cannot upload. Remote clients then retain new captures in their durable outboxes. Keep the old service running only for its owner export socket, then stop it before enabling the new instance and repointing clients. Never leave both instances accepting writes. Repoint each existing client with `memento agent add HARNESS --url NEW_PRIVATE_URL`, retaining its own config/identity; queued captures then upload to the new host. Configure exactly one processor there. If using Drive, reconnect with the original Desktop client, account and folder. Do not copy client identities or grants between machines.
 
+</details>
+
+<details>
+<summary><strong>Troubleshooting and development</strong></summary>
 
 ## Troubleshooting
 
@@ -507,3 +600,5 @@ uv run --extra media --extra embedding --extra drive pytest -q
 Key implementation areas: `api.py`/`mcp_server.py` (interfaces), `runner.py`/`bridge.py`/`native_*.ts` (native integration), `processing.py`/`extraction.py`/`consolidation.py` (processing), `store.py`/`graph.py`/`retrieval.py` (evidence and retrieval), and `drive_*.py`/`cold_*.py` (optional storage).
 
 Linear is the source of truth for design and status: [Personal Clone](https://linear.app/mellanni/project/personal-clone-d5c1389b6508) · [Memory 2](https://linear.app/mellanni/document/memory-2-4d1f54cbf034) · [origin MEL-657](https://linear.app/mellanni/issue/MEL-657). Repository operator details are in [AGENTS.md](AGENTS.md); third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+</details>
