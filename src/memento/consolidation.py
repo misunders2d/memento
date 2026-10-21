@@ -143,12 +143,12 @@ class Consolidator:
         db = self.store._db
         position = db.execute('SELECT seq FROM episodes WHERE id=?', (episode['id'],)).fetchone()[0]
         rows = []
-        for comparison, order in (('<', 'DESC'), ('>', 'ASC')):
+        for comparison, order, limit in (('<', 'DESC', 1024), ('>', 'ASC', 64)):
             rows.extend(db.execute(f'''SELECT id,kind,
                 CASE WHEN kind='native_hook' THEN metadata END AS metadata,
                 CASE WHEN kind='native_hook' THEN occurred_at END AS occurred_at FROM episodes
-                WHERE source=? AND conversation_id=? AND seq{comparison}? ORDER BY seq {order} LIMIT 64''',
-                (episode['source'], episode['conversation_id'], position)))
+                WHERE source=? AND conversation_id=? AND seq{comparison}? ORDER BY seq {order} LIMIT ?''',
+                (episode['source'], episode['conversation_id'], position, limit)))
         offers = []
         for row in rows:
             if row['kind'] != 'native_hook':

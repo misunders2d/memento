@@ -195,10 +195,23 @@ def test_compressed_replayed_receipt_needs_no_hydration_and_only_two_latest_offe
 def test_receipt_outside_metadata_window_is_unattributed(exposure):
     store, _, processing, lesson, _ = exposure
     offer(store, lesson)
-    for i in range(65):
+    for i in range(1024):
         capture(store, f'noise-{i}', 'Not a receipt.', kind='native_hook', metadata=dict(extraction_mode='skip'))
     _, task = prepare(processing)
     assert task['input']['behavior_exposures'] == []
+
+
+def test_prior_offer_survives_a_tool_heavy_turn(exposure):
+    store, _, processing, lesson, _ = exposure
+    receipt = offer(store, lesson)
+    for i in range(100):
+        capture(store, f'raw-tool-{i}', '{"type":"tool_result","output":"' + 'x' * 4000 + '"}',
+            kind='native_record', metadata=dict(extraction_mode='skip', native_id=f'tool-{i}'))
+        capture(store, f'tool-{i}', f'Tool result {i}: ' + 'x' * 1500,
+            kind='tool', metadata=dict(extraction_mode='tool_output', native_id=f'tool-{i}'))
+    feedback = capture(store, 'feedback', FEEDBACK, time='2026-01-01T00:02:00Z')
+    offers = processing.consolidator._offers(feedback)
+    assert [item['episode_id'] for item in offers] == [receipt['id']]
 
 
 def test_exposed_versions_share_48_context_budget_before_generic_neighbors(exposure, monkeypatch):
