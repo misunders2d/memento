@@ -14,7 +14,7 @@ from .embedder import EMBED_DIM, embed_query, embed_texts, load_model
 from .graph import Graph, NODE_SUMMARY, ENTITY_TYPES
 from .extraction import ACTIVE_CANDIDATE_SQL, source_text_ranges
 from .text_chunks import TextChunk, chunks
-from .importance import query_key
+from .importance import query_key, query_recency
 from .store import GOAL_CONTEXT_PREFIX, LEGACY_CONTEXT_PREFIX, legacy_native_context
 
 MODEL_ID = 'google/embeddinggemma-2'
@@ -379,6 +379,7 @@ class Retrieval:
             last_change=dict(recorded_at=episode['captured_at'], actor=episode['source'], why='Immutable captured evidence'))
 
     def related(self, node_id, hops, *, scope=None, include_archived=False):
+        # Retain the caller option; age-archived rows remain eligible.
         if hops not in (1, 2):
             raise ValueError('Related traversal is limited to one or two hops')
         with self.store._mutex:
@@ -386,8 +387,7 @@ class Retrieval:
                 current_nodes AS (
                     SELECT n.* FROM node_versions n WHERE n.state='active'
                     AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)
-                    AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))
-                    AND (? OR coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0)=0)),
+                    AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))),
                 current_edges AS (
                     SELECT e.* FROM edge_versions e WHERE e.state='active'
                     AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id)),
@@ -410,7 +410,7 @@ class Retrieval:
                     FROM walk w JOIN current_nodes n ON n.id=w.id WHERE w.depth>0 AND n.id<>?)
                 SELECT id,type,one_line,valid_from,valid_to,scope,importance,hops,via,relation,direction,edge_id
                 FROM reached WHERE choice=1 ORDER BY hops,importance DESC,id LIMIT 16''',
-                (scope, scope, include_archived, node_id, hops, node_id)).fetchall()
+                (scope, scope, node_id, hops, node_id)).fetchall()
             from .loops import current
             return [dict(row, scope=json.loads(row['scope']), loop=current(self.graph, row['id'])) for row in rows]
 
@@ -454,6 +454,7 @@ class Retrieval:
         limit = min(limit, AUTOMATIC_RESULT_LIMIT)
         with self._query_inference:
             vector = embed_query(self.model, _automatic_query(query, context))
+        ranked_at = datetime.now(timezone.utc)
         with self.store._mutex:
             db = self.store._db
             rows = []
@@ -463,8 +464,7 @@ class Retrieval:
                     WHERE v.embedding MATCH ? AND k=? AND v.current=1
                     AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({_AUTOMATIC_ELIGIBLE}) a
                         ON a.id=i.target AND a.kind=i.kind AND a.version=i.version
-                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?))
-                        AND coalesce((SELECT archived FROM node_stats WHERE node_id=a.rank_target),0)=0)
+                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?)))
                     ORDER BY v.distance''',
                     (vector.tobytes(), min(120, max(24, limit * 20)), kind, scope, scope)).fetchall())
             matches = {}
@@ -494,18 +494,19 @@ class Retrieval:
                 if isinstance(record.get('scope'), str):
                     record['scope'] = json.loads(record['scope'])
                 record.setdefault('category', 'memory')
+                record.update(query_recency(self.store, record, authority=record.get('authority'), now=ranked_at))
                 if record.get('tier') == 'candidate':
                     full = db.execute('SELECT text FROM candidates WHERE id=?', (record['id'],)).fetchone()
                 else:
                     full = db.execute('SELECT text FROM node_versions WHERE id=? AND version=?',
                                       (record['id'], record['version'])).fetchone()
-                record.update(cosine=float(row['cosine']), score=float(row['cosine']),
+                record.update(cosine=float(row['cosine']), score=float(row['cosine']) * record['decay'],
                               match='semantic', related=[], _full_text=full['text'] if full else record['text'])
                 matches[record['id']] = record
             # Collapse equivalent assertions while retaining every returned source
             # identity and evidence span. Similar but different facts stay separate.
             grouped = {}
-            for record in matches.values():
+            for record in sorted(matches.values(), key=lambda item: (-item['score'], item['id'])):
                 signature = (record['category'], record.get('authority'), tuple(record['scope']),
                              ' '.join(record.pop('_full_text').casefold().split()).rstrip('.!'))
                 previous = grouped.get(signature)
@@ -526,6 +527,12 @@ class Retrieval:
                     if suggestions == AUTOMATIC_SUGGESTION_LIMIT:
                         continue
                     suggestions += 1
+                if record['source_occurred_at']:
+                    prefix = 'Source ' + record['source_occurred_at'][:10] + ': '
+                    record['text'] = prefix + record['text']
+                    if record.get('behavior'):
+                        record['behavior'] = dict(record['behavior'],
+                            applicability=prefix + record['behavior']['applicability'])
                 results.append(record)
                 if len(results) == limit:
                     break
@@ -545,6 +552,7 @@ class Retrieval:
         matches = {row['id']: dict(row, score=TEXT_COSINE_FLOOR + 0.25, match='keyword') for row in keywords}
         with self._query_inference:
             query_vector = embed_query(self.model, query)
+        ranked_at = datetime.now(timezone.utc)
         with self.store._mutex:
             match = ' '.join('"' + term.replace('"', '""') + '"' for term in query.split())
             segment_keywords = self.store._db.execute(f'''SELECT {NODE_SUMMARY},
@@ -557,9 +565,8 @@ class Retrieval:
                 WHERE segment_fts MATCH ? AND n.state='active'
                   AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
                   AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))
-                  AND (? OR coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0)=0)
                 ORDER BY bm25(segment_fts),s.id LIMIT ?''',
-                (match, scope, scope, effort == 'deep', min(100, limit * 4))).fetchall()
+                (match, scope, scope, min(100, limit * 4))).fetchall()
             seen_segments = set()
             for record in segment_keywords:
                 if record['id'] in seen_segments:
@@ -570,9 +577,8 @@ class Retrieval:
                 JOIN candidates c ON c.id=candidate_fts.id WHERE candidate_fts MATCH ?
                 AND {ACTIVE_CANDIDATE_SQL}
                 AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?))
-                AND (? OR coalesce((SELECT archived FROM node_stats WHERE node_id=c.id),0)=0)
                 ORDER BY bm25(candidate_fts),c.id LIMIT ?''',
-                (match, scope, scope, effort == 'deep', min(100, limit * 4))).fetchall()
+                (match, scope, scope, min(100, limit * 4))).fetchall()
             for candidate in candidate_keywords:
                 record = self._candidate_record(candidate['id'])
                 if record is not None:
@@ -591,10 +597,9 @@ class Retrieval:
                     WHERE v.embedding MATCH ? AND k=? AND v.current=1
                     AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({_RECALL_ELIGIBLE}) a
                         ON a.id=i.target AND a.kind=i.kind AND a.version=i.version
-                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?))
-                        AND (? OR coalesce((SELECT archived FROM node_stats WHERE node_id=a.rank_target),0)=0))
+                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?)))
                     ORDER BY v.distance''',
-                    (query_vector.tobytes(), min(1000, limit * 20), kind, scope, scope, effort == 'deep')).fetchall())
+                    (query_vector.tobytes(), min(1000, limit * 20), kind, scope, scope)).fetchall())
             keyword_ids = set(matches)
             seen_raw = set()
             for row in rows:
@@ -650,8 +655,10 @@ class Retrieval:
                 if isinstance(item.get('scope'), str):
                     item['scope'] = json.loads(item['scope'])
                 item.setdefault('importance', .5)
-                item.setdefault('decay', 1.0)
                 item.setdefault('archived', 0)
+                behavior = self.graph._behavior(item['id']) if item['type'] == 'experience' else None
+                item.update(query_recency(self.store, item,
+                    authority=behavior.get('authority') if behavior else None, now=ranked_at))
                 item['score'] *= item['importance'] * item['decay'] * (1 + .1 * feedback.get(item['id'], 0))
         results = sorted(matches.values(), key=lambda item: (-item['score'], item['id']))[:limit]
         for item in results:

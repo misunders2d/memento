@@ -507,6 +507,7 @@ class Graph:
 
     def recall_keywords(self, query, limit=20, *, scope=None, include_archived=True):
         """Literal keyword lookup, filtering before either FTS result limit."""
+        # Keep include_archived compatible; age affects ranking, not eligibility.
         if not 1 <= limit <= 100 or '\x00' in query or scope not in (None, 'personal', 'professional'):
             raise ValueError('Invalid recall limit, query or scope')
         match = ' '.join('"' + term.replace('"', '""') + '"' for term in query.split())
@@ -514,14 +515,13 @@ class Graph:
             return []
         visible = '''n.state='active'
             AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)
-            AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))
-            AND (? OR coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0)=0)'''
+            AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))'''
         with self.store._mutex:
             matches = [dict(row) for row in self.store._db.execute(f'''
                 SELECT {NODE_SUMMARY},bm25(node_fts) AS keyword_rank
                 FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version
                 WHERE node_fts MATCH ? AND {visible}
-                ORDER BY keyword_rank,n.id LIMIT ?''', (match, scope, scope, include_archived, limit))]
+                ORDER BY keyword_rank,n.id LIMIT ?''', (match, scope, scope, limit))]
             aliases = self.store._db.execute(f'''WITH RECURSIVE canonical(source,target,depth) AS (
                 SELECT source,target,0 FROM entity_merges
                 UNION ALL SELECT c.source,m.target,c.depth+1 FROM canonical c
@@ -531,7 +531,7 @@ class Graph:
                 JOIN node_versions n ON n.id=a.target
                 WHERE alias_fts MATCH ? AND {visible}
                 AND NOT EXISTS (SELECT 1 FROM entity_merges WHERE source=a.target)
-                ORDER BY keyword_rank,n.id LIMIT ?''', (match, scope, scope, include_archived, limit))
+                ORDER BY keyword_rank,n.id LIMIT ?''', (match, scope, scope, limit))
             seen = {item['id'] for item in matches}
             for row in aliases:
                 if row['id'] not in seen:

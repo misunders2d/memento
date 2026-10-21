@@ -104,7 +104,7 @@ def test_new_types_do_not_become_active_without_human_approval(curated):
     assert graph.history(event['id'])[-1]['state'] == 'active'
 
 
-def test_pin_survives_age_based_archive_without_changing_evidence(curated):
+def test_pin_and_old_memories_remain_searchable_without_changing_evidence(curated):
     from datetime import datetime, timezone
     from memento.importance import refresh
 
@@ -114,7 +114,8 @@ def test_pin_survives_age_based_archive_without_changing_evidence(curated):
     approve(review(dict(op='pin', node_id=pinned['id'], pinned=True), 'pin-old'), 'pin-old-yes')
     history = graph.history(pinned['id'])
     refresh(store, datetime(2100, 1, 1, tzinfo=timezone.utc))
-    assert [hit['id'] for hit in graph.recall_keywords('Preserve', include_archived=False)] == [pinned['id']]
+    assert {hit['id'] for hit in graph.recall_keywords('Preserve', include_archived=False)} == {pinned['id'], ordinary['id']}
+    assert store._db.execute('SELECT sum(archived) FROM node_stats').fetchone()[0] == 0
     assert {hit['id'] for hit in graph.recall_keywords('Preserve')} == {pinned['id'], ordinary['id']}
     assert graph.history(pinned['id']) == history
     assert history[-1]['evidence'] == history[0]['evidence']

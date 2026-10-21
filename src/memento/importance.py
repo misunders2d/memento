@@ -7,6 +7,42 @@ from datetime import datetime, timezone
 
 from .extraction import ACTIVE_CANDIDATE_SQL
 
+HALF_LIFE_DAYS = 90
+
+
+def query_recency(store, record, *, authority=None, now=None):
+    """Rank bounded recall results from original evidence, without hydrating text."""
+    db = store._db
+    if record.get('tier') == 'raw':
+        row = db.execute('''SELECT occurred_at,
+            (SELECT last_cited_at FROM node_stats WHERE node_id=episodes.id) AS last_cited_at
+            FROM episodes WHERE id=?''', (record['id'],)).fetchone()
+    else:
+        row = db.execute('''SELECT (SELECT e.occurred_at FROM graph_evidence g
+            JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?
+            AND e.occurred_at IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)
+            ORDER BY julianday(e.occurred_at) DESC,e.id LIMIT 1) AS occurred_at,
+            (SELECT last_cited_at FROM node_stats WHERE node_id=?) AS last_cited_at''',
+            (record['id'], record['version'], record['id'])).fetchone()
+
+    def instant(value):
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+            return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    source = instant(row['occurred_at']) if row else None
+    cited = instant(row['last_cited_at']) if row else None
+    anchor = max(value for value in (source, cited) if value is not None) if source or cited else None
+    age = max(0, ((now or datetime.now(timezone.utc)) - anchor).total_seconds() / 86400) if anchor else 0
+    decay = 1.0 if record.get('pinned') or authority == 'explicit_user' else math.exp2(-age / HALF_LIFE_DAYS)
+    return dict(source_occurred_at=source.isoformat() if source else None,
+                ranking_anchor=anchor.isoformat() if anchor else None, decay=decay)
+
 
 def query_key(query):
     shape = ' '.join(sorted(set(re.findall(r'\w+', query.casefold()))))
@@ -42,9 +78,9 @@ def refresh(store, now=None):
         citations = row['access_count'] / (row['access_count'] + 3)
         sources = row['sources'] / (row['sources'] + 3)
         importance = 1.0 if row['pinned'] else min(.95, .30 + .25 * links + .30 * citations + .15 * sources)
-        decay = 1.0 if row['pinned'] else math.exp2(-age_days / 90)
-        archived = int(not row['pinned'] and importance * decay < .10)
-        values.append((importance, decay, archived, row['id']))
+        decay = 1.0 if row['pinned'] else math.exp2(-age_days / HALF_LIFE_DAYS)
+        # Age affects query ranking, never ordinary-search eligibility.
+        values.append((importance, decay, 0, row['id']))
     db.executemany('UPDATE node_stats SET importance=?,decay=?,archived=? WHERE node_id=?', values)
     return len(values)
 

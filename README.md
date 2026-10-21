@@ -378,6 +378,8 @@ The six MCP tools are:
 
 `recall(query, effort="normal", scope=...)` performs semantic retrieval; effort can be `cheap`, `normal` or `deep`. Omit the query for recent raw activity; use aware ISO `since` or `source` for literal raw evidence filtering. Raw history has no inferred personal/professional scope.
 
+Memory age affects ranking, not deletion or availability in normal searches. Recency uses the original supporting messages, with a 90-day half-life and renewal through committed citations; importing old chats does not make them new. Pinned memories and explicit behavioral guidance are exempt from aging. Automatic context shows the original source date when known; that date does not establish whether a past task is still active.
+
 Explicit saves require **nonempty verbatim quotes**, with zero-based `occurrence` for repeats; native hooks resolve current-conversation provenance. Mutations require a stable `command_id`, `actor` and `why`. Reuse a command ID only for an identical retry. Save/replacement scopes are `["personal"]`, `["professional"]` or both. World-time changes require an aware `valid_at`. Native/MCP empty optional strings are treated as omitted; required text and invalid nonempty dates still fail validation. HTTP commands remain strict.
 
 Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence.

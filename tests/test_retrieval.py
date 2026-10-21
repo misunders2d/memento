@@ -31,23 +31,23 @@ def retrieval(tmp_path, monkeypatch):
     store.close()
 
 
-def assertion(r, text, *, scope=None, type='knowledge'):
+def assertion(r, text, *, scope=None, type='knowledge', occurred_at=None):
     key = uuid4().hex
     episode, _ = r.store.capture(dict(source='test', event_id=key, conversation_id='c',
-        kind='user', text=text, occurred_at=None, metadata={}))
+        kind='user', text=text, occurred_at=occurred_at, metadata={}))
     evidence = [dict(episode_id=episode['id'], quote=text)]
     node = r.graph.remember(command_id=key, actor='user', why='explicit assertion',
                             type=type, text=text, scope=scope or ['professional'], evidence=evidence)
     return node['id'], evidence
 
 
-def index(r, node_id, cosine):
+def index(r, node_id, cosine, *, kind='node', version=1):
     vector = np.zeros(768, np.float32)
     vector[0], vector[1] = cosine, math.sqrt(1 - cosine*cosine)
     with r.store._mutex:
         r.store._db.execute('BEGIN IMMEDIATE')
         try:
-            r._put(node_id, 'node', 1, vector)
+            r._put(node_id, kind, version, vector)
             r.store._db.execute('COMMIT')
         except BaseException:
             r.store._db.execute('ROLLBACK')
@@ -133,6 +133,197 @@ def test_automatic_duplicate_normalization_preserves_numeric_signs_and_operators
         target, _ = assertion(r, text)
         index(r, target, .9)
     assert len(r.recall('account balance and accepted measurement', automatic=True)) == 4
+
+
+@pytest.fixture
+def recency_clock(monkeypatch):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 21, tzinfo=timezone.utc)
+    monkeypatch.setattr('memento.importance.datetime', Clock)
+    monkeypatch.setattr('memento.retrieval.datetime', Clock)
+
+
+@pytest.mark.parametrize('tier', ['candidate', 'durable'])
+@pytest.mark.parametrize('automatic', [False, True])
+def test_original_source_recency_ranks_without_hiding_old_imports(
+        retrieval, recency_clock, monkeypatch, tier, automatic):
+    r = retrieval
+    make = candidate if tier == 'candidate' else assertion
+    fresh, _ = make(r, 'The Cedar task uses the current report.', occurred_at='2026-10-20T00:00:00Z')
+    old, _ = make(r, 'The Cedar task used the earlier report.', occurred_at='2026-05-23T07:30:02Z')
+    kind = 'candidate' if tier == 'candidate' else 'node'
+    index(r, old, .90, kind=kind)
+    index(r, fresh, .89, kind=kind)
+    r.store._db.execute('INSERT INTO node_stats(node_id,archived) VALUES (?,1) '
+                        'ON CONFLICT(node_id) DO UPDATE SET archived=1', (old,))
+    before = r.graph.history(old)
+    if tier == 'durable':
+        r.graph.link(command_id='time-related', actor='fixture', why='Related source facts',
+            a=fresh, rel='related_to', b=old, evidence=before[0]['evidence'])
+        assert old in {item['id'] for item in r.related(fresh, 1)}
+    monkeypatch.setattr(r.store, 'get', lambda *_: pytest.fail('recency hydrated source text'))
+    options = dict(automatic=automatic, effort='cheap')
+    assert r.recall('unmatchedword', limit=1, **options)[0]['id'] == fresh
+    hits = r.recall('unmatchedword', limit=2, **options)
+    assert [hit['id'] for hit in hits] == [fresh, old]
+    assert hits[1]['source_occurred_at'] == '2026-05-23T07:30:02+00:00'
+    age = (datetime(2026, 10, 21, tzinfo=timezone.utc) - datetime.fromisoformat('2026-05-23T07:30:02+00:00')).total_seconds() / 86400
+    assert hits[1]['decay'] == pytest.approx(math.exp2(-age / 90))
+    assert hits[1]['text'].startswith('Source 2026-05-23: ') is automatic
+    assert hits[1]['valid_from'] is hits[1]['valid_to'] is None
+    r.store._db.execute('UPDATE memory_vectors SET current=0 WHERE rowid IN '
+                        '(SELECT seq FROM vector_items WHERE target=?)', (fresh,))
+    assert r.recall('unmatchedword', limit=1, **options)[0]['id'] == old
+    assert r.graph.history(old) == before
+
+
+@pytest.mark.parametrize('tier', ['candidate', 'durable'])
+def test_recency_reads_complete_evidence_without_using_display_or_capture_time(
+        retrieval, recency_clock, monkeypatch, tier):
+    r = retrieval
+    make = candidate if tier == 'candidate' else assertion
+    target, _ = make(r, 'The Cedar report has independent corroboration.', occurred_at=None)
+    for number in range(5):
+        episode, _ = r.store.capture(dict(source='time-evidence', event_id=str(number), conversation_id='c',
+            kind='user', text='Earlier corroboration.', occurred_at='2026-01-01T00:00:00Z', metadata={}))
+        r.graph._evidence(target, 1, [dict(episode_id=episode['id'], quote=episode['text'])])
+    with monkeypatch.context() as patch:
+        patch.setattr('memento.store.uuid4', lambda: SimpleNamespace(hex='z' * 32))
+        latest, _ = r.store.capture(dict(source='time-evidence', event_id='last', conversation_id='c',
+            kind='user', text='Latest corroboration.', occurred_at='2026-10-20T23:30:00-03:00', metadata={}))
+    r.graph._evidence(target, 1, [dict(episode_id=latest['id'], quote=latest['text'])])
+    index(r, target, .9, kind='candidate' if tier == 'candidate' else 'node')
+    monkeypatch.setattr(r.store, 'get', lambda *_: pytest.fail('recency hydrated source text'))
+    hit = r.recall('unmatchedword', automatic=True)[0]
+    assert latest['id'] not in {ref['episode_id'] for ref in hit['evidence']}
+    assert hit['source_occurred_at'] == '2026-10-21T02:30:00+00:00'
+    assert hit['text'].startswith('Source 2026-10-21: ')
+    assert hit['decay'] == 1
+
+
+@pytest.mark.parametrize('automatic', [False, True])
+def test_citation_renews_recency_without_redating_original_evidence(retrieval, recency_clock, automatic):
+    from memento.importance import cite
+    r = retrieval
+    old, _ = assertion(r, 'The Cedar task used an earlier report.', occurred_at='2026-05-23T07:30:02Z')
+    fresh, _ = assertion(r, 'The Cedar task uses a recent report.', occurred_at='2026-10-20T00:00:00Z')
+    index(r, old, .90)
+    index(r, fresh, .89)
+    options = dict(automatic=automatic, effort='cheap')
+    assert r.recall('unmatchedword', limit=1, **options)[0]['id'] == fresh
+    before = r.graph.history(old)
+    cite(r.graph, event_id='renew-old', ids=[old])
+    hit = r.recall('unmatchedword', limit=1, **options)[0]
+    assert hit['id'] == old and hit['decay'] == 1
+    assert hit['source_occurred_at'] == '2026-05-23T07:30:02+00:00'
+    assert hit['ranking_anchor'] == '2026-10-21T00:00:00+00:00'
+    assert hit['text'].startswith('Source 2026-05-23: ') is automatic
+    assert r.graph.history(old) == before
+
+
+@pytest.mark.parametrize('protection', ['pinned', 'explicit_user', 'inferred'])
+def test_pins_and_explicit_preferences_keep_priority_and_bridge_source_provenance(
+        retrieval, recency_clock, monkeypatch, protection):
+    from memento import bridge
+    r = retrieval
+    text = 'Use the supported Cedar installer for ordinary setup.'
+    episode, _ = r.store.capture(dict(source='behavior-time', event_id=protection, conversation_id='c',
+        kind='user', text=text, occurred_at='2026-01-01T00:00:00Z', metadata={}))
+    behavior = dict(applicability='Ordinary Cedar setup.', conduct=text, rationale='Avoid manual errors.',
+                    exceptions=['Keep consent explicit.'], authority='explicit_user' if protection == 'explicit_user' else 'inferred')
+    proposal = dict(candidate_id='fixture', operation='remember', type='experience', behavior=behavior)
+    def apply(commit):
+        result = r.graph._apply_remember(commit, dict(type='experience', text=text, scope=['professional'],
+            evidence=[dict(episode_id=episode['id'], quote=text)], pinned=protection == 'pinned'))
+        return dict(results={'fixture': result})
+    target = r.graph._command('behavior-time', 'fixture', 'Supported behavior fixture',
+        dict(op='consolidate', output=dict(actions=[proposal])), apply)['results']['fixture']['id']
+    index(r, target, .9)
+    fact, _ = assertion(r, 'The Cedar installer supports local setup.', occurred_at='2026-01-01T00:00:00Z')
+    index(r, fact, .8)
+    original = r.graph._behavior(target)
+    hits = r.recall('unmatchedword', automatic=True)
+    hit = next(item for item in hits if item['id'] == target)
+    assert hit['decay'] == pytest.approx(1 if protection != 'inferred' else math.exp2(-293 / 90))
+    assert hit['source_occurred_at'] == '2026-01-01T00:00:00+00:00'
+    class Spool:
+        db = sqlite3.connect(':memory:')
+        config = {}
+    spool = Spool()
+    spool.db.execute('CREATE TABLE recall_cache(conversation TEXT PRIMARY KEY,query TEXT,context TEXT,shown TEXT,updated REAL)')
+    monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {'memories': hits})
+    try:
+        rendered = bridge.passive(spool, 'time', 'Ordinary Cedar setup')['context']
+        assert 'Source 2026-01-01:' in rendered and text in rendered and len(rendered.encode()) <= 1500
+        assert '[fact] Source 2026-01-01: The Cedar installer supports local setup.' in rendered
+    finally:
+        spool.db.close()
+    assert r.graph._behavior(target) == original
+
+
+def test_unknown_source_time_is_neutral_and_duplicate_keeps_best_recency_rank(retrieval, recency_clock):
+    r = retrieval
+    old, _ = assertion(r, 'The Cedar task uses the supported report.', occurred_at='2026-01-01T00:00:00Z')
+    unknown, _ = assertion(r, 'The Cedar task uses the supported report!')
+    index(r, old, .95)
+    index(r, unknown, .85)
+    hit = r.recall('unmatchedword', automatic=True, limit=1)[0]
+    assert hit['id'] == unknown and hit['duplicate_ids'] == [old]
+    assert hit['source_occurred_at'] is None and hit['ranking_anchor'] is None and hit['decay'] == 1
+    assert hit['text'] == 'The Cedar task uses the supported report!'
+    assert len(hit['evidence']) == 2
+
+
+@pytest.mark.parametrize('kind,automatic', [('segment', False), ('segment', True), ('episode', False)])
+def test_media_parent_and_raw_episode_use_original_source_recency(retrieval, recency_clock, kind, automatic):
+    r = retrieval
+    ids = []
+    for name, occurred_at, cosine in [('old', '2026-01-01T00:00:00Z', .90),
+                                      ('fresh', '2026-10-20T00:00:00Z', .89)]:
+        if kind == 'segment':
+            target, _ = assertion(r, f'The Cedar {name} document.', type='media', occurred_at=occurred_at)
+            r.store._db.execute('INSERT INTO media_files VALUES (?,?,?,?,?)', (target, 'a' * 64, 'fixture.txt', 'text', 'fixture'))
+            r.store._db.execute('''INSERT INTO segments(id,node_id,modality,text,artifact_sha256,source_sha256)
+                VALUES (?,?,?,?,?,?)''', (name, target, 'text', f'The Cedar {name} page.', 'b' * 64, 'c' * 64))
+        else:
+            episode, _ = r.store.capture(dict(source='raw-time', event_id=name, conversation_id='c',
+                kind='tool', text=f'The Cedar {name} observation.', occurred_at=occurred_at, metadata={}))
+            target = episode['id']
+            r.store._db.execute('INSERT INTO episode_chunks VALUES (?,?,0,?)', (name, target, len(episode['text'])))
+        index(r, name, cosine, kind=kind)
+        ids.append(target)
+    hits = r.recall('unmatchedword', effort='deep' if kind == 'episode' else 'cheap', automatic=automatic)
+    assert [item['id'] for item in hits] == ids[::-1]
+    assert hits[0]['source_occurred_at'] == '2026-10-20T00:00:00+00:00'
+    assert hits[0]['text'].startswith('Source 2026-10-20: ') is automatic
+
+
+def test_recency_metadata_work_is_bounded_by_target_evidence(retrieval, recency_clock):
+    from memento.importance import query_recency
+    r = retrieval
+    target, _ = assertion(r, 'The Cedar report has a source date.', occurred_at='2026-10-20T00:00:00Z')
+    record = dict(id=target, version=1)
+    def measure():
+        ticks = []
+        db = r.store._db
+        db.set_authorizer(lambda action, table, column, *_: sqlite3.SQLITE_DENY
+            if action == sqlite3.SQLITE_READ and table == 'episodes' and column == 'text' else sqlite3.SQLITE_OK)
+        db.set_progress_handler(lambda: ticks.append(1) or 0, 1)
+        try:
+            value = query_recency(r.store, record)
+        finally:
+            db.set_progress_handler(None, 0)
+            db.set_authorizer(None)
+        return value, len(ticks)
+    before, work = measure()
+    for number in range(200):
+        episode, _ = r.store.capture(dict(source='unrelated-time', event_id=str(number), conversation_id='other',
+            kind='user', text='Unrelated source payload.', occurred_at='2026-10-21T00:00:00Z', metadata={}))
+        r.graph._evidence('unrelated-' + str(number), 1, [dict(episode_id=episode['id'], quote=episode['text'])])
+    after, later_work = measure()
+    assert after == before and later_work < work * 2
 
 
 def test_automatic_followup_uses_context_but_independent_request_does_not(retrieval, monkeypatch):
@@ -756,10 +947,11 @@ def test_one_invalid_embedding_does_not_block_other_assertions(retrieval, monkey
     assert r.store._db.execute('SELECT resolved FROM index_failures WHERE target=?', (bad,)).fetchone()[0] == 0
 
 
-def candidate(r, text, *, type='knowledge', kind='memory', scope=None, source='candidate-fixture', raw=None):
+def candidate(r, text, *, type='knowledge', kind='memory', scope=None, source='candidate-fixture', raw=None,
+              occurred_at='2000-01-01T00:00:00+00:00'):
     key = uuid4().hex
     episode, _ = r.store.capture(dict(source=source, event_id=key, conversation_id='c',
-        kind='user', text=text if raw is None else raw, occurred_at='2000-01-01T00:00:00+00:00', metadata={}))
+        kind='user', text=text if raw is None else raw, occurred_at=occurred_at, metadata={}))
     target = 'c_' + uuid4().hex
     def create(commit):
         r.store._db.execute('INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)',
@@ -865,16 +1057,14 @@ def test_human_exclusion_hides_candidate_and_raw_vectors_without_deleting_histor
 
 
 @pytest.mark.parametrize('channel', ['semantic', 'keyword'])
-def test_scope_and_archive_filter_precede_retrieval_limits(retrieval, channel):
+def test_scope_filter_precedes_limits_without_hiding_legacy_archived_rows(retrieval, channel):
     r = retrieval
     wanted, _ = assertion(r, 'needle ' + 'background ' * 100, scope=['personal'])
+    r.store._db.execute('UPDATE node_stats SET archived=1 WHERE node_id=?', (wanted,))
     for position in range(25):
         wrong, _ = assertion(r, f'needle wrong {position}', scope=['professional'])
-        archived, _ = assertion(r, f'needle archived {position}', scope=['personal'])
-        r.store._db.execute('UPDATE node_stats SET archived=1 WHERE node_id=?', (archived,))
         if channel == 'semantic':
             index(r, wrong, .99)
-            index(r, archived, .98)
     if channel == 'semantic':
         index(r, wanted, .80)
     query = 'unmatchedword' if channel == 'semantic' else 'needle'
@@ -917,11 +1107,12 @@ def test_committed_citation_is_idempotent_and_changes_rank_not_assertions(retrie
     assert r.graph.history(cited) == history
     assert r.store.get(raw['id']) == raw
     refresh(r.store, datetime(2100, 1, 1, tzinfo=timezone.utc))
-    assert r.recall('Orion', effort='cheap') == []
+    assert {hit['id'] for hit in r.recall('Orion', effort='cheap')} == {cited, other}
+    assert r.store._db.execute('SELECT sum(archived) FROM node_stats').fetchone()[0] == 0
     assert {hit['id'] for hit in r.recall('Orion', effort='deep')
             if hit['tier'] == 'durable'} == {cited, other}
     cite(r.graph, event_id='later-answer', ids=[cited])
-    assert [hit['id'] for hit in r.recall('Orion', effort='cheap')] == [cited]
+    assert r.recall('Orion', effort='cheap')[0]['id'] == cited
     assert r.graph.history(cited) == history
 
 
