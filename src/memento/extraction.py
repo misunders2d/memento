@@ -3,7 +3,7 @@
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -93,13 +93,11 @@ Set open_loop true only for source-supported pending obligations or waits; retai
 Otherwise set open_loop false. A loop is a marker, never a memory type. Never invent reminder times, proactive work, nudging or polling.'''
 
 
-class Draft(BaseModel):
+class DraftBase(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, allow_inf_nan=False)
     key: str = Field(min_length=1, max_length=64)
-    kind: Literal['memory', 'entity', 'relation']
     type: str = Field(min_length=1, max_length=64)
     text: str = Field(min_length=1, max_length=8192)
-    scope: Scope
     open_loop: bool
     why: str = Field(min_length=1, max_length=2048)
     quote: str = Field(min_length=1, max_length=12000)
@@ -109,6 +107,19 @@ class Draft(BaseModel):
     valid_from: str | None
     valid_to: str | None
     confidence: float = Field(ge=0, le=1)
+
+
+class EntityDraft(DraftBase):
+    kind: Literal['entity']
+    scope: Scope
+
+
+class SingleScopeDraft(DraftBase):
+    kind: Literal['memory', 'relation']
+    scope: Annotated[Scope, Field(min_length=1, max_length=1)]
+
+
+Draft = Annotated[EntityDraft | SingleScopeDraft, Field(discriminator='kind')]
 
 
 class Drafts(BaseModel):

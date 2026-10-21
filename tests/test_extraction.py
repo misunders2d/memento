@@ -452,6 +452,43 @@ def test_committed_derivation_recovers_without_regeneration_after_lost_ack(extra
     assert store._db.execute('SELECT count(*) FROM candidates').fetchone()[0] == 5
 
 
+@pytest.mark.parametrize('kind', ['memory', 'entity', 'relation'])
+@pytest.mark.parametrize('scope', [['personal'], ['professional'], ['personal', 'professional']],
+                         ids=['personal', 'professional', 'both'])
+def test_claim_schema_matches_candidate_scope_cardinality(extraction, kind, scope):
+    from jsonschema import Draft202012Validator
+    _, _, _, _, _, work, output = extraction
+    candidates = output['windows'][0]['candidates']
+    candidates.append(draft('fact', 'memory', 'knowledge', TEXT, TEXT))
+    next(item for item in candidates if item['kind'] == kind)['scope'] = scope
+    Draft202012Validator.check_schema(work['schema'])
+    assert Draft202012Validator(work['schema']).is_valid(output) is (kind == 'entity' or len(scope) == 1)
+
+
+@pytest.mark.parametrize('kind', ['memory', 'entity', 'relation'])
+@pytest.mark.parametrize('scope', [['personal'], ['professional'], ['personal', 'professional']],
+                         ids=['personal', 'professional', 'both'])
+def test_extraction_completion_matches_candidate_scope_cardinality(extraction, kind, scope):
+    store, _, processing, _, _, work, output = extraction
+    candidates = output['windows'][0]['candidates']
+    candidates.append(draft('fact', 'memory', 'knowledge', TEXT, TEXT))
+    selected = next(item for item in candidates if item['kind'] == kind)
+    selected['scope'] = scope
+    if kind != 'entity' and len(scope) == 2:
+        with pytest.raises(ValueError, match='^candidate_schema_invalid$'):
+            processing.complete(id=work['id'], owner=work['owner'], agent='fixture', output=output)
+        assert store._db.execute('SELECT count(*) FROM candidates').fetchone()[0] == 0
+        assert store._db.execute('SELECT count(*) FROM extraction_runs').fetchone()[0] == 0
+        assert processing.queue.get(work['id'])['state'] == 'leased'
+    else:
+        result = processing.complete(id=work['id'], owner=work['owner'], agent='fixture', output=output)
+        assert result['candidate_count'] == len(candidates)
+        stored = store._db.execute('''SELECT scope FROM candidates WHERE kind=? AND text=?
+            ORDER BY rowid LIMIT 1''', (kind, selected['text'])).fetchone()
+        assert json.loads(stored['scope']) == sorted(scope)
+        assert processing.queue.get(work['id'])['state'] == 'done'
+
+
 @pytest.mark.parametrize('failure', ['invented_quote', 'dangling_relation', 'ambiguous_quote', 'wrong_confidence_type'])
 def test_invalid_candidate_batch_stays_uncommitted_and_retriable(extraction, failure):
     store, graph, processing, episode, payload, work, output = extraction
