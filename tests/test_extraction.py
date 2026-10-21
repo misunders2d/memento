@@ -935,6 +935,65 @@ def test_promotion_preserves_committed_citation_usage_and_feedback(tmp_path, nod
         store.close()
 
 
+@pytest.mark.parametrize('reference', ['direct', 'candidate_alias'])
+def test_consolidation_prioritizes_promoted_endpoint_snapshots(extraction, monkeypatch, reference):
+    store, graph, processing, episode, _, work, _ = extraction
+    evidence = [dict(episode_id=episode['id'], quote=TEXT)]
+    nodes = [graph.remember(command_id=f'context-node-{index}', actor='fixture',
+        why='Synthetic existing project context', type='project',
+        text='Memory' if index == 48 else 'Mellanni' if index == 0 else f'Optional neighbor {index}',
+        scope=['professional'], evidence=evidence)['id'] for index in range(49)]
+    fillers = [draft(f'group-{index}', 'memory', 'knowledge', f'Optional group {index}', TEXT)
+               for index in range(6)]
+    candidates = fillers + [
+        draft('left', 'entity', 'project', 'Memory', TEXT),
+        draft('right', 'entity', 'project', 'Mellanni', TEXT),
+        draft('relation', 'relation', 'related_to', 'Memory relates to Mellanni', TEXT, 'left', 'right')]
+    processing.complete(id=work['id'], owner=work['owner'], agent='fixture',
+        output=dict(windows=[dict(id=work['input']['windows'][0]['id'], candidates=candidates)]))
+    relation = store._db.execute("SELECT id,src,dst FROM candidates WHERE kind='relation'").fetchone()
+
+    def prior_promotions(commit):
+        for index, (candidate, target) in enumerate(zip((relation['src'], relation['dst']), (nodes[-1], nodes[0]))):
+            store._db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)',
+                (f'prior-endpoint-{index}', candidate, commit, 'promote', target, None))
+        return {}
+
+    graph._command('prior-endpoint-promotions', 'fixture', 'Previously promoted relation endpoints',
+                   dict(op='fixture_promotions'), prior_promotions)
+    # Six earlier candidates offer eight distinct optional neighbors each.
+    # Only retrieval is stubbed; prepare must allocate its real bounded snapshot.
+    neighbors = {item['text']: nodes[index * 8:(index + 1) * 8] for index, item in enumerate(fillers)}
+    monkeypatch.setattr(graph, 'recall_keywords',
+        lambda query, limit: [dict(id=node) for node in neighbors.get(query, [])][:limit])
+    task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True,
+        now=datetime(2030, 1, 1, 12, tzinfo=timezone.utc))['work'][0]
+    context = task['input']
+    assert len(context['candidates']) == 7
+    assert len(context['existing_nodes']) == 48
+    assert context['resolved_candidates'][relation['src']] == nodes[-1]
+    assert context['resolved_candidates'][relation['dst']] == nodes[0]
+    actions = [dict(candidate_id=item['id'], operation='reject', type=None, text=None,
+        scope=None, open_loop=None, target=None, src=None, dst=None, relation=None,
+        change_kind=None, valid_at=None, valid_from=None, valid_to=None, category=None, sensitive=None,
+        evidence=[], why='Synthetic optional-neighbor candidate is not promoted')
+        for item in context['candidates']]
+    link = next(action for action in actions if action['candidate_id'] == relation['id'])
+    link.update(operation='link', src='unknown-node', dst=nodes[0], relation='related_to',
+        evidence=[dict(episode_id=episode['id'], quote=TEXT, occurrence=None)],
+        why='Preserve the original source-supported relation direction')
+    with pytest.raises(ValueError, match='^consolidation_reference_not_supplied$'):
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=actions))
+    link.update(src=nodes[-1] if reference == 'direct' else relation['src'],
+                dst=nodes[0] if reference == 'direct' else relation['dst'])
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=actions))
+    edge = graph.history(result['results'][relation['id']]['id'])[-1]
+    assert (edge['src'], edge['dst']) == (nodes[-1], nodes[0])
+    assert edge['evidence'][0]['quote'] == TEXT
+    assert nodes[-1] in {item['id'] for item in context['existing_nodes']}, 'Promoted endpoint lacks a versioned snapshot'
+    assert processing.queue.get(task['id'])['state'] == 'done'
+
+
 def test_night_promotion_with_existing_relations_preserves_loop_and_evidence(tmp_path):
     store = Store(tmp_path)
     try:

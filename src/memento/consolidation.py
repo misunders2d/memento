@@ -174,6 +174,8 @@ class Consolidator:
                     if decision is not None and decision['decision'] == 'promote':
                         resolutions[endpoint] = decision['target_id']
                         add_node(decision['target_id'])
+        # Snapshot required endpoints before optional neighbors consume the bounded context.
+        for candidate in candidates:
             vector = db.execute('''SELECT v.embedding FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
                 WHERE i.target=? AND i.kind='candidate' AND v.current=1''', (candidate['id'],)).fetchone()
             if vector is not None:
