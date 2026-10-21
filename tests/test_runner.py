@@ -378,6 +378,67 @@ def test_drain_excludes_failures_without_retrying_or_disclosing_text(monkeypatch
     assert 'secret' not in json.dumps(calls)
 
 
+def test_drain_retries_same_failed_id_after_healthy_work_passes_retry_interval(monkeypatch):
+    clock = [100.0]
+    claims, completed, releases = [], [], []
+    pending = {'A', 'B'}
+    active, attempts = {}, {'A': 0, 'B': 0}
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, path, value):
+            if path == '/work/claim':
+                claims.append(value['exclude'])
+                ident = next((ident for ident in sorted(pending) if ident not in value['exclude']), None)
+                if ident is None:
+                    return {'lease_seconds': 60, 'work': []}
+                attempts[ident] += 1
+                owner = f'{ident}-{attempts[ident]}'
+                active[ident] = owner
+                item = {'id': ident, 'owner': owner,
+                        'kind': 'consolidate' if ident == 'A' else 'extract',
+                        'instruction': 'fixture', 'input': {'id': ident}, 'schema': {'type': 'object'}}
+                return {'lease_seconds': 60, 'work': [item]}
+            if path == '/work/complete':
+                ident = value['id']
+                assert active[ident] == value['owner']
+                if ident == 'A' and attempts[ident] == 1:
+                    raise runner.RunnerError('service_rejected')
+                completed.append(ident)
+                pending.remove(ident)
+                active.pop(ident)
+                return {}
+            if path == '/work/release':
+                releases.append(value)
+                assert active.pop(value['id']) == value['owner']
+                return {'released': True}
+            assert path == '/work/renew'
+            return {'renewed': active.get(value['id']) == value['owner']}
+
+    def generate(_argv, payload, **_kwargs):
+        ident = runner.decode(payload)['input']['id']
+        if ident == 'B' or attempts[ident] == 1:
+            # Even a slow failed A must be excluded after its batch finishes.
+            clock[0] += runner.RETRY_SECONDS + 1
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
+    monkeypatch.setattr(runner, 'run_process', generate)
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: clock[0])
+    config = {'preset': 'pi', 'agent': 'pi', 'command': ['pi'], 'timezone': 'Etc/UTC',
+              'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2, 'mode': 'server'}
+
+    assert runner.tick(config) == 1
+    assert claims == [[], ['A'], ['B'], ['A', 'B']]
+    assert completed == ['B', 'A']
+    assert attempts == {'A': 2, 'B': 1}
+    assert releases == [{'id': 'A', 'owner': 'A-1', 'error': 'service_rejected'}]
+    assert not active and not pending
+
+
 @pytest.mark.parametrize('consolidate_now', [False, True])
 def test_tick_drains_new_batches_without_cap_and_checks_cli_once(monkeypatch, consolidate_now):
     claims, completed, checked = [], [], []

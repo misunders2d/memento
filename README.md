@@ -126,6 +126,8 @@ sudo loginctl enable-linger YOUR_AGENT_USER
 
 Keep one server processing config/timer. Do not silently convert it into a client when installing another harness. A sleeping or powered-off host cannot process memory; keep it awake for an overnight acceptance check.
 
+During a long import, a failed processing job can be retried after a 15-minute wait following its batch, while other work continues. A run still exits nonzero if any attempt failed, even if a later retry succeeded.
+
 ### Codex limitation
 
 Codex capture/import/recall/MCP client integration is available after **human `/hooks` trust and MCP permissions**. Setup never grants those permissions. Codex **server extraction is fail-closed**: the tested native CLI still exposed tool routing under its read-only/approval flags, so it did not meet tools-zero processing requirements. Use Pi, OMP or Claude Code as the processor; do not bypass a native refusal or claim Codex extraction acceptance.
