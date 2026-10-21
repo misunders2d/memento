@@ -399,6 +399,8 @@ The same consolidation step can turn an experience into a general lesson. These 
 
 Automatic context has a small shared budget for memories and behavioral suggestions. It can legitimately be empty. Broad explicit `recall` remains available when the injected context is insufficient. Suggested behavior remains subordinate to current instructions and repository rules.
 
+Updated native clients record the IDs, versions and emission time of behavioral suggestions freshly offered to a session. These receipts provide advisory context within a bounded same-conversation consolidation lookup; changes still require original source quotes and normal version checks. A receipt does not prove that an agent received or followed a suggestion, or that it caused later feedback. Cached replays reuse the original receipt. Old clients and imported histories have no retrospective receipts. The normal explicit `memento agent update HARNESS`, with your installation's options, enables receipts on the next fresh offer through an existing integration; this bridge-only update needs no session restart.
+
 </details>
 
 <details>
