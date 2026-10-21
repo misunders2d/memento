@@ -128,6 +128,8 @@ Keep one server processing config/timer. Do not silently convert it into a clien
 
 During a long import, a failed processing job can be retried after a 15-minute wait following its batch, while other work continues. A run still exits nonzero if any attempt failed, even if a later retry succeeded.
 
+Failed attempts write a JSON diagnostic to stderr, visible in `journalctl --user -u memento-runner.service`: job ID, work kind, error category and, when available, HTTP status with an allowlisted Memento rejection code or a safe failure cause. Diagnostics exclude memory text, model output, URLs and arbitrary server error messages.
+
 ### Codex limitation
 
 Codex capture/import/recall/MCP client integration is available after **human `/hooks` trust and MCP permissions**. Setup never grants those permissions. Codex **server extraction is fail-closed**: the tested native CLI still exposed tool routing under its read-only/approval flags, so it did not meet tools-zero processing requirements. Use Pi, OMP or Claude Code as the processor; do not bypass a native refusal or claim Codex extraction acceptance.

@@ -2,6 +2,7 @@ import json
 import base64
 import hashlib
 import http.server
+import io
 import os
 import sys
 import threading
@@ -346,21 +347,70 @@ def test_heartbeat_renews_all_claimed_work_and_marks_lost():
     assert not leases.is_lost('one')
 
 
-def test_drain_excludes_failures_without_retrying_or_disclosing_text(monkeypatch):
+@pytest.mark.parametrize('failure,status,body,diagnostic', [
+    ('http', 422, runner.encode({'detail': 'consolidation_candidate_coverage_invalid', 'private': 'secret'}),
+     {'http_status': 422, 'detail_code': 'consolidation_candidate_coverage_invalid'}),
+    ('http', 422, runner.encode({'detail': 'candidate_quote_ambiguous'}).ljust(1024, b' '),
+     {'http_status': 422, 'detail_code': 'candidate_quote_ambiguous'}),
+    ('http', 422, runner.encode({'detail': 'secret private evidence'}), {'http_status': 422}),
+    ('http', 422, runner.encode({'detail': 'consolidation_schema_invalid_secret'}), {'http_status': 422}),
+    ('http', 409, runner.encode({'detail': 'secret conflict'}), {'http_status': 409}),
+    ('timeout', None, b'', {'cause': 'timeout'}),
+    ('wrapped_timeout', None, b'', {'cause': 'timeout'}),
+    ('transport', None, b'', {'cause': 'transport_error'}),
+    ('invalid_response', None, b'secret invalid JSON', {'cause': 'invalid_response'}),
+    ('http', 422, b'{"detail": secret malformed JSON', {'http_status': 422}),
+    ('http', 422, runner.encode({'detail': [{'msg': 'secret'}]}), {'http_status': 422}),
+    ('http', 422, runner.encode({'detail': 'consolidation_schema_invalid'}).ljust(1025, b' '),
+     {'http_status': 422}),
+    ('body_read_failure', 422, b'', {'http_status': 422}),
+    ('broken_stderr', 422, runner.encode({'detail': 'consolidation_schema_invalid'}), None),
+])
+def test_drain_excludes_failures_without_retrying_or_disclosing_text(
+        monkeypatch, capsys, failure, status, body, diagnostic):
     calls = []
+    reads, leases = [], set()
+    backlog = {'pending_extract_conversations': 1, 'pending_extract_jobs': 1, 'leased_extract_jobs': 0}
     item = {'id': 'work', 'owner': 'lease', 'kind': 'extract', 'instruction': 'private',
             'input': {'text': 'secret'}, 'schema': {'type': 'object'}}
 
-    class Service:
+    class ErrorBody(io.BytesIO):
+        def read(self, size=-1):
+            reads.append(size)
+            if failure == 'body_read_failure':
+                raise TimeoutError('secret body timeout')
+            return super().read(size)
+
+    error_body = ErrorBody(body)
+
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            if failure == 'timeout':
+                raise TimeoutError('secret timeout')
+            if failure == 'wrapped_timeout':
+                raise runner.urllib.error.URLError(TimeoutError('secret wrapped timeout'))
+            if failure == 'transport':
+                raise runner.urllib.error.URLError('secret transport')
+            if failure == 'invalid_response':
+                return io.BytesIO(body)
+            raise runner.urllib.error.HTTPError('https://private.invalid/secret', status,
+                'secret status text', {'X-Private': 'secret'}, error_body)
+
+    class Service(runner.Service):
         def __init__(self, *args, **kwargs):
-            pass
+            super().__init__(*args, **kwargs)
+            self.opener = Opener()
 
         def post(self, path, value):
             calls.append((path, value))
             if path == '/work/claim':
-                return {'lease_seconds': 60, 'work': [] if item['id'] in value['exclude'] else [item]}
+                work = [] if item['id'] in value['exclude'] else [item]
+                leases.update(entry['id'] for entry in work)
+                return {'lease_seconds': 60, 'work': work, 'backlog': backlog}
             if path == '/work/complete':
-                raise runner.RunnerError('service_rejected')
+                return super().post(path, value)
+            if path == '/work/release':
+                leases.remove(value['id'])
             return {'released': True, 'renewed': True}
 
     monkeypatch.setattr(runner, 'Service', Service)
@@ -369,13 +419,30 @@ def test_drain_excludes_failures_without_retrying_or_disclosing_text(monkeypatch
     config = {'preset': 'pi', 'agent': 'pi', 'command': ['pi'], 'timezone': 'Etc/UTC',
               'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2, 'mode': 'server'}
     compaction = {'source': 'pi', 'conversation_id': 'conversation'}
-    assert runner.tick(config, compaction) == 1
+    with monkeypatch.context() as logging_patch:
+        if failure == 'broken_stderr':
+            class BrokenStderr:
+                def write(self, _value):
+                    raise BrokenPipeError('secret broken stderr')
+            logging_patch.setattr(runner.sys, 'stderr', BrokenStderr())
+        assert runner.tick(config, compaction) == 1
     assert sum(path == '/work/claim' for path, _ in calls) == 2
     assert [value['exclude'] for path, value in calls if path == '/work/claim'] == [[], ['work']]
     assert calls[0][1]['compaction'] == compaction
     release = next(value for path, value in calls if path == '/work/release')
     assert release == {'id': 'work', 'owner': 'lease', 'error': 'service_rejected'}
-    assert 'secret' not in json.dumps(calls)
+    assert not leases
+    captured = capsys.readouterr()
+    assert [json.loads(line) for line in captured.out.splitlines()] == [{'backlog': backlog}] * 2
+    receipts = [json.loads(line) for line in captured.err.splitlines()]
+    assert receipts == ([] if diagnostic is None else [
+        {'id': 'work', 'kind': 'extract', 'error': 'service_rejected', **diagnostic}])
+    assert 'secret' not in captured.out + captured.err + json.dumps(calls)
+    if status is not None:
+        assert reads == [1025]
+        assert error_body.closed
+    else:
+        assert not reads
 
 
 def test_drain_retries_same_failed_id_after_healthy_work_passes_retry_interval(monkeypatch):
@@ -440,7 +507,7 @@ def test_drain_retries_same_failed_id_after_healthy_work_passes_retry_interval(m
 
 
 @pytest.mark.parametrize('consolidate_now', [False, True])
-def test_tick_drains_new_batches_without_cap_and_checks_cli_once(monkeypatch, consolidate_now):
+def test_tick_drains_new_batches_without_cap_and_checks_cli_once(monkeypatch, capsys, consolidate_now):
     claims, completed, checked = [], [], []
     items = [
         {'id': f'work-{number}', 'owner': f'lease-{number}', 'kind': 'extract',
@@ -479,6 +546,7 @@ def test_tick_drains_new_batches_without_cap_and_checks_cli_once(monkeypatch, co
     assert claims[-1]['exclude'] == sorted(completed)
     assert len(checked) == 1
     assert all(claim['consolidate_now'] is consolidate_now for claim in claims)
+    assert capsys.readouterr().err == ''
 
 
 
