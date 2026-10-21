@@ -703,7 +703,8 @@ def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monke
     baseline_work = work.copy()
     assert before['selected']['captured'] == dict(episodes=13, conversations=1)
     assert before['selected']['raw_storage'] == dict(inline_raw_episodes=2,
-        inline_raw_bytes=2 * len(raw.encode('utf-8')), offloaded_raw_episodes=1)
+        inline_raw_bytes=2 * len(raw.encode('utf-8')), offloaded_raw_episodes=1,
+        compressed_raw_episodes=0, compressed_original_bytes=0, compressed_raw_bytes=0)
     assert before['selected']['indexing']['unprepared_episodes'] == 8
     r.store._db.execute('BEGIN')
     try:
@@ -724,7 +725,7 @@ def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monke
     assert global_status['captured']['episodes'] == 2013
     assert global_status['raw_storage'] == dict(inline_raw_episodes=2002,
         inline_raw_bytes=2 * len(raw.encode('utf-8')) + 2000 * len('Unrelated synthetic history.' * 256),
-        offloaded_raw_episodes=1)
+        offloaded_raw_episodes=1, compressed_raw_episodes=0, compressed_original_bytes=0, compressed_raw_bytes=0)
     assert global_status['indexing']['unprepared_episodes'] == 8
     if sqlite3.sqlite_version_info >= (3, 46, 1):
         # Qualification is for the target runtime; older planners retain exact counts.

@@ -147,16 +147,18 @@ class Graph:
         db = self.store._db
         seen = set()
         for source in sources:
-            row = db.execute('SELECT text,source,event_id,text_runs FROM episodes WHERE id=?',
+            row = db.execute('''SELECT text,source,event_id,text_runs,raw_frame,text_sha256,conversation_id
+                FROM episodes WHERE id=?''',
                              (source['episode_id'],)).fetchone()
             if row is None:
                 raise ValueError('Unknown source episode')
             if db.execute('SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1',
                           (row['source'], row['event_id'])).fetchone():
                 raise ConflictError('This evidence was excluded from active memory by a human decision')
-            text, quote = row['text'], source['quote']
+            quote = source['quote']
             if row['text_runs'] is not None:
                 raise ValueError('Offloaded raw source is not assertion evidence; cite the message projection')
+            text = self.store.original_text(row)
             if not isinstance(quote, str) or not quote:
                 raise ValueError('Evidence quote must be a nonempty string')
             matches = []

@@ -20,6 +20,14 @@ def events(graph, id):
             JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? ORDER BY l.rowid''', (id,))]
 
 
+def _transferred_from(graph, target, commit):
+    return [row['id'] for row in graph.store._db.execute('''SELECT id,0 AS priority FROM node_versions
+        WHERE superseded_by=? AND commit_id=?
+        UNION SELECT candidate_id,1 FROM candidate_decisions
+        WHERE target_id=? AND commit_id=? AND decision='promote'
+        ORDER BY priority,id''', (target, commit, target, commit))]
+
+
 def _closed_at(graph, id):
     """Find the explicit close behind copied state, not the later transfer time."""
     db = graph.store._db
@@ -29,7 +37,7 @@ def _closed_at(graph, id):
         if target in seen:
             continue
         seen.add(target)
-        event = db.execute('''SELECT l.commit_id,l.state,c.request,c.recorded_at
+        event = db.execute('''SELECT l.commit_id,l.state,c.request,c.result,c.recorded_at
             FROM loop_events l LEFT JOIN graph_commits c ON c.id=l.commit_id
             WHERE l.target=? ORDER BY l.rowid DESC LIMIT 1''', (target,)).fetchone()
         if event is None or event['state'] != 'closed':
@@ -37,12 +45,11 @@ def _closed_at(graph, id):
         request = json.loads(event['request'])['command'] if event['request'] else {}
         if request.get('op') == 'loop' and request.get('action') == 'close':
             return event['recorded_at']
-        sources = db.execute('''SELECT id,0 AS priority FROM node_versions
-            WHERE superseded_by=? AND commit_id=?
-            UNION SELECT candidate_id,1 FROM candidate_decisions
-            WHERE target_id=? AND commit_id=? AND decision='promote'
-            ORDER BY priority,id''', (target, event['commit_id'], target, event['commit_id'])).fetchall()
-        pending.extend(row['id'] for row in reversed(sources))
+        if request.get('op') == 'consolidate' and event['result']:
+            for closure in json.loads(event['result']).get('loop_closures', []):
+                if closure.get('target') == target and closure.get('status') == 'closed':
+                    return closure['source_occurred_at']
+        pending.extend(reversed(_transferred_from(graph, target, event['commit_id'])))
     return None
 
 
@@ -86,6 +93,65 @@ def transfer(graph, commit, source, target):
         _append(graph, commit, target, previous['state'], previous['due_at'], previous['deferred_until'])
     if previous['state'] == 'open':
         _append(graph, commit, source, 'closed', previous['due_at'], None)
+
+
+def decline_extracted(graph, commit, id):
+    """Discard only an untouched extraction flag, never a chosen loop state."""
+    previous = current(graph, id)
+    if (previous is None or previous['state'] != 'open' or previous['due_at'] is not None
+            or previous['deferred_until'] is not None):
+        return False
+    requests = graph.store._db.execute('''SELECT c.request FROM loop_events l
+        LEFT JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=?''', (id,)).fetchall()
+    if not requests or any(not row['request'] or json.loads(row['request'])['command'].get('op') != 'extract'
+                           for row in requests):
+        return False
+    _append(graph, commit, id, 'closed', None, None)
+    return True
+
+
+def snapshot(graph, id, version):
+    """Freeze marker identity and original chronology for a consolidation plan."""
+    db = graph.store._db
+    row = db.execute('''SELECT id,state,due_at,deferred_until FROM loop_events
+        WHERE target=? ORDER BY rowid DESC LIMIT 1''', (id,)).fetchone()
+    pending, seen, manual_dates = [id], set(), []
+    while pending:
+        target = pending.pop()
+        if target in seen:
+            continue
+        seen.add(target)
+        manual = db.execute('''SELECT c.recorded_at FROM loop_events l
+            JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=?
+            AND json_extract(c.request,'$.command.op')='loop' ORDER BY l.rowid DESC LIMIT 1''', (target,)).fetchone()
+        if manual:
+            manual_dates.append(manual['recorded_at'])
+        else:
+            first = db.execute('SELECT commit_id FROM loop_events WHERE target=? ORDER BY rowid LIMIT 1',
+                               (target,)).fetchone()
+            if first:
+                pending.extend(_transferred_from(graph, target, first['commit_id']))
+    dates = [item[0] for item in db.execute('''SELECT DISTINCT e.occurred_at
+        FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
+        WHERE g.target=? AND g.version=?''', (id, version))]
+    return dict(event_id=row['id'] if row else None, state=row['state'] if row else None,
+                pending_source_at=max(dates, key=datetime.fromisoformat) if dates and None not in dates else None,
+                manual_choice_at=max(manual_dates, key=datetime.fromisoformat) if manual_dates else None)
+
+
+def closure_time(snapshot, sources):
+    """Unknown chronology never changes a marker; every closing premise is newer."""
+    if snapshot['state'] != 'open':
+        return None, 'not_open'
+    if not snapshot['pending_source_at'] or not sources or any(value is None for value in sources):
+        return None, 'chronology_unknown'
+    boundary = datetime.fromisoformat(snapshot['pending_source_at'])
+    if snapshot['manual_choice_at']:
+        boundary = max(boundary, datetime.fromisoformat(snapshot['manual_choice_at']))
+    dates = [datetime.fromisoformat(value) for value in sources]
+    if min(dates) <= boundary:
+        return None, 'not_newer'
+    return max(dates).astimezone(timezone.utc).isoformat(), None
 
 
 def _target(graph, id):

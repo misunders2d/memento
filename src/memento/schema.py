@@ -14,6 +14,24 @@ _EPISODES_TEXT_INDEX = """CREATE TRIGGER episodes_text_index AFTER INSERT ON epi
     AND coalesce(json_extract(NEW.metadata,'$.extraction_mode'),'message')<>'skip'
     BEGIN INSERT INTO episodes_fts(rowid,text) VALUES (NEW.seq,NEW.text); END"""
 
+_RAW_FRAMES = """CREATE TABLE IF NOT EXISTS raw_frames (
+    id INTEGER PRIMARY KEY,source TEXT NOT NULL,conversation_id TEXT NOT NULL,
+    raw_size INTEGER NOT NULL CHECK(raw_size BETWEEN 0 AND 262144),
+    record_count INTEGER NOT NULL CHECK(record_count>=0),sha256 TEXT NOT NULL,
+    data BLOB NOT NULL) STRICT"""
+
+_EPISODES_NO_UPDATE = """CREATE TRIGGER episodes_no_update BEFORE UPDATE ON episodes
+    WHEN NOT (raw_frame_write(OLD.seq,NEW.raw_frame,NEW.text_sha256)=1
+        AND OLD.raw_frame IS NULL AND OLD.text_runs IS NULL AND NEW.text=''
+        AND OLD.kind IN ('native_record','native_live_record','native_hook')
+        AND coalesce(json_extract(OLD.metadata,'$.extraction_mode'),'message')='skip'
+        AND NEW.seq IS OLD.seq AND NEW.id IS OLD.id AND NEW.source IS OLD.source
+        AND NEW.event_id IS OLD.event_id AND NEW.conversation_id IS OLD.conversation_id
+        AND NEW.kind IS OLD.kind AND NEW.occurred_at IS OLD.occurred_at
+        AND NEW.metadata IS OLD.metadata AND NEW.captured_at IS OLD.captured_at
+        AND NEW.text_runs IS OLD.text_runs)
+    BEGIN SELECT RAISE(ABORT, 'episodes are immutable'); END"""
+
 _SCHEMA = (
     """CREATE TABLE episodes (
            seq INTEGER PRIMARY KEY CHECK(seq > 0),
@@ -28,6 +46,7 @@ _SCHEMA = (
            captured_at TEXT NOT NULL,
            text_runs TEXT,
            text_sha256 TEXT,
+           raw_frame TEXT,
            UNIQUE(source, event_id)
        ) STRICT""",
     'CREATE INDEX episodes_conversation ON episodes(source, conversation_id)',
@@ -35,9 +54,7 @@ _SCHEMA = (
     """CREATE VIRTUAL TABLE episodes_fts USING fts5(
            text, content='episodes', content_rowid='seq', tokenize='unicode61'
        )""",
-    """CREATE TRIGGER episodes_no_update BEFORE UPDATE ON episodes BEGIN
-           SELECT RAISE(ABORT, 'episodes are immutable');
-       END""",
+    _EPISODES_NO_UPDATE,
     """CREATE TRIGGER episodes_no_delete BEFORE DELETE ON episodes BEGIN
            SELECT RAISE(ABORT, 'episodes are immutable');
        END""",
@@ -46,6 +63,15 @@ _SCHEMA = (
                     OR (source = NEW.source AND event_id = NEW.event_id))
        BEGIN SELECT RAISE(ABORT, 'episodes are immutable'); END""",
     _EPISODES_TEXT_INDEX,
+    _RAW_FRAMES,
+    'CREATE INDEX raw_frames_source ON raw_frames(source)',
+    """CREATE TRIGGER raw_frames_no_update BEFORE UPDATE ON raw_frames
+       BEGIN SELECT RAISE(ABORT, 'raw frames are immutable'); END""",
+    """CREATE TRIGGER raw_frames_no_delete BEFORE DELETE ON raw_frames
+       BEGIN SELECT RAISE(ABORT, 'raw frames are immutable'); END""",
+    """CREATE TRIGGER raw_frames_no_replace BEFORE INSERT ON raw_frames
+       WHEN EXISTS (SELECT 1 FROM raw_frames WHERE id=NEW.id)
+       BEGIN SELECT RAISE(ABORT, 'raw frames are immutable'); END""",
     """CREATE TABLE graph_commits (
        id TEXT PRIMARY KEY, command_id TEXT UNIQUE NOT NULL,
        request TEXT NOT NULL, result TEXT NOT NULL,
@@ -273,11 +299,26 @@ def upgrade_episode_fts(db):
 
 
 def upgrade_raw_text(db):
-    """Only physical columns: existing immutable source text is never rewritten."""
+    """Upgrade physical storage only; conversion happens in bounded background work."""
     columns = {row[1] for row in db.execute('PRAGMA table_info(episodes)')}
     for column in ('text_runs', 'text_sha256'):
         if column not in columns:
             db.execute(f'ALTER TABLE episodes ADD COLUMN {column} TEXT')
+    if 'raw_frame' not in columns:
+        db.execute('ALTER TABLE episodes ADD COLUMN raw_frame TEXT')
+    db.execute(_RAW_FRAMES)
+    db.execute('CREATE INDEX IF NOT EXISTS raw_frames_source ON raw_frames(source)')
+    for operation in ('UPDATE', 'DELETE'):
+        db.execute(f"""CREATE TRIGGER IF NOT EXISTS raw_frames_no_{operation.lower()}
+            BEFORE {operation} ON raw_frames
+            BEGIN SELECT RAISE(ABORT, 'raw frames are immutable'); END""")
+    db.execute("""CREATE TRIGGER IF NOT EXISTS raw_frames_no_replace BEFORE INSERT ON raw_frames
+        WHEN EXISTS (SELECT 1 FROM raw_frames WHERE id=NEW.id)
+        BEGIN SELECT RAISE(ABORT, 'raw frames are immutable'); END""")
+    trigger = db.execute("SELECT sql FROM sqlite_schema WHERE name='episodes_no_update'").fetchone()
+    if trigger is None or trigger[0] != _EPISODES_NO_UPDATE:
+        db.execute('DROP TRIGGER IF EXISTS episodes_no_update')
+        db.execute(_EPISODES_NO_UPDATE)
 
 
 def upgrade_status_index(db):

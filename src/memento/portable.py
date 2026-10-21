@@ -16,7 +16,7 @@ from pathlib import Path
 import sqlite_vec
 
 from .blobs import BlobStore
-from .raw_text import runs
+from .raw_text import runs, validate_frames
 from .drive_connect import public_binding, read_binding, check_binding, _publish
 
 _FORMAT = 'memento-portable'
@@ -83,6 +83,7 @@ def _registered(db):
             for _, sha256, length in runs(references):
                 if sha256 not in result or result[sha256]['size'] != length:
                     raise ValueError('Raw source references an unregistered or incorrectly sized blob')
+    validate_frames(db)
     return result
 
 

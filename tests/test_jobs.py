@@ -84,6 +84,20 @@ def test_failed_work_does_not_starve_later_input_or_disclose_error_body(tmp_path
         store.close()
 
 
+def test_storage_maintenance_failure_retains_media_dispatch_without_private_logs(tmp_path, caplog):
+    store, graph, queue, command = setup_queue(tmp_path)
+    try:
+        accepted = queue.submit_media(**command)
+        def failed_storage():
+            raise OSError('private raw source must never reach logs')
+        worker = Worker(queue, {'media': lambda job: dict(handled=job.id)}, maintenance=failed_storage)
+        assert worker.run_once()
+        assert queue.get(accepted['job_id'])['state'] == 'done'
+        assert 'OSError' in caplog.text and 'private raw source' not in caplog.text
+    finally:
+        store.close()
+
+
 def test_media_quote_only_provenance_is_resolved_once_before_worker_runs(tmp_path):
     store, graph, queue, command = setup_queue(tmp_path)
     try:

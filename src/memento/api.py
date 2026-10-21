@@ -275,6 +275,7 @@ def create_app(data_dir: Path) -> FastAPI:
             enabled = os.environ.get('MEMENTO_EMBEDDINGS', '0')
             if enabled not in ('0', '1'):
                 raise RuntimeError('MEMENTO_EMBEDDINGS must be 0 or 1')
+            handlers = {}
             if enabled == '1':
                 from .retrieval import Retrieval
                 retrieval = await asyncio.to_thread(Retrieval, app.state.graph)
@@ -284,10 +285,11 @@ def create_app(data_dir: Path) -> FastAPI:
                     if app.state.cold is not None:
                         app.state.cold.fetch(job.payload['sha256'])
                     return app.state.media.ingest(**dict(job.payload, command_id='job/' + job.id), lease=job)
-                worker = Worker(app.state.jobs, {'media': process_media})
-                worker.start()
+                handlers['media'] = process_media
                 retrieval.start()
             app.state.retrieval = retrieval
+            worker = Worker(app.state.jobs, handlers, maintenance=app.state.store.compress_raw_step)
+            worker.start()
             if cold_runtime is not None:
                 cold_runtime.start()
             drive_authorization = DriveAuthorization(data_dir, install_drive)

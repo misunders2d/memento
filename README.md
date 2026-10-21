@@ -337,7 +337,9 @@ Import reports the selected conversation IDs and queues a processing boundary af
 
 Raw-record and message-projection deduplication are independent: replay can add missing supported message projections without duplicating preserved raw records. Native attachment import supports objects up to **32 MiB** each; larger or unsupported attachments are reported in coverage rather than silently counted as imported. The original native record remains preserved.
 
-Large opaque runs of at least 64 KiB in newly captured skipped native records use the existing artifact store, keeping binary text out of SQLite and text processing. Explicit source/history reads reconstruct and verify the exact original text; a missing or corrupt artifact produces an error. To support an assertion, cite the message projection with its exact quote and offsets; offloaded raw JSON is available for inspection and export but cannot be assertion evidence. Existing inline evidence remains supported. Identical runs share storage, but different native chunk boundaries can prevent reuse. Existing inline records are retained without a bulk rewrite; status reports the remaining inline raw bytes.
+Large opaque runs of at least 64 KiB in newly captured skipped native records use the existing artifact store, keeping binary text out of SQLite and text processing. Explicit source/history reads reconstruct and verify the exact original text; a missing or corrupt artifact produces an error. To support an assertion, cite the message projection with its exact quote and offsets; offloaded raw JSON is available for inspection and export but cannot be assertion evidence. Existing inline evidence remains supported. Identical runs share storage, but different native chunk boundaries can prevent reuse.
+
+The existing background worker losslessly compresses remaining raw native records inside SQLite, grouping text from the same conversation into small frames. This applies to existing history and later captures without another import or model call. Message projections remain available for extraction and search; original raw text, identifiers, timestamps and evidence are preserved. Source reads transparently reconstruct and verify the original bytes. Status reports remaining inline bytes, compressed records, their original bytes and compressed bytes. Compression frees database pages for reuse; use the owner maintenance command below to return those pages to the filesystem.
 
 ### Read progress without guessing
 
@@ -382,7 +384,9 @@ Memory age affects ranking, not deletion or availability in normal searches. Rec
 
 Explicit saves require **nonempty verbatim quotes**, with zero-based `occurrence` for repeats; native hooks resolve current-conversation provenance. Mutations require a stable `command_id`, `actor` and `why`. Reuse a command ID only for an identical retry. Save/replacement scopes are `["personal"]`, `["professional"]` or both. World-time changes require an aware `valid_at`. Native/MCP empty optional strings are treated as omitted; required text and invalid nonempty dates still fail validation. HTTP commands remain strict.
 
-Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence.
+Open loops are markers on ordinary memories. Extraction can suggest a pending obligation or a relevant wait on someone else; these remain visibly unconfirmed until consolidation. Nightly consolidation can combine repeated evidence for the same obligation, decline an incorrect automatic flag, and close an existing obligation when exact, dated evidence establishes its completion or cancellation. Different obligations stay separate. Age and inactivity alone never close a loop, and uncertain or older completion evidence leaves it open. A newer human loop choice makes a stale consolidation plan re-evaluate before applying; genuinely newer evidence can reopen a completed obligation.
+
+To save one explicitly, tell your agent, for example: “Remember this as an open loop: I still need to send Mira the release checklist.” The agent saves the quoted statement with `remember`, then uses `loop` to open its memory ID. Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence.
 
 ## Administration, backup and recovery
 
@@ -396,6 +400,16 @@ docker compose exec memory /app/.venv/bin/memento-admin --data-dir /data backup
 `approve PROPOSAL_ID --why REASON`, `reject PROPOSAL_ID --why REASON` and `forget ID --why REASON` are operator actions. Forget removes active memory and suppresses re-extraction; **it does not erase raw history, artifacts or existing backups**. Restoring an old backup can restore forgotten content.
 
 There is **no automatic database backup**. The backup command requests and verifies a manual Drive snapshot.
+
+To reclaim database space after background compression, the service owner runs:
+
+```sh
+docker compose exec memory /app/.venv/bin/memento-admin --data-dir /data compact
+```
+
+This compacts the existing database and checkpoints its WAL. It creates no export archive and performs no Drive transfers. Allow free disk space of roughly twice the database size for SQLite's temporary work; scratch files use the persistent data volume. Service writes and memory operations using the writer lock wait during compaction, so clients can temporarily time out and retain captures in their outboxes. Let the operation finish. The JSON result reports database/WAL sizes before and after, free pages and whether the checkpoint completed. A busy checkpoint is reported as incomplete rather than claiming that all disk space was reclaimed. Ctrl+C disconnects the client; it does not cancel work already running in the service.
+
+Once raw frames exist, use a Memento version that supports compressed raw history when serving or restoring this database. Older pre-compression images cannot read those frames. Old archives remain readable by the new version.
 
 When Drive is connected, media and payloads of at least **10 MiB** are eligible for prompt upload, including newly saved images below that size. Pinning or memory importance does not prevent their verified remote storage. Other unprotected artifacts remain eligible after 90 days. The existing overrides are `MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS` and `MEMENTO_COLD_MIN_BYTES`.
 

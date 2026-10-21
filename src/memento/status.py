@@ -30,6 +30,11 @@ def operational_status(state, source=None):
             WHERE kind IN ('native_record','native_live_record','native_hook')
             AND CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS TEXT)='skip'
             {'AND source=?' if source is not None else ''}''', source_args).fetchone())
+        compressed = db.execute('''SELECT coalesce(sum(record_count),0),coalesce(sum(raw_size),0),
+            coalesce(sum(length(data)),0) FROM raw_frames''' + source_where, source_args).fetchone()
+        raw_storage['inline_raw_episodes'] -= compressed[0]
+        raw_storage.update(compressed_raw_episodes=compressed[0], compressed_original_bytes=compressed[1],
+                           compressed_raw_bytes=compressed[2])
         objects = db.execute('''SELECT count(*) AS objects,coalesce(sum(size),0) AS bytes,
             coalesce(sum(remote_id IS NULL),0) AS local_objects,
             coalesce(sum(CASE WHEN remote_id IS NULL THEN size ELSE 0 END),0) AS local_bytes,

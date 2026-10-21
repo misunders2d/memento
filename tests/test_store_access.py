@@ -33,8 +33,12 @@ def test_status_index_startup_upgrade_is_atomic_and_idempotent(tmp_path, monkeyp
     assert store._db.execute("SELECT 1 FROM sqlite_schema WHERE name='episodes_status_cover_v1'").fetchone()
     store._db.execute('DROP INDEX episodes_status_cover_v1')
     if old_physical_columns:
-        for column in ('text_runs', 'text_sha256'):
+        store._db.execute('DROP TRIGGER episodes_no_update')
+        for column in ('text_runs', 'text_sha256', 'raw_frame'):
             store._db.execute('ALTER TABLE episodes DROP COLUMN ' + column)
+        store._db.execute('DROP TABLE raw_frames')
+        store._db.execute("""CREATE TRIGGER episodes_no_update BEFORE UPDATE ON episodes
+            BEGIN SELECT RAISE(ABORT,'episodes are immutable'); END""")
     store.close()
     upgrade = store_module.upgrade_status_index
 

@@ -39,6 +39,8 @@ async def serve_admin(graph, data_dir: Path, services):
                 from .portable import export_archive
                 result = await asyncio.to_thread(export_archive, data_dir, Path(request['output']),
                                                  cold=services.cold)
+            elif request['operation'] == 'compact':
+                result = await asyncio.to_thread(graph.store.compact)
             elif request['operation'] in ('approve', 'reject'):
                 result = await asyncio.to_thread(graph._decide_review,
                     command_id=request['command_id'], actor=f'human:uid:{uid}',
@@ -78,7 +80,7 @@ def _request(data_dir, request):
         client.settimeout(30)
         client.connect(str(data_dir / 'admin.sock'))
         client.sendall(json.dumps(request).encode() + b'\n')
-        if request['operation'] in ('backup', 'export'):
+        if request['operation'] in ('backup', 'export', 'compact'):
             # Verified snapshots, downloads and uploads may exceed decision timeouts.
             client.settimeout(None)
         with client.makefile('rb') as response:
@@ -91,6 +93,7 @@ def main():
     commands = parser.add_subparsers(dest='operation', required=True)
     commands.add_parser('list')
     commands.add_parser('backup')
+    commands.add_parser('compact', help='Reclaim free database pages; pauses service writes')
     export = commands.add_parser('export', help='Export database, Drive references and local-only payloads privately')
     export.add_argument('--output', type=Path, required=True, help='New file in an owner-private directory')
     for operation in ('approve', 'reject'):
@@ -112,7 +115,7 @@ def main():
         if input(f'This plaintext archive contains private memory and Drive references; remote files stay on Drive. Type {expected!r} to confirm: ') != expected:
             parser.exit(1, 'Not confirmed; nothing changed.\n')
         request['output'] = str(output)
-    elif args.operation not in ('list', 'backup'):
+    elif args.operation not in ('list', 'backup', 'compact'):
         if not sys.stdin.isatty():
             parser.error('Administrative decisions require an interactive human terminal')
         if args.operation == 'forget':
@@ -131,6 +134,8 @@ def main():
     result = _request(args.data_dir, request)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if 'error' in result:
+        raise SystemExit(1)
+    if args.operation == 'compact' and not result['result']['complete']:
         raise SystemExit(1)
 
 

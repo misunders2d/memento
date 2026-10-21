@@ -81,13 +81,19 @@ def test_immutability_including_replace_and_search_consistency(tmp_path):
         episode_id = client.post('/episodes', json=evidence()).json()['id']
         original = client.get(f'/episodes/{episode_id}').json()
         with sqlite3.connect(tmp_path / 'memory.sqlite') as db:
+            with pytest.raises(sqlite3.OperationalError, match='^no such function: raw_frame_write$'):
+                db.execute("UPDATE episodes SET text='rewritten'")
+            db.rollback()
+            assert client.get(f'/episodes/{episode_id}').json() == original
+            # Even hostile authorization cannot bypass the logical-field guards.
+            db.create_function('raw_frame_write', 3, lambda *args: 1)
             for sql in ['UPDATE episodes SET text=\'rewritten\'', 'DELETE FROM episodes',
                         'INSERT OR REPLACE INTO episodes SELECT * FROM episodes',
                         'REPLACE INTO episodes SELECT * FROM episodes',
                         "INSERT INTO episodes SELECT * FROM episodes WHERE true ON CONFLICT(id) DO UPDATE SET text='changed'",
                         """INSERT OR REPLACE INTO episodes
                            SELECT seq, id || 'new', source || 'new', event_id, conversation_id,
-                                  kind, text, occurred_at, metadata, captured_at, text_runs, text_sha256 FROM episodes"""]:
+                                  kind, text, occurred_at, metadata, captured_at, text_runs, text_sha256,raw_frame FROM episodes"""]:
                 with pytest.raises(sqlite3.IntegrityError, match='immutable'):
                     db.execute(sql)
                 db.rollback()

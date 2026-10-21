@@ -8,6 +8,8 @@ import re
 import sqlite3
 import subprocess
 import sys
+import zlib
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,7 +19,7 @@ from memento.cold_manager import ColdManager
 from memento.graph import Graph
 from memento.jobs import Queue
 from memento.portable import export_archive, import_archive
-from memento.raw_text import MIME, RawTextUnavailable, runs
+from memento.raw_text import FRAME_BYTES, MIME, RawTextUnavailable, decode_frame, runs
 from memento.store import ConflictError, Store
 from test_cold import DirectoryColdFixture
 
@@ -302,8 +304,12 @@ def test_old_portable_database_without_physical_columns_restores(tmp_path):
     store = Store(data)
     record, _ = store.capture(episode('Legacy inline raw.'))
     store._db.execute('DROP INDEX episodes_status_cover_v1')
-    for column in ('text_runs', 'text_sha256'):
+    store._db.execute('DROP TRIGGER episodes_no_update')
+    for column in ('text_runs', 'text_sha256', 'raw_frame'):
         store._db.execute('ALTER TABLE episodes DROP COLUMN ' + column)
+    store._db.execute('DROP TABLE raw_frames')
+    store._db.execute("""CREATE TRIGGER episodes_no_update BEFORE UPDATE ON episodes
+        BEGIN SELECT RAISE(ABORT,'episodes are immutable'); END""")
     store.close()
     archive = tmp_path / 'old.tar'
     export_archive(data, archive)
@@ -330,10 +336,197 @@ def test_http_raw_retrieval_and_status_keep_wire_unchanged_and_fail_explicitly(t
         assert response.json()['text'] == payload['text']
         assert response.json()['metadata'] == payload['metadata']
         status = client.get('/status').json()['raw_storage']
-        assert status == dict(inline_raw_episodes=0, inline_raw_bytes=0, offloaded_raw_episodes=1)
+        assert status == dict(inline_raw_episodes=0, inline_raw_bytes=0, offloaded_raw_episodes=1,
+                             compressed_raw_episodes=0, compressed_original_bytes=0, compressed_raw_bytes=0)
         sha = client.app.state.store._db.execute('SELECT sha256 FROM blobs').fetchone()[0]
         client.app.state.blobs.path(sha).write_bytes(b'corrupted')
         for path in ('/episodes/' + identity, '/history/' + identity):
             failure = client.get(path)
             assert failure.status_code == 503
             assert failure.json()['detail'] == 'Original raw source artifact is unavailable or corrupt'
+
+
+def test_local_frames_preserve_raw_history_replay_quotes_and_activity(storage, tmp_path):
+    store, graph, manager = storage
+    quote = 'Ω exact repeated statement.'
+    payloads = [episode(quote + '\r\n' + ('literal context ' * 1000) + '\r\n' + quote, str(i))
+                for i in range(3)]
+    payloads += [episode('Other conversation raw.', 'other', conversation_id='other'),
+                 episode('Searchable projection token.', 'projection', kind='user',
+                         metadata={'extraction_mode': 'message'})]
+    captured = [store.capture(payload)[0] for payload in payloads]
+    opaque, _ = store.capture(episode(OPAQUE, 'opaque'))
+    command = dict(command_id='before-frame', actor='fixture', why='Exact legacy raw evidence',
+        type='knowledge', text=quote, scope=['personal'],
+        evidence=[dict(episode_id=captured[0]['id'], quote=quote, occurrence=1)])
+    before = graph.remember(**command)
+    manager.backend.download = lambda *a: pytest.fail('Local frames do not fetch Drive')
+    for _ in range(20):
+        if not store.compress_raw_step():
+            break
+    else:
+        pytest.fail('Finite raw conversion did not finish')
+    assert store._db.execute('SELECT count(*) FROM raw_frames').fetchone()[0] == 2
+    assert [store.get(row['id']) for row in captured] == captured
+    assert graph.history(captured[0]['id'])[0]['text'] == payloads[0]['text']
+    assert graph.remember(**command) == before
+    after = graph.remember(**dict(command, command_id='after-frame'))
+    expected = dict(episode_id=captured[0]['id'], start=payloads[0]['text'].rfind(quote),
+                    end=len(payloads[0]['text']), quote=quote)
+    assert graph.history(after['id'])[0]['evidence'] == [expected]
+    for payload, row in zip(payloads, captured):
+        assert store.capture(payload) == (row, False)
+    with pytest.raises(ConflictError):
+        store.capture(payloads[0] | {'text': 'Different raw bytes'})
+    assert store._db.execute('SELECT raw_frame FROM episodes WHERE id=?', (opaque['id'],)).fetchone()[0] is None
+    activity = {row['id']: row['excerpt'] for row in store.search(limit=20)}
+    assert all(activity[row['id']] == row['text'][:512] for row in captured)
+    assert [row['id'] for row in store.search('Searchable projection')] == [captured[-1]['id']]
+    assert store.search('literal context') == []  # Skipped raw was never in FTS.
+    for statement in ("UPDATE episodes SET text='changed' WHERE raw_frame IS NOT NULL",
+                      "UPDATE episodes SET metadata='{}' WHERE raw_frame IS NOT NULL"):
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            store._db.execute(statement)
+    archive = tmp_path / 'frames.tar'
+    export_archive(store._data_dir, archive, cold=manager)
+    restored = tmp_path / 'restored'
+    import_archive(archive, restored)
+    recovered = Store(restored)
+    try:
+        assert [recovered.get(row['id']) for row in captured] == captured
+        assert recovered.capture(payloads[0]) == (captured[0], False)
+        assert Graph(recovered).history(after['id']) == graph.history(after['id'])
+    finally:
+        recovered.close()
+
+
+def test_large_legacy_raw_spans_bounded_frames_with_exact_utf8_and_source_counts(storage, tmp_path, monkeypatch):
+    store, graph, _ = storage
+    import memento.store as storage_module
+    encode = storage_module.zlib.compress
+    sizes = []
+    def outside_writer(payload, level):
+        assert not store._mutex._is_owned()
+        sizes.append(len(payload))
+        return encode(payload, level)
+    monkeypatch.setattr(storage_module.zlib, 'compress', outside_writer)
+    text = ('Ω\r\nlegacy context ' * (FRAME_BYTES // 8)) + 'exact ending'
+    payload = episode(text)
+    original, _ = store.capture(payload)
+    assert store.compress_raw_step()
+    frames = store._db.execute('SELECT raw_size,record_count,length(data) FROM raw_frames').fetchall()
+    assert len(frames) > 1 and all(row[0] <= FRAME_BYTES for row in frames)
+    assert sizes and max(sizes) <= FRAME_BYTES
+    assert sum(row[0] for row in frames) == len(text.encode())
+    assert sum(row[1] for row in frames) == 1
+    assert store.get(original['id']) == original
+    assert store.capture(payload) == (original, False)
+    saved = graph.remember(command_id='large-quote', actor='fixture', why='Legacy exact quote',
+        type='knowledge', text='exact ending', scope=['personal'],
+        evidence=[dict(episode_id=original['id'], quote='exact ending')])
+    assert graph.history(saved['id'])[0]['evidence'][0]['start'] == len(text) - len('exact ending')
+    from memento.status import operational_status
+    from types import SimpleNamespace
+    from memento.processing import Processing
+    state = SimpleNamespace(store=store, processing=Processing(graph), retrieval=None,
+                            cold_runtime=None, cold=None, drive_reauthorization_required=False)
+    status = operational_status(state, payload['source'])['raw_storage']
+    assert status['inline_raw_episodes'] == 0 and status['inline_raw_bytes'] == 0
+    assert status['compressed_raw_episodes'] == 1
+    assert status['compressed_original_bytes'] == len(text.encode())
+    assert status['compressed_raw_bytes'] == sum(row[2] for row in frames)
+    other = operational_status(state, 'unrelated')['raw_storage']
+    assert all(value == 0 for value in other.values())
+    archive = tmp_path / 'large-frame.tar'
+    export_archive(store._data_dir, archive)
+    destination = tmp_path / 'large-frame-restored'
+    import_archive(archive, destination)
+    restored = Store(destination)
+    try:
+        assert restored.get(original['id']) == original
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize('failure', ['publish', 'corrupt-frame', 'oversized-payload', 'wrong-owner', 'wrong-offset'])
+def test_frame_failures_never_publish_partial_conversion_or_hide_corruption(storage, failure, monkeypatch):
+    store, _, _ = storage
+    original, _ = store.capture(episode('Exact raw Ω source. ' * 100))
+    if failure == 'publish':
+        store._db.execute("""CREATE TRIGGER fail_frame_reference BEFORE UPDATE ON episodes
+            WHEN NEW.raw_frame IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture failure'); END""")
+        with pytest.raises(sqlite3.IntegrityError, match='fixture failure'):
+            store.compress_raw_step()
+        assert store.get(original['id']) == original
+        assert store._db.execute('SELECT count(*) FROM raw_frames').fetchone()[0] == 0
+        store._db.execute('DROP TRIGGER fail_frame_reference')
+    assert store.compress_raw_step()
+    if failure == 'publish':
+        assert store.get(original['id']) == original
+        return
+    if failure in ('corrupt-frame', 'oversized-payload', 'wrong-owner'):
+        store._db.execute('DROP TRIGGER raw_frames_no_update')
+        if failure == 'corrupt-frame':
+            store._db.execute("UPDATE raw_frames SET data=x'00010203'")
+        elif failure == 'oversized-payload':
+            store._db.execute('UPDATE raw_frames SET data=zeroblob(?)', (FRAME_BYTES + 1025,))
+        else:
+            store._db.execute("UPDATE raw_frames SET conversation_id='wrong'")
+    else:
+        store._db.execute('DROP TRIGGER episodes_no_update')
+        refs = json.loads(store._db.execute('SELECT raw_frame FROM episodes').fetchone()[0])
+        refs[0][1] += 1
+        store._db.execute('UPDATE episodes SET raw_frame=?', (json.dumps(refs),))
+    with pytest.raises(RawTextUnavailable):
+        store.get(original['id'])
+    with pytest.raises((ValueError, RawTextUnavailable)):
+        export_archive(store._data_dir, store._data_dir / 'refused.tar')
+    assert not (store._data_dir / 'refused.tar').exists()
+
+
+@pytest.mark.parametrize('damage', ['trailing', 'oversized', 'truncated', 'checksum'])
+def test_local_frame_decoder_rejects_bombs_and_invalid_streams(damage):
+    payload = b'exact bytes' * 100
+    encoded = zlib.compress(payload, 1)
+    size, sha = len(payload), hashlib.sha256(payload).hexdigest()
+    if damage == 'trailing':
+        encoded += b'extraneous'
+    elif damage == 'oversized':
+        encoded, size = zlib.compress(b'x' * (FRAME_BYTES + 1)), FRAME_BYTES
+    elif damage == 'truncated':
+        encoded = encoded[:-1]
+    else:
+        sha = '0' * 64
+    with pytest.raises((ValueError, zlib.error)):
+        decode_frame(encoded, size, sha)
+
+
+def test_background_frames_work_without_embeddings_or_drive_and_keep_http_reads(tmp_path, monkeypatch):
+    monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
+    payload = episode('Local raw Ω\r\n' * 200)
+    with TestClient(create_app(tmp_path / 'service')) as client:
+        identity = client.post('/episodes', json=payload).json()['id']
+        store = client.app.state.store
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with store._mutex:
+                framed = store._db.execute('SELECT raw_frame FROM episodes WHERE id=?', (identity,)).fetchone()[0]
+            if framed is not None:
+                break
+            time.sleep(0.01)
+        assert framed is not None
+        assert client.get('/episodes/' + identity).json()['text'] == payload['text']
+        assert client.get('/history/' + identity).json()['versions'][0]['text'] == payload['text']
+        assert client.get('/episodes/search').json()['episodes'][0]['excerpt'] == payload['text'][:512]
+        assert client.post('/episodes', json=payload).json() == {'id': identity}
+        counters = client.get('/status', params={'source': payload['source']}).json()['raw_storage']
+        assert counters['compressed_raw_episodes'] == 1 and counters['inline_raw_episodes'] == 0
+
+
+def test_idle_raw_maintenance_does_not_create_temporary_files(storage, monkeypatch):
+    store, _, _ = storage
+    store.capture(episode('Genuine projection.', kind='user', metadata={'extraction_mode': 'message'}))
+    monkeypatch.setattr('memento.store.tempfile.TemporaryFile',
+                        lambda *a, **kw: pytest.fail('Idle scan must not create a staging file'))
+    assert store.compress_raw_step()
+    assert not store.compress_raw_step()

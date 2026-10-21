@@ -8,7 +8,12 @@ import re
 import stat
 import sqlite3
 import sqlite_vec
-from contextlib import closing, contextmanager
+import tempfile
+import zlib
+import subprocess
+import sys
+import logging
+from contextlib import closing, contextmanager, ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -17,7 +22,8 @@ from uuid import uuid4
 from .schema import initialize, upgrade_episode_fts, upgrade_raw_text, upgrade_status_index
 from .blobs import BlobStore
 from .artifacts import Artifacts
-from .raw_text import KINDS as RAW_KINDS, MIME as RAW_MIME, elide, hydrate
+from .raw_text import (FRAME_BYTES, KINDS as RAW_KINDS, MIME as RAW_MIME,
+                       RawTextUnavailable, decode_frame, elide, hydrate, hydrate_frames)
 from .portable import _connect
 
 LEGACY_CONTEXT_PREFIX = '# AGENTS.md instructions'
@@ -64,6 +70,9 @@ class Store:
         if agent_uid is not None and int(agent_uid) == os.getuid():
             raise RuntimeError('Memory service and agent must use distinct operating-system UIDs')
         self._mutex = RLock()
+        self._data_dir = data_dir.absolute()
+        self._raw_cursor = 0
+        self._frame_writes = {}
         self._writer_lock = (data_dir / 'writer.lock').open('a')
         self._db = None
         try:
@@ -76,6 +85,8 @@ class Store:
             self._db = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
             db_path.chmod(0o600)
             self._db.row_factory = sqlite3.Row
+            self._db.create_function('raw_frame_write', 3,
+                lambda seq, refs, sha: int(self._frame_writes.get(seq) == (refs, sha)))
             # Extraction filters before its LIMIT using the same pure predicate
             # as authority/recall checks. No schema or persisted flags are added.
             self._db.create_function('legacy_native_context', 4, legacy_native_context, deterministic=True)
@@ -135,6 +146,37 @@ class Store:
             self._db.execute('BEGIN IMMEDIATE')
             self._db.execute('ROLLBACK')
 
+    def compact(self):
+        """Owner-only physical maintenance; a fresh child keeps SQLite scratch off tmpfs."""
+        program = '''import json,sys,time
+from pathlib import Path
+from contextlib import closing
+from memento.portable import _connect
+p=Path(sys.argv[1]);wal=Path(str(p)+'-wal')
+def sizes():
+ return dict(database=p.stat().st_size,wal=wal.stat().st_size if wal.exists() else 0)
+started=time.monotonic();before=sizes()
+with closing(_connect(p)) as db:
+ free_before=db.execute('PRAGMA freelist_count').fetchone()[0]
+ db.execute('VACUUM')
+ checkpoint=db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+ free_after=db.execute('PRAGMA freelist_count').fetchone()[0]
+print(json.dumps(dict(complete=checkpoint[0]==0,before=before,after=sizes(),
+ freelist_before=free_before,freelist_after=free_after,checkpoint_busy=checkpoint[0],
+ elapsed_seconds=time.monotonic()-started)))
+'''
+        with self._mutex, tempfile.TemporaryDirectory(prefix='.memento-compact-', dir=self._data_dir) as scratch:
+            log = logging.getLogger(__name__)
+            log.warning('Database compaction started')
+            result = subprocess.run([sys.executable, '-c', program, str(self._data_dir / 'memory.sqlite')],
+                env=dict(os.environ, SQLITE_TMPDIR=scratch), capture_output=True, check=False)
+            if result.returncode:
+                raise RuntimeError('Database compaction failed; logical data retained')
+            value = json.loads(result.stdout)
+            log.warning('Database compaction completed in %.3f seconds (checkpoint busy=%s)',
+                        value['elapsed_seconds'], value['checkpoint_busy'])
+            return value
+
     @contextmanager
     def read_snapshot(self):
         """Read one WAL snapshot without holding the capture mutex during queries."""
@@ -156,6 +198,7 @@ class Store:
         episode.pop('seq', None)
         episode.pop('text_runs', None)
         episode.pop('text_sha256', None)
+        episode.pop('raw_frame', None)
         episode['metadata'] = json.loads(episode['metadata'])
         return episode
 
@@ -230,9 +273,123 @@ class Store:
 
     def hydrate_episode(self, row):
         episode = self._episode(row)
-        if episode is not None and row['text_runs'] is not None:
-            episode['text'] = hydrate(row['text'], row['text_runs'], row['text_sha256'], self.artifact_reader)
+        if episode is not None:
+            episode['text'] = self.original_text(row)
         return episode
+
+    def _frame(self, identity):
+        with self._mutex:
+            row = self._db.execute('''SELECT source,conversation_id,raw_size,sha256,
+                CASE WHEN length(data)<=? THEN data END AS data FROM raw_frames WHERE id=?''',
+                (FRAME_BYTES + 1024, identity)).fetchone()
+            frame = dict(row) if row is not None else None
+        if frame is not None:
+            frame['decoded'] = decode_frame(frame.pop('data'), frame['raw_size'], frame['sha256'])
+        return frame
+
+    def original_text(self, row):
+        if row['raw_frame'] is not None:
+            return hydrate_frames(row['raw_frame'], row['text_sha256'], row['source'],
+                                  row['conversation_id'], self._frame)
+        if row['text_runs'] is not None:
+            return hydrate(row['text'], row['text_runs'], row['text_sha256'], self.artifact_reader)
+        return row['text']
+
+    def compress_raw_step(self):
+        """One bounded scan/frame batch. Encoding and legacy large-row reads use no writer mutex."""
+        with ExitStack() as files:
+            with self.read_snapshot() as reader:
+                rows = reader.execute('''SELECT seq,source,conversation_id,text_sha256,
+                    CASE WHEN kind IN ('native_record','native_live_record','native_hook')
+                        THEN text_runs IS NULL AND raw_frame IS NULL
+                            AND coalesce(json_extract(metadata,'$.extraction_mode'),'message')='skip'
+                        ELSE 0 END AS eligible
+                    FROM episodes WHERE seq>? ORDER BY seq LIMIT 64''', (self._raw_cursor,))
+                selected, total, through, origin = [], 0, self._raw_cursor, None
+                for row in rows:
+                    if row['eligible']:
+                        current = (row['source'], row['conversation_id'])
+                        if origin is not None and current != origin:
+                            break
+                        with reader.blobopen('episodes', 'text', row['seq'], readonly=True) as source:
+                            size = len(source)
+                        if selected and total + size > FRAME_BYTES:
+                            break
+                        origin = current
+                        selected.append((row, size))
+                        total += size
+                    through = row['seq']
+                    if total >= FRAME_BYTES:
+                        break
+                if not selected:
+                    if through == self._raw_cursor:
+                        return False
+                    self._raw_cursor = through
+                    return True
+                packed = files.enter_context(tempfile.TemporaryFile(dir=self._data_dir))
+                frames, references, checksums = [], {}, {}
+                payload, count = bytearray(), 0
+                def flush():
+                    nonlocal payload, count
+                    if payload or count:
+                        encoded = zlib.compress(payload, 1)
+                        frames.append((packed.tell(), len(encoded), len(payload), count,
+                                       hashlib.sha256(payload).hexdigest()))
+                        packed.write(encoded)
+                        payload, count = bytearray(), 0
+                for row, size in selected:
+                    if len(payload) + size > FRAME_BYTES and (payload or count):
+                        flush()
+                    refs, digest, first = [], hashlib.sha256(), True
+                    with reader.blobopen('episodes', 'text', row['seq'], readonly=True) as source:
+                        remaining = size
+                        while remaining or first:
+                            chunk = source.read(min(remaining, FRAME_BYTES - len(payload)))
+                            if remaining and not chunk:
+                                raise RawTextUnavailable()
+                            refs.append([len(frames), len(payload), len(chunk)])
+                            count += int(first)
+                            payload.extend(chunk)
+                            digest.update(chunk)
+                            remaining -= len(chunk)
+                            first = False
+                            if len(payload) == FRAME_BYTES:
+                                flush()
+                    references[row['seq']] = refs
+                    checksums[row['seq']] = digest.hexdigest()
+                    if row['text_sha256'] is not None and row['text_sha256'] != digest.hexdigest():
+                        raise RawTextUnavailable()
+                flush()
+            # Reads/encoding precede the writer mutex. Each published payload is
+            # bounded; a legacy outlier can span several frames in this transaction.
+            with self._mutex:
+                db = self._db
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    identities = []
+                    for offset, length, raw_size, records, sha in frames:
+                        packed.seek(offset)
+                        identities.append(db.execute('''INSERT INTO raw_frames
+                            (source,conversation_id,raw_size,record_count,sha256,data)
+                            VALUES (?,?,?,?,?,?)''', (*origin, raw_size, records, sha, packed.read(length))).lastrowid)
+                    for row, _ in selected:
+                        seq = row['seq']
+                        refs = json.dumps([[identities[index], offset, length]
+                            for index, offset, length in references[seq]], separators=(',', ':'))
+                        self._frame_writes[seq] = (refs, checksums[seq])
+                        changed = db.execute('''UPDATE episodes SET text='',raw_frame=?,text_sha256=?
+                            WHERE seq=? AND raw_frame IS NULL AND text_runs IS NULL''',
+                            (refs, checksums[seq], seq)).rowcount
+                        if changed != 1:
+                            raise ConflictError('Raw source storage changed during compression')
+                    db.execute('COMMIT')
+                    self._raw_cursor = through
+                except BaseException:
+                    db.execute('ROLLBACK')
+                    raise
+                finally:
+                    self._frame_writes.clear()
+        return True
 
     def search(self, query: str | None = None, limit: int = 20,
                conversation_id: str | None = None, source: str | None = None,
@@ -263,7 +420,7 @@ class Store:
                 WHERE episodes_fts MATCH ?'''
             params.append(match)
         else:
-            sql = f'''SELECT {columns}, substr(e.text, 1, 512) AS excerpt
+            sql = f'''SELECT {columns},e.raw_frame,e.text_sha256, substr(e.text, 1, 512) AS excerpt
                       FROM episodes e WHERE 1=1'''
         if conversation_id is not None:
             sql += ' AND e.conversation_id=?'
@@ -281,4 +438,9 @@ class Store:
         sql += ' LIMIT ?'
         params.append(limit)
         with self._mutex:
-            return [dict(row) for row in self._db.execute(sql, params).fetchall()]
+            result = [dict(row) for row in self._db.execute(sql, params).fetchall()]
+        for row in result:
+            if row.pop('raw_frame', None) is not None:
+                row['excerpt'] = self.get(row['id'])['text'][:512]
+            row.pop('text_sha256', None)
+        return result

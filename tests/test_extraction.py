@@ -724,6 +724,384 @@ def test_candidate_loop_keeps_explicit_reminder_and_deferral_through_promotion(t
         store.close()
 
 
+def _loop_action(candidate, episode, *, operation='remember', target=None, open_loop=True, **extra):
+    return dict(candidate_id=candidate['id'], operation=operation,
+        type='knowledge' if operation == 'remember' else None,
+        text=candidate['text'] if operation == 'remember' else None,
+        scope=['professional'] if operation == 'remember' else None,
+        open_loop=open_loop, target=target, src=None, dst=None, relation=None,
+        change_kind=None, valid_at=None, valid_from=None, valid_to=None,
+        category=None, sensitive=None,
+        evidence=[dict(episode_id=episode['id'], quote=episode['text'], occurrence=None)],
+        why='Original source determines the obligation state', **extra)
+
+
+@pytest.mark.parametrize('open_loop,choice,target_choice', [
+    (False, None, None), (None, None, None),
+    (False, 'open', None), (False, 'later', None),
+    (False, 'remind', None), (False, 'close', None),
+    (False, None, 'open'),
+])
+def test_consolidation_declines_only_bare_extracted_loop_flags(extraction, open_loop, choice, target_choice):
+    from memento.loops import current
+    store, graph, processing, episode, _, work, output = extraction
+    obligation = draft('pending', 'memory', 'knowledge', TEXT, TEXT)
+    obligation['open_loop'] = True
+    output['windows'][0]['candidates'] = [obligation]
+    processing.complete(id=work['id'], owner=work['owner'], output=output, agent='fixture')
+    candidate_id = store._db.execute('SELECT id FROM candidates').fetchone()[0]
+    if choice:
+        graph.loop(action=choice, id=candidate_id, command_id='candidate-choice',
+                   **(dict(due_at='2050-01-01T00:00:00Z') if choice == 'remind' else {}))
+    before = current(graph, candidate_id)
+    target = None
+    if target_choice:
+        target = graph.remember(command_id='existing-obligation', actor='user', why='Known pending work',
+            type='knowledge', text=TEXT, scope=['professional'],
+            evidence=[dict(episode_id=episode['id'], quote=TEXT)])['id']
+        graph.loop(action=target_choice, id=target, command_id='target-choice')
+    target_before = current(graph, target) if target else None
+    task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+    action = _loop_action(task['input']['candidates'][0], episode,
+        operation='duplicate' if target else 'remember', target=target, open_loop=open_loop)
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    destination = result['results'][candidate_id]['id']
+    assert current(graph, candidate_id)['state'] == 'closed'
+    if target:
+        assert current(graph, destination) == target_before
+    elif open_loop is False and choice is None:
+        assert current(graph, destination) is None
+        assert graph.loop(action='list')['loops'] == []
+    else:
+        assert current(graph, destination) == dict(before, id=destination)
+
+
+def test_same_batch_duplicate_loops_share_one_promoted_obligation(extraction):
+    from memento.loops import current
+    store, graph, processing, episode, _, work, output = extraction
+    obligations = [draft(key, 'memory', 'knowledge', text, TEXT)
+                   for key, text in [('first', 'The report is pending.'), ('repeat', 'Waiting for that report.')]]
+    for item in obligations:
+        item['open_loop'] = True
+    output['windows'][0]['candidates'] = obligations
+    processing.complete(id=work['id'], owner=work['owner'], output=output, agent='fixture')
+    task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+    first, repeat = task['input']['candidates']
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[
+        _loop_action(first, episode),
+        _loop_action(repeat, episode, operation='duplicate', target=first['id'])]))
+    target = result['results'][first['id']]['id']
+    assert result['results'][repeat['id']]['id'] == target
+    assert [item['id'] for item in graph.loop(action='list')['loops']] == [target]
+    assert all(current(graph, item['id'])['state'] == 'closed' for item in (first, repeat))
+
+
+def test_legacy_consolidation_lease_reprepares_same_job_before_loop_changes(extraction):
+    from memento.loops import current
+    from memento.store import ConflictError
+    store, graph, processing, episode, _, work, output = extraction
+    obligation = draft('pending', 'memory', 'knowledge', TEXT, TEXT)
+    obligation['open_loop'] = True
+    output['windows'][0]['candidates'] = [obligation]
+    processing.complete(id=work['id'], owner=work['owner'], output=output, agent='fixture')
+    task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+    action = _loop_action(task['input']['candidates'][0], episode, open_loop=False)
+    legacy = dict(task['input'])
+    legacy.pop('loop_policy_version')
+    payload = json.loads(store._db.execute('SELECT payload FROM jobs WHERE id=?', (task['id'],)).fetchone()[0])
+    payload['version'] = 'consolidate-v3'
+    store._db.execute('UPDATE jobs SET payload=?,context=? WHERE id=?',
+                      (json.dumps(payload), json.dumps(legacy), task['id']))
+    commits = store._db.execute('SELECT count(*) FROM graph_commits').fetchone()[0]
+    with pytest.raises(ConflictError, match='loop policy changed'):
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    assert store._db.execute('SELECT count(*) FROM graph_commits').fetchone()[0] == commits
+    assert current(graph, action['candidate_id'])['state'] == 'open'
+    store._db.execute('UPDATE jobs SET lease_until=0 WHERE id=?', (task['id'],))
+    fresh = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+    assert fresh['id'] == task['id'] and fresh['owner'] != task['owner']
+    assert fresh['input']['loop_policy_version'] == 'consolidate-v4'
+    result = processing.complete(id=fresh['id'], owner=fresh['owner'], agent='fixture', output=dict(actions=[action]))
+    assert current(graph, result['results'][action['candidate_id']]['id']) is None
+
+
+def test_empty_consolidation_job_finishes_without_model_work(tmp_path):
+    store = Store(tmp_path)
+    try:
+        processing = Processing(Graph(store))
+        job_id = processing.queue._insert('empty-consolidation', 'consolidate',
+            dict(version='consolidate-v3', night=None, candidate_ids=[], next_cursor=0))
+        result = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)
+        assert result['work'] == []
+        job = processing.queue.get(job_id)
+        assert job['state'] == 'done' and job['result']['candidate_count'] == 0
+    finally:
+        store.close()
+
+
+@pytest.fixture
+def loop_completion(tmp_path, monkeypatch):
+    clock = {'now': datetime(2030, 1, 1, tzinfo=timezone.utc)}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock['now'] if tz is not None else clock['now'].replace(tzinfo=None)
+
+    monkeypatch.setattr('memento.graph.datetime', Clock)
+    monkeypatch.setattr('memento.loops.datetime', Clock)
+    stores = []
+
+    def prepare(*, pending_at='2020-01-01T00:00:00Z', completed_at='2035-01-01T00:00:00Z',
+                choice='open', text='I sent Alex the report.', include_pending=False, inherited_choice=False):
+        store = Store(tmp_path)
+        stores.append(store)
+        graph = Graph(store)
+        original, _ = store.capture(dict(source='completion-fixture', event_id='pending', conversation_id='c',
+            kind='user', text='I owe Alex the report.', occurred_at=pending_at, metadata={}))
+        processing = Processing(graph)
+        if inherited_choice == 'promotion':
+            task = processing.claim(agent='fixture', timezone_name='UTC', now=clock['now'],
+                compaction=dict(source='completion-fixture', conversation_id='c'))['work'][0]
+            pending = draft('pending', 'memory', 'knowledge', original['text'], original['text'])
+            pending['open_loop'] = True
+            result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+                output=dict(windows=[dict(id=w['id'], candidates=[pending]) for w in task['input']['windows']]))
+            target = store._db.execute('SELECT id FROM candidates').fetchone()[0]
+        else:
+            target = graph.remember(command_id='known-report', actor='user', why='Source-supported pending report',
+                type='knowledge', text=original['text'], scope=['professional'],
+                evidence=[dict(episode_id=original['id'], quote=original['text'])])['id']
+        graph.loop(action=choice, id=target, command_id='manual-choice',
+                   **(dict(due_at='2050-01-01T00:00:00Z') if choice == 'remind' else {}))
+        if inherited_choice == 'promotion':
+            task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+            result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+                output=dict(actions=[_loop_action(task['input']['candidates'][0], original)]))
+            target = result['results'][target]['id']
+        elif inherited_choice == 'refinement':
+            target = graph.supersede(command_id='refined-obligation', actor='user', why='Same pending obligation',
+                old=target, new=dict(type='knowledge', text='The report for Alex remains pending.', scope=['professional']),
+                kind='refinement', evidence=[dict(episode_id=original['id'], quote=original['text'])])['superseded_by']
+        clock['now'] = datetime(2040, 1, 1, tzinfo=timezone.utc)
+        source, _ = store.capture(dict(source='completion-fixture', event_id='outcome', conversation_id='c',
+            kind='user', text=text, occurred_at=completed_at, metadata={}))
+        task = processing.claim(agent='fixture', timezone_name='UTC', now=clock['now'],
+            compaction=dict(source='completion-fixture', conversation_id='c'))['work'][0]
+        candidate = draft('outcome', 'memory', 'knowledge', text, text)
+        pending = draft('pending', 'memory', 'knowledge', original['text'], original['text'])
+        pending['open_loop'] = True
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+            output=dict(windows=[dict(id=window['id'], candidates=[candidate]
+                if window['episode_id'] == source['id'] else [pending] if include_pending else [])
+                for window in task['input']['windows']]))
+        # Only neighbor discovery is controlled; prepare/apply use real snapshots,
+        # original source spans, leases, graph commits and loop history.
+        monkeypatch.setattr(graph, 'recall_keywords', lambda *_args, **_kwargs: [dict(id=target)])
+        task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True,
+                                now=clock['now'])['work'][0]
+        return store, graph, processing, target, source, task
+
+    yield prepare
+    for store in stores:
+        store.close()
+
+
+@pytest.mark.parametrize('pending_at,completed_at,choice,text,status', [
+    ('2020-01-01T00:00:00Z', '2035-01-01T00:00:00Z', 'open', 'I sent Alex the report.', 'closed'),
+    ('2020-01-01T00:00:00Z', '2035-01-01T00:00:00Z', 'later', 'I cancelled the report I owed Alex.', 'closed'),
+    ('2020-01-01T00:00:00Z', '2035-01-01T00:00:00Z', 'remind', 'I sent Alex the report.', 'closed'),
+    ('2020-01-01T00:00:00Z', '2025-01-01T00:00:00Z', 'open', 'I sent Alex the report.', 'not_newer'),
+    ('2020-01-01T00:00:00Z', '2030-01-01T00:00:00Z', 'open', 'I sent Alex the report.', 'not_newer'),
+    ('2038-01-01T00:00:00Z', '2035-01-01T00:00:00Z', 'open', 'I sent Alex the report.', 'not_newer'),
+    ('2020-01-01T00:00:00Z', None, 'open', 'I sent Alex the report.', 'chronology_unknown'),
+    (None, '2035-01-01T00:00:00Z', 'open', 'I sent Alex the report.', 'chronology_unknown'),
+])
+def test_consolidation_closes_only_from_strictly_newer_original_outcomes(
+        loop_completion, pending_at, completed_at, choice, text, status):
+    from memento.loops import current, _closed_at
+    store, graph, processing, target, source, task = loop_completion(
+        pending_at=pending_at, completed_at=completed_at, choice=choice, text=text)
+    before = current(graph, target)
+    assert next(w for w in task['input']['raw_windows'] if w['episode_id'] == source['id'])['occurred_at'] == completed_at
+    action = _loop_action(task['input']['candidates'][0], source,
+                         operation='duplicate', target=target, open_loop=False, closed_targets=[target])
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    assert result['loop_closures'][0]['status'] == status
+    assert current(graph, target)['state'] == ('closed' if status == 'closed' else 'open')
+    assert current(graph, target)['due_at'] == before['due_at']
+    if status == 'closed':
+        assert datetime.fromisoformat(_closed_at(graph, target)) == datetime.fromisoformat(completed_at)
+    else:
+        assert current(graph, target) == before
+    assert store.get(source['id'])['text'] == text
+    assert graph.history(target)[-1]['evidence'][-1]['quote'] in (text, 'I owe Alex the report.')
+
+
+def test_consolidation_closure_does_not_override_intervening_human_choice(loop_completion):
+    from memento.loops import current
+    from memento.store import ConflictError
+    store, graph, processing, target, source, task = loop_completion()
+    graph.loop(action='later', id=target, command_id='newer-human-choice')
+    before = current(graph, target)
+    version = graph._node(target)['version']
+    commits = store._db.execute('SELECT count(*) FROM graph_commits').fetchone()[0]
+    action = _loop_action(task['input']['candidates'][0], source,
+                         operation='duplicate', target=target, open_loop=False, closed_targets=[target])
+    with pytest.raises(ConflictError, match='loop state changed'):
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    assert current(graph, target) == before and graph._node(target)['version'] == version
+    assert store._db.execute('SELECT count(*) FROM graph_commits').fetchone()[0] == commits
+    store._db.execute('UPDATE jobs SET lease_until=0 WHERE id=?', (task['id'],))
+    fresh = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+    assert fresh['id'] == task['id']
+    result = processing.complete(id=fresh['id'], owner=fresh['owner'], agent='fixture', output=dict(actions=[action]))
+    assert result['loop_closures'][0]['status'] == 'not_newer'
+    assert current(graph, target) == before
+
+
+def test_same_batch_closure_alias_preserves_existing_target_choice(loop_completion):
+    from memento.loops import current
+    from memento.store import ConflictError
+    store, graph, processing, target, source, task = loop_completion(include_pending=True)
+    pending, outcome = task['input']['candidates']
+    original = store.get(pending['evidence'][0]['episode_id'])
+    actions = [_loop_action(pending, original, operation='duplicate', target=target),
+               _loop_action(outcome, source, operation='duplicate', target=target,
+                            open_loop=False, closed_targets=[pending['id']])]
+    graph.loop(action='later', id=target, command_id='alias-human-choice')
+    before = current(graph, target)
+    version = graph._node(target)['version']
+    with pytest.raises(ConflictError, match='loop state changed'):
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=actions))
+    assert current(graph, target) == before and graph._node(target)['version'] == version
+    store._db.execute('UPDATE jobs SET lease_until=0 WHERE id=?', (task['id'],))
+    fresh = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+    result = processing.complete(id=fresh['id'], owner=fresh['owner'], agent='fixture', output=dict(actions=actions))
+    assert result['loop_closures'][0]['target'] == target
+    assert result['loop_closures'][0]['status'] == 'not_newer'
+    assert current(graph, target) == before
+
+
+@pytest.mark.parametrize('completed_at,status', [
+    ('2025-01-01T00:00:00Z', 'not_newer'), ('2035-01-01T00:00:00Z', 'closed')])
+@pytest.mark.parametrize('inherited_choice', ['promotion', 'refinement'])
+def test_inherited_manual_loop_choice_keeps_original_time(loop_completion, completed_at, status, inherited_choice):
+    from memento.loops import current
+    _, graph, processing, target, source, task = loop_completion(
+        inherited_choice=inherited_choice, completed_at=completed_at)
+    assert datetime.fromisoformat(task['input']['loop_snapshots'][target]['manual_choice_at']).year == 2030
+    action = _loop_action(task['input']['candidates'][0], source,
+                         operation='duplicate', target=target, open_loop=False, closed_targets=[target])
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    assert result['loop_closures'][0]['status'] == status
+    assert current(graph, target)['state'] == ('closed' if status == 'closed' else 'open')
+
+
+def test_consolidated_closure_reopens_from_later_source_after_reload(loop_completion, monkeypatch, tmp_path):
+    from memento.loops import current
+    store, graph, processing, target, source, task = loop_completion()
+    action = _loop_action(task['input']['candidates'][0], source,
+                         operation='duplicate', target=target, open_loop=False, closed_targets=[target])
+    processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    store.close()
+    store = Store(tmp_path)
+    try:
+        graph = Graph(store)
+        processing = Processing(graph)
+        assert current(graph, target)['state'] == 'closed'
+        later, _ = store.capture(dict(source='completion-fixture', event_id='new-obligation', conversation_id='c',
+            kind='user', text='I owe Alex a follow-up report.', occurred_at='2036-01-01T00:00:00Z', metadata={}))
+        task = processing.claim(agent='fixture', timezone_name='UTC',
+            compaction=dict(source='completion-fixture', conversation_id='c'))['work'][0]
+        candidate = draft('later-promise', 'memory', 'knowledge', later['text'], later['text'])
+        candidate['open_loop'] = True
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+            output=dict(windows=[dict(id=w['id'], candidates=[candidate]) for w in task['input']['windows']]))
+        monkeypatch.setattr(graph, 'recall_keywords', lambda *_args, **_kwargs: [dict(id=target)])
+        task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[
+            _loop_action(task['input']['candidates'][0], later, operation='duplicate', target=target)]))
+        assert current(graph, target)['state'] == 'open'
+        original = next(item for item in graph.history(target) if item['id'] == target and item['version'] == 1)
+        assert [event['state'] for event in original['loop_events']] == ['open', 'closed', 'open']
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('text', ['I might send Alex the report.', 'I sent Jordan another report.'])
+def test_uncertain_or_other_obligation_does_not_close_without_explicit_reconciliation(loop_completion, text):
+    from memento.loops import current
+    _, graph, processing, target, source, task = loop_completion(text=text)
+    before = current(graph, target)
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[
+        _loop_action(task['input']['candidates'][0], source, operation='duplicate', target=target, open_loop=False)]))
+    assert result['loop_closures'] == [] and current(graph, target) == before
+
+
+@pytest.mark.parametrize('defect', ['unprovided', 'contradictory'])
+def test_consolidation_rejects_invalid_closure_plans_atomically(loop_completion, defect):
+    from memento.loops import current
+    _, graph, processing, target, source, task = loop_completion()
+    before = current(graph, target)
+    action = _loop_action(task['input']['candidates'][0], source, operation='duplicate', target=target,
+        open_loop=defect == 'contradictory', closed_targets=['not-supplied'] if defect == 'unprovided' else [target])
+    version = graph._node(target)['version']
+    with pytest.raises(ValueError, match='consolidation_loop_'):
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    assert current(graph, target) == before and graph._node(target)['version'] == version
+
+
+def test_same_batch_completion_closes_resolved_candidate_without_merging_other_work(tmp_path):
+    from memento.loops import current
+    store = Store(tmp_path)
+    try:
+        graph = Graph(store)
+        processing = Processing(graph)
+        episodes = []
+        for event, text, at in [('pending', 'I owe Alex the report.', '2020-01-01T00:00:00Z'),
+                                ('done', 'I sent Alex the report.', '2035-01-01T00:00:00Z'),
+                                ('other', 'Brian will send the videos I need.', '2035-01-01T00:00:00Z')]:
+            episodes.append(store.capture(dict(source='same-batch', event_id=event, conversation_id='c',
+                kind='user', text=text, occurred_at=at, metadata={}))[0])
+        task = processing.claim(agent='fixture', timezone_name='UTC',
+            compaction=dict(source='same-batch', conversation_id='c'))['work'][0]
+        drafts_by_id = {}
+        for episode in episodes:
+            item = draft(episode['event_id'], 'memory', 'knowledge', episode['text'], episode['text'])
+            item['open_loop'] = episode['event_id'] != 'done'
+            drafts_by_id[episode['id']] = item
+        processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(windows=[
+            dict(id=w['id'], candidates=[drafts_by_id[w['episode_id']]]) for w in task['input']['windows']]))
+        task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
+        pending, done, other = [next(c for c in task['input']['candidates'] if c['text'] == e['text']) for e in episodes]
+        result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[
+            _loop_action(done, episodes[1], open_loop=False, closed_targets=[pending['id']]),
+            _loop_action(pending, episodes[0]), _loop_action(other, episodes[2])]))
+        target = result['results'][pending['id']]['id']
+        unrelated = result['results'][other['id']]['id']
+        assert current(graph, target)['state'] == 'closed'
+        assert [item['id'] for item in graph.loop(action='list')['loops']] == [unrelated]
+        assert result['loop_closures'][0]['target'] == target
+    finally:
+        store.close()
+
+
+def test_completion_closes_superseding_destination_without_losing_lineage(loop_completion):
+    from memento.loops import current
+    _, graph, processing, target, source, task = loop_completion()
+    action = _loop_action(task['input']['candidates'][0], source, operation='supersede',
+                         target=target, open_loop=False, closed_targets=[target])
+    action.update(type='knowledge', text=source['text'], scope=['professional'],
+                  change_kind='change', valid_at=source['occurred_at'])
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    replacement = result['results'][action['candidate_id']]['superseded_by']
+    assert current(graph, replacement)['state'] == 'closed'
+    assert result['loop_closures'][0]['target'] == replacement
+    assert {item['id'] for item in graph.history(replacement)} == {target, replacement}
+    assert graph.loop(action='list')['loops'] == []
+
+
 def test_partial_message_cursor_keeps_overlap_and_newly_captured_messages(tmp_path):
     store = Store(tmp_path)
     try:

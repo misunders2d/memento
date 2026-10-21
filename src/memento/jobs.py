@@ -129,15 +129,23 @@ class Queue:
 
 
 class Worker:
-    def __init__(self, queue, handlers):
+    def __init__(self, queue, handlers, *, maintenance=None):
         self.queue, self.handlers = queue, handlers
+        self.maintenance = maintenance
         self.stop = Event()
         self.thread = None
 
     def run_once(self):
+        maintained = False
+        if self.maintenance is not None:
+            try:
+                maintained = self.maintenance()
+            except Exception as error:
+                logging.getLogger(__name__).warning('Raw storage compression failed (%s); data retained',
+                                                    type(error).__name__)
         job = self.queue.claim(self.handlers)
         if job is None:
-            return False
+            return bool(maintained)
         finished = Event()
         def heartbeat():
             while not finished.wait(self.queue.lease_seconds / 3):
