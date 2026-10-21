@@ -187,7 +187,7 @@ def export_archive(data_dir: Path, output: Path, *, cold=None):
             packed = stage / 'archive.tar'
             fd = os.open(packed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'wb') as stream:
-                with tarfile.open(fileobj=stream, mode='w|', format=tarfile.USTAR_FORMAT) as archive:
+                with tarfile.open(fileobj=stream, mode='w|', format=tarfile.GNU_FORMAT) as archive:
                     header = tarfile.TarInfo('manifest.json')
                     header.size, header.mode = len(manifest), 0o600
                     archive.addfile(header, io.BytesIO(manifest))

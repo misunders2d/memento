@@ -156,6 +156,62 @@ def test_mixed_hot_cold_roundtrip_retains_drive_references_without_downloads(por
         recovered.close()
 
 
+def test_large_database_header_reaches_strict_reader_without_large_payload_io(portable, tmp_path, monkeypatch):
+    """Exercise real export headers and reader admission, not an 8 GiB roundtrip."""
+    from memento import portable as module
+    p = portable
+    size = 2**33  # First size that cannot be represented in a USTAR size field.
+    name = 'memory.sqlite'
+    metadata = module._file_metadata
+    monkeypatch.setattr(module, '_file_metadata', lambda path: dict(metadata(path), size=size))
+
+    class StopAtPayload(Exception):
+        pass
+
+    headers, reads = [], []
+    serialize = tarfile.TarInfo.tobuf
+    copy = tarfile.copyfileobj
+    def header(member, *args, **kwargs):
+        value = serialize(member, *args, **kwargs)
+        if member.name == name and member.size == size:
+            headers.append(value)
+        return value
+    def bounded_copy(source, destination, length=None, **kwargs):
+        if length == size:
+            reads.append(len(source.read(1)))
+            raise StopAtPayload
+        return copy(source, destination, length, **kwargs)
+    monkeypatch.setattr(tarfile.TarInfo, 'tobuf', header)
+    monkeypatch.setattr(tarfile, 'copyfileobj', bounded_copy)
+    with pytest.raises(StopAtPayload):
+        export_archive(p.data, p.archive, cold=p.cold)
+    assert reads == [1] and len(headers) == 1 and len(headers[0]) == tarfile.BLOCKSIZE
+    parsed = tarfile.TarInfo.frombuf(headers[0], 'utf-8', 'strict')
+    assert parsed.name == name and parsed.size == size and parsed.type == tarfile.REGTYPE
+    assert headers[0][124] == 0x80 and not parsed.pax_headers and not parsed.linkname
+    assert not p.archive.exists() and not list(tmp_path.glob('.memento-export-*'))
+
+    files = {name: dict(size=size, sha256='0' * 64)}
+    manifest = json.dumps(dict(format='memento-portable', version=2, files=files, drive=None)).encode()
+    first = tarfile.TarInfo('manifest.json')
+    first.size = len(manifest)
+    probe = tmp_path / 'large-header.tar'
+    probe.write_bytes(first.tobuf(format=tarfile.USTAR_FORMAT) + manifest +
+        b'\0' * (-len(manifest) % tarfile.BLOCKSIZE) + headers[0] + b'x')
+    assert probe.stat().st_size < 4096
+    def admitted(source, destination, expected):
+        assert destination.name == name
+        # Header guards have passed; do not ask BufferedReader to prefetch a
+        # deliberately absent giant body. Complete byte validation is separate.
+        assert expected['size'] == size and source.tell() == 0
+        raise StopAtPayload
+    monkeypatch.setattr(module, '_copy_verified', admitted)
+    destination = tmp_path / 'large-restored'
+    with pytest.raises(StopAtPayload):
+        import_archive(probe, destination)
+    assert not destination.exists() and not list(tmp_path.glob('.memento-import-*'))
+
+
 @pytest.mark.parametrize('damage', ['missing-hot', 'corrupt-hot'])
 def test_export_refuses_any_payload_gap_without_publication(portable, tmp_path, damage):
     p = portable
