@@ -35,9 +35,11 @@ class ConflictError(Exception):
 
 
 def legacy_native_context(source, kind, text, metadata):
-    """Recognize only complete, metadata-less Codex instruction envelopes."""
-    if kind != 'user' or not isinstance(source, str) or re.fullmatch(r'native:[^:]+:codex', source) is None:
+    """Recognize native Codex developer instructions and exact legacy user envelopes."""
+    if kind not in ('user', 'developer') or not isinstance(source, str) or re.fullmatch(r'native:[^:]+:codex', source) is None:
         return False
+    if kind == 'developer':
+        return True
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)

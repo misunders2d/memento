@@ -76,7 +76,8 @@ def test_import_upload_marks_old_prefix_eligible_while_later_live_capture_stays_
                                 compact_through=boundary[0], latest_seq=boundary[0] + 1)]
         task = processing.claim(agent='synthetic', timezone_name='UTC', now=datetime.now(timezone.utc))['work'][0]
         assert [window['text'] for window in task['input']['windows']] == ['Imported finite evidence.']
-        assert all(window['episode_id'] not in later for window in task['input']['windows'])
+        _, context = processing._leased(task['id'], task['owner'])
+        assert all(window['episode_id'] not in later for window in context['windows'])
         processing.complete(id=task['id'], owner=task['owner'], agent='synthetic',
             output={'windows': [{'id': window['id'], 'candidates': []} for window in task['input']['windows']]})
         progress = store._db.execute('SELECT seq,compact_through,latest_seq FROM processing_progress').fetchone()

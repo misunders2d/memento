@@ -438,7 +438,8 @@ class Retrieval:
         # Ordinary episode text is read directly; never hydrate cold/raw data.
         context_only = False
         for episode in self.store._db.execute('''SELECT e.source,e.kind,e.metadata,
-            CASE WHEN e.kind='user' AND e.source GLOB 'native:*:codex'
+            CASE WHEN e.kind='developer' AND e.source GLOB 'native:*:codex' THEN ''
+                 WHEN e.kind='user' AND e.source GLOB 'native:*:codex'
                  AND (substr(e.text,1,?)=? OR substr(e.text,1,?)=?)
                  THEN e.text END AS text
             FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id

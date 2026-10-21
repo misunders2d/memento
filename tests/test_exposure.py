@@ -54,10 +54,11 @@ def prepare(processing, *, feedback=FEEDBACK, kind='user', time='2026-01-01T00:0
     candidate = dict(key='feedback', kind='memory', type='experience', text='Manual edits suit training exercises.',
         quote=feedback, why='Original feedback with uncertainty retained', occurrence=None, src_key=None, dst_key=None,
         valid_from=None, valid_to=None, scope=['professional'], open_loop=False, confidence=.8)
+    _, context = processing._leased(task['id'], task['owner'])
     processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(windows=[
         dict(id=window['id'], candidates=[dict(candidate, key=f'feedback-{i}', text=candidate['text'] + f' ({i})')
-            for i in range(count)] if window['episode_id'] == episode['id'] else [])
-        for window in task['input']['windows']]))
+            for i in range(count)] if source['episode_id'] == episode['id'] else [])
+        for window, source in zip(task['input']['windows'], context['windows'], strict=True)]))
     return episode, processing.claim(**args, consolidate_now=True)['work'][0]
 
 

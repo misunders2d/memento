@@ -190,8 +190,9 @@ class Processing:
                     context = handler.prepare(job)
                     self.store._db.execute('UPDATE jobs SET context=? WHERE id=? AND owner=?',
                         (json.dumps(context, ensure_ascii=False), job.id, job.owner))
+                model_input = self.extractor.model_input(context) if kind == 'extract' else context
                 if kind == 'extract' and not any(item['text'] for item in context['windows']):
-                    output = dict(windows=[dict(id=item['id'], candidates=[]) for item in context['windows']])
+                    output = dict(windows=[dict(id=item['id'], candidates=[]) for item in model_input['windows']])
                 elif kind == 'consolidate' and not context['candidates']:
                     output = dict(actions=[])
                 else:
@@ -199,7 +200,7 @@ class Processing:
                     if kind == 'extract':
                         instruction += '\nReturn windows with exactly the supplied ids and candidates for each. Entity keys are local to each window.'
                     work.append(dict(id=job.id, owner=job.owner, kind=kind, instruction=instruction,
-                        input=context, schema=(BatchDrafts if kind == 'extract' else Plan).model_json_schema()))
+                        input=model_input, schema=(BatchDrafts if kind == 'extract' else Plan).model_json_schema()))
                     break
                 result = handler.apply(job, context, output, agent=agent)
                 self.queue.complete(job, result)

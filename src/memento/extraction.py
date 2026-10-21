@@ -172,14 +172,22 @@ class Extractor:
             end = min(item['end'], item['start'] + 2000) if projection == 'tool_output' or episode['kind'] == 'tool' else item['end']
             windows.append(dict(id=item['id'], episode_id=episode['id'], source=episode['source'],
                 kind=episode['kind'], start=item['start'], end=end, text=episode['text'][item['start']:end]))
-        return dict(windows=windows)
+        # Keep immutable provenance in the lease; only the model view uses handles.
+        return dict(windows=windows, window_view='handles-v1')
+
+    def model_input(self, context):
+        return dict(windows=[dict(id=f'w{index}', kind=window['kind'], text=window['text'])
+            for index, window in enumerate(context['windows'])])
 
     def apply(self, job, context, output, *, agent, model=None, usage=None):
         try:
             drafts = BatchDrafts.model_validate(output)
         except ValidationError:
             raise ValueError('candidate_schema_invalid') from None
-        windows = {item['id']: item for item in context['windows']}
+        # Unmarked contexts were already leased with full IDs before this view.
+        compact = context.get('window_view') == 'handles-v1'
+        windows = {(f'w{index}' if compact else item['id']): item
+            for index, item in enumerate(context['windows'])}
         if len(drafts.windows) != len(windows) or {item.id for item in drafts.windows} != set(windows):
             raise ValueError('candidate_window_coverage_invalid')
         prepared = {}
@@ -242,7 +250,7 @@ class Extractor:
                 if (source_blocked(self.store, episode['source'], episode['event_id'])
                         or legacy_native_context(episode['source'], episode['kind'], episode['text'], episode['metadata'])):
                     continue
-                run_id = job.id + '/' + window_id
+                run_id = job.id + '/' + window['id']
                 db.execute('INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)',
                     (run_id, commit, episode['id'], VERSION, 'connected-harness-default',
                      json.dumps([model] if model else []), json.dumps(usage), datetime.now(timezone.utc).isoformat()))

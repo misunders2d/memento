@@ -131,7 +131,8 @@ def prepared_case(directory):
         task = post('/work/claim', dict(agent='fixture', timezone='UTC',
                     compaction=dict(source=SOURCE, conversation_id=CONVERSATION)))['work'][0]
         assert task['kind'] == 'extract'
-        assert {window['episode_id']: window['text'] for window in task['input']['windows']} == {
+        context = json.loads(store._db.execute('SELECT context FROM jobs WHERE id=?', (task['id'],)).fetchone()[0])
+        assert {window['episode_id']: window['text'] for window in context['windows']} == {
             feedback[case['role']]: case['text'] for case in CASES}
         extracted = post('/work/complete', dict(id=task['id'], owner=task['owner'], agent='fixture',
             output=dict(windows=[dict(id=window['id'], candidates=[dict(key='feedback', kind='memory',

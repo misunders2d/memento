@@ -39,6 +39,13 @@ def drafts():
         draft('link2', 'relation', 'related_to', 'Связано с Mellanni', 'Связи: Сергей → Mellanni; Memory → Mellanni.', 'project', 'org')]
 
 
+def source_windows(processing, work):
+    """Inspect saved provenance while echoing only the IDs actually served."""
+    _, context = processing._leased(work['id'], work['owner'])
+    return [dict(source, **shown, canonical_id=source['id'])
+        for source, shown in zip(context['windows'], work['input']['windows'], strict=True)]
+
+
 @pytest.mark.parametrize('defect', [None, 'abstain', 'personal_experience', 'personal_decision',
     'subject', 'version', 'condition', 'record_limit', 'byte_limit', 'qualified_experience',
     'invented_subject', 'personal_key', 'personal_location', 'personal_scope', 'invalid_type', 'quote'])
@@ -122,7 +129,7 @@ def test_newer_due_conversation_precedes_imported_backlog_without_reordering_win
                     now=datetime(2026, 10, 18, 12, tzinfo=timezone.utc))
         for expected in ('live-conversation', 'imported-history'):
             task = processing.claim(**args)['work'][0]
-            assert [window['episode_id'] for window in task['input']['windows']] == episodes[expected]
+            assert [window['episode_id'] for window in source_windows(processing, task)] == episodes[expected]
             assert [window['text'] for window in task['input']['windows']] == [
                 f'{expected} message 0', f'{expected} message 1']
             processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
@@ -159,7 +166,7 @@ def test_finite_import_prefix_finishes_while_newer_conversation_keeps_growing(tm
         for _ in range(4):
             task = processing.claim(**args, exclude=attempted)['work'][0]
             attempted.append(task['id'])
-            batch = task['input']['windows']
+            batch = source_windows(processing, task)
             conversation = store.get(batch[0]['episode_id'])['conversation_id']
             admissions.append(conversation)
             assert store._db.execute("""SELECT count(*) FROM (SELECT 1 FROM jobs
@@ -204,7 +211,7 @@ def test_extraction_admission_order_survives_restart_and_ignores_non_extract_job
         processing = Processing(Graph(store))
         args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc).replace(hour=12))
         first = processing.claim(**args)['work'][0]
-        assert store.get(first['input']['windows'][0]['episode_id'])['conversation_id'] == 'old'
+        assert store.get(source_windows(processing, first)[0]['episode_id'])['conversation_id'] == 'old'
         assert json.loads(store._db.execute('SELECT payload FROM jobs WHERE id=?', (first['id'],)).fetchone()[0])['order'] == 'oldest'
         processing.complete(id=first['id'], owner=first['owner'], agent='fixture',
             output=dict(windows=[dict(id=window['id'], candidates=[]) for window in first['input']['windows']]))
@@ -214,7 +221,7 @@ def test_extraction_admission_order_survives_restart_and_ignores_non_extract_job
         store = Store(tmp_path)
         processing = Processing(Graph(store))
         second = processing.claim(**args, exclude=[first['id']])['work'][0]
-        assert store.get(second['input']['windows'][0]['episode_id'])['conversation_id'] == 'new'
+        assert store.get(source_windows(processing, second)[0]['episode_id'])['conversation_id'] == 'new'
         assert json.loads(store._db.execute('SELECT payload FROM jobs WHERE id=?', (second['id'],)).fetchone()[0])['order'] == 'newest'
     finally:
         store.close()
@@ -362,7 +369,7 @@ def test_extraction_filters_more_than_65_legacy_contexts_before_its_window_limit
         work = processing.claim(agent='fixture', timezone_name='UTC',
             compaction=dict(source=NATIVE_SOURCE, conversation_id='c'),
             now=datetime.now(timezone.utc).replace(hour=12))['work'][0]
-        assert [window['episode_id'] for window in work['input']['windows']] == [genuine['id']]
+        assert [window['episode_id'] for window in source_windows(processing, work)] == [genuine['id']]
         result = processing.complete(id=work['id'], owner=work['owner'], agent='fixture',
             output=dict(windows=[dict(id=work['input']['windows'][0]['id'], candidates=drafts())]))
         assert result['candidate_count'] == 5
@@ -405,7 +412,7 @@ def test_preexisting_queued_and_leased_context_work_completes_without_losing_rea
                 assert claimed == []
             else:
                 work = claimed[0]
-                assert [window['episode_id'] for window in work['input']['windows']] == [genuine['id']]
+                assert [window['episode_id'] for window in source_windows(processing, work)] == [genuine['id']]
         if leased or mixed:
             output = dict(windows=[dict(id=window['id'], candidates=drafts()) for window in work['input']['windows']])
             result = processing.complete(id=work['id'], owner=work['owner'], agent='fixture', output=output)
@@ -550,7 +557,7 @@ def test_huge_original_tool_output_projects_only_first_2000_once(tmp_path, kind,
             compaction=dict(source='tool-fixture', conversation_id='c'), now=now)['work']
         assert len(tasks) == 1
         task = tasks[0]
-        windows = task['input']['windows']
+        windows = source_windows(processing, task)
         assert len(windows) == 1
         assert windows[0]['text'] == text[:2000]
         assert (windows[0]['start'], windows[0]['end']) == (0, 2000)
@@ -613,7 +620,7 @@ def test_interleaved_skip_envelopes_pack_eligible_messages_with_exact_coverage(t
         while tasks := processing.claim(**args)['work']:
             assert len(tasks) == 1 and tasks[0]['kind'] == 'extract'
             task = tasks[0]
-            windows = task['input']['windows']
+            windows = source_windows(processing, task)
             assert len(windows) <= 64
             assert sum(len(window['text']) for window in windows) <= 48000
             assert all(window['text'] == expected[window['episode_id']] for window in windows)
@@ -663,7 +670,7 @@ def test_skip_only_and_trailing_ranges_advance_only_through_compaction_boundary(
         assert progress['seq'] == boundary and progress['offset'] == 0
         assert processing.claim(**args)['work'] == []
         task = processing.claim(**args, compaction=dict(source='skip-fixture', conversation_id='c'))['work'][0]
-        assert [window['episode_id'] for window in task['input']['windows']] == [later['id']]
+        assert [window['episode_id'] for window in source_windows(processing, task)] == [later['id']]
         store.capture(dict(source='skip-fixture', event_id='new-trailing-raw', conversation_id='c',
             kind='native_hook', text='Captured during lease', occurred_at=None, metadata={'extraction_mode': 'skip'}))
         processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
@@ -894,7 +901,7 @@ def loop_completion(tmp_path, monkeypatch):
         processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
             output=dict(windows=[dict(id=window['id'], candidates=[candidate]
                 if window['episode_id'] == source['id'] else [pending] if include_pending else [])
-                for window in task['input']['windows']]))
+                for window in source_windows(processing, task)]))
         # Only neighbor discovery is controlled; prepare/apply use real snapshots,
         # original source spans, leases, graph commits and loop history.
         monkeypatch.setattr(graph, 'recall_keywords', lambda *_args, **_kwargs: [dict(id=target)])
@@ -1072,7 +1079,7 @@ def test_same_batch_completion_closes_resolved_candidate_without_merging_other_w
             item['open_loop'] = episode['event_id'] != 'done'
             drafts_by_id[episode['id']] = item
         processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(windows=[
-            dict(id=w['id'], candidates=[drafts_by_id[w['episode_id']]]) for w in task['input']['windows']]))
+            dict(id=w['id'], candidates=[drafts_by_id[w['episode_id']]]) for w in source_windows(processing, task)]))
         task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
         pending, done, other = [next(c for c in task['input']['candidates'] if c['text'] == e['text']) for e in episodes]
         result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[
@@ -1119,7 +1126,7 @@ def test_partial_message_cursor_keeps_overlap_and_newly_captured_messages(tmp_pa
         args = dict(agent='fixture', timezone_name='UTC', now=now,
                     compaction=dict(source='cursor-fixture', conversation_id='c'))
         task = processing.claim(**args)['work'][0]
-        first = task['input']['windows']
+        first = source_windows(processing, task)
         assert first[0]['episode_id'] == tool['id'] and first[0]['text'] == tool_text[:2000]
         long_first = [window for window in first if window['episode_id'] == original['id']]
         assert max(window['end'] for window in long_first) < len(text)
@@ -1131,7 +1138,7 @@ def test_partial_message_cursor_keeps_overlap_and_newly_captured_messages(tmp_pa
         episodes = {tool['id']: tool_text[:2000], original['id']: original['text'], later['id']: later['text']}
         windows = []
         for _ in range(4):
-            batch = task['input']['windows']
+            batch = source_windows(processing, task)
             windows.extend(batch)
             assert all(window['text'] == episodes[window['episode_id']][window['start']:window['end']]
                        for window in batch)
@@ -1150,7 +1157,7 @@ def test_partial_message_cursor_keeps_overlap_and_newly_captured_messages(tmp_pa
                            if window['episode_id'] == episode_id)
             assert spans[0][0] == 0 and spans[-1][1] == len(raw)
             assert all(next_start == end - 1000 for (_, end), (next_start, _) in zip(spans, spans[1:]))
-        assert len({window['id'] for window in windows}) == len(windows)
+        assert len({window['canonical_id'] for window in windows}) == len(windows)
         assert processing.claim(**args)['work'] == []
         assert store.get(tool['id'])['text'] == tool_text
     finally:
@@ -1182,7 +1189,7 @@ def test_forgotten_partial_source_does_not_apply_its_offset_to_next_eligible_mes
         assert claimed['backlog'] == dict(pending_extract_conversations=1, pending_extract_jobs=0,
             leased_extract_jobs=1)
         task = claimed['work'][0]
-        assert max(window['end'] for window in task['input']['windows']
+        assert max(window['end'] for window in source_windows(processing, task)
                    if window['episode_id'] == original['id']) < len(original['text'])
         preview = graph._forget_preview(node['id'])
         graph._forget(command_id='forget-partial', actor='human-fixture', why='Explicit source exclusion',
@@ -1191,7 +1198,7 @@ def test_forgotten_partial_source_does_not_apply_its_offset_to_next_eligible_mes
             output=dict(windows=[dict(id=window['id'], candidates=[]) for window in task['input']['windows']]))
         task = processing.claim(**args)['work'][0]
         assert len(task['input']['windows']) == 1
-        window = task['input']['windows'][0]
+        window = source_windows(processing, task)[0]
         assert window['episode_id'] == later['id'] and window['start'] == 0
         assert window['text'] == later['text']
         processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
@@ -1291,7 +1298,7 @@ def test_consolidation_reopens_closed_loop_only_from_newer_source_evidence(
         processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
             output=dict(windows=[dict(id=window['id'],
                 candidates=[candidate] if window['episode_id'] == source['id'] else [])
-                for window in task['input']['windows']]))
+                for window in source_windows(processing, task)]))
         task = processing.claim(agent='fixture', timezone_name='UTC',
             consolidate_now=True, now=instant)['work'][0]
         candidate_id = task['input']['candidates'][0]['id']
