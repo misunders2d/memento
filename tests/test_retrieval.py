@@ -663,6 +663,78 @@ def test_index_status_counts_current_units_failures_and_unprepared_sources(retri
     assert r.status(source='other')['total'] == 0
 
 
+def test_status_cover_preserves_mixed_units_and_avoids_projected_episode_bodies(retrieval, monkeypatch):
+    r, statements = retrieval, []
+    db = r.store._db
+    for prefix, source in (('selected', 'selected'), ('empty', '')):
+        episodes = {}
+        for name in ('normal', 'skipped', 'forgotten', 'unprepared'):
+            episode, _ = r.store.capture(dict(source=source, event_id=name, conversation_id='c', kind='user',
+                text='Synthetic evidence. ' + 'Large projected message. ' * 4096, occurred_at=None,
+                metadata={'extraction_mode': 'skip'} if name == 'skipped' else {}))
+            episodes[name] = episode['id']
+        db.execute('INSERT INTO forgotten_sources VALUES (?,?,?,?)', (source, 'forgotten', 'fixture', 'fixture'))
+        for name, episode in episodes.items():
+            if name != 'unprepared':
+                db.execute('INSERT INTO episode_chunks VALUES (?,?,0,20)', (prefix + '-' + name, episode))
+        db.execute('INSERT INTO episode_chunks VALUES (?,?,20,40)', (prefix + '-failed', episodes['normal']))
+        run = prefix + '-run'
+        db.execute('INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)',
+            (run, 'fixture', episodes['normal'], 'extract-v2', 'fixture', '[]', 'null', '2026-10-22T00:00:00Z'))
+        for name in ('candidate', 'rejected-candidate', 'forgotten-candidate'):
+            db.execute('INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                (prefix + '-' + name, run, 'memory', 'knowledge', 'Synthetic evidence.', 'Fixture source',
+                 None, None, .8, None, None, '["professional"]'))
+        db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)',
+            (prefix + '-rejection', prefix + '-rejected-candidate', 'fixture', 'reject', None, None))
+        db.execute('INSERT INTO forgotten_targets VALUES (?,?,?)',
+            (prefix + '-forgotten-candidate', 'fixture', 'fixture'))
+        for name, type, state in (('node', 'knowledge', 'active'), ('retired-node', 'knowledge', 'active'),
+                                  ('media', 'media', 'active'), ('retired-media', 'media', 'rejected')):
+            target = prefix + '-' + name
+            db.execute('INSERT INTO node_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (target, 1, 'fixture', type, 'Synthetic evidence.', state, None, None, None, 0, '["personal"]'))
+            db.execute('INSERT INTO graph_evidence VALUES (?,?,?,?,?,?)',
+                (target, 1, episodes['normal'], 0, 19, 'Synthetic evidence.'))
+            if name == 'retired-node':
+                db.execute('''INSERT INTO node_versions SELECT id,2,commit_id,type,text,'rejected',
+                    valid_from,valid_to,superseded_by,pinned,scope FROM node_versions WHERE id=?''', (target,))
+        for name in ('media', 'retired-media'):
+            db.execute('''INSERT INTO segments(id,node_id,modality,text,artifact_sha256,source_sha256)
+                VALUES (?,?,?,?,?,?)''',
+                (prefix + '-' + name + '-segment', prefix + '-' + name, 'text', 'Synthetic page.', 'a' * 64, 'b' * 64))
+        for name, kind in (('normal', 'episode'), ('skipped', 'episode'), ('forgotten', 'episode'),
+                           ('node', 'node'), ('retired-node', 'node'), ('media-segment', 'segment'),
+                           ('retired-media-segment', 'segment')):
+            index(r, prefix + '-' + name, .9, kind=kind)
+        db.execute('INSERT INTO index_failures VALUES (?,1,1,\'ValueError\',0,0)', (prefix + '-failed',))
+        db.execute('INSERT INTO graph_evidence VALUES (?,?,?,?,?,?)',
+            (prefix + '-candidate', 1, episodes['normal'], 0, 19, 'Synthetic evidence.'))
+
+    snapshot = r.store.read_snapshot
+    @contextmanager
+    def observed_snapshot():
+        with snapshot() as reader:
+            reader.set_trace_callback(lambda sql: statements.append(sql)
+                if 'indexed_units AS MATERIALIZED' in sql else None)
+            yield reader
+    monkeypatch.setattr(r.store, 'read_snapshot', observed_snapshot)
+    for source, multiplier in ((None, 2), ('selected', 1), ('absent', 0), ('', 1)):
+        assert r.status(source) == dict(available=True, total=5 * multiplier, indexed=3 * multiplier,
+            pending=multiplier, failed=multiplier, unprepared_episodes=multiplier, error=None)
+    if sqlite3.sqlite_version_info >= (3, 46, 1):
+        with snapshot() as reader:
+            page = reader.execute("SELECT rootpage FROM sqlite_schema WHERE name='episodes'").fetchone()[0]
+            body_columns = {row['cid'] for row in reader.execute('PRAGMA table_info(episodes)')
+                            if row['name'] in ('text', 'metadata')}
+            assert len(statements) == 4
+            for sql in statements:
+                program = list(reader.execute('EXPLAIN ' + sql))
+                cursors = {op['p1'] for op in program if op['opcode'] == 'OpenRead' and op['p2'] == page}
+                assert not any(op['opcode'] == 'Column' and op['p1'] in cursors
+                               and op['p2'] in body_columns for op in program), sql
+
+
 def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monkeypatch):
     r = retrieval
     raw = 'Exact synthetic Ω\x00 evidence.'
@@ -807,7 +879,7 @@ def test_status_wal_snapshot_allows_capture_during_real_raw_and_index_queries(re
     def trace(sql):
         nonlocal active
         active = ('AS inline_raw_episodes' in sql if stage == 'raw'
-                  else sql.startswith('WITH indexed_units AS MATERIALIZED'))
+                  else 'indexed_units AS MATERIALIZED' in sql)
 
     def pause_query():
         nonlocal paused

@@ -49,7 +49,7 @@ def prepare(processing, *, feedback=FEEDBACK, kind='user', time='2026-01-01T00:0
     episode = capture(processing.store, 'feedback', feedback, kind=kind, time=time)
     if before_claim:
         before_claim(episode)
-    args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc).replace(hour=12))
+    args = dict(agent='fixture', timezone_name='UTC', now=datetime.now(timezone.utc))
     task = processing.claim(**args, compaction=dict(source=episode['source'], conversation_id='c'))['work'][0]
     candidate = dict(key='feedback', kind='memory', type='experience', text='Manual edits suit training exercises.',
         quote=feedback, why='Original feedback with uncertainty retained', occurrence=None, src_key=None, dst_key=None,

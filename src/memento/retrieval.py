@@ -28,6 +28,13 @@ AUTOMATIC_COSINE_FLOOR = 0.66
 AUTOMATIC_RESULT_LIMIT = 6
 AUTOMATIC_SUGGESTION_LIMIT = 2
 
+
+def _episode_units(episodes='episodes'):
+    return f'''SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,
+        x.episode_id,x.start,x.end,2 AS priority,NULL AS scope,x.rowid AS position
+        FROM episode_chunks x JOIN {episodes} e ON e.id=x.episode_id'''
+
+
 _INDEX_SOURCES = (
     ('node', 'node_versions', '''SELECT n.id,'node' AS kind,n.version,n.text,n.type,
         NULL AS episode_id,NULL AS start,NULL AS end,0 AS priority,n.scope,n.rowid AS position
@@ -36,17 +43,19 @@ _INDEX_SOURCES = (
     ('candidate', 'candidates', f'''SELECT c.id,'candidate' AS kind,1 AS version,c.text,c.type,
         NULL AS episode_id,NULL AS start,NULL AS end,1 AS priority,c.scope,c.rowid AS position
         FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}'''),
-    ('episode', 'episode_chunks', '''SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,
-        x.episode_id,x.start,x.end,2 AS priority,NULL AS scope,x.rowid AS position
-        FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id
+    ('episode', 'episode_chunks', _episode_units() + '''
         WHERE coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip'
         AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)'''),
 )
 _INDEXABLE = ' UNION ALL '.join(source for _, _, source in _INDEX_SOURCES)
 
-_RECALL_ELIGIBLE = f'''SELECT a.id,a.kind,a.version,a.scope,a.id AS rank_target FROM ({_INDEXABLE}) a
+def _recall_eligible(indexable):
+    return f'''SELECT a.id,a.kind,a.version,a.scope,a.id AS rank_target FROM ({indexable}) a
     UNION ALL SELECT s.id,'segment',1,n.scope,n.id FROM segments s JOIN node_versions n ON n.id=s.node_id
     WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)'''
+
+
+_RECALL_ELIGIBLE = _recall_eligible(_INDEXABLE)
 
 _ENTITY_SQL = ','.join("'" + kind + "'" for kind in sorted(ENTITY_TYPES))
 _AUTOMATIC_ELIGIBLE = f'''SELECT n.id,'node' AS kind,n.version,n.scope,n.id AS rank_target
@@ -721,13 +730,25 @@ class Retrieval:
             return self._status(db, source)
 
     def _status(self, db, source):
+        indexable = ' UNION ALL '.join(_episode_units('status_episodes') if kind == 'episode' else query
+            for kind, _, query in _INDEX_SOURCES)
+        eligible = _recall_eligible(indexable)
+        source_args = (source,) if source is not None else ()
+        # Read eligibility once from the covering index, rather than visiting
+        # large episode bodies for metadata again for every prepared chunk.
         # Probe vector metadata once, rather than repeating a virtual-table
         # row lookup for every unit and aggregate expression.
-        row = db.execute(f'''WITH indexed_units AS MATERIALIZED (
+        row = db.execute(f'''WITH status_episodes AS MATERIALIZED (
+                SELECT e.id FROM episodes e INDEXED BY episodes_status_cover_v1
+                WHERE {'e.source=? AND' if source is not None else ''}
+                CAST(coalesce(json_extract(e.metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip'
+                AND NOT EXISTS (SELECT 1 FROM forgotten_sources f
+                    WHERE f.source=e.source AND f.event_id=e.event_id)),
+                indexed_units AS MATERIALIZED (
                 SELECT i.target,i.kind,i.version FROM memory_vectors v
                 JOIN vector_items i ON i.seq=v.rowid WHERE v.current=1),
                 units AS (
-                SELECT a.* FROM ({_RECALL_ELIGIBLE}) a WHERE ? IS NULL
+                SELECT a.* FROM ({eligible}) a WHERE ? IS NULL
                 OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
                     WHERE g.target=a.rank_target AND e.source=?)
                 OR (a.kind='episode' AND EXISTS (SELECT 1 FROM episode_chunks x
@@ -739,7 +760,7 @@ class Retrieval:
                 SELECT count(*) AS total,coalesce(sum(indexed),0) AS indexed,
                     coalesce(sum(NOT indexed AND NOT failed),0) AS pending,
                     coalesce(sum(NOT indexed AND failed),0) AS failed FROM states''',
-                (source, source, source)).fetchone()
+                (*source_args, source, source, source)).fetchone()
         unprepared = db.execute(f'''SELECT count(*) FROM episodes e
                 WHERE {'e.source=? AND' if source is not None else ''}
                 CAST(coalesce(json_extract(e.metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip'

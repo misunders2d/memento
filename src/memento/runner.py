@@ -45,6 +45,7 @@ WORK_REJECTION_CODES = frozenset({
     'consolidation_schema_invalid', 'consolidation_candidate_coverage_invalid',
     'consolidation_reference_not_supplied', 'consolidation_evidence_not_supplied',
     'consolidation_evidence_outside_context', 'consolidation_missing_candidate_source',
+    'consolidation_loop_target_not_supplied', 'consolidation_loop_state_contradictory',
     'consolidation_behavior_requires_experience', 'consolidation_behavior_exception_invalid',
     'consolidation_behavior_requires_user_ground_truth', 'consolidation_world_interval_invalid',
     'consolidation_remember_invalid', 'consolidation_supersede_invalid',
@@ -57,6 +58,9 @@ WORK_REJECTION_CODES = frozenset({
     'candidate_unexpected_relation_endpoints', 'candidate_world_interval_invalid', 'candidate_relation_endpoint_missing',
     'World time must be an aware ISO timestamp', 'scope requires distinct personal/professional labels',
     'Only an entity may have both scopes',
+    'Invalid reviewed type definition', 'Merge requires distinct active entities of the same type',
+    'Relations require active endpoints', 'Supersession requires an active node',
+    'Change must follow the previous valid_from',
 })
 SYSTEM = (
     'Process the supplied Memento task. Return exactly one JSON object matching its schema, '
