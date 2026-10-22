@@ -533,14 +533,14 @@ class Spool:
         if role == 'assistant' and typ not in ('function_call', 'custom_tool_call'):
             self.usage(harness, conversation, identity, cited_text)
 
-    def journal(self, path, harness, conversation, *, force=False):
+    def journal(self, path, harness, conversation, *, force=False, defer=False):
         path = str(Path(path).resolve())
         existing = self.db.execute('SELECT harness,conversation FROM journals WHERE path=?', (path,)).fetchone()
         if existing and existing[0] != harness:
             raise ValueError('journal already belongs to another native harness')
         self.db.execute('INSERT INTO journals(path,harness,conversation) VALUES(?,?,?) ON CONFLICT(path) DO NOTHING',
                         (path, harness, conversation))
-        return self.reconcile(path, force=force)
+        return 0 if defer else self.reconcile(path, force=force)
 
     def reconcile(self, path, *, force=False):
         row = self.db.execute('SELECT harness,conversation,offset,prefix,fingerprint FROM journals WHERE path=?', (path,)).fetchone()
@@ -1269,13 +1269,23 @@ def codex_late(spool, data):
     return {}  # Missing/untrusted/cancelled async delivery leaves next-human fallback.
 
 
+def defer_hook_capture(harness, data):
+    return (harness == 'codex' and data.get('hook_event_name') in (
+        'SessionStart', 'UserPromptSubmit', 'Stop', 'SubagentStop', 'Interrupt', 'SessionEnd')
+        and not (data.get('hook_event_name') == 'SessionStart' and data.get('source') == 'compact'))
+
+
 def hook(spool, harness, data, *, recall=automatic):
     conversation = str(data.get('session_id') or data.get('thread_id') or 'unknown')
     event = data.get('hook_event_name', '')
     for name in ('transcript_path', 'agent_transcript_path'):
         if data.get(name):
             target = str(data.get('agent_id')) if name == 'agent_transcript_path' and data.get('agent_id') else conversation
-            spool.journal(data[name], harness, target)
+            # Ordinary Codex callbacks must reach recall/return within the native
+            # deadline even when a large transcript suffix remains unread. The
+            # existing detached uploader reconciles these registered paths.
+            # Quote saves and compaction still capture before their boundary.
+            spool.journal(data[name], harness, target, defer=defer_hook_capture(harness, data))
     # Hook envelopes are raw records, not synthetic committed assistant messages.
     spool.episode(harness, conversation, 'hook:' + digest(data), 'native_hook', encode(data).decode('utf-8'),
                   metadata={'extraction_mode': 'skip'})
@@ -1614,6 +1624,8 @@ def main(argv=None):
         parser.error('recall-worker requires --conversation-id and --owner')
     if args.late_recall and args.operation != 'codex':
         parser.error('late-recall requires codex')
+    deferred_capture = False
+    paths = []
     try:
         if args.operation == 'install':
             print(json.dumps(install(args.config, args.native_config_dir)))
@@ -1653,7 +1665,11 @@ def main(argv=None):
             return 0
         data = None if args.operation == 'import-history' else json.load(sys.stdin)
         ready_only = args.operation == 'native' and data.get('action') == 'recall-ready'
-        spool = Spool(args.config, config, timeout=.05 if ready_only else 3)
+        deferred_capture = bool(data and not args.late_recall and defer_hook_capture(args.operation, data))
+        paths = ([data['session_file']] if data and data.get('session_file') else [])
+        paths += [data[name] for name in ('transcript_path', 'agent_transcript_path', 'transcriptPath')
+                  if data and data.get(name)]
+        spool = Spool(args.config, config, timeout=.05 if ready_only or deferred_capture else 3)
         try:
             result = import_history(spool, args.agent, args.paths, artifact_roots=args.artifact_root,
                 progress=lambda value: print(json.dumps({'progress': value}), file=sys.stderr, flush=True)) if args.operation == 'import-history' else (
@@ -1663,9 +1679,6 @@ def main(argv=None):
             spool.commit()
         finally:
             spool.close()
-        paths = ([data['session_file']] if data and data.get('session_file') else [])
-        paths += [data[name] for name in ('transcript_path', 'agent_transcript_path', 'transcriptPath')
-                  if data and data.get(name)]
         if not ready_only and (not args.late_recall or result):
             kick(args.config, paths)
         if result or args.operation == 'agy':
@@ -1673,6 +1686,11 @@ def main(argv=None):
             print(json.dumps(result or {}, ensure_ascii=False))
         return 0
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, HTTPException) as exc:
+        if deferred_capture and isinstance(exc, sqlite3.Error):
+            # A busy writer must not consume the foreground allowance or stop
+            # recovery of the already registered transcript after it releases.
+            with contextlib.suppress(OSError):
+                kick(args.config, paths)
         # Never leak transcripts, query text, native config, credentials or URL errors.
         if args.operation == 'install':
             print('{"status":"error","error":"native_install_failed"}')

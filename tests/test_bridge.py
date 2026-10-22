@@ -1075,6 +1075,126 @@ def test_hundred_registered_histories_do_not_reopen_during_current_hook(tmp_path
     assert opened == [str(paths[0])]
 
 
+@pytest.mark.parametrize('event', ['SessionStart', 'UserPromptSubmit', 'Stop'])
+def test_codex_ordinary_hook_defers_unread_transcript_until_detached_upload(tmp_path, monkeypatch, capsys, event):
+    spool = spool_at(tmp_path, preset='codex')
+    config_path, config = spool.config_path, spool.config
+    spool.close()
+    path = tmp_path / 'current.jsonl'
+    raw = bridge.encode({'type': 'response_item', 'payload': {'type': 'message',
+        'role': 'user', 'content': 'Exact unread source. ' + '猫' * 10000}}) + b'\n'
+    tail = bridge.encode({'type': 'event_msg', 'payload': {'opaque': 'Exact next record.'}}) + b'\n'
+    path.write_bytes(raw + tail[:20])
+    reads_allowed = False
+    original_open = builtins.open
+
+    def guarded_open(value, *args, **kwargs):
+        if str(value) == str(path):
+            assert reads_allowed, 'ordinary Codex hook must not drain the transcript before returning'
+        return original_open(value, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', guarded_open)
+    monkeypatch.setattr(bridge, '_automatic', lambda *_args, **_kwargs:
+                        {'context': 'Immediate recall [memory:synthetic].', 'shown': ['synthetic']})
+    kicked = []
+    monkeypatch.setattr(bridge, 'kick', lambda config, paths=(): kicked.append((config, paths)))
+    data = {'session_id': 'current', 'hook_event_name': event, 'transcript_path': str(path),
+            'prompt': 'Current synthetic query.', 'turn_id': 'current-turn'}
+    monkeypatch.setattr(bridge.sys, 'stdin', io.StringIO(json.dumps(data)))
+    started = time.monotonic()
+    assert bridge.main(['codex', '--config', config_path]) == 0
+    assert time.monotonic() - started < 1
+    output = capsys.readouterr().out
+    if event == 'UserPromptSubmit':
+        assert 'Immediate recall [memory:synthetic].' in json.loads(output)['hookSpecificOutput']['additionalContext']
+    assert kicked == [(config_path, [str(path)])]
+    spool = bridge.Spool(config_path, config)
+    assert spool.db.execute('SELECT conversation,offset FROM journals').fetchone() == ('current', 0)
+    assert [body['kind'] for body in pending(spool)] == ['native_hook']
+    spool.close()
+
+    reads_allowed = True
+    uploaded = []
+    monkeypatch.setattr(bridge, 'http', lambda _config, endpoint, body, **_kwargs:
+                        uploaded.append((endpoint, body)) or {})
+    monkeypatch.setattr(bridge.time, 'sleep', lambda *_: None)
+    assert bridge.upload(config_path, config, background=True, paths=[str(path)]) == {'pending': 0, 'conflicts': 0}
+    assert [body['text'] for endpoint, body in uploaded
+            if endpoint == '/episodes' and body['kind'] == 'native_record'] == [raw.decode()]
+    assert [body['text'] for endpoint, body in uploaded
+            if endpoint == '/episodes' and body['kind'] == 'user'] == [json.loads(raw)['payload']['content']]
+    with original_open(path, 'ab') as stream:
+        stream.write(tail[20:])
+    bridge.upload(config_path, config, background=True, paths=[str(path)])
+    assert [body['text'] for endpoint, body in uploaded
+            if endpoint == '/episodes' and body['kind'] == 'native_record'] == [raw.decode(), tail.decode()]
+    spool = bridge.Spool(config_path, config)
+    assert spool.db.execute('SELECT offset FROM journals').fetchone()[0] == path.stat().st_size
+    assert spool.db.execute('SELECT COUNT(*) FROM records').fetchone()[0] == 2
+    spool.close()
+
+
+def test_codex_busy_hook_returns_promptly_and_retries_registered_transcript(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path, preset='codex')
+    config_path, config = spool.config_path, spool.config
+    path = tmp_path / 'current.jsonl'
+    path.write_bytes(b'')
+    spool.journal(path, 'codex', 'current')
+    spool.commit()
+    spool.close()
+    raw = bridge.encode({'type': 'response_item', 'payload': {'type': 'message',
+        'role': 'user', 'content': 'Source retained while the writer is busy.'}}) + b'\n'
+    path.write_bytes(raw)
+    kicked = []
+    monkeypatch.setattr(bridge, 'kick', lambda config, paths=(): kicked.append((config, paths)))
+    monkeypatch.setattr(bridge.sys, 'stdin', io.StringIO(json.dumps({
+        'session_id': 'current', 'hook_event_name': 'Stop', 'transcript_path': str(path)})))
+    blocker = bridge.sqlite3.connect(tmp_path / 'runner.bridge.sqlite3')
+    try:
+        blocker.execute('BEGIN IMMEDIATE')
+        started = time.monotonic()
+        assert bridge.main(['codex', '--config', config_path]) == 0
+        assert time.monotonic() - started < 1
+        assert kicked == [(config_path, [str(path)])]
+    finally:
+        blocker.rollback()
+        blocker.close()
+    uploaded = []
+    monkeypatch.setattr(bridge, 'http', lambda _config, endpoint, body, **_kwargs:
+                        uploaded.append((endpoint, body)) or {})
+    monkeypatch.setattr(bridge.time, 'sleep', lambda *_: None)
+    bridge.upload(config_path, config, background=True, paths=kicked[0][1])
+    assert [body['text'] for endpoint, body in uploaded if body.get('kind') == 'native_record'] == [raw.decode()]
+
+
+@pytest.mark.parametrize('event', ['PreCompact', 'PostCompact', 'SessionStart', 'PreToolUse'])
+def test_codex_evidence_and_compaction_hooks_reconcile_before_the_boundary(tmp_path, monkeypatch, event):
+    spool = spool_at(tmp_path, preset='codex')
+    path = tmp_path / 'current.jsonl'
+    quote = 'Exact evidence preceding the boundary.'
+    raw = bridge.encode({'type': 'response_item', 'payload': {'type': 'message',
+        'role': 'user', 'content': quote}}) + b'\n'
+    path.write_bytes(raw)
+    uploaded = []
+    monkeypatch.setattr(bridge, 'http', lambda _config, endpoint, body, **_kwargs:
+                        uploaded.append((endpoint, body)) or {'id': 'acknowledged'})
+    result = bridge.hook(spool, 'codex', {'session_id': 'current', 'hook_event_name': event,
+        'source': 'compact', 'transcript_path': str(path), 'tool_name': 'mcp__memento__remember',
+        'tool_input': {'command': {'source': bridge.source(spool.config, 'codex'),
+            'conversation_id': 'current', 'evidence': [{'quote': quote}]}}},
+        recall=lambda *_args, **_kwargs: {'context': '', 'shown': []})
+    assert spool.db.execute('SELECT offset FROM journals').fetchone()[0] == len(raw)
+    if event == 'PreToolUse':
+        assert result == {}  # Preserve native approval policy.
+        assert [(endpoint, body['text']) for endpoint, body in uploaded] == [('/episodes', quote)]
+    else:
+        queued = [(endpoint, json.loads(body)) for endpoint, body in
+                  spool.db.execute('SELECT endpoint,body FROM outbox ORDER BY id')]
+        assert queued[-1][0] == '/work/compaction'
+        assert any(body.get('text') == quote for _, body in queued[:-1])
+    spool.close()
+
+
 def test_journal_rotation_with_same_header_and_size_preserves_new_record(tmp_path):
     spool = spool_at(tmp_path)
     path = tmp_path / 'journal.jsonl'
