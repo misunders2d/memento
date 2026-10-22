@@ -1018,11 +1018,14 @@ def agy_hook(spool, event, data):
     if event == 'SessionStart':
         return {'injectSteps': [{'systemMessage': {'systemMessage': provenance}}]}
     if event == 'PreToolUse':
+        # agy 1.4.4 denies on {}; "ask" keeps its normal permission policy and
+        # never grants a tool permission merely to supply provenance.
+        passthrough = {'decision': 'ask'}
         call = data.get('toolCall') if isinstance(data.get('toolCall'), dict) else {}
         arguments = call.get('args') if isinstance(call.get('args'), dict) else {}
         if (call.get('name') != 'call_mcp_tool' or arguments.get('ServerName') != 'memento'
                 or arguments.get('ToolName') not in ('remember', 'link', 'supersede')):
-            return {}
+            return passthrough
         original = arguments.get('Arguments')
         if isinstance(original, str):
             with contextlib.suppress(ValueError):
@@ -1036,11 +1039,9 @@ def agy_hook(spool, event, data):
                 flush_conversation(spool, 'agy', conversation, quotes)
         except (OSError, ValueError, sqlite3.Error, HTTPException):
             return {'decision': 'deny', 'reason': 'Memento current-conversation capture is pending; retry after upload.'}
-        # An empty decision keeps the native permission flow; never grant a
-        # tool permission merely to supply provenance.
         if any(command.get(key) != value for key, value in expected.items()):
             return {'decision': 'deny', 'reason': 'Retry this Memento command with ' + encode(expected).decode('utf-8')}
-        return {}
+        return passthrough
     if turn:
         query = agy_request(data['transcriptPath']) if data.get('transcriptPath') else ''
         if not query:

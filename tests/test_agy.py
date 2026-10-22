@@ -92,11 +92,12 @@ def test_memento_writes_need_provenance_and_never_auto_approve(tmp_path, monkeyp
         'ServerName': 'memento', 'ToolName': 'remember', 'Arguments': {'command': command}}}}
     assert bridge.agy_hook(spool, 'PreToolUse', data)['decision'] == 'deny'
     command.update(source='native:test-device:agy', conversation_id='c0nv')
-    assert bridge.agy_hook(spool, 'PreToolUse', data) == {}
+    # agy denies an empty object; "ask" keeps its normal permission policy.
+    assert bridge.agy_hook(spool, 'PreToolUse', data) == {'decision': 'ask'}
     data['toolCall']['args']['Arguments'] = json.dumps({'command': command})
-    assert bridge.agy_hook(spool, 'PreToolUse', data) == {}
+    assert bridge.agy_hook(spool, 'PreToolUse', data) == {'decision': 'ask'}
     data['toolCall']['args'].update(ServerName='other', Arguments={})
-    assert bridge.agy_hook(spool, 'PreToolUse', data) == {}
+    assert bridge.agy_hook(spool, 'PreToolUse', data) == {'decision': 'ask'}
     spool.close()
 
 
