@@ -62,8 +62,8 @@ def _behaviors(db, ids=None):
             WHERE n.version=1 AND n.type='experience' {where}''', args):
         owners[row['commit_id']].append(row['id'])
     behaviors = {}
-    for row in db.execute(f'''SELECT id,request,result FROM graph_commits
-            WHERE id IN ({",".join("?" * len(owners))})''', tuple(owners)) if owners else ():
+    for row in db.execute(f'''SELECT id,request,result FROM graph_commits WHERE id IN (SELECT n.commit_id
+            FROM node_versions n WHERE n.version=1 AND n.type='experience' {where})''', args):
         found = commit_behaviors(row['request'], row['result'])
         behaviors.update({node: found[node] for node in owners[row['id']] if node in found})
     return behaviors
