@@ -20,6 +20,9 @@ _RAW_FRAMES = """CREATE TABLE IF NOT EXISTS raw_frames (
     record_count INTEGER NOT NULL CHECK(record_count>=0),sha256 TEXT NOT NULL,
     data BLOB NOT NULL) STRICT"""
 
+_RAW_FRAMES_STATUS_INDEX = """CREATE INDEX IF NOT EXISTS raw_frames_status_cover_v1 ON raw_frames (
+    source,record_count,raw_size,length(data))"""
+
 _EPISODES_NO_UPDATE = """CREATE TRIGGER episodes_no_update BEFORE UPDATE ON episodes
     WHEN NOT (raw_frame_write(OLD.seq,NEW.raw_frame,NEW.text_sha256)=1
         AND OLD.raw_frame IS NULL AND OLD.text_runs IS NULL AND NEW.text=''
@@ -64,7 +67,7 @@ _SCHEMA = (
        BEGIN SELECT RAISE(ABORT, 'episodes are immutable'); END""",
     _EPISODES_TEXT_INDEX,
     _RAW_FRAMES,
-    'CREATE INDEX raw_frames_source ON raw_frames(source)',
+    _RAW_FRAMES_STATUS_INDEX,
     """CREATE TRIGGER raw_frames_no_update BEFORE UPDATE ON raw_frames
        BEGIN SELECT RAISE(ABORT, 'raw frames are immutable'); END""",
     """CREATE TRIGGER raw_frames_no_delete BEFORE DELETE ON raw_frames
@@ -307,7 +310,13 @@ def upgrade_raw_text(db):
     if 'raw_frame' not in columns:
         db.execute('ALTER TABLE episodes ADD COLUMN raw_frame TEXT')
     db.execute(_RAW_FRAMES)
-    db.execute('CREATE INDEX IF NOT EXISTS raw_frames_source ON raw_frames(source)')
+    if not db.execute("SELECT 1 FROM sqlite_schema WHERE name='raw_frames_status_cover_v1'").fetchone():
+        log = logging.getLogger(__name__)
+        log.warning('Building raw frame status index')
+        started = time.perf_counter()
+        db.execute(_RAW_FRAMES_STATUS_INDEX)
+        log.warning('Raw frame status index build completed in %.3f seconds', time.perf_counter() - started)
+    db.execute('DROP INDEX IF EXISTS raw_frames_source')
     for operation in ('UPDATE', 'DELETE'):
         db.execute(f"""CREATE TRIGGER IF NOT EXISTS raw_frames_no_{operation.lower()}
             BEFORE {operation} ON raw_frames

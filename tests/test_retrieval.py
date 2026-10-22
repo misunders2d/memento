@@ -663,6 +663,57 @@ def test_index_status_counts_current_units_failures_and_unprepared_sources(retri
     assert r.status(source='other')['total'] == 0
 
 
+def test_status_conversation_count_seeks_exact_keys_instead_of_all_episode_rows(retrieval, monkeypatch):
+    r = retrieval
+    for index_value, (source, conversation) in enumerate([
+            ('selected', 'repeat'), ('selected', 'repeat'), ('selected', ''), ('', 'repeat'), ('', '')]):
+        r.store.capture(dict(source=source, event_id=str(index_value), conversation_id=conversation,
+            kind='native_record' if index_value == 1 else 'user', text='Synthetic source.', occurred_at=None,
+            metadata={'extraction_mode': 'skip'} if index_value == 1 else {}))
+    db = r.store._db
+    db.executemany('''INSERT INTO episodes
+        (seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at)
+        VALUES (?,?,'legacy',?,?,'user','Legacy synthetic source.','{}','2026-10-22T00:00:00Z')''',
+        [(1000, 'legacy1', 'legacy1', 'without-progress'), (2000, 'legacy2', 'legacy2', 'Точный 😀 ключ')])
+    db.execute("INSERT INTO forgotten_sources VALUES ('selected','2','fixture','fixture')")
+    db.execute("INSERT INTO processing_progress(source,conversation_id) VALUES ('empty-compaction','none')")
+    state = SimpleNamespace(store=r.store, retrieval=None, cold_runtime=None, cold=None,
+                            drive_reauthorization_required=False)
+    snapshot, work = r.store.read_snapshot, []
+
+    @contextmanager
+    def measured_snapshot():
+        with snapshot() as reader:
+            active, ticks = False, 0
+            def trace(sql):
+                nonlocal active
+                active = 'GROUP BY source,conversation_id' in sql or 'conversations(source,conversation_id)' in sql
+            def progress():
+                nonlocal ticks
+                ticks += int(active)
+                return 0
+            reader.set_trace_callback(trace)
+            reader.set_progress_handler(progress, 100)
+            yield reader
+            work.append(ticks)
+
+    monkeypatch.setattr(r.store, 'read_snapshot', measured_snapshot)
+    expected = {None: (7, 6), 'selected': (3, 2), 'legacy': (2, 2), '': (2, 2), 'absent': (0, 0)}
+    for added in (0, 2000):
+        if added:
+            db.executemany('''INSERT INTO episodes
+                (seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at)
+                VALUES (?,?,'selected',?,'repeat','native_record','Repeated synthetic source.',
+                    '{"extraction_mode":"skip"}','2026-10-22T00:00:00Z')''',
+                ((3000 + i, f'bulk{i}', f'bulk{i}') for i in range(added)))
+        for position, (source, (episodes, conversations)) in enumerate(expected.items()):
+            count = episodes + (added if source is None or source == 'selected' else 0)
+            assert operational_status(state, source)['captured'] == dict(episodes=count, conversations=conversations)
+            if added:
+                assert work[-1] <= baseline[position] + 2
+        baseline = work.copy()
+
+
 def test_status_cover_preserves_mixed_units_and_avoids_projected_episode_bodies(retrieval, monkeypatch):
     r, statements = retrieval, []
     db = r.store._db

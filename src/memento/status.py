@@ -12,6 +12,25 @@ _JOB_ERROR_CATEGORIES = frozenset({
 })
 
 
+def _conversation_count(db, source):
+    # Seek distinct keys in the existing index, including raw/forgotten history
+    # that may have no processing progress. Empty strings are ordinary keys.
+    sources = '''SELECT min(source) FROM episodes
+        UNION ALL
+        SELECT (SELECT min(e.source) FROM episodes e WHERE e.source>s.source)
+        FROM sources s WHERE s.source IS NOT NULL''' if source is None else 'VALUES (?)'
+    return db.execute(f'''WITH RECURSIVE sources(source) AS ({sources}),
+        conversations(source,conversation_id) AS (
+        SELECT s.source,(SELECT min(e.conversation_id) FROM episodes e WHERE e.source=s.source)
+            FROM sources s WHERE s.source IS NOT NULL
+        UNION ALL
+        SELECT c.source,(SELECT min(e.conversation_id) FROM episodes e
+            WHERE e.source=c.source AND e.conversation_id>c.conversation_id)
+        FROM conversations c WHERE c.conversation_id IS NOT NULL)
+        SELECT count(*) FROM conversations WHERE conversation_id IS NOT NULL''',
+        () if source is None else (source,)).fetchone()[0]
+
+
 def operational_status(state, source=None):
     # A bound equality lets source-specific observations use the existing index.
     source_where = ' WHERE source=?' if source is not None else ''
@@ -19,9 +38,7 @@ def operational_status(state, source=None):
     with state.store.read_snapshot() as db:
         captured = dict(episodes=db.execute(
             'SELECT count(*) FROM episodes' + source_where, source_args).fetchone()[0],
-            conversations=db.execute(f'''SELECT count(*) FROM (
-                SELECT source,conversation_id FROM episodes{source_where}
-                GROUP BY source,conversation_id)''', source_args).fetchone()[0])
+            conversations=_conversation_count(db, source))
         raw_storage = dict(db.execute(f'''SELECT
             coalesce(sum(text_runs IS NULL),0) AS inline_raw_episodes,
             coalesce(sum(CASE (text_runs IS NULL) WHEN 1 THEN length(CAST(text AS BLOB)) ELSE 0 END),0) AS inline_raw_bytes,
@@ -31,7 +48,8 @@ def operational_status(state, source=None):
             AND CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS TEXT)='skip'
             {'AND source=?' if source is not None else ''}''', source_args).fetchone())
         compressed = db.execute('''SELECT coalesce(sum(record_count),0),coalesce(sum(raw_size),0),
-            coalesce(sum(length(data)),0) FROM raw_frames''' + source_where, source_args).fetchone()
+            coalesce(sum(length(data)),0) FROM raw_frames INDEXED BY raw_frames_status_cover_v1'''
+            + source_where, source_args).fetchone()
         raw_storage['inline_raw_episodes'] -= compressed[0]
         raw_storage.update(compressed_raw_episodes=compressed[0], compressed_original_bytes=compressed[1],
                            compressed_raw_bytes=compressed[2])

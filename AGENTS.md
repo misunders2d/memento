@@ -143,6 +143,8 @@ The first startup without the status covering index builds it transactionally fr
 
 Watch for `Building episode status index` and `Episode status index build completed in N seconds` in the service logs. Health can fail and Docker can mark the container unhealthy until completion. Do not restart during the build: interruption rolls back the transaction and the next start repeats it.
 
+The raw-frame covering-index replacement also builds once at startup, logging `Building raw frame status index` and `Raw frame status index build completed in N seconds`; the same wait and no-restart guidance applies.
+
 `artifact_storage` is explicitly global even in source-filtered status: it counts registered, local-only and verified-remote objects/bytes, not cache residency, eligibility or queued work. The existing Drive worker drains full bounded batches immediately and checks shutdown between batches; idle and failed work retain existing waits/backoff.
 
 Use `memento media save FILE --agent HARNESS --scope personal|professional`, `memento media status JOB_ID --agent HARNESS`, and `memento media get SHA256 --agent HARNESS --output NEW_FILE`. Save streams up to the existing 1 GiB blob limit; retain its job ID and stable command ID for identical retries. An exact native `--quote TEXT --conversation-id ID` supplies conversational evidence; otherwise the command records honest artifact-identity evidence, not a fabricated user statement. Retrieval verifies the checksum and refuses overwrite. MCP `remember` accepts uploaded media references and evidence, never inline binary.

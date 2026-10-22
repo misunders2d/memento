@@ -448,6 +448,103 @@ def test_large_legacy_raw_spans_bounded_frames_with_exact_utf8_and_source_counts
         restored.close()
 
 
+def test_frame_status_cover_preserves_source_counts_without_frame_table_reads(storage, monkeypatch):
+    from types import SimpleNamespace
+    from memento.status import operational_status
+
+    store, _, _ = storage
+    captured = [store.capture(episode('Ω raw source.\n' * (FRAME_BYTES // 8),
+        source=source))[0] for source in ('native:fixture:codex', '')]
+    for _ in range(4):
+        if not store.compress_raw_step():
+            break
+    else:
+        pytest.fail('Synthetic raw frames did not finish compressing')
+    frames = store._db.execute('SELECT source,record_count,raw_size,length(data) FROM raw_frames').fetchall()
+    assert any(row[1] == 0 for row in frames), 'Continuation frames must not count as extra records'
+    assert store._db.execute("SELECT 1 FROM sqlite_schema WHERE name='raw_frames_status_cover_v1'").fetchone()
+    assert not store._db.execute("SELECT 1 FROM sqlite_schema WHERE name='raw_frames_source'").fetchone()
+    state = SimpleNamespace(store=store, retrieval=None, cold_runtime=None, cold=None,
+                            drive_reauthorization_required=False)
+    snapshot, statements = store.read_snapshot, []
+
+    @contextmanager
+    def observed_snapshot():
+        with snapshot() as reader:
+            reader.set_trace_callback(lambda sql: statements.append(sql) if 'sum(record_count)' in sql else None)
+            yield reader
+
+    monkeypatch.setattr(store, 'read_snapshot', observed_snapshot)
+    for source in (None, 'native:fixture:codex', 'absent', ''):
+        selected = [row for row in frames if source is None or row[0] == source]
+        assert operational_status(state, source)['raw_storage'] == dict(
+            inline_raw_episodes=0, inline_raw_bytes=0, offloaded_raw_episodes=0,
+            compressed_raw_episodes=sum(row[1] for row in selected),
+            compressed_original_bytes=sum(row[2] for row in selected),
+            compressed_raw_bytes=sum(row[3] for row in selected))
+    assert [store.get(row['id']) for row in captured] == captured
+    if sqlite3.sqlite_version_info >= (3, 46, 1):
+        with snapshot() as reader:
+            page = reader.execute("SELECT rootpage FROM sqlite_schema WHERE name='raw_frames'").fetchone()[0]
+            assert len(statements) == 4
+            for sql in statements:
+                program = list(reader.execute('EXPLAIN ' + sql))
+                cursors = {op['p1'] for op in program if op['opcode'] == 'OpenRead' and op['p2'] == page}
+                assert not any(op['opcode'] == 'Column' and op['p1'] in cursors for op in program), sql
+
+
+def test_frame_status_cover_upgrade_is_atomic_and_preserves_physical_data(tmp_path, monkeypatch, caplog):
+    import memento.store as store_module
+
+    data = tmp_path / 'instance'
+    store = Store(data)
+    original, _ = store.capture(episode('Exact frame source Ω. ' * 100))
+    assert store.compress_raw_step()
+    frames = [tuple(row) for row in store._db.execute('SELECT * FROM raw_frames ORDER BY id')]
+    store._db.execute('DROP INDEX IF EXISTS raw_frames_status_cover_v1')
+    store._db.execute('CREATE INDEX IF NOT EXISTS raw_frames_source ON raw_frames(source)')
+    store.close()
+    upgrade = store_module.upgrade_status_index
+
+    def interrupted(db):
+        upgrade(db)
+        raise RuntimeError('Synthetic interruption after raw frame index build')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store_module, 'upgrade_status_index', interrupted)
+        with pytest.raises(RuntimeError, match='Synthetic interruption'):
+            Store(data)
+    with sqlite3.connect(data / 'memory.sqlite') as db:
+        assert db.execute("SELECT 1 FROM sqlite_schema WHERE name='raw_frames_source'").fetchone()
+        assert not db.execute("SELECT 1 FROM sqlite_schema WHERE name='raw_frames_status_cover_v1'").fetchone()
+        assert db.execute('SELECT * FROM raw_frames ORDER BY id').fetchall() == frames
+    caplog.clear()
+    reopened = Store(data)
+    try:
+        assert reopened.get(original['id']) == original
+        assert [tuple(row) for row in reopened._db.execute('SELECT * FROM raw_frames ORDER BY id')] == frames
+        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert not reopened._db.execute("SELECT 1 FROM sqlite_schema WHERE name='raw_frames_source'").fetchone()
+        page = reopened._db.execute(
+            "SELECT rootpage FROM sqlite_schema WHERE name='raw_frames_status_cover_v1'").fetchone()[0]
+        version = reopened._db.execute('PRAGMA schema_version').fetchone()[0]
+        messages = [record.message for record in caplog.records if record.name == 'memento.schema']
+        assert len(messages) == 2 and messages[0] == 'Building raw frame status index'
+        assert messages[1].startswith('Raw frame status index build completed in ')
+    finally:
+        reopened.close()
+    caplog.clear()
+    reopened = Store(data)
+    try:
+        assert reopened.get(original['id']) == original
+        assert reopened._db.execute('PRAGMA schema_version').fetchone()[0] == version
+        assert reopened._db.execute(
+            "SELECT rootpage FROM sqlite_schema WHERE name='raw_frames_status_cover_v1'").fetchone()[0] == page
+        assert not [record for record in caplog.records if record.name == 'memento.schema']
+    finally:
+        reopened.close()
+
+
 @pytest.mark.parametrize('failure', ['publish', 'corrupt-frame', 'oversized-payload', 'wrong-owner', 'wrong-offset'])
 def test_frame_failures_never_publish_partial_conversion_or_hide_corruption(storage, failure, monkeypatch):
     store, _, _ = storage
