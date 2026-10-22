@@ -171,6 +171,10 @@ def preset_flags(preset, directory):
 
 
 def check_cli(command, preset):
+    if preset == 'agy':
+        # Synthetic qualification still executed manage_task/list with empty
+        # tools and default components excluded. Native transcripts also persist.
+        raise RunnerError('AGY tools-zero isolation unverified: native task-list access remained enabled; refusing captured input')
     if not isinstance(command, list) or len(command) != 1 or not isinstance(command[0], str):
         raise RunnerError('command must contain exactly one native executable, without arguments')
     executable = shutil.which(command[0])

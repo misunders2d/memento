@@ -187,6 +187,8 @@ Failed attempts write a JSON diagnostic to stderr, visible in `journalctl --user
 
 Codex capture/import/recall/MCP client integration is available after **human `/hooks` trust and MCP permissions**. Setup never grants those permissions. Codex **server extraction is fail-closed**: the tested native CLI still exposed tool routing under its read-only/approval flags, so it did not meet tools-zero processing requirements. Use Pi, OMP or Claude Code as the processor; do not bypass a native refusal or claim Codex extraction acceptance.
 
+Antigravity (`agy`) remains a production capture/recall client. Server processing stays refused: synthetic qualification executed native task-list access despite empty tools and excluded default components, so tools-zero isolation is unverified. Native headless calls also retain task/output transcripts as explicit-user history; do not import those processing sessions as human evidence. Qualification rejected that tool activity; no AGY server processing adapter or automatic quota fallback is enabled.
+
 ## 3. Add other harnesses or devices as clients
 
 A client captures conversations, retrieves relevant context automatically and nudges the server after compaction. It does **not** discover a processing model, generate memories or install another processing timer.
@@ -233,7 +235,9 @@ Choose the installed harness and reuse any custom `--config` and `--native-confi
 
 Downloads are fully validated before replacing code. Each file is replaced atomically, with the standalone runner last; this is **not a whole-installation transaction**. If interrupted during replacement, rerun the command when connected to complete it. Use native reload or a fresh session to load new code. If a release changes hook or MCP definitions, rerun `memento agent add HARNESS`; native trust remains a human decision.
 
-If the service is unavailable, capture remains in the client's durable outbox and retries on a later native lifecycle hook or explicit `bridge.py upload`. An idle client has no retry daemon. Automatic recall is bounded and fails open with a warning; a same-query cache up to five minutes old may be used with that warning. Explicit memory saves fail instead of pretending to succeed and are not queued as mutations. Retry an identical uncertain command with its original command ID.
+Codex's additional async recall hook requires `memento agent add codex` with the same installation options after updating, then human review in `/hooks`. Updating files alone does not install or trust that definition. Pi/OMP need an extension reload or fresh session for same-turn late delivery.
+
+If the service is unavailable, capture remains in the client's durable outbox and retries on a later native lifecycle hook or explicit `bridge.py upload`. An idle client has no retry daemon. Automatic recall waits up to three seconds; the same request can finish within a fifteen-second background limit. A fresh nonempty result for the current query takes priority; an older delayed result is fallback only while the current query is pending or healthy-empty, with its original-query label. Pi/OMP can receive it before the next model request in the same turn; their local claim uses a cooperative 200-millisecond deadline with a one-second process backstop, retaining an expired claim for a later boundary. Codex needs native async-hook support and human trust. Otherwise it is offered once at the next human turn, labeled for its original request. Claude/AGY retain next-human delivery. Recall cannot interrupt a running model request or force a continuation. Pending recall is not an outage. A terminal failure warns; a same-query cache up to five minutes old may be used with that warning. Explicit memory saves fail instead of pretending to succeed and are not queued as mutations. Retry an identical uncertain command with its original command ID.
 
 
 ### Private access from another machine

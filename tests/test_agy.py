@@ -72,7 +72,7 @@ def test_hooks_inject_provenance_and_turn_recall(tmp_path, monkeypatch):
     start = bridge.agy_hook(spool, 'SessionStart', common)
     text = start['injectSteps'][0]['systemMessage']['systemMessage']
     assert '"source":"native:test-device:agy"' in text and '"conversation_id":"c0nv"' in text
-    first = bridge.agy_hook(spool, 'PreInvocation', {**common, 'invocationNum': 0, 'initialNumSteps': 1})
+    first = bridge.agy_hook(spool, 'PreInvocation', {**common, 'invocationNum': 0, 'initialNumSteps': 1}, recall=bridge.passive)
     context = first['injectSteps'][0]['systemMessage']['systemMessage']
     assert '[memory:m1]' in context and len(context.encode()) <= bridge.CONTEXT_BYTES
     assert queries == ['My synthetic badge number is 4417.']

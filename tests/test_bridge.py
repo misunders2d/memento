@@ -143,6 +143,12 @@ def test_native_installer_preserves_hooks_mcp_and_codex_trust(tmp_path):
     assert hooks['hooks']['SessionStart'][-1]['hooks'][0]['additionalContextLimit'] == 1500
     assert 'additionalContextLimit' not in hooks['hooks']['PreCompact'][-1]['hooks'][0]
     assert hooks['hooks']['SessionEnd'][-1]['hooks'][0]['timeout'] == 3
+    prompt = hooks['hooks']['UserPromptSubmit']
+    assert prompt[-2]['hooks'][0] == {'type': 'command', 'command': prompt[-1]['hooks'][0]['command'].removesuffix(' --late-recall'),
+                                     'timeout': 5, 'additionalContextLimit': 1500}
+    assert prompt[-1]['hooks'][0] == {'type': 'command', 'command': prompt[-2]['hooks'][0]['command'] + ' --late-recall',
+        'async': True, 'timeout': 16, 'additionalContextLimit': 1500}
+    assert again == hooks
 
 
 def test_processing_guard_before_stdin_and_spool(tmp_path, monkeypatch, capsys):
@@ -168,6 +174,48 @@ def test_healthy_empty_recall_is_not_reported_as_unavailable(tmp_path, monkeypat
     monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {'memories': []})
     assert bridge.passive(spool, 'session', 'query') == {'context': '', 'shown': []}
     spool.close()
+
+
+def test_passive_slow_healthy_response_and_stalled_request_budget(tmp_path):
+    release = threading.Event()
+    calls = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append(self.path)
+            if len(calls) > 1:
+                release.wait(10)
+                return
+            time.sleep(1.1)
+            body = bridge.encode({'memories': [{'id': 'slow-fact', 'text': 'Synthetic recalled fact.'}]})
+            try:
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .05}, daemon=True)
+    thread.start()
+    spool = spool_at(tmp_path, url=f'http://127.0.0.1:{server.server_port}')
+    try:
+        healthy = bridge.passive(spool, 'session', 'synthetic query')
+        assert 'error' not in healthy and healthy['shown'] == ['slow-fact']
+        started = time.monotonic()
+        assert bridge.passive(spool, 'session', 'synthetic query') == {**healthy, 'error': 'recall_unavailable'}
+        assert 2.5 <= time.monotonic() - started < 4.5
+        assert len(calls) == 2  # No retry after the stalled request.
+    finally:
+        release.set()
+        spool.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 @pytest.mark.parametrize('installed,offered', [
@@ -611,7 +659,7 @@ def test_passive_preserves_human_query_and_native_followup_boundary_with_cwd(tmp
         assert effective == query
     assert '/projects/example' not in effective and 'Directory/repo name' not in effective
     assert spool.db.execute('SELECT query FROM recall_cache WHERE conversation=?', ('s',)).fetchone()[0] == query
-    assert all(timeout == 1 for _, timeout in endpoints)
+    assert all(timeout == 3 for _, timeout in endpoints)
     spool.close()
 
 

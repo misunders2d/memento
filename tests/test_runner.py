@@ -266,6 +266,14 @@ def test_native_result_and_metadata_are_parsed_without_executing_text():
         {'facts': []}, 'claude-native', {'output_tokens': 3})
 
 
+def test_agy_server_processing_stays_refused_before_native_execution(monkeypatch):
+    def forbidden(_command):
+        pytest.fail('unqualified AGY production setup must not invoke the native CLI')
+    monkeypatch.setattr(runner.shutil, 'which', forbidden)
+    with pytest.raises(runner.RunnerError, match='AGY tools-zero isolation unverified'):
+        runner.check_cli(['agy'], 'agy')
+
+
 @pytest.mark.parametrize('raw', [
     assistant_events('private evidence is not JSON'),
     assistant_events(stopReason='length'),

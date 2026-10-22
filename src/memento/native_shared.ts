@@ -134,6 +134,7 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
   let injected = false;
   let generation = 0;
   let recallGeneration = 0;
+  let pendingRecall: { turn: string; token: string; deadline: number } | undefined;
   let capturePending = false;
   let captureAgain = false;
   let warned = false;
@@ -168,6 +169,7 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
     shown = [];
     query = "";
     injected = false;
+    pendingRecall = undefined;
   }
   function envelope(action: string, ctx: Context): RecordValue {
     return { harness, session_id: ctx.sessionManager.getSessionId(),
@@ -181,6 +183,7 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
     const epoch = generation;
     const manager = current!.sessionManager;
     const base = envelope("capture", current!);
+    const passive = injected ? { query, shown: [...shown] } : undefined;
     // Defer serialization/spooling until after the native notification returns.
     setTimeout(() => {
       if (epoch !== generation) { capturePending = false; captureAgain = false; if (current) capture(current); return; }
@@ -212,7 +215,7 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
       }
       const request = { ...base, entries: pending,
         live: observations,
-        ...(injected ? { passive: { query, shown } } : {}), };
+        ...(passive ? { passive } : {}), };
       void bridge(loader, request, 5000).then(() => {
         if (epoch !== generation) return;
         for (const entry of pending) sent.add(entry.id);
@@ -231,29 +234,36 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
     bind(ctx);
     capture(ctx);
   });
+  function applyRecall(result: RecordValue): void {
+    if (typeof result.update_notice === "string" && result.update_notice) console.error(result.update_notice);
+    if (result.error) warnRecall(); else if (!result.pending) recallWarned = false;
+    if (typeof result.query === "string") query = result.query;
+    // Keep complete conditional suggestions together under the bridge budget.
+    const source = [typeof result.update_notice === "string" ? result.update_notice : "",
+                    typeof result.context === "string" ? result.context : ""].filter(Boolean).join("\n");
+    cache = Buffer.byteLength(source, "utf8") <= 1500 ? source : "";
+    shown = Array.isArray(result.shown) ? result.shown.filter((id: unknown): id is string =>
+      typeof id === "string" && cache.includes(id)) : [];
+  }
   async function refresh(ctx: Context, prompt: string): Promise<void> {
     // Peer envelopes are captured, but the most recent human request remains
     // the automatic-recall anchor until another actual human prompt arrives.
     if (prompt.trimStart().startsWith("[HERDR AGENT MESSAGE]")) return;
     const epoch = generation;
     const recallEpoch = ++recallGeneration;
+    const turn = randomUUID();
+    const deadline = Date.now() + 16000; // Fifteen-second worker lifetime plus startup slack.
+    pendingRecall = undefined;
     query = prompt;
     cache = "";
     shown = [];
     injected = false;
     if (!query || !loader) return;
     try {
-      const result = await bridge(loader, { ...envelope("recall", ctx), query }, 1500);
-      if (typeof result.update_notice === "string" && result.update_notice) console.error(result.update_notice);
+      const result = await bridge(loader, { ...envelope("recall", ctx), query, turn }, 4000);
       if (epoch !== generation || recallEpoch !== recallGeneration) return;
-      if (result.error) warnRecall(); else recallWarned = false;
-      // The bridge budgets framing and complete conditional suggestions
-      // together. A second tail slice could discard a suggestion's exceptions.
-      const source = [typeof result.update_notice === "string" ? result.update_notice : "",
-                      typeof result.context === "string" ? result.context : ""].filter(Boolean).join("\n");
-      cache = Buffer.byteLength(source, "utf8") <= 1500 ? source : "";
-      shown = Array.isArray(result.shown) ? result.shown.filter((id: unknown): id is string =>
-        typeof id === "string" && cache.includes(id)) : [];
+      if (typeof result.recall_token === "string") pendingRecall = { turn, token: result.recall_token, deadline };
+      applyRecall(result);
     } catch { warnRecall(); /* Passive recall failure must not block a native turn. */ }
   }
   api.on("before_agent_start", async (event, ctx) => {
@@ -261,8 +271,25 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
     capture(ctx);
     await refresh(ctx, typeof event.prompt === "string" ? event.prompt : textOf(event.message ?? {}));
   });
-  api.on("context", (event, ctx) => {
+  api.on("context", async (event, ctx) => {
     bind(ctx);
+    if (pendingRecall && Date.now() >= pendingRecall.deadline) pendingRecall = undefined;
+    const epoch = generation, recallEpoch = recallGeneration, pending = pendingRecall;
+    if (pending && loader) {
+      try {
+        // Local claim only: no HTTP and no new recall for tool-successor requests.
+        // Roll back claims after 200ms before commit; the 1s kill is a backstop
+        // with return margin, rather than the normal claim deadline.
+        const result = await bridge(loader, { ...envelope("recall-ready", ctx),
+          turn: pending.turn, recall_token: pending.token, claim_before: Date.now() / 1000 + .2 }, 1000);
+        if (epoch !== generation || recallEpoch !== recallGeneration) return;
+        if (pendingRecall === pending) {
+          if (!result.pending) pendingRecall = undefined;
+          if ("context" in result) applyRecall(result);
+        }
+      } catch { /* Keep the existing offer and next-human fallback. */ }
+      if (epoch !== generation || recallEpoch !== recallGeneration) return;
+    }
     if (!cache) return;
     injected = true;
     // Request-local only: do not append to the journal or rewrite structured
@@ -287,17 +314,16 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
   });
   api.on("session_compact", (_event, ctx) => {
     bind(ctx);
-    cache = "";
-    shown = [];
     injected = false;
     capture(ctx);
     if (loader) void bridge(loader, envelope("compaction", ctx), 5000).catch(warn);
-    if (query) void refresh(ctx, query);
+    // Keep this turn's request-local offer and pending recall across compaction.
   });
   if (harness === "omp") {
     for (const event of ["session_switch", "session_branch", "session_tree"]) {
       api.on(event, (_event, ctx) => {
         generation++;
+        pendingRecall = undefined;
         cache = "";
         shown = [];
         injected = false;

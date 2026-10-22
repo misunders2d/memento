@@ -49,12 +49,12 @@ def test_each_fresh_offer_is_unique_even_for_identical_prompts_and_time(spool, m
     for _ in range(2):
         if harness in ('pi', 'omp'):
             result = bridge.native(spool, {'harness': harness, 'session_id': 'conversation',
-                                          'action': 'recall', 'query': 'Connect another agent.'})
+                                          'action': 'recall', 'query': 'Connect another agent.'}, recall=bridge.passive)
             context = result['context']
             assert result['shown'] == ['lesson']
         else:
             result = bridge.hook(spool, harness, {'session_id': 'conversation',
-                'hook_event_name': 'UserPromptSubmit', 'prompt': 'Connect another agent.'})
+                'hook_event_name': 'UserPromptSubmit', 'prompt': 'Connect another agent.'}, recall=bridge.passive)
             context = result['hookSpecificOutput']['additionalContext']
         assert 'Use the supported installer.' in context
     offered = receipts(spool)

@@ -86,7 +86,7 @@ def prepared_case(directory):
         with patch.object(bridge, 'http', return_value=dict(memories=[memory])), \
                 patch.object(bridge.datetime, 'datetime', OfferClock):
             offers = [bridge.native(spool, dict(harness='pi', session_id=CONVERSATION,
-                       action='recall', query='Connect the agent.')) for _ in range(2)]
+                       action='recall', query='Connect the agent.'), recall=bridge.passive) for _ in range(2)]
         assert offers[0] == offers[1] and original in offers[0]['shown']
         spool.commit()
         queued = [bytes(row[0]) for row in spool.db.execute('SELECT body FROM outbox ORDER BY id')]
