@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memento</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="static/app.css">
+</head>
+<body>
+<header>
+  <strong class="brand">Memento</strong>
+  <nav id="tabs" aria-label="Views">
+    <button type="button" data-view="memories" aria-pressed="true">Memories</button>
+    <button type="button" data-view="behaviors" aria-pressed="false">Behaviors</button>
+    <button type="button" data-view="loops" aria-pressed="false">Open loops</button>
+    <button type="button" data-view="unprocessed" aria-pressed="false">Unprocessed</button>
+  </nav>
+  <form id="search" role="search">
+    <input id="q" type="search" placeholder="Search memories" autocomplete="off" aria-label="Search memories">
+  </form>
+  <select id="scope" aria-label="Scope">
+    <option value="">Personal + professional</option>
+    <option value="personal">Personal</option>
+    <option value="professional">Professional</option>
+  </select>
+  <label class="toggle"><input id="all" type="checkbox"> Show all</label>
+</header>
+<main>
+  <section id="graph-view">
+    <div id="canvas"></div>
+    <div id="status" role="status"></div>
+    <div id="legend"></div>
+    <aside id="sidelist" hidden></aside>
+  </section>
+  <section id="unprocessed-view" hidden>
+    <div class="column">
+      <h2>Waiting for extraction <span id="conv-total" class="muted"></span></h2>
+      <ol id="conversations" class="rows"></ol>
+      <div class="pager"><button type="button" id="conv-prev">Newer</button><button type="button" id="conv-next">Older</button></div>
+    </div>
+    <div class="column">
+      <h2>Candidates not yet promoted <span id="cand-total" class="muted"></span></h2>
+      <form id="cand-search" role="search"><input id="cand-q" type="search" placeholder="Search candidates" autocomplete="off" aria-label="Search candidates"></form>
+      <ol id="candidates" class="rows"></ol>
+      <div class="pager"><button type="button" id="cand-prev">Newer</button><button type="button" id="cand-next">Older</button></div>
+    </div>
+  </section>
+  <aside id="panel" hidden>
+    <button type="button" id="panel-close" aria-label="Close details">×</button>
+    <div id="panel-body"></div>
+  </aside>
+</main>
+<script src="static/vendor/graphology.umd.min.js"></script>
+<script src="static/vendor/sigma.min.js"></script>
+<script src="static/app.js"></script>
+</body>
+</html>

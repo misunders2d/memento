@@ -21,6 +21,7 @@ from .blobs import BlobStore
 from .artifacts import Artifacts
 from .jobs import LostLease
 from .raw_text import RawTextUnavailable
+from .viewer import install as install_viewer
 
 
 MAX_CAPTURE_BYTES = 1024 * 1024
@@ -330,6 +331,7 @@ def create_app(data_dir: Path) -> FastAPI:
         return Response(status_code=307, headers={'Location': location})
 
     app.mount('/mcp', mcp_app)
+    install_viewer(app, allowed_hosts)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):

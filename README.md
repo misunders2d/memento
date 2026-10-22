@@ -251,6 +251,10 @@ Clients use the canonical `/mcp/` URL. Existing `/mcp` URLs receive a relative H
 
 On a client device, download `/runner` from `https://YOUR_MACHINE.YOUR_TAILNET.ts.net`, then run `memento agent add HARNESS --url https://YOUR_MACHINE.YOUR_TAILNET.ts.net`. No client timezone is needed. Do not disable TLS verification or use a public reverse proxy as a shortcut.
 
+### Memory viewer
+
+Open `/ui/` on the same private origin (for example `https://YOUR_MACHINE.YOUR_TAILNET.ts.net/ui/`) for a read-only graph of current memories, behavioral suggestions, open loops and unprocessed conversations/candidates. It only answers on loopback names or hosts listed in `MEMENTO_ALLOWED_HOSTS`, loads no third-party resources, renders memory text as plain text and never writes. "Show all" draws up to 50,000 memories; above that it reports the count instead.
+
 ### Technical architecture and trust boundaries
 
 ![Memento architecture: native capture and automatic recall, separate service identity, evidence-backed candidates, nightly consolidation and optional Drive storage](docs/images/architecture.svg)

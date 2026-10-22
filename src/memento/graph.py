@@ -79,6 +79,21 @@ NODE_SUMMARY = ('n.id,n.version,n.type,substr(n.text,1,240) AS text,n.state,'
                 '(SELECT last_cited_at FROM node_stats WHERE node_id=n.id) AS last_cited_at')
 
 
+def commit_behaviors(request, result):
+    """Map experience identities created by one consolidation commit to their behavior."""
+    command = json.loads(request).get('command', {})
+    if command.get('op') != 'consolidate':
+        return {}
+    results, behaviors = json.loads(result).get('results', {}), {}
+    for action in command.get('output', {}).get('actions', []):
+        outcome = results.get(action.get('candidate_id'), {})
+        target = outcome.get('superseded_by') or outcome.get('id')
+        if (target and action.get('operation') in ('remember', 'supersede')
+                and action.get('type') == 'experience' and action.get('behavior')):
+            behaviors.setdefault(target, action['behavior'])
+    return behaviors
+
+
 class Graph:
     def __init__(self, store: Store):
         self.store = store
@@ -102,19 +117,7 @@ class Graph:
         row = self.store._db.execute('''SELECT g.request,g.result FROM node_versions n
             JOIN graph_commits g ON g.id=n.commit_id WHERE n.id=? AND n.version=1''',
             (node_id,)).fetchone()
-        if row is None:
-            return None
-        command = json.loads(row['request']).get('command', {})
-        if command.get('op') != 'consolidate':
-            return None
-        results = json.loads(row['result']).get('results', {})
-        for action in command.get('output', {}).get('actions', []):
-            result = results.get(action.get('candidate_id'), {})
-            target = result.get('superseded_by') or result.get('id')
-            if (target == node_id and action.get('operation') in ('remember', 'supersede')
-                    and action.get('type') == 'experience' and action.get('behavior')):
-                return action['behavior']
-        return None
+        return None if row is None else commit_behaviors(row['request'], row['result']).get(node_id)
 
     def _resolve_evidence(self, request):
         sources = []
