@@ -7,7 +7,8 @@ const css = name => getComputedStyle(document.documentElement).getPropertyValue(
 const $ = id => document.getElementById(id);
 
 const state = {view: 'memories', scope: '', all: false, data: null, graph: null, renderer: null,
-  selected: null, matches: new Set(), conv: 0, cand: 0, candQuery: ''};
+  selected: null, matches: new Set(), focus: new Set(), moved: new Set(), dragging: null, dragged: false,
+  conv: 0, cand: 0, candQuery: ''};
 const worker = new Worker('static/layout-worker.js');
 let layoutRun = 0;
 
@@ -90,30 +91,73 @@ function layout(graph) {
   const run = ++layoutRun;
   worker.onmessage = ({data}) => {
     if (data.run !== run || state.graph !== graph) return;
-    nodes.forEach((node, n) => graph.mergeNodeAttributes(node, {x: data.positions[2 * n], y: data.positions[2 * n + 1]}));
-    if (data.done && state.renderer && !state.selected) state.renderer.getCamera().animatedReset({duration: 300});
+    nodes.forEach((node, n) => state.moved.has(node) ||
+      graph.mergeNodeAttributes(node, {x: data.positions[2 * n], y: data.positions[2 * n + 1]}));
+    if (data.done && state.renderer && !state.selected) state.matches.size ? fitMatches() : state.renderer.getCamera().animatedReset({duration: 300});
   };
   worker.postMessage({x: nodes.map(node => graph.getNodeAttribute(node, 'x')),
     y: nodes.map(node => graph.getNodeAttribute(node, 'y')), edges});
 }
 
+// Sigma's default hover box is white; draw the hovered/selected label in the page theme instead.
+function drawHover(context, data, settings) {
+  const size = settings.labelSize, label = typeof data.label === 'string' ? data.label : '';
+  context.font = `${settings.labelWeight} ${size}px ${settings.labelFont}`;
+  const width = label ? context.measureText(label).width + 10 : 0, height = size + 8;
+  context.fillStyle = css('--surface');
+  context.shadowColor = 'rgba(0, 0, 0, .35)';
+  context.shadowBlur = 8;
+  context.beginPath();
+  context.arc(data.x, data.y, data.size + 3, 0, 2 * Math.PI);
+  if (width) context.rect(data.x + data.size, data.y - height / 2, width + 3, height);
+  context.fill();
+  context.shadowBlur = 0;
+  if (label) {
+    context.fillStyle = css('--text');
+    context.fillText(label, data.x + data.size + 6, data.y + size / 3);
+  }
+}
+
 function render(graph) {
   if (state.renderer) state.renderer.kill();
   const large = graph.order > 2000;
-  state.renderer = new Sigma(graph, $('canvas'), {
-    renderEdgeLabels: false, zIndex: true, labelColor: {color: css('--text')},
+  const renderer = state.renderer = new Sigma(graph, $('canvas'), {
+    renderEdgeLabels: true, zIndex: true, labelColor: {color: css('--text')},
+    edgeLabelColor: {color: css('--muted')}, edgeLabelSize: 11, defaultDrawNodeHover: drawHover,
     labelRenderedSizeThreshold: large ? 12 : 6, hideEdgesOnMove: large,
     nodeReducer: (node, data) => reduceNode(graph, node, data),
     edgeReducer: (edge, data) => reduceEdge(graph, edge, data)});
-  state.renderer.on('clickNode', ({node}) => select(node));
-  state.renderer.on('clickStage', () => select(null));
+  renderer.on('clickNode', ({node}) => { if (!state.dragged) select(node); });
+  renderer.on('clickStage', () => { if (!state.dragged) select(null); });
+  // Drag a node out of the way. Positions live only in this page; nothing is saved.
+  renderer.on('downNode', ({node}) => {
+    state.dragging = node; state.dragged = false;
+    // Grabbing a node settles the layout, so the frame stays still while dragging.
+    worker.postMessage({stop: true}); layoutRun++;
+    if (!renderer.getCustomBBox()) renderer.setCustomBBox(renderer.getBBox());
+  });
+  renderer.getMouseCaptor().on('mousemovebody', event => {
+    if (!state.dragging) return;
+    const position = renderer.viewportToGraph(event);
+    graph.mergeNodeAttributes(state.dragging, {x: position.x, y: position.y});
+    state.moved.add(state.dragging);
+    state.dragged = true;
+    event.preventSigmaDefault();
+    event.original.preventDefault();
+    event.original.stopPropagation();
+  });
+  const drop = () => { state.dragging = null; setTimeout(() => { state.dragged = false; }, 0); };
+  renderer.getMouseCaptor().on('mouseup', drop);
+  renderer.getMouseCaptor().on('mouseleave', drop);
 }
 
 function reduceNode(graph, node, data) {
   const result = {...data};
   const context = (state.view === 'behaviors' || state.view === 'loops') && !data.raw.focus;
   if (context && !(state.selected && graph.hasNode(state.selected) && graph.areNeighbors(node, state.selected))) result.label = '';
-  if (state.matches.has(node)) Object.assign(result, {highlighted: true, zIndex: 2});
+  if (state.focus.size && !state.focus.has(node)) Object.assign(result, {color: css('--dim'), label: '', zIndex: 0});
+  // Matches outrank neighbours for label space; the label grid still prevents overlapping text.
+  if (state.matches.has(node)) Object.assign(result, {zIndex: 2, size: data.size + 2});
   if (state.selected && graph.hasNode(state.selected)) {
     if (node === state.selected) Object.assign(result, {highlighted: true, zIndex: 3});
     else if (!graph.areNeighbors(node, state.selected)) Object.assign(result, {color: css('--dim'), label: '', zIndex: 0});
@@ -122,8 +166,33 @@ function reduceNode(graph, node, data) {
 }
 
 function reduceEdge(graph, edge, data) {
-  if (state.selected && graph.hasNode(state.selected) && !graph.hasExtremity(edge, state.selected)) return {...data, hidden: true};
+  if (state.selected && graph.hasNode(state.selected)) {
+    if (!graph.hasExtremity(edge, state.selected)) return {...data, hidden: true};
+  } else if (state.focus.size && !(state.focus.has(graph.source(edge)) && state.focus.has(graph.target(edge)))) {
+    return {...data, hidden: true};
+  }
   return data;
+}
+
+// Search keeps the graph for context: matches and their direct neighbours stay in colour, the rest is greyed.
+function updateFocus() {
+  const graph = state.graph;
+  state.focus = new Set();
+  if (!graph) return;
+  for (const node of state.matches) {
+    if (!graph.hasNode(node)) continue;
+    state.focus.add(node);
+    graph.forEachNeighbor(node, neighbor => state.focus.add(neighbor));
+  }
+}
+
+function fitMatches() {
+  const renderer = state.renderer, points = [...state.matches].map(node => renderer.getNodeDisplayData(node)).filter(Boolean);
+  if (!points.length) return;
+  const xs = points.map(point => point.x), ys = points.map(point => point.y);
+  const [minX, maxX, minY, maxY] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+  renderer.getCamera().animate({x: (minX + maxX) / 2, y: (minY + maxY) / 2,
+    ratio: Math.min(1, Math.max(0.05, 1.3 * Math.max(maxX - minX, maxY - minY)))}, {duration: 400});
 }
 
 function status(text) { $('status').textContent = text; }
@@ -146,6 +215,8 @@ async function loadGraph() {
       status(`${data.total_nodes.toLocaleString()} memories is more than this page can draw at once. Turn off "Show all" or narrow the scope.`);
     } else {
       state.graph = buildGraph(data);
+      state.moved = new Set();
+      updateFocus();
       render(state.graph);
       layout(state.graph);
       status(data.nodes.length ? summary(data) : 'Nothing to show here yet.');
@@ -232,6 +303,7 @@ async function reveal(id) {
         if (!graph.hasNode(node.id)) addNode(graph, node, base.x + (Math.random() - .5) * 20, base.y + (Math.random() - .5) * 20);
       }
       for (const edge of data.edges) addEdge(graph, edge);
+      updateFocus();
       status(summary(state.data));
     } catch (error) {
       return status(`Could not open: ${error.message}`);
@@ -260,7 +332,14 @@ async function search(event) {
       return status(`Search failed: ${error.message}`);
     }
   }
-  state.renderer && state.renderer.refresh();
+  updateFocus();
+  if (state.renderer) {
+    state.renderer.refresh();
+    if (state.matches.size) fitMatches();
+    else state.renderer.getCamera().animatedReset({duration: 300});
+  }
+  if (state.graph && state.matches.size && !state.focus.size) status('No matches in this graph; pick a result to reveal it.');
+  else if (state.data && state.graph) status(summary(state.data));
   sidelist();
 }
 
@@ -326,6 +405,7 @@ function setView(view) {
 
 document.querySelectorAll('#tabs button').forEach(button => button.addEventListener('click', () => setView(button.dataset.view)));
 $('search').addEventListener('submit', search);
+$('q').addEventListener('input', event => { if (!event.target.value && (state.matches.size || state.searchResults)) search(event); });
 $('scope').addEventListener('change', event => { state.scope = event.target.value; state.view === 'unprocessed' || loadGraph(); });
 $('all').addEventListener('change', event => { state.all = event.target.checked; state.view === 'unprocessed' || loadGraph(); });
 $('panel-close').addEventListener('click', () => select(null));
