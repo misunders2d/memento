@@ -537,7 +537,7 @@ The agent performs installation; do not ask the human to run commands, edit
 configuration, move credentials, or change chats. Use the private service origin
 from which you fetched this guide, not the public product website.
 
-1. Identify your native harness: pi, omp, claude, or codex. Keep its existing
+1. Identify your native harness: pi, omp, claude, codex or agy. Keep its existing
    account, login, model selection, unrelated hooks and MCP definitions.
 2. Download /runner into ~/.local/share/memento/runner.py (private parent,
    executable only by this user). It needs only Python 3's stdlib. Expose it as
@@ -546,7 +546,7 @@ from which you fetched this guide, not the public product website.
    replace an unrelated existing command. An installed Memento package also
    supports the agent command. Use the full executable path if not on PATH.
 3. Run: memento agent add HARNESS --url SERVICE_ORIGIN
-   Substitute pi, omp, claude or codex and this private service origin.
+   Substitute pi, omp, claude, codex or agy and this private service origin.
    This installs only that harness's capture, automatic recall and memory tools.
    A matching default runner.json keeps its role and identity; otherwise the
    config is ${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS/runner.json.

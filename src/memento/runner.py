@@ -1023,11 +1023,11 @@ def load_config(path):
         if info.st_size > MAX_BODY:
             raise RunnerError('invalid runner config')
         config = decode(path.read_bytes())
-        if config['uid'] != os.getuid() or config['agent'] not in ('pi', 'omp', 'claude', 'codex', 'custom'):
+        if config['uid'] != os.getuid() or config['agent'] not in ('pi', 'omp', 'claude', 'codex', 'agy', 'custom'):
             raise RunnerError('runner must execute as the configured host agent user')
         if not isinstance(config['client_uid'], str) or not config['client_uid']:
             raise RunnerError('client_uid must identify this client installation')
-        if config['preset'] not in ('pi', 'omp', 'claude', 'codex') or (config['agent'] != 'custom' and config['preset'] != config['agent']):
+        if config['preset'] not in ('pi', 'omp', 'claude', 'codex', 'agy') or (config['agent'] != 'custom' and config['preset'] != config['agent']):
             raise RunnerError('invalid CLI preset')
         if config['mode'] not in ('client', 'server'):
             raise RunnerError('runner mode must be client or server')
@@ -1054,7 +1054,7 @@ def main(argv=None):
     install = sub.add_parser('setup', help='write host-user config and a fifteen-minute user timer')
     # Accept --config both before and after setup, without overwriting the global default.
     install.add_argument('--config', type=Path, default=argparse.SUPPRESS)
-    install.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex', 'custom'), required=True)
+    install.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex', 'agy', 'custom'), required=True)
     install.add_argument('--custom-preset', choices=('pi', 'omp', 'claude', 'codex'))
     install.add_argument('--command-json', help='custom native executable as a one-element JSON argv')
     install.add_argument('--timezone', help='explicit IANA timezone required for server processing')
@@ -1067,28 +1067,28 @@ def main(argv=None):
     agents = sub.add_parser('agent', help='connect native harnesses to Memento')
     actions = agents.add_subparsers(dest='agent_operation', required=True)
     add = actions.add_parser('add', help='install capture, automatic recall and memory tools')
-    add.add_argument('agent', choices=('pi', 'omp', 'claude', 'codex'))
+    add.add_argument('agent', choices=('pi', 'omp', 'claude', 'codex', 'agy'))
     add.add_argument('--config', type=Path, default=argparse.SUPPRESS,
                      help='reuse a specific private installation config')
     add.add_argument('--url', help='private service URL; defaults to the existing connection')
     add.add_argument('--native-config-dir', type=Path,
                      help='override selected harness config root for isolated setup')
     update = actions.add_parser('update', help='pull a complete integration release without changing configuration')
-    update.add_argument('agent', choices=('pi', 'omp', 'claude', 'codex'))
+    update.add_argument('agent', choices=('pi', 'omp', 'claude', 'codex', 'agy'))
     update.add_argument('--config', type=Path, default=argparse.SUPPRESS,
                         help='reuse a specific private installation config')
     update.add_argument('--native-config-dir', type=Path,
                         help='selected harness config root used during isolated installation')
     history = sub.add_parser('import-history', help='queue explicitly selected origin-device histories')
     history.add_argument('paths', type=Path, nargs='+')
-    history.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex'), required=True)
+    history.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex', 'agy'), required=True)
     history.add_argument('--artifact-root', type=Path, action='append', default=[],
                          help='explicit additional root for referenced native attachments')
     history.add_argument('--config', type=Path, default=argparse.SUPPRESS)
     for name, description in (('upload', 'drain the durable capture outbox; retry after an outage'),
                               ('status', 'show local capture and service processing stages')):
         operation = sub.add_parser(name, help=description)
-        operation.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex'))
+        operation.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex', 'agy'))
         operation.add_argument('--config', type=Path, default=argparse.SUPPRESS)
     media = sub.add_parser('media', help='save an original artifact, inspect indexing, or retrieve original bytes')
     media_actions = media.add_subparsers(dest='media_operation', required=True)
@@ -1106,7 +1106,7 @@ def main(argv=None):
     job = media_actions.add_parser('status')
     job.add_argument('job_id')
     for operation in (save, get, job):
-        operation.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex'))
+        operation.add_argument('--agent', choices=('pi', 'omp', 'claude', 'codex', 'agy'))
         operation.add_argument('--config', type=Path, default=argparse.SUPPRESS)
     poll = sub.add_parser('tick', help='drain all due work, attempting each ID once')
     poll.add_argument('--consolidate-now', action='store_true',

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Standalone native Memento hooks, durable capture and installer (stdlib only).
 
-Native hooks call ``bridge.py claude|codex --config PATH`` with JSON stdin.
+Native hooks call ``bridge.py claude|codex|agy --config PATH`` with JSON stdin.
 Extensions call ``bridge.py native --config PATH`` with JSON stdin. No journal is
 modified. Uploads run in a separate bounded process; only passive recall waits
 for HTTP (one second). A later lifecycle hook retries every pending upload.
-Explicit history import: ``bridge.py import-history --config PATH --agent pi|omp|claude|codex FILE_OR_DIR...``.
+Explicit history import: ``bridge.py import-history --config PATH --agent pi|omp|claude|codex|agy FILE_OR_DIR...``.
 It queues complete JSONL records, retries uploads asynchronously and never
 discovers user history locations. ``bridge.py upload --config PATH`` drains
 pending uploads and reports remaining work; detached hook uploads stay bounded.
@@ -150,6 +150,47 @@ def codex_message(record):
                              'name': str(item.get('server', '')) + ':' + str(item.get('tool', '')),
                              'input': item.get('arguments', {})}]}
     return None
+
+
+AGY_REQUEST = re.compile(r'\A<USER_REQUEST>\n?(.*?)\n?</USER_REQUEST>', re.S)
+
+
+def agy_message(record):
+    """Project Antigravity transcript steps; injected system steps stay raw only."""
+    typ = record.get('type')
+    content = record.get('content')
+    timestamp = record.get('created_at')
+    if typ == 'USER_INPUT' and isinstance(content, str):
+        # The native envelope adds local time and settings notices around the request.
+        request = AGY_REQUEST.match(content)
+        return {'role': 'user', 'content': request.group(1) if request else content, 'timestamp': timestamp}
+    if typ == 'PLANNER_RESPONSE' and isinstance(content, str) and content:
+        return {'role': 'assistant', 'content': content, 'timestamp': timestamp}
+    if typ == 'PLANNER_RESPONSE' and record.get('tool_calls'):
+        return agy_tool_calls(record)
+    if typ == 'GENERIC' and isinstance(content, str):
+        return {'role': 'tool', 'content': content, 'timestamp': timestamp}
+    return None
+
+
+def agy_tool_calls(record):
+    return {'type': 'function_call', 'tool_calls': record['tool_calls'], 'timestamp': record.get('created_at')}
+
+
+def agy_request(path):
+    """Latest native user request in a bounded transcript tail."""
+    with open(path, 'rb') as stream:
+        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 4 * MAX_BODY))
+        lines = stream.read().split(b'\n')
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(record, dict) and record.get('type') == 'USER_INPUT':
+            message = agy_message(record)
+            return message['content'] if message else ''
+    return ''
 
 
 def attachment_metadata(value):
@@ -376,10 +417,12 @@ class Spool:
             'SELECT 1 FROM records WHERE source=? AND conversation=? AND identity=? AND sha=?', key).fetchone()
         if not seen:
             self.episode(harness, conversation, 'raw:' + identity + ':' + sha, 'native_record', raw,
-                         timestamp=record.get('timestamp'), metadata={'extraction_mode': 'skip', 'native_id': identity})
+                         timestamp=record.get('created_at' if harness == 'agy' else 'timestamp'), metadata={'extraction_mode': 'skip', 'native_id': identity})
         message = None
         if harness == 'codex':
             message = codex_message(record)
+        elif harness == 'agy':
+            message = agy_message(record)
         elif harness == 'claude':
             # Request blobs replay provider input, including passive recall and
             # earlier assistant output. They are raw evidence, not new commits.
@@ -410,15 +453,20 @@ class Spool:
                 if isinstance(result, dict):
                     self.project(harness, conversation, identity + ':result',
                                  {'role': 'tool', 'content': result.get('content', result)}, record)
+            if (harness == 'agy' and message.get('role') == 'assistant' and record.get('tool_calls')
+                    and not projected):
+                # Keep the response text eligible; its tool calls never are.
+                self.project(harness, conversation, identity + ':tools', agy_tool_calls(record), record)
         elif record.get('type') not in (
                 'session', 'session_meta', 'system', 'event_msg', 'turn_context',
-                'compacted', 'compaction', 'custom', 'model_change', 'thinking_level_change'):
+                'compacted', 'compaction', 'custom', 'model_change', 'thinking_level_change',
+                'SYSTEM_MESSAGE', 'CHECKPOINT'):
             self.coverage['unsupported_records'] += 1
         # Raw preservation and message projection advance independently, so a
         # newer projector can recover messages from previously imported records.
         if seen:
             return False
-        if record.get('type') in ('compacted', 'compaction'):
+        if record.get('type') in ('compacted', 'compaction') or (harness == 'agy' and record.get('type') == 'CHECKPOINT'):
             self.queue('/work/compaction', {'source': source(self.config, harness), 'conversation_id': conversation},
                        'compact:' + digest([harness, conversation, identity]))
         self.db.execute('INSERT INTO records VALUES(?,?,?,?)', key)
@@ -525,6 +573,8 @@ class Spool:
                     if not isinstance(record, dict):
                         record = {'type': 'native_value', 'value': record}
                     native_id = record.get('id') or record.get('uuid') or record.get('ordinal')
+                    if native_id is None and harness == 'agy' and isinstance(record.get('step_index'), int):
+                        native_id = 'step:' + str(record['step_index'])
                     identity = str(native_id) if native_id is not None else 'line:' + str(start) + ':' + digest(line)
                     added += self.record(harness, conversation, record, raw=text, identity=identity)
                     offset = stream.tell()
@@ -731,7 +781,7 @@ def client_update_notice(spool, revision, *, budget=CONTEXT_BYTES):
             or revision == CLIENT_REVISION):
         return ''
     harness = spool.config.get('preset') or spool.config.get('agent')
-    if harness not in ('pi', 'omp', 'claude', 'codex'):
+    if harness not in ('pi', 'omp', 'claude', 'codex', 'agy'):
         return ''
     command = shlex.join(['memento', 'agent', 'update', harness, '--config', spool.config_path])
     notice = ('Memento client notice (not memory evidence): A different client bundle is available. When asked, use ' + command +
@@ -829,7 +879,7 @@ def passive(spool, conversation, query, cwd=None, *, budget=CONTEXT_BYTES, notic
         context = '\n'.join(lines) if shown else ''
         spool.db.execute('INSERT OR REPLACE INTO recall_cache VALUES(?,?,?,?,?)',
                          (conversation, query, context, json.dumps(shown), time.time()))
-        if harness in ('pi', 'omp', 'claude', 'codex') and 1 <= len(exposure) <= 2:
+        if harness in ('pi', 'omp', 'claude', 'codex', 'agy') and 1 <= len(exposure) <= 2:
             # A fresh bridge offer, not proof that the host/provider received or
             # followed it. Cache/peer replays retain this original version/time.
             spool.episode(harness, conversation, 'exposure:' + uuid4().hex, 'native_hook', '',
@@ -952,6 +1002,57 @@ def hook(spool, harness, data):
     return {}
 
 
+def agy_hook(spool, event, data):
+    """Antigravity hooks: camelCase payloads, named-event argv and injectSteps output."""
+    conversation = str(data.get('conversationId') or 'unknown')
+    if data.get('transcriptPath'):
+        spool.journal(data['transcriptPath'], 'agy', conversation)
+    turn = event == 'PreInvocation' and not data.get('invocationNum')
+    if event != 'PreInvocation' or turn:
+        # Later invocations in one turn only advance the journal.
+        spool.episode('agy', conversation, 'hook:' + digest([event, data]), 'native_hook',
+                      encode({'event': event, **data}).decode('utf-8'), metadata={'extraction_mode': 'skip'})
+    expected = {'source': source(spool.config, 'agy'), 'conversation_id': conversation}
+    provenance = 'Memento current-conversation quote context: ' + encode(expected).decode('utf-8')
+    provenance += '\nFor quote-only remember/link/supersede, use those exact command context fields; episode IDs are optional.'
+    if event == 'SessionStart':
+        return {'injectSteps': [{'systemMessage': {'systemMessage': provenance}}]}
+    if event == 'PreToolUse':
+        call = data.get('toolCall') if isinstance(data.get('toolCall'), dict) else {}
+        arguments = call.get('args') if isinstance(call.get('args'), dict) else {}
+        if (call.get('name') != 'call_mcp_tool' or arguments.get('ServerName') != 'memento'
+                or arguments.get('ToolName') not in ('remember', 'link', 'supersede')):
+            return {}
+        original = arguments.get('Arguments')
+        if isinstance(original, str):
+            with contextlib.suppress(ValueError):
+                original = json.loads(original)
+        command = original.get('command') if isinstance(original, dict) else None
+        if not isinstance(command, dict):
+            return {'decision': 'deny', 'reason': 'Memento requires a command object.'}
+        try:
+            quotes = unresolved_quotes(command)
+            if quotes:
+                flush_conversation(spool, 'agy', conversation, quotes)
+        except (OSError, ValueError, sqlite3.Error, HTTPException):
+            return {'decision': 'deny', 'reason': 'Memento current-conversation capture is pending; retry after upload.'}
+        # An empty decision keeps the native permission flow; never grant a
+        # tool permission merely to supply provenance.
+        if any(command.get(key) != value for key, value in expected.items()):
+            return {'decision': 'deny', 'reason': 'Retry this Memento command with ' + encode(expected).decode('utf-8')}
+        return {}
+    if turn:
+        query = agy_request(data['transcriptPath']) if data.get('transcriptPath') else ''
+        if not query:
+            cached = spool.db.execute('SELECT query FROM recall_cache WHERE conversation=?', (conversation,)).fetchone()
+            query = cached[0] if cached else 'relevant current conversation context'
+        available = CONTEXT_BYTES - len((provenance + '\n').encode('utf-8'))
+        result = passive(spool, conversation, query, budget=available, notice_in_context=True, harness='agy')
+        context = '\n'.join(part for part in (provenance, result.get('update_notice'), result['context']) if part)
+        return {'injectSteps': [{'systemMessage': {'systemMessage': context}}]}
+    return {}
+
+
 def load_object(path):
     if not path.exists():
         return {}
@@ -974,7 +1075,9 @@ def import_history(spool, harness, paths, *, artifact_roots=(), progress=None):
         path = Path(value).resolve(strict=True)
         if path.is_dir():
             roots.add(path)
-            files.update(item.resolve() for item in path.rglob('*.jsonl') if item.is_file())
+            # Antigravity also keeps truncated and chunked copies of each transcript.
+            files.update(item.resolve() for item in path.rglob('transcript_full.jsonl' if harness == 'agy' else '*.jsonl')
+                         if item.is_file())
         elif path.is_file():
             roots.add(path.parent)
             files.add(path)
@@ -990,7 +1093,10 @@ def import_history(spool, harness, paths, *, artifact_roots=(), progress=None):
         existing = spool.db.execute('SELECT conversation FROM journals WHERE path=? AND harness=?',
                                     (str(path), harness)).fetchone()
         conversation = existing[0] if existing else None
-        if not conversation:
+        if not conversation and harness == 'agy':
+            # brain/<conversationId>/.system_generated/logs/transcript_full.jsonl
+            conversation = path.parents[2].name if path.parent.parent.name == '.system_generated' else None
+        elif not conversation:
             with path.open('rb') as stream:
                 for line in stream:
                     if not line.endswith(b'\n'):
@@ -1040,13 +1146,14 @@ def install(config_path, native_config_dir=None):
     config_path = str(Path(config_path).resolve())
     config = read_config(config_path)
     harness = config.get('preset') or config.get('agent')
-    if harness not in ('claude', 'codex', 'pi', 'omp'):
+    if harness not in ('claude', 'codex', 'pi', 'omp', 'agy'):
         raise ValueError('native installation requires a supported preset')
     if not config.get('client_uid'):
         config['client_uid'] = uuid4().hex
         private_write(config_path, encode(config))
     defaults = {'claude': Path.home() / '.claude', 'codex': Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))),
-                'pi': Path.home() / '.pi' / 'agent', 'omp': Path.home() / '.omp' / 'agent'}
+                'pi': Path.home() / '.pi' / 'agent', 'omp': Path.home() / '.omp' / 'agent',
+                'agy': Path.home() / '.gemini' / 'config'}
     root = Path(native_config_dir).resolve() if native_config_dir else defaults[harness]
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     bridge_path = str(Path(__file__).resolve())
@@ -1066,6 +1173,26 @@ def install(config_path, native_config_dir=None):
         private_write(target, encode({'config': config_path, 'bridge': bridge_path, 'python': sys.executable}))
         files.append(str(target))
         return {'status': 'installed', 'harness': harness, 'files': files}
+    if harness == 'agy':
+        # One owned named hook; other named hooks (and their order) stay untouched.
+        settings_path = root / 'hooks.json'
+        settings = load_object(settings_path)
+        handlers = {}
+        for event in ('SessionStart', 'PreInvocation', 'PreToolUse', 'Stop'):
+            definition = {'type': 'command', 'timeout': 15 if event == 'PreToolUse' else 5,
+                          'command': shlex.join([sys.executable, bridge_path, 'agy', '--config', config_path,
+                                                 '--event', event])}
+            handlers[event] = ([{'matcher': '^call_mcp_tool$', 'hooks': [definition]}]
+                               if event == 'PreToolUse' else [definition])
+        settings['memento'] = handlers
+        private_write(settings_path, encode(settings))
+        mcp_path = root / 'mcp_config.json'
+        mcp = load_object(mcp_path)
+        servers = mcp.setdefault('mcpServers', {})
+        servers['memento'] = {**servers.get('memento', {}), 'serverUrl': config['url'].rstrip('/') + '/mcp/'}
+        private_write(mcp_path, encode(mcp))
+        return {'status': 'installed', 'harness': harness, 'files': [str(settings_path), str(mcp_path)],
+                'notice': 'Start a fresh agy session to load hooks and MCP.'}
     command = shlex.join([sys.executable, bridge_path, harness, '--config', config_path])
     settings_path = root / ('settings.json' if harness == 'claude' else 'hooks.json')
     settings = load_object(settings_path)
@@ -1124,12 +1251,13 @@ def install(config_path, native_config_dir=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['install', 'upload', 'import-history', 'status', 'flush-conversation', 'claude', 'codex', 'native'])
+    parser.add_argument('operation', choices=['install', 'upload', 'import-history', 'status', 'flush-conversation', 'claude', 'codex', 'agy', 'native'])
     parser.add_argument('--config', required=True)
     parser.add_argument('--native-config-dir')
     parser.add_argument('--background', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--journal', action='append', default=[], help=argparse.SUPPRESS)
-    parser.add_argument('--agent', choices=['pi', 'omp', 'claude', 'codex'])
+    parser.add_argument('--agent', choices=['pi', 'omp', 'claude', 'codex', 'agy'])
+    parser.add_argument('--event', help=argparse.SUPPRESS)
     parser.add_argument('--conversation-id')
     parser.add_argument('--quote', action='append',
                         help='flush matching eligible message projections; repeat for each exact quote')
@@ -1141,6 +1269,8 @@ def main(argv=None):
         parser.error('import-history requires --agent and explicit history paths')
     if args.operation != 'import-history' and args.paths:
         parser.error('history paths require import-history')
+    if args.operation == 'agy' and not args.event:
+        parser.error('agy hooks require --event')
     if args.operation == 'flush-conversation' and (not args.agent or not args.conversation_id):
         parser.error('flush-conversation requires --agent and --conversation-id')
     try:
@@ -1150,6 +1280,8 @@ def main(argv=None):
         if os.environ.get('MEMENTO_PROCESSING') == '1':
             if args.operation == 'native':
                 print('{"context":"","shown":[]}')
+            elif args.operation == 'agy':
+                print('{}')
             return 0
         config = read_config(args.config)
         if args.operation == 'upload':
@@ -1180,15 +1312,18 @@ def main(argv=None):
         try:
             result = import_history(spool, args.agent, args.paths, artifact_roots=args.artifact_root,
                 progress=lambda value: print(json.dumps({'progress': value}), file=sys.stderr, flush=True)) if args.operation == 'import-history' else (
-                native(spool, data) if args.operation == 'native' else hook(spool, args.operation, data))
+                native(spool, data) if args.operation == 'native' else
+                agy_hook(spool, args.event, data) if args.operation == 'agy' else hook(spool, args.operation, data))
             spool.commit()
         finally:
             spool.close()
         paths = ([data['session_file']] if data and data.get('session_file') else [])
-        paths += [data[name] for name in ('transcript_path', 'agent_transcript_path') if data and data.get(name)]
+        paths += [data[name] for name in ('transcript_path', 'agent_transcript_path', 'transcriptPath')
+                  if data and data.get(name)]
         kick(args.config, paths)
-        if result:
-            print(json.dumps(result, ensure_ascii=False))
+        if result or args.operation == 'agy':
+            # Antigravity requires a JSON object on stdout, including no output.
+            print(json.dumps(result or {}, ensure_ascii=False))
         return 0
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, HTTPException) as exc:
         # Never leak transcripts, query text, native config, credentials or URL errors.
@@ -1212,6 +1347,8 @@ def main(argv=None):
             return 1
         if args.operation == 'native':
             print('{"context":"","shown":[],"error":"bridge_failed"}')
+        elif args.operation == 'agy':
+            print('{}')
         return 1 if args.operation == 'native' else 0
     except KeyboardInterrupt:
         print('{"status":"interrupted","action":"Rerun the same command; committed capture remains queued."}',

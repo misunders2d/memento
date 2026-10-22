@@ -4,7 +4,7 @@
 
 A decision you explain to Pi on one computer should be useful when you open Claude Code on another.
 
-Memento gives **one owner's agents a shared, private memory** across Pi, OMP, Claude Code and Codex. It keeps useful facts, lessons from experience and unfinished obligations connected to their original conversations, so a new session can pick up relevant context.
+Memento gives **one owner's agents a shared, private memory** across Pi, OMP, Claude Code, Codex and Antigravity (`agy`). It keeps useful facts, lessons from experience and unfinished obligations connected to their original conversations, so a new session can pick up relevant context.
 
 **Memories keep their original evidence, and corrections keep their history.**
 
@@ -210,13 +210,14 @@ Then connect the **selected** harness:
 memento agent add claude
 ```
 
-Choose `pi`, `omp`, `claude` or `codex`. The existing harness config or default `runner.json` supplies the URL; otherwise pass `--url https://YOUR_MACHINE.YOUR_TAILNET.ts.net`. A matching default `runner.json` retains its server/client role and identity; otherwise the config is `${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS/runner.json`. Use `--config PATH` for an existing custom location. Repeating the command reinstalls only that harness and preserves its identity and processing role.
+Choose `pi`, `omp`, `claude`, `codex` or `agy`. The existing harness config or default `runner.json` supplies the URL; otherwise pass `--url https://YOUR_MACHINE.YOUR_TAILNET.ts.net`. A matching default `runner.json` retains its server/client role and identity; otherwise the config is `${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS/runner.json`. Use `--config PATH` for an existing custom location. Repeating the command reinstalls only that harness and preserves its identity and processing role.
 
 | Harness | Installed integration |
 | --- | --- |
 | Pi / OMP | Native extension for capture, automatic context and six memory tools |
 | Claude Code | Native capture/recall/compaction hooks and Memento MCP definition |
 | Codex | Native hooks and MCP definition; human `/hooks` trust and MCP permissions still required |
+| Antigravity (`agy`) | A `memento` named hook in `~/.gemini/config/hooks.json` (session provenance, per-turn automatic context, transcript capture, save provenance checks) and `mcp_config.json` server entry; other named hooks are untouched. Client only: it cannot be the server processor |
 
 This command reuses the shipped native installer and does not add a daemon or restart active agents. Without the command link, `python3 ~/.local/share/memento/runner.py agent add HARNESS --url "$URL"` is equivalent. Keep each device's own config and stable generated `client_uid`; do not copy configs or histories to pretend they came from another origin.
 
@@ -323,7 +324,7 @@ memento upload --agent pi
 memento status --agent pi
 ```
 
-Use `--agent omp`, `claude` or `codex` for other histories. A matching default config is reused; otherwise the command selects that harness's config. Keep using `--config PATH` for a custom installation. Directories recurse over `*.jsonl`; only complete JSONL records are queued. Repeating an import with the same origin identity/event content is idempotent. Explicit upload drains until empty or transport failure, reports JSON `pending`/`conflicts` counts and exits nonzero if either remains. Native background upload has a bounded runtime and retries durably. A large attachment on a slow connection may need explicit `memento upload`; its retries do not block later text uploads.
+Use `--agent omp`, `claude`, `codex` or `agy` for other histories. For `agy`, pass its `~/.gemini/antigravity-cli/brain` directory; only each conversation's `transcript_full.jsonl` is imported, not the truncated or chunked copies. A matching default config is reused; otherwise the command selects that harness's config. Keep using `--config PATH` for a custom installation. Directories recurse over `*.jsonl`; only complete JSONL records are queued. Repeating an import with the same origin identity/event content is idempotent. Explicit upload drains until empty or transport failure, reports JSON `pending`/`conflicts` counts and exits nonzero if either remains. Native background upload has a bounded runtime and retries durably. A large attachment on a slow connection may need explicit `memento upload`; its retries do not block later text uploads.
 
 An unsuccessful upload also reports a sanitized `error` category (`timeout`, `http`, `network`, `validation` or `lock`), with an HTTP status and local outbox ID when available. The result excludes message contents, credentials and server response bodies. Keep the result when investigating; a healthy service alone does not explain an upload failure. Address the reported cause, then retry the same upload without importing again. Conflicts require investigation; retrying does not overwrite the existing event.
 
