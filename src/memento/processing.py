@@ -109,7 +109,7 @@ class Processing:
             self.queue._insert(key, 'extract', dict(payload, order=order))
             return
 
-    def _enqueue_night(self, now, zone, force=False):
+    def _enqueue_night(self, now, zone, force=False, exclude=()):
         db = self.store._db
         local = now.astimezone(zone)
         night = zone.key + '/' + local.date().isoformat()
@@ -120,8 +120,19 @@ class Processing:
             AND (json_extract(payload,'$.night')<>? OR ?=0)''', (now.timestamp(), night, int(within)))
         if not within and not force:
             return False
-        if db.execute("SELECT 1 FROM jobs WHERE kind='consolidate' AND state IN ('pending','leased') LIMIT 1").fetchone():
+        # One consolidator at a time. A live lease always blocks another batch, whatever
+        # the caller excludes; Queue.claim enforces the same invariant when leasing.
+        if db.execute("SELECT 1 FROM jobs WHERE kind='consolidate' AND state='leased' AND lease_until>? LIMIT 1",
+                      (time.time(),)).fetchone():
             return True
+        exclude = tuple(exclude)
+        excluded = f"AND id NOT IN ({','.join('?' for _ in exclude)})" if exclude else ''
+        if db.execute(f'''SELECT 1 FROM jobs WHERE kind='consolidate' AND state IN ('pending','leased')
+            {excluded} LIMIT 1''', exclude).fetchone():
+            return True
+        # Only the caller's cooling-down or expired batches remain. They keep their
+        # identities, payloads and candidates; a disjoint batch may proceed around them.
+        reserved = db.execute("SELECT 1 FROM jobs WHERE kind='consolidate' AND state IN ('pending','leased') LIMIT 1").fetchone()
         row = db.execute('SELECT * FROM consolidation_nights WHERE id=?', (night,)).fetchone()
         if force:
             night, cursor = None, 0
@@ -136,8 +147,12 @@ class Processing:
             if row['finished_at'] is not None:
                 return False
             cursor, through = row['cursor'], row['through_rowid']
-        candidates = self.consolidator.pending(limit=16, after=cursor, through=through)
+        candidates = self.consolidator.pending(limit=16, after=cursor, through=through, unreserved=True)
         if not candidates:
+            if reserved:
+                # Excluded batches still hold undecided candidates: nothing new is admitted,
+                # and the night is not finished until they are decided or retired.
+                return True
             if night is not None:
                 db.execute('UPDATE consolidation_nights SET finished_at=? WHERE id=?', (now.isoformat(), night))
             from .importance import refresh
@@ -165,7 +180,7 @@ class Processing:
                 db.execute('BEGIN IMMEDIATE')
                 try:
                     self._enqueue_extract(now)
-                    night_due = self._enqueue_night(now, zone, force=consolidate_now)
+                    night_due = self._enqueue_night(now, zone, force=consolidate_now, exclude=exclude)
                     db.execute('COMMIT')
                     return night_due
                 except BaseException:

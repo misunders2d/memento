@@ -624,23 +624,58 @@ def work_failure_receipt(ident, kind, error, exception):
 
 
 def process_work(config, service, work, seconds, command):
+    """Run one extraction alongside one consolidation; same-kind work stays sequential."""
     preset = config['preset']
     # Bound each renewal timeout relative to the lease and number of claimed jobs.
     heartbeat_service = Service(config['url'], timeout=min(15, seconds / (8 * len(work))))
     leases = Leases(heartbeat_service, work, seconds)
     leases.thread.start()
-    failures = 0
+    cancel = threading.Event()
+    started, outcomes = [], []
     try:
         if command is False:
+            # Native isolation flags are checked once, before any parallel execution.
             try:
                 command = check_cli(config['command'], preset)
             except (RunnerError, OSError):
                 command = None
-        for item in work:
+        # One lane per work kind bounds native executions to two, each with its own
+        # child process, temporary directory, schema flags and service client.
+        for index, kind in enumerate(dict.fromkeys(item['kind'] for item in work)):
+            items = [item for item in work if item['kind'] == kind]
+            lane_service = service if index == 0 else Service(config['url'])
+            lane = threading.Thread(target=process_lane, name='memento-' + kind, daemon=True,
+                                    args=(config, lane_service, items, command, leases, cancel, outcomes))
+            lane.start()
+            started.append(lane)
+        for lane in started:
+            lane.join()
+    except BaseException:
+        # An interrupted main thread or a failed lane start cancels running children;
+        # started lanes then finish promptly and are joined below.
+        cancel.set()
+        raise
+    finally:
+        for lane in started:
+            lane.join()
+        # Leases stop only after every started lane has finished its work.
+        leases.stop.set()
+        leases.thread.join()
+    for _, error in outcomes:
+        if error is not None:
+            raise error
+    return sum(count for count, _ in outcomes), command
+
+
+def process_lane(config, service, items, command, leases, cancel, outcomes):
+    """Sequential same-kind work. Each item's failure, lease loss or release is its own."""
+    preset, failures = config['preset'], 0
+    try:
+        for item in items:
             ident, owner = item['id'], item['owner']
             error = None
             try:
-                if command is None or leases.is_lost(ident):
+                if command is None or leases.is_lost(ident) or cancel.is_set():
                     raise RunnerError('cli_failed')
                 payload = encode({key: item[key] for key in ('instruction', 'input', 'schema')})
                 # Claude's strict native validator rejects the extraction schema's
@@ -649,7 +684,7 @@ def process_work(config, service, work, seconds, command):
                 with tempfile.TemporaryDirectory(prefix='memento-task-') as directory:
                     raw = run_process(command + preset_flags(preset, directory, schema), payload,
                                       timeout=config['deadline_seconds'], cwd=directory,
-                                      cancelled=lambda: leases.is_lost(ident))
+                                      cancelled=lambda: cancel.is_set() or leases.is_lost(ident))
                 output, model, usage = parse_result(raw, preset)
                 if leases.is_lost(ident):
                     raise RunnerError('cli_failed')
@@ -669,10 +704,10 @@ def process_work(config, service, work, seconds, command):
                           file=sys.stderr, flush=True)
             finally:
                 leases.remove(ident)
-        return failures, command
-    finally:
-        leases.stop.set()
-        leases.thread.join()
+        outcomes.append((failures, None))
+    except BaseException as exc:
+        # Never swallowed: the caller re-raises after the other lane has finished.
+        outcomes.append((failures, exc))
 
 
 def timezone_name(value):

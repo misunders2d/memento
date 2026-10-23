@@ -6,6 +6,7 @@ import io
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -345,15 +346,17 @@ def test_claude_natively_validates_consolidation_but_not_extraction(monkeypatch)
     monkeypatch.setattr(runner, 'run_process', generate)
     config = {'preset': 'claude', 'agent': 'claude', 'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2}
     assert runner.process_work(config, Service(), [extract, item], 60, ['/native/claude']) == (0, ['/native/claude'])
-    (original, _), (argv, payload) = observed
-    assert '--json-schema' not in original
+    # Extraction and consolidation may finish in either order.
+    (original, _), = [entry for entry in observed if '--json-schema' not in entry[0]]
+    (argv, payload), = [entry for entry in observed if '--json-schema' in entry[0]]
     assert argv[argv.index('--json-schema') + 1] == runner.encode(schema).decode('utf-8')
     for flags in (original, argv):
         assert flags[flags.index('--tools') + 1] == '' and '--safe-mode' in flags and '--permission-prompts' in flags
         assert 'secret evidence' not in ' '.join(flags)
     assert payload['input'] == item['input']
-    assert [value['output'] for value in completed] == [{'windows': []}, plan]
-    assert completed[1]['model'] == 'claude-native'
+    outputs = {value['id']: value for value in completed}
+    assert outputs['extract']['output'] == {'windows': []} and outputs['work']['output'] == plan
+    assert outputs['work']['model'] == 'claude-native'
 
 
 def test_claude_without_native_schema_validation_is_fatal(monkeypatch, tmp_path):
@@ -596,6 +599,212 @@ def test_drain_retries_same_failed_id_after_healthy_work_passes_retry_interval(m
     assert attempts == {'A': 2, 'B': 1}
     assert releases == [{'id': 'A', 'owner': 'A-1', 'error': 'service_rejected'}]
     assert not active and not pending
+
+
+OVERLAP_CONFIG = {'preset': 'pi', 'agent': 'pi', 'command': ['pi'], 'timezone': 'Etc/UTC',
+                  'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2, 'mode': 'server'}
+
+
+def overlap_items(extra_extracts=0):
+    items = [{'id': 'extract-1', 'owner': 'lease-e', 'kind': 'extract', 'instruction': 'fixture',
+              'input': {'id': 'extract-1'}, 'schema': {'type': 'object'}},
+             {'id': 'consolidate-1', 'owner': 'lease-c', 'kind': 'consolidate', 'instruction': 'fixture',
+              'input': {'id': 'consolidate-1'}, 'schema': {'type': 'object'}}]
+    for number in range(extra_extracts):
+        items.append({'id': f'extract-{number + 2}', 'owner': f'lease-e{number + 2}', 'kind': 'extract',
+                      'instruction': 'fixture', 'input': {'id': f'extract-{number + 2}'}, 'schema': {'type': 'object'}})
+    return items
+
+
+def recording_service(monkeypatch, lost=()):
+    """Every Service the runner builds shares one thread-safe call log."""
+    calls, lock = [], threading.Lock()
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, path, value):
+            with lock:
+                calls.append((path, value))
+            if path == '/work/renew':
+                return {'renewed': value['id'] not in lost}
+            return {'released': True, 'renewed': True}
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    return Service(), calls
+
+
+def posted(calls, path):
+    return sorted(value['id'] for entry, value in calls if entry == path)
+
+
+def test_extraction_and_consolidation_model_calls_overlap_with_isolated_executions(monkeypatch):
+    service, calls = recording_service(monkeypatch)
+    barrier = threading.Barrier(2)
+    seen, lock = [], threading.Lock()
+
+    def generate(argv, payload, **kwargs):
+        with lock:
+            seen.append((runner.decode(payload)['input']['id'], kwargs['cwd'], kwargs['cancelled']))
+        barrier.wait(5)  # both calls are inside before either returns
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    before = threading.active_count()
+    assert runner.process_work(OVERLAP_CONFIG, service, overlap_items(), 60, ['/native/pi']) == (0, ['/native/pi'])
+    assert sorted(ident for ident, _, _ in seen) == ['consolidate-1', 'extract-1']
+    assert len({cwd for _, cwd, _ in seen}) == 2 and len({id(check) for _, _, check in seen}) == 2
+    assert posted(calls, '/work/complete') == ['consolidate-1', 'extract-1']
+    assert posted(calls, '/work/release') == []
+    assert threading.active_count() == before
+
+
+def test_same_kind_work_never_overlaps_and_at_most_two_executions_run(monkeypatch):
+    service, calls = recording_service(monkeypatch)
+    started = threading.Barrier(2)
+    active, peak, lock = {}, [0], threading.Lock()
+
+    def generate(argv, payload, **kwargs):
+        ident = runner.decode(payload)['input']['id']
+        kind = ident.split('-')[0]
+        with lock:
+            assert kind not in active, 'same-kind work overlapped'
+            active[kind] = True
+            peak[0] = max(peak[0], len(active))
+        try:
+            if ident in ('extract-1', 'consolidate-1'):
+                # The first extraction and the consolidation meet; later extractions wait their turn.
+                started.wait(5)
+            return assistant_events()
+        finally:
+            with lock:
+                del active[kind]
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    assert runner.process_work(OVERLAP_CONFIG, service, overlap_items(extra_extracts=2), 60, ['/native/pi']) == (0, ['/native/pi'])
+    assert peak[0] == 2
+    assert posted(calls, '/work/complete') == ['consolidate-1', 'extract-1', 'extract-2', 'extract-3']
+
+
+@pytest.mark.parametrize('failure', ['cli_failed', 'lease_lost'])
+def test_overlapped_failure_or_lease_loss_affects_only_its_own_item(monkeypatch, capsys, failure):
+    service, calls = recording_service(monkeypatch, lost={'consolidate-1'} if failure == 'lease_lost' else ())
+    barrier = threading.Barrier(2)
+
+    def generate(argv, payload, *, cancelled, **kwargs):
+        ident = runner.decode(payload)['input']['id']
+        barrier.wait(5)
+        if ident == 'consolidate-1':
+            if failure == 'cli_failed':
+                raise runner.RunnerError('cli_failed')
+            # run_process polls cancelled(); the heartbeat must mark only this item lost.
+            limit = time.monotonic() + 5
+            while not cancelled():
+                assert time.monotonic() < limit, 'lease loss never cancelled its own item'
+                time.sleep(.01)
+            raise runner.RunnerError('cli_failed')
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    before = threading.active_count()
+    assert runner.process_work(OVERLAP_CONFIG, service, overlap_items(), .4, ['/native/pi']) == (1, ['/native/pi'])
+    assert posted(calls, '/work/complete') == ['extract-1']
+    assert [value for path, value in calls if path == '/work/release'] == [
+        {'id': 'consolidate-1', 'owner': 'lease-c', 'error': 'cli_failed'}]
+    receipts = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert receipts == [{'id': 'consolidate-1', 'kind': 'consolidate', 'error': 'cli_failed'}]
+    assert threading.active_count() == before
+
+
+def test_unexpected_lane_error_surfaces_after_the_other_item_completes(monkeypatch):
+    service, calls = recording_service(monkeypatch)
+    barrier = threading.Barrier(2)
+
+    def generate(argv, payload, **kwargs):
+        barrier.wait(5)
+        if runner.decode(payload)['input']['id'] == 'extract-1':
+            raise RuntimeError('unexpected programming error')
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    before = threading.active_count()
+    with pytest.raises(RuntimeError, match='unexpected programming error'):
+        runner.process_work(OVERLAP_CONFIG, service, overlap_items(), 60, ['/native/pi'])
+    assert posted(calls, '/work/complete') == ['consolidate-1']
+    assert threading.active_count() == before
+
+
+def test_failed_lane_start_cancels_started_lane_stops_heartbeat_and_propagates(monkeypatch):
+    service, calls = recording_service(monkeypatch)
+    entered = threading.Event()
+
+    class Thread(threading.Thread):
+        def start(self):
+            if self.name == 'memento-consolidate':
+                # Fail only once the first lane is executing, so cancellation is tested mid-run.
+                assert entered.wait(5), 'first lane never entered its model call'
+                raise RuntimeError('cannot start new thread')
+            super().start()
+
+    def generate(argv, payload, *, cancelled, **kwargs):
+        entered.set()
+        limit = time.monotonic() + 5
+        while not cancelled():
+            assert time.monotonic() < limit, 'started lane was never cancelled'
+            time.sleep(.01)
+        raise runner.RunnerError('cli_failed')
+
+    monkeypatch.setattr(runner.threading, 'Thread', Thread)
+    monkeypatch.setattr(runner, 'run_process', generate)
+    before = threading.active_count()
+    with pytest.raises(RuntimeError, match='cannot start new thread'):
+        runner.process_work(OVERLAP_CONFIG, service, overlap_items(), 60, ['/native/pi'])
+    assert entered.is_set()
+    assert posted(calls, '/work/complete') == []
+    assert posted(calls, '/work/release') == ['extract-1']
+    # The started lane and the heartbeat were both joined; nothing lingers.
+    assert threading.active_count() == before
+
+
+def test_tick_keeps_failure_exit_and_excludes_after_overlapped_batch(monkeypatch):
+    claims, completed, releases = [], [], []
+    pending = {'extract-1': 'extract', 'consolidate-1': 'consolidate'}
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, path, value):
+            if path == '/work/claim':
+                claims.append(value['exclude'])
+                work = [{'id': ident, 'owner': 'lease-' + ident, 'kind': kind, 'instruction': 'fixture',
+                         'input': {'id': ident}, 'schema': {'type': 'object'}}
+                        for ident, kind in pending.items() if ident not in value['exclude']]
+                return {'lease_seconds': 60, 'work': work}
+            if path == '/work/complete':
+                completed.append(value['id'])
+                pending.pop(value['id'])
+            if path == '/work/release':
+                releases.append(value['id'])
+                pending.pop(value['id'])
+            return {'released': True, 'renewed': True}
+
+    barrier = threading.Barrier(2)
+
+    def generate(argv, payload, **kwargs):
+        barrier.wait(5)
+        if runner.decode(payload)['input']['id'] == 'extract-1':
+            raise runner.RunnerError('invalid_output')
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
+    monkeypatch.setattr(runner, 'run_process', generate)
+    assert runner.tick(OVERLAP_CONFIG) == 1
+    assert completed == ['consolidate-1'] and releases == ['extract-1']
+    # Both IDs are excluded together only after the overlapped batch finished.
+    assert claims == [[], ['consolidate-1', 'extract-1']]
 
 
 @pytest.mark.parametrize('consolidate_now', [False, True])

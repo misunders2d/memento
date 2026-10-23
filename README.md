@@ -188,7 +188,7 @@ sudo loginctl enable-linger YOUR_AGENT_USER
 
 Keep one server processing config/timer. Do not silently convert it into a client when installing another harness. A sleeping or powered-off host cannot process memory; keep it awake for an overnight acceptance check.
 
-During a long import, a failed processing job can be retried after a 15-minute wait following its batch, while other work continues. A run still exits nonzero if any attempt failed, even if a later retry succeeded.
+During a long import, a failed processing job can be retried after a 15-minute wait following its batch, while other work continues. A rejected consolidation batch stays pending, unchanged, for that retry while other ready candidates consolidate in separate batches; at most one consolidation runs at a time, and one extraction can run alongside it. A run still exits nonzero if any attempt failed, even if a later retry succeeded.
 
 Failed attempts write a JSON diagnostic to stderr, visible in `journalctl --user -u memento-runner.service`: job ID, work kind, error category and, when available, HTTP status with an allowlisted Memento rejection code or a safe failure cause. Diagnostics exclude memory text, model output, URLs and arbitrary server error messages.
 

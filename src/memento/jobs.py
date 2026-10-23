@@ -89,9 +89,14 @@ class Queue:
             db = self.store._db
             db.execute('BEGIN IMMEDIATE')
             try:
+                # Consolidation plans share one versioned graph: never lease a second
+                # consolidator while another lease is live. Other kinds stay independent.
                 row = db.execute(f'''SELECT * FROM jobs WHERE kind IN ({','.join('?' for _ in kinds)})
                     AND ((state='pending' AND available_at<=?) OR (state='leased' AND lease_until<=?))
-                    {excluded} ORDER BY available_at,id LIMIT 1''', (*kinds, now, now, *exclude)).fetchone()
+                    {excluded}
+                    AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live
+                        WHERE live.kind='consolidate' AND live.state='leased' AND live.lease_until>?))
+                    ORDER BY available_at,id LIMIT 1''', (*kinds, now, now, *exclude, now)).fetchone()
                 if row is not None:
                     db.execute('''UPDATE jobs SET state='leased',owner=?,lease_until=?,attempts=attempts+1
                         WHERE id=?''', (owner, now + self.lease_seconds, row['id']))

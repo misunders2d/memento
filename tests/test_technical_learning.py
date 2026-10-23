@@ -109,6 +109,9 @@ def test_native_empty_results_and_changed_approach_reach_automatic_recall(tmp_pa
         windows = task['input']['raw_windows']
         assert {episode['id'] for episode in episodes} <= {window['episode_id'] for window in windows}
         assert all(not window['behavior_ground_truth'] for window in windows)
+        # Native evidence references carry the same per-quote marker the validator applies.
+        assert all(ref['behavior_ground_truth'] is False
+                   for candidate in task['input']['candidates'] for ref in candidate['evidence'])
         assert [window['sequence'] for window in windows] == sorted(window['sequence'] for window in windows)
         learned = complete(processing, task, proposal(task, episodes[-1], episodes))['id']
         history = graph.history(learned)[0]
