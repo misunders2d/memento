@@ -70,9 +70,15 @@ def test_automatic_eligibility_precedes_vector_limit_and_explicit_entities_remai
         index(r, entity, .99)
     useful, _ = assertion(r, 'Memento stores exact source evidence for each assertion.')
     index(r, useful, .85)
-    automatic = r.recall('Memento evidence', automatic=True, limit=1)
-    assert [item['id'] for item in automatic] == [useful]
-    assert automatic[0]['category'] == 'memory' and automatic[0]['related'] == []
+    # Entity nodes never enter the semantic pass, however similar; the spelled
+    # name anchors one of them explicitly, and the fact follows within the limit.
+    automatic = r.recall('Memento evidence', automatic=True, limit=3)
+    assert [item['category'] for item in automatic] == ['entity_context', 'entity_context', 'memory']
+    assert automatic[2]['id'] == useful and automatic[2]['related'] == []
+    assert all(item['type'] == 'project' and item['same_name_count'] == 30 for item in automatic[:2])
+    assert [item['id'] for item in r.recall('evidence for assertions', automatic=True, limit=1)] == [useful]
+    # Entity-only data still answers a small requested limit with the entity itself.
+    assert [item['category'] for item in r.recall('Memento evidence', automatic=True, limit=1)] == ['entity_context']
     assert any(item['type'] == 'project' for item in r.recall('Memento', effort='cheap', limit=100))
 
 
@@ -534,6 +540,279 @@ def test_automatic_keeps_factual_candidates_but_not_unconsolidated_experiences(r
     result = r.recall('launch setup', automatic=True)
     assert [item['id'] for item in result] == [factual]
     assert result[0]['confirmed'] is False and result[0]['tier'] == 'candidate'
+
+
+def relation_candidate(r, src, dst, rel, text, *, scope=None):
+    """A pending relation between two pending entity candidates, as extraction stores it."""
+    key = uuid4().hex
+    episode, _ = r.store.capture(dict(source='candidate-fixture', event_id=key, conversation_id='c',
+        kind='user', text=text, occurred_at='2026-10-20T00:00:00+00:00', metadata={}))
+    target = 'c_' + uuid4().hex
+    def create(commit):
+        r.store._db.execute('INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)',
+            (key, commit, episode['id'], 'extract-v1', 'fixture-model', '[]', '[]', datetime.now(timezone.utc).isoformat()))
+        r.store._db.execute('INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+            (target, key, 'relation', rel, text, 'Explicit source candidate', src, dst, .8,
+             None, None, json.dumps(scope or ['professional'])))
+        r.graph._evidence(target, 1, [dict(episode_id=episode['id'], quote=text)])
+        return dict(id=target)
+    r.graph._command(key, 'fixture', 'Create provenance-backed relation candidate fixture', dict(op='extract-fixture'), create)
+    return target
+
+
+MARGARITA_PROMPT = "let's do Margarita - what comes up?"
+
+
+def test_automatic_anchors_durable_entity_spelled_in_request_with_one_hop_connections(retrieval):
+    r = retrieval
+    person, person_evidence = assertion(r, 'Margarita', type='person')
+    company, _ = assertion(r, 'Mellanni', type='organization')
+    folder, evidence = assertion(r, 'Margarita keeps the team Drive evidence folder for quarterly follow-ups.')
+    r.graph.link(command_id='works', actor='fixture', why='fixture', a=person, rel='works_in', b=company, evidence=evidence)
+    r.graph.link(command_id='owns', actor='fixture', why='fixture', a=folder, rel='mentions', b=person, evidence=evidence)
+    index(r, person, .99)
+    index(r, folder, .80)
+    hits = r.recall(MARGARITA_PROMPT, automatic=True)
+    assert [hit['id'] for hit in hits] == [person, folder]
+    anchor = hits[0]
+    assert anchor['category'] == 'entity_context' and anchor['match'] == 'entity_name'
+    assert anchor['tier'] == 'durable' and anchor['confirmed'] is True and anchor['scope'] == ['professional']
+    assert anchor['text'].startswith('Margarita [person; professional] Connections: ')
+    assert 'works_in Mellanni [organization; edge ' in anchor['text']
+    assert 'Margarita keeps the team Drive evidence folder' in anchor['text'] and 'mentions this' in anchor['text']
+    assert {item['relation'] for item in anchor['connections']} == {'works_in', 'mentions'}
+    # The anchor carries its own entity evidence; each rendered connection names
+    # its edge ID, which history() resolves, so the association survives rendering.
+    assert anchor['evidence'][0]['episode_id'] == person_evidence[0]['episode_id']
+    assert all(item['basis'] == 'edge' and '; edge ' + item['relation_id'] + ']' in anchor['text']
+               for item in anchor['connections'])
+    assert all(r.graph.history(item['relation_id']) for item in anchor['connections'])
+    # The ordinary fact keeps its semantic record; anchors share the bounded limit.
+    assert hits[1]['category'] == 'memory' and hits[1]['match'] == 'semantic'
+    # An ordinary cap: small limits still return the spelled entity first.
+    assert [hit['id'] for hit in r.recall(MARGARITA_PROMPT, automatic=True, limit=2)] == [person, folder]
+    assert [hit['id'] for hit in r.recall(MARGARITA_PROMPT, automatic=True, limit=1)] == [person]
+    # Scope filtering applies to anchors exactly as to facts.
+    assert r.recall(MARGARITA_PROMPT, automatic=True, scope='personal') == []
+
+
+def test_automatic_anchors_pending_entity_candidates_with_pending_relations(retrieval):
+    r = retrieval
+    first, _ = candidate(r, 'Margarita', type='person', kind='entity')
+    second, _ = candidate(r, 'Margarita', type='person', kind='entity')
+    mellanni, _ = candidate(r, 'Mellanni', type='organization', kind='entity')
+    acme, _ = candidate(r, 'Acme Linen', type='organization', kind='entity')
+    first_relation = relation_candidate(r, first, mellanni, 'works_in', 'Margarita works in Mellanni.')
+    second_relation = relation_candidate(r, second, acme, 'works_in', 'Margarita works in Acme Linen.')
+    outreach, _ = candidate(r, 'Margarita asked for direct outreach about the bed-sheet line.')
+    r._put(outreach, 'candidate', 1, np.eye(1, 768, dtype=np.float32)[0])
+    durable, _ = assertion(r, 'Margarita Ivanova', type='person')
+    with r.store._mutex:
+        r.store._db.execute('INSERT INTO candidate_entity_matches VALUES (?,?,?,?,?,?,?,?)',
+            (first, durable, 1, .91, 1, 'fixture', 'name match only', datetime.now(timezone.utc).isoformat()))
+        r.store._db.commit()
+    hits = r.recall(MARGARITA_PROMPT, automatic=True)
+    # Two same-spelled pending people stay two identities, each with only its own
+    # neighbours and relation IDs; the semantic fact follows in the shared limit.
+    assert {hit['id'] for hit in hits[:2]} == {first, second} and hits[2]['id'] == outreach and len(hits) == 3
+    by_id = {hit['id']: hit for hit in hits[:2]}
+    for hit in by_id.values():
+        assert hit['category'] == 'entity_context' and hit['tier'] == 'candidate' and hit['confirmed'] is False
+        assert hit['same_name_count'] == 2 and hit['duplicate_ids'] == []
+        assert hit['text'].startswith('One of 2 separate entries spelled alike; not merged. Margarita [person; professional] Connections: ')
+    assert by_id[first]['same_name_ids'] == [second] and by_id[second]['same_name_ids'] == [first]
+    assert 'works_in Mellanni [organization; pending ' + first_relation + ']' in by_id[first]['text']
+    assert 'Acme' not in by_id[first]['text'] and second_relation not in by_id[first]['text']
+    assert 'works_in Acme Linen [organization; pending ' + second_relation + ']' in by_id[second]['text']
+    assert 'Mellanni' not in by_id[second]['text'] and first_relation not in by_id[second]['text']
+    assert [item['relation_id'] for item in by_id[first]['connections'] if item['basis'] == 'pending_relation'] == [first_relation]
+    assert [item['relation_id'] for item in by_id[second]['connections'] if item['basis'] == 'pending_relation'] == [second_relation]
+    assert ('possibly the same as durable Margarita Ivanova [person; memory ' + durable + '] (unverified name match)'
+            in by_id[first]['text'])
+    assert 'Ivanova' not in by_id[second]['text']
+    assert {ref['episode_id'] for ref in by_id[first]['evidence']} != {ref['episode_id'] for ref in by_id[second]['evidence']}
+    assert r.store._db.execute('SELECT count(*) FROM node_versions').fetchone()[0] == 1
+    # The two-word durable spelling is not in the request, so it is not an anchor itself.
+    assert durable not in {hit['id'] for hit in hits}
+    # A durable node with the same spelling is one more separate identity: it is
+    # ordered first, and the pending entries are neither hidden nor merged into it.
+    promoted, _ = assertion(r, 'Margarita', type='person')
+    hits = r.recall(MARGARITA_PROMPT, automatic=True)
+    assert hits[0]['id'] == promoted and hits[1]['id'] in (first, second) and hits[2]['id'] == outreach
+    assert hits[0]['same_name_count'] == 3 and set(hits[0]['same_name_ids']) == {first, second}
+    assert hits[0]['text'].startswith('One of 3 separate entries spelled alike; not merged. ')
+
+
+def test_automatic_anchor_pending_connections_apply_endpoint_state_scope_and_promotion(retrieval):
+    r = retrieval
+    person, _ = candidate(r, 'Margarita', type='person', kind='entity')
+    rejected, _ = candidate(r, 'Old Shop', type='organization', kind='entity')
+    personal, _ = candidate(r, 'Home Club', type='organization', kind='entity', scope=['personal'])
+    promoted, _ = candidate(r, 'Mellanni', type='organization', kind='entity')
+    forgotten, _ = candidate(r, 'Gone Ltd', type='organization', kind='entity')
+    relation_candidate(r, person, rejected, 'works_in', 'Margarita works in Old Shop.')
+    relation_candidate(r, person, personal, 'belongs_to', 'Margarita belongs to Home Club.', scope=['personal'])
+    relation_candidate(r, person, promoted, 'works_in', 'Margarita works in Mellanni.')
+    relation_candidate(r, person, forgotten, 'works_in', 'Margarita works in Gone Ltd.')
+    node, _ = assertion(r, 'Mellanni', type='organization')
+    stamp = datetime.now(timezone.utc).isoformat()
+    with r.store._mutex:
+        r.store._db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)',
+                            ('d-reject', rejected, 'fixture', 'reject', None, None))
+        r.store._db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)',
+                            ('d-promote', promoted, 'fixture', 'promote', node, None))
+        r.store._db.execute('INSERT INTO forgotten_targets VALUES (?,?,?)', (forgotten, 'fixture', 'candidate'))
+        r.store._db.commit()
+    hits = r.recall(MARGARITA_PROMPT, automatic=True)
+    assert [hit['id'] for hit in hits] == [person]
+    lines = hits[0]['connections']
+    # Rejected and forgotten endpoints vanish; the promoted endpoint resolves to its
+    # durable node; the personal relation remains visible without a scope filter.
+    assert [(item['id'], item['tier'], item['relation']) for item in lines] == [
+        (node, 'durable', 'works_in'), (personal, 'candidate', 'belongs_to')] or \
+        [(item['id'], item['tier'], item['relation']) for item in lines] == [
+        (personal, 'candidate', 'belongs_to'), (node, 'durable', 'works_in')]
+    assert 'works_in Mellanni [organization; pending ' in hits[0]['text']
+    assert 'Old Shop' not in hits[0]['text'] and 'Gone Ltd' not in hits[0]['text']
+    professional = r.recall(MARGARITA_PROMPT, automatic=True, scope='professional')
+    assert [(item['id'], item['relation']) for item in professional[0]['connections']] == [(node, 'works_in')]
+    # A reviewed merge of the promoted endpoint keeps the recorded promotion target;
+    # the connection follows the existing merge chain to the active survivor.
+    from memento.curation import apply_review
+    survivor, _ = assertion(r, 'Mellanni Group', type='organization')
+    r.graph._command('merge-mellanni', 'fixture', 'reviewed merge', dict(op='merge', a=node, b=survivor),
+                     lambda commit: apply_review(r.graph, commit, dict(op='merge', a=node, b=survivor)))
+    merged = r.recall(MARGARITA_PROMPT, automatic=True, scope='professional')[0]
+    assert [(item['id'], item['tier'], item['relation']) for item in merged['connections']] == [(survivor, 'durable', 'works_in')]
+    assert 'works_in Mellanni Group [organization; pending ' in merged['text']
+    # Forgetting the survivor removes that connection under the same current-state check.
+    preview = r.graph._forget_preview(survivor)
+    r.graph._forget(command_id='forget-survivor', actor='operator', why='Synthetic forget', target=survivor, token=preview['token'])
+    gone = r.recall(MARGARITA_PROMPT, automatic=True)[0]
+    assert [(item['id'], item['relation']) for item in gone['connections']] == [(personal, 'belongs_to')]
+    assert 'Mellanni' not in gone['text']
+    # Forgetting the anchored person itself removes the anchor, not just a neighbour.
+    with r.store._mutex:
+        r.store._db.execute('INSERT INTO forgotten_targets VALUES (?,?,?)', (person, 'fixture', 'candidate'))
+        r.store._db.commit()
+    assert r.recall(MARGARITA_PROMPT, automatic=True) == []
+
+
+def test_automatic_pending_anchor_connections_cap_includes_name_hints_with_relations_first(retrieval):
+    from memento.retrieval import ENTITY_ANCHOR_CONNECTIONS
+    r = retrieval
+    person, _ = candidate(r, 'Margarita', type='person', kind='entity')
+    hint, _ = assertion(r, 'Margarita Ivanova', type='person')
+    with r.store._mutex:
+        r.store._db.execute('INSERT INTO candidate_entity_matches VALUES (?,?,?,?,?,?,?,?)',
+            (person, hint, 1, .91, 1, 'fixture', 'name match only', datetime.now(timezone.utc).isoformat()))
+        r.store._db.commit()
+    organizations = []
+    for number in range(ENTITY_ANCHOR_CONNECTIONS - 1):
+        organization, _ = candidate(r, f'Org {number}', type='organization', kind='entity')
+        relation_candidate(r, person, organization, 'works_in', f'Margarita works in Org {number}.')
+        organizations.append(organization)
+    # Four recorded relations leave one slot: the uncertain hint fills it, labelled as such.
+    anchor = r.recall(MARGARITA_PROMPT, automatic=True)[0]
+    assert [item['basis'] for item in anchor['connections']] == ['pending_relation'] * 4 + ['candidate_entity_match']
+    assert 'possibly the same as durable Margarita Ivanova' in anchor['text']
+    # A fifth recorded relation takes priority over the hint; the cap holds in total.
+    organization, _ = candidate(r, 'Org 4', type='organization', kind='entity')
+    relation_candidate(r, person, organization, 'works_in', 'Margarita works in Org 4.')
+    anchor = r.recall(MARGARITA_PROMPT, automatic=True)[0]
+    assert len(anchor['connections']) == ENTITY_ANCHOR_CONNECTIONS == 5
+    assert all(item['basis'] == 'pending_relation' for item in anchor['connections'])
+    assert 'possibly the same as' not in anchor['text'] and anchor['text'].count('works_in Org') == 5
+
+
+def test_automatic_pending_anchor_order_follows_original_source_time_not_extraction_time(retrieval):
+    r = retrieval
+    # The fresh conversation was extracted first; the old import was extracted later.
+    fresh, _ = candidate(r, 'Margarita', type='person', kind='entity', occurred_at='2026-10-20T00:00:00+00:00')
+    old, _ = candidate(r, 'Margarita', type='person', kind='entity', occurred_at='2020-01-01T00:00:00+00:00')
+    undated, _ = candidate(r, 'Margarita', type='person', kind='entity', occurred_at=None)
+    fresh_run = r.store._db.execute('SELECT r.recorded_at FROM candidates c JOIN extraction_runs r ON r.id=c.run_id WHERE c.id=?', (fresh,)).fetchone()[0]
+    old_run = r.store._db.execute('SELECT r.recorded_at FROM candidates c JOIN extraction_runs r ON r.id=c.run_id WHERE c.id=?', (old,)).fetchone()[0]
+    assert old_run >= fresh_run
+    assert [hit['id'] for hit in r.recall(MARGARITA_PROMPT, automatic=True, limit=1)] == [fresh]
+    assert [hit['id'] for hit in r.recall(MARGARITA_PROMPT, automatic=True)] == [fresh, old]
+    # Old eligible entities still anchor by name; order, not eligibility, follows source time.
+    assert all(hit['same_name_count'] == 3 for hit in r.recall(MARGARITA_PROMPT, automatic=True))
+    assert undated in r.recall(MARGARITA_PROMPT, automatic=True)[0]['same_name_ids']
+
+
+def test_automatic_anchor_selection_precedes_traversal_and_stays_bounded(retrieval, monkeypatch):
+    r = retrieval
+    people = {assertion(r, 'Margarita', type='person')[0] for _ in range(5)}
+    pending = {candidate(r, 'Margarita', type='person', kind='entity')[0] for _ in range(3)}
+    walks, details = [], []
+    original_related, original_details = r.related, r._candidate_details
+    monkeypatch.setattr(r, 'related', lambda node_id, hops, **options: walks.append(node_id) or original_related(node_id, hops, **options))
+    monkeypatch.setattr(r, '_candidate_details', lambda target, **options: details.append(target) or original_details(target, **options))
+    hits = r.recall(MARGARITA_PROMPT, automatic=True)
+    assert len(hits) == 2 and all(hit['tier'] == 'durable' and hit['same_name_count'] == 8 for hit in hits)
+    assert set(hits[0]['same_name_ids']) == (people | pending) - {hits[0]['id']}
+    # Exactly one bounded walk per selected anchor; unselected identities cost no traversal or detail read.
+    assert walks == [hit['id'] for hit in hits] and details == []
+
+
+def test_automatic_anchors_keep_same_name_entities_separate_and_never_use_similarity(retrieval):
+    r = retrieval
+    one, _ = assertion(r, 'Margarita', type='person', scope=['personal'])
+    two, _ = assertion(r, 'Margarita', type='person', scope=['professional'])
+    sergey, _ = assertion(r, 'Sergey', type='person')
+    sergey_fact, _ = assertion(r, 'Sergey plays drums every weekend with the band.')
+    index(r, sergey, .99)
+    index(r, sergey_fact, .747)
+    hits = r.recall(MARGARITA_PROMPT, automatic=True)
+    # Both same-named people anchor separately; the ordinary semantic fact follows.
+    assert {hit['id'] for hit in hits[:2]} == {one, two} and [hit['id'] for hit in hits[2:]] == [sergey_fact]
+    anchors = {hit['id']: hit for hit in hits[:2]}
+    for hit in anchors.values():
+        assert hit['same_name_count'] == 2
+        assert hit['text'].startswith('One of 2 separate entries spelled alike; not merged. Margarita [person; ')
+    assert anchors[one]['scope'] == ['personal'] and anchors[two]['scope'] == ['professional']
+    assert [hit['id'] for hit in r.recall(MARGARITA_PROMPT, automatic=True, scope='personal')[:1]] == [one]
+    # An unknown name anchors nothing: the similar person label stays out, and only
+    # the ordinary semantic fact path answers, under its existing floor.
+    leonid = r.recall('Leonid started to play drums', automatic=True)
+    assert [hit['id'] for hit in leonid] == [sergey_fact]
+    assert all(hit['category'] != 'entity_context' for hit in leonid)
+    assert [hit['id'] for hit in r.recall('Леонид начал играть на барабанах', automatic=True)] == [sergey_fact]
+
+
+def test_automatic_anchors_do_not_impose_length_or_script_limits_and_follow_merged_aliases(retrieval):
+    r = retrieval
+    short, _ = assertion(r, 'Al', type='person')
+    acronym, _ = assertion(r, 'AI', type='concept')
+    cyrillic, _ = assertion(r, 'Леонид', type='person')
+    hits = r.recall('ask Al about AI tonight', automatic=True)
+    assert {hit['id'] for hit in hits} == {short, acronym}
+    assert [hit['id'] for hit in r.recall('Леонид начал играть на барабанах', automatic=True)] == [cyrillic]
+    # The exact spelling must be present: an inflected form is not matched or guessed.
+    assert r.recall('позвони Леониду', automatic=True) == []
+    # The identical written name matches even where casefolding would rewrite it:
+    # FTS unicode61 keeps "ß", so "Straße" must not be compared as "strasse".
+    street, _ = assertion(r, 'Königstraße', type='place')
+    assert [hit['id'] for hit in r.recall('Treffen in der Königstraße heute', automatic=True)] == [street]
+    assert [hit['id'] for hit in r.recall('TREFFEN IN DER KÖNIGSTRASSE', automatic=True)] == []
+    # A multi-token name must appear contiguously and in order; scattered tokens
+    # never assert the identity, while the exact sequence does.
+    full, _ = assertion(r, 'John Smith', type='person')
+    assert r.recall('John asked whether Smith replied', automatic=True) == []
+    assert r.recall('Smith, John called', automatic=True) == []
+    assert [hit['id'] for hit in r.recall('call John Smith tomorrow', automatic=True)] == [full]
+    from memento.curation import apply_review
+    canonical, evidence = assertion(r, 'Margarita', type='person')
+    alias, _ = assertion(r, 'Rita', type='person')
+    assert {hit['id'] for hit in r.recall('call Rita today', automatic=True)} == {alias}
+    # An existing reviewed merge is the only equivalence that lets one spelling stand for another.
+    r.graph._command('merge-rita', 'fixture', 'reviewed merge', dict(op='merge', a=alias, b=canonical),
+                     lambda commit: apply_review(r.graph, commit, dict(op='merge', a=alias, b=canonical)))
+    hits = r.recall('call Rita today', automatic=True)
+    assert [hit['id'] for hit in hits] == [canonical]
+    assert hits[0]['text'].startswith('Margarita [person; professional] (matched alias "Rita") No recorded connections.')
+    assert hits[0].get('same_name_count') is None
 
 
 @pytest.mark.parametrize('tier', ['candidate', 'durable'])

@@ -11,7 +11,7 @@ from threading import Event, RLock, Thread
 import numpy as np
 
 from .embedder import EMBED_DIM, embed_query, embed_texts, load_model
-from .graph import Graph, NODE_SUMMARY, ENTITY_TYPES
+from .graph import Graph, NODE_SUMMARY, ENTITY_TYPES, identity_text
 from .extraction import ACTIVE_CANDIDATE_SQL, source_text_ranges
 from .text_chunks import TextChunk, chunks
 from .importance import query_key, query_recency
@@ -28,6 +28,12 @@ TEXT_COSINE_FLOOR = 0.685  # corporate_search's measured native text relevance f
 AUTOMATIC_COSINE_FLOOR = 0.66
 AUTOMATIC_RESULT_LIMIT = 6
 AUTOMATIC_SUGGESTION_LIMIT = 2
+# Entity anchors: at most two named entities whose stored spelling appears in the
+# current request, each with bounded one-hop connections. Lexical containment
+# only; semantic neighbours never become identity anchors.
+ENTITY_ANCHOR_LIMIT = 2
+ENTITY_ANCHOR_CONNECTIONS = 5
+ENTITY_ANCHOR_TERMS = 64
 MEDIA_COSINE_FLOORS = {'image': 0.67, 'audio': 0.645, 'text': TEXT_COSINE_FLOOR}
 
 
@@ -88,6 +94,39 @@ def _automatic_content(text):
     if re.fullmatch(r'.{1,120}\s+(?:is\s+)?(?:related to|associated with|mentions)\s+.{1,120}[.!]?', text, re.I):
         return False
     return True
+
+
+def _name_tokens(text):
+    """Lowercased word tokens, split like the unicode61 FTS tokenizer (no underscores).
+
+    str.lower, as in identity_text: casefold would turn "Straße" into "strasse",
+    which the FTS prefilter never matches, so the identical written name would fail.
+    """
+    return [token.lower() for token in re.findall(r'[^\W_]+', text, re.UNICODE)]
+
+
+def _anchor_terms(query):
+    """Distinct request tokens, in request order, bounded only by count; no word lists."""
+    terms = []
+    for token in _name_tokens(query):
+        if token not in terms:
+            terms.append(token)
+            if len(terms) == ENTITY_ANCHOR_TERMS:
+                break
+    return terms
+
+
+def _name_in_request(name, request_tokens):
+    """The stored name's tokens occur contiguously, in order, in the request tokens.
+
+    Any length or script qualifies; a scattered "John … Smith" does not assert
+    "John Smith". Alternate spellings come only from reviewed merged aliases.
+    """
+    tokens = _name_tokens(name)
+    if not tokens or len(tokens) > len(request_tokens):
+        return False
+    return any(request_tokens[start:start + len(tokens)] == tokens
+               for start in range(len(request_tokens) - len(tokens) + 1))
 
 
 def _automatic_query(query, context):
@@ -516,6 +555,197 @@ class Retrieval:
             context_only = True
         return context_only
 
+    def _entity_anchors(self, query, limit, scope, db):
+        """Named entities spelled in the current request, with bounded connections.
+
+        Identity is lexical containment of the stored spelling (or a reviewed merged
+        alias), never semantic similarity, so an unknown name selects nothing.
+        Durable nodes come first, then pending entity candidates. Every durable node
+        and every pending candidate is its own identity: entries spelled alike are
+        labelled with their count and the other IDs, and nothing is merged here.
+        """
+        budget = min(ENTITY_ANCHOR_LIMIT, limit)
+        terms = _anchor_terms(query)
+        if budget <= 0 or not terms:
+            return []
+        request_tokens = _name_tokens(query)
+        match = ' OR '.join('"' + term + '"' for term in terms)
+        # Bounded prefilter in bm25 order: rarer request terms and shorter stored
+        # spellings rank first, so a true name is not hidden behind common-word hits.
+        # Exact containment then decides; nothing below is ranked by similarity.
+        entity_type = f'''(n.type IN ({_ENTITY_SQL}) OR EXISTS (
+            SELECT 1 FROM memory_types t WHERE t.name=n.type AND t.category='entity'))'''
+        visible = f'''n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+            AND {entity_type} AND {visible_sql()}
+            AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))
+            AND NOT EXISTS (SELECT 1 FROM entity_merges m WHERE m.source=n.id)'''
+        evidence_count = '(SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS evidence_count'
+        found = {}  # identity id -> light row; no traversal or detail reads yet
+        for row in db.execute(f'''SELECT {NODE_SUMMARY},{evidence_count},NULL AS alias,'durable' AS tier
+                FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version
+                WHERE node_fts MATCH ? AND {visible} ORDER BY bm25(node_fts),n.id LIMIT 64''', (match, scope, scope)):
+            if _name_in_request(row['text'], request_tokens):
+                found.setdefault(row['id'], dict(row))
+        for row in db.execute(f'''WITH RECURSIVE canonical(source,target,depth) AS (
+                SELECT source,target,0 FROM entity_merges
+                UNION ALL SELECT c.source,m.target,c.depth+1 FROM canonical c
+                JOIN entity_merges m ON m.source=c.target WHERE c.depth<64)
+                SELECT {NODE_SUMMARY},{evidence_count},alias_fts.text AS alias,'durable' AS tier
+                FROM alias_fts JOIN canonical a ON a.source=alias_fts.id JOIN node_versions n ON n.id=a.target
+                WHERE alias_fts MATCH ? AND {visible} ORDER BY bm25(alias_fts),n.id LIMIT 64''', (match, scope, scope)):
+            if _name_in_request(row['alias'], request_tokens):
+                found.setdefault(row['id'], dict(row))
+        # Pending entries are ordered by original source time, as recall decay is,
+        # so importing old history later never makes its person look newest.
+        for row in db.execute(f'''SELECT c.id,c.type,c.text,c.scope,'candidate' AS tier,
+                (SELECT max(julianday(e.occurred_at)) FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
+                 WHERE g.target=c.id AND g.version=1 AND e.occurred_at IS NOT NULL) AS source_at
+                FROM candidate_fts JOIN candidates c ON c.id=candidate_fts.id
+                WHERE candidate_fts MATCH ? AND c.kind='entity' AND {ACTIVE_CANDIDATE_SQL}
+                AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?))
+                ORDER BY bm25(candidate_fts),c.id LIMIT 64''', (match, scope, scope)):
+            if _name_in_request(row['text'], request_tokens):
+                found.setdefault(row['id'], dict(row))
+        if not found:
+            return []
+        # Every identity stays separate: a durable node, or each pending candidate.
+        # Only existing canonical merges (aliases above) equate spellings.
+        spelled = {}
+        for item in found.values():
+            spelled.setdefault((item['type'], identity_text(item['text'])), []).append(item['id'])
+        anchors = []
+        for item in self._select_anchors(found.values(), budget):
+            same = spelled[(item['type'], identity_text(item['text']))]
+            anchor = (self._durable_anchor(item, scope, db) if item['tier'] == 'durable'
+                      else self._pending_anchor(item, scope, db))
+            if anchor is None:
+                continue
+            if len(same) > 1:
+                anchor['same_name_count'] = len(same)
+                anchor['same_name_ids'] = [other for other in same if other != anchor['id']]
+                anchor['text'] = f'One of {len(same)} separate entries spelled alike; not merged. ' + anchor['text']
+            anchors.append(anchor)
+            if len(anchors) == budget:
+                break
+        return anchors
+
+    @staticmethod
+    def _select_anchors(found, budget):
+        """Deterministic order, decided before any traversal: resolved durable
+        identities by evidence count, then pending candidates by latest original
+        source time (extraction or import time is never used), then ID."""
+        durable = sorted((item for item in found if item['tier'] == 'durable'),
+                         key=lambda item: (-item['evidence_count'], item['id']))
+        pending = sorted((item for item in found if item['tier'] != 'durable'),
+                         key=lambda item: (-(item['source_at'] if item['source_at'] is not None else float('-inf')),
+                                           item['id']))
+        # One extra candidate per slot covers an identity excluded during enrichment.
+        return (durable + pending)[:budget * 2]
+
+    def _durable_anchor(self, node, scope, db):
+        if self._legacy_context_only(node['id'], node['version'], db=db):
+            return None
+        record = {key: node[key] for key in node.keys() if key not in ('evidence_count', 'alias', 'tier')}
+        record.update(tier='durable', confirmed=True, scope=json.loads(record['scope']))
+        record.update(self.graph._recall_details(record['id'], record['version'], db=db))
+        # The existing one-hop walk already restricts endpoints to active, visible,
+        # scope-matching nodes over current active edges.
+        connections = [dict(id=item['id'], type=item['type'], relation=item['relation'], direction=item['direction'],
+                            relation_id=item['edge_id'], basis='edge', text=item['one_line'])
+                       for item in self.related(record['id'], 1, scope=scope, db=db)[:ENTITY_ANCHOR_CONNECTIONS]]
+        return self._anchor_record(record, node['text'], connections, alias=node['alias'])
+
+    def _pending_anchor(self, item, scope, db):
+        record = self._candidate_record(item['id'], db=db)
+        if record is None or self._legacy_context_only(record['id'], 1, db=db):
+            return None
+        record.update(self._candidate_details(record['id'], db=db))
+        connections = []
+        for row in db.execute(f'''SELECT c.id,c.type AS relation,c.src,c.dst FROM candidates c
+                WHERE c.kind='relation' AND (c.src=? OR c.dst=?) AND {ACTIVE_CANDIDATE_SQL}
+                AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?))
+                ORDER BY c.id LIMIT 32''', (item['id'], item['id'], scope, scope)):
+            outgoing = row['src'] == item['id']
+            endpoint = self._pending_endpoint(row['dst'] if outgoing else row['src'], scope, db)
+            if endpoint is None:
+                continue  # Rejected, forgotten, out-of-scope or no longer active endpoints are omitted.
+            connections.append(dict(endpoint, relation=row['relation'], direction='out' if outgoing else 'in',
+                                    relation_id=row['id'], basis='pending_relation'))
+            if len(connections) == ENTITY_ANCHOR_CONNECTIONS:
+                break
+        for row in db.execute(f'''SELECT m.target,n.type,substr(n.text,1,160) AS text
+                FROM candidate_entity_matches m JOIN node_versions n ON n.id=m.target
+                WHERE m.candidate_id=? AND m.name_match=1 AND n.state='active'
+                AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+                AND {visible_sql()} AND NOT EXISTS (SELECT 1 FROM entity_merges e WHERE e.source=n.id)
+                AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))
+                ORDER BY m.target LIMIT 2''', (item['id'], scope, scope)):
+            # Recorded relations take priority; uncertain name hints use remaining
+            # room only, so the total never exceeds the connection cap.
+            if len(connections) >= ENTITY_ANCHOR_CONNECTIONS:
+                break
+            connections.append(dict(id=row['target'], type=row['type'], text=row['text'], relation='possibly_same_as',
+                                    direction='out', relation_id=None, basis='candidate_entity_match'))
+        return self._anchor_record(record, item['text'], connections, alias=None)
+
+    def _pending_endpoint(self, candidate_id, scope, db):
+        """The other end of a pending relation, as it currently stands.
+
+        An active candidate is shown as pending; a promoted one resolves through
+        the existing merge chain to its current durable survivor under the same
+        active/visible/scope checks; anything else (rejected, forgotten, out of
+        scope, or a chain ending in no active survivor) yields None.
+        """
+        row = db.execute(f'''SELECT c.id,c.type,substr(c.text,1,160) AS text FROM candidates c
+            WHERE c.id=? AND {ACTIVE_CANDIDATE_SQL}
+            AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?))''',
+            (candidate_id, scope, scope)).fetchone()
+        if row is not None:
+            return dict(row, tier='candidate')
+        promoted = db.execute('''SELECT d.target_id FROM candidate_decisions d WHERE d.candidate_id=?
+            AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=?)
+            AND d.decision='promote' AND d.target_id IS NOT NULL''', (candidate_id, candidate_id)).fetchone()
+        if promoted is None:
+            return None
+        # The promotion target keeps its recorded ID after a reviewed merge; follow
+        # the existing bounded merge chain to the current survivor before checking it.
+        row = db.execute(f'''WITH RECURSIVE canonical(id,depth) AS (
+                SELECT ?,0 UNION ALL SELECT m.target,c.depth+1 FROM canonical c
+                JOIN entity_merges m ON m.source=c.id WHERE c.depth<64)
+            SELECT n.id,n.type,substr(n.text,1,160) AS text FROM node_versions n
+            WHERE n.id=(SELECT id FROM canonical ORDER BY depth DESC LIMIT 1)
+            AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+            AND {visible_sql()} AND NOT EXISTS (SELECT 1 FROM entity_merges e WHERE e.source=n.id)
+            AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))''',
+            (promoted['target_id'], scope, scope)).fetchone()
+        return dict(row, tier='durable') if row is not None else None
+
+    def _anchor_record(self, record, name, connections, *, alias):
+        """Compose the injected line from stored spellings only; nothing is inferred."""
+        name = ' '.join(name.split())
+        head = name + ' [' + record['type'] + '; ' + '/'.join(record['scope']) + ']'
+        if alias:
+            head += ' (matched alias ' + json.dumps(' '.join(alias.split()), ensure_ascii=False) + ')'
+        lines = []
+        for item in connections:
+            # Each line names the existing edge, pending relation or node ID that
+            # history() resolves, so the association survives client rendering.
+            reference = ('edge ' + item['relation_id'] if item['basis'] == 'edge' else
+                         'pending ' + item['relation_id'] if item['basis'] == 'pending_relation' else
+                         'memory ' + item['id'])
+            other = ' '.join(item['text'].split())[:60] + ' [' + item['type'] + '; ' + reference + ']'
+            if item['basis'] == 'candidate_entity_match':
+                lines.append('possibly the same as durable ' + other + ' (unverified name match)')
+            elif item['direction'] == 'out':
+                lines.append(item['relation'] + ' ' + other)
+            else:
+                lines.append(other + ' ' + item['relation'] + ' this')
+        body = 'Connections: ' + '; '.join(lines) + '.' if lines else 'No recorded connections.'
+        record.update(text=head + ' ' + body, category='entity_context', match='entity_name',
+                      connections=connections, cosine=None, score=1.0, related=[])
+        record.setdefault('duplicate_ids', [])
+        return record
+
     def _automatic(self, query, limit, scope, context):
         limit = min(limit, AUTOMATIC_RESULT_LIMIT)
         with self._query_inference:
@@ -524,6 +754,12 @@ class Retrieval:
         # One WAL snapshot serves every read of this request; the writer
         # connection and its mutex stay free for capture, health and commits.
         with self.store.read_snapshot() as db:
+            # Named entities spelled in the request anchor the offer; semantic
+            # facts fill the remaining slots of the same bounded limit.
+            anchors = self._entity_anchors(query, limit, scope, db)
+            limit -= len(anchors)
+            if limit <= 0:
+                return anchors
             rows = []
             for kind in ('node', 'candidate', 'segment'):
                 rows.extend(db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
@@ -617,7 +853,7 @@ class Retrieval:
                 results.append(record)
                 if len(results) == limit:
                     break
-            return results
+            return anchors + results
 
     def recall(self, query, effort='normal', limit=10, *, scope=None, automatic=False, context=''):
         if effort not in ('cheap', 'normal', 'deep') or not 1 <= limit <= 100 or scope not in (None, 'personal', 'professional'):

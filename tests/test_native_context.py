@@ -50,6 +50,31 @@ def test_full_conditions_and_exceptions_survive_summary_and_hook_provenance(spoo
     assert direct['shown'] == ['behavior-id']
 
 
+def test_entity_anchor_rendering_keeps_relation_ids_and_candidate_tier_within_budget(spool, monkeypatch):
+    edge, relation, hint = 'e' * 32, 'c_' + 'r' * 32, 'n' * 32
+    durable = {'id': 'person-id', 'category': 'entity_context', 'tier': 'durable', 'match': 'entity_name',
+               'text': 'Margarita [person; professional] Connections: works_in Mellanni [organization; edge ' + edge
+                       + ']; Margarita keeps the Drive evidence folder [knowledge; edge ' + edge[::-1] + '] mentions this.'}
+    pending = {'id': 'c_pending-id', 'category': 'entity_context', 'tier': 'candidate', 'match': 'entity_name',
+               'text': 'One of 2 separate entries spelled alike; not merged. Margarita [person; professional] '
+                       'Connections: works_in Acme Linen [organization; pending ' + relation + ']; possibly the same as '
+                       'durable Margarita Ivanova [person; memory ' + hint + '] (unverified name match).'}
+    fact = {'id': 'fact-id', 'text': 'Margarita asked for direct outreach about the bed-sheet line.', 'category': 'memory'}
+    monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: {'memories': [durable, pending, fact]})
+    result = bridge.passive(spool, 's', "let's do Margarita - what comes up?")
+    context = result['context']
+    assert result['shown'] == ['person-id', 'c_pending-id', 'fact-id']
+    assert len(context.encode('utf-8')) <= bridge.CONTEXT_BYTES
+    lines = context.splitlines()
+    assert lines[1].startswith('[memory:person-id] [fact] Margarita [person; professional] Connections: ')
+    assert lines[2].startswith('[memory:c_pending-id] [fact] [unconfirmed candidate] One of 2 separate entries spelled alike; not merged. ')
+    # The existing IDs that history() resolves survive unchanged client rendering.
+    for reference in (edge, edge[::-1], relation, hint):
+        assert reference in context
+    assert 'pending ' + relation in lines[2] and 'edge ' + edge in lines[1]
+    assert lines[3].startswith('[memory:fact-id] [fact] Margarita asked for direct outreach')
+
+
 def test_user_authority_candidate_and_rationale_remain_distinct(spool, monkeypatch):
     memory = suggestion(authority='explicit_user')
     memory['tier'] = 'candidate'
