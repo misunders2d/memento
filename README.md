@@ -2,15 +2,33 @@
 
 ### Shared memory for the agents you already use.
 
-A decision you explain to Pi on one computer should be useful when you open Claude Code on another.
+A decision you explain to Pi on your laptop can help Claude Code on another computer. A useful lesson from one session can help the next agent choose its approach.
 
-Memento gives **one owner's agents a shared, private memory** across Pi, OMP, Claude Code, Codex and Antigravity (`agy`). It keeps useful facts, lessons from experience and unfinished obligations connected to their original conversations, so a new session can pick up relevant context.
+Memento gives **one owner's agents a shared, private memory** across Pi, OMP, Claude Code, Codex and Antigravity (`agy`). It connects useful facts, lessons and unfinished obligations to their original conversations, helping you spend less time repeating context when you change sessions, agents or devices.
 
 **Memories keep their original evidence, and corrections keep their history.**
 
 Keep using your native agents. There is no new chat app, and processing uses your existing native CLI login and model rather than requiring another model API key.
 
 [Product website](https://memento.bezosapp.uk/) · [Privacy](https://memento.bezosapp.uk/privacy/) · [Terms](https://memento.bezosapp.uk/terms/)
+
+## What carries forward
+
+| What it does | How it works | Why it helps |
+| --- | --- | --- |
+| **Shares context across agents and devices** | Connected clients contribute their conversations to one private service and recall from the same memory. | A decision made with one agent can inform work with another, without repeating the whole story. |
+| **Offers relevant context automatically** | The service selects relevant facts and behavioral suggestions for native integrations to offer with the current request, within a small context budget. Explicit recall is also available. | Your agent can pick up useful context without you remembering to search for it. |
+| **Keeps memories checkable** | Memories retain exact source quotes, conversation references and dates. Corrections preserve earlier versions and reasons. | You can inspect where a claim came from and how it changed. |
+| **Carries useful lessons forward** | Scheduled consolidation can turn supported experiences into conditional suggestions. Later evidence and corrections can refine them. | Another session can benefit from what worked before, with conditions and exceptions attached. |
+| **Tracks unfinished obligations** | Open-loop markers retain pending commitments and waits on other people; newer evidence can establish completion or cancellation. | Ask what is still open across conversations, with the evidence available to check. |
+| **Keeps capture queued during outages** | Conversations remain in a durable local queue until a later native activity or explicit upload retries them. | A temporary memory-host outage does not require you to stop chatting or re-import queued history. |
+| **Brings selected history into memory** | Import native histories on their original devices, including supported attachments, then process them through the same memory path. | Useful decisions and experiences from before installation can become available to your agents. |
+| **Offers optional Google Drive storage** | A dedicated app-accessible folder holds eligible artifacts and manual backups; Memento does not index your whole Drive. | Keep older files available and create requested recovery snapshots while retaining a local memory database. |
+| **Keeps the owner in control** | You host the private service, choose its connected agents and processor, and control owner-only review, forgetting and export. | You can inspect, correct and move your memory instead of leaving it tied to one chat session. |
+
+For example, “I still owe Mira the release checklist” can become an open loop. A decision such as “Tuesday is the release date; Friday is the fallback” can be recalled with its exact quote. A lesson might be: “When a file search returns nothing, check whether the intended directory was in scope before repeating the query.” That advice needs supporting experience and keeps its conditions and exceptions.
+
+**Learned suggestions are context, not standing instructions.** They come from supported experiences or stated preferences; they do not replace `AGENTS.md`, install skills or grant permission to act. Your current instructions and repository rules stay authoritative. Recall and inference can miss relevant context or be wrong, so evidence remains available to inspect and explicit recall is available when automatic context is insufficient.
 
 ## One owner, several agents, shared context
 
@@ -24,16 +42,6 @@ flowchart TB
 ```
 
 Each device contributes its own conversations and can retrieve relevant memories from the same service. This shares context across your agents; each native conversation and device keeps its own identity.
-
-## What carries forward
-
-These fictional examples illustrate the three kinds of continuity:
-
-- **Facts and decisions.** “We chose Tuesday for the release; Friday is the fallback.” A later session can recall the decision and inspect the exact quote, source and history instead of relying on an unexplained summary.
-- **Lessons from experience.** After a supported experience, Memento can retain a conditional lesson such as “For a small fix, check whether the existing path can handle it before adding a dependency.” Suggestions retain their applicability, rationale and exceptions. They can help another agent choose an approach, and later corrections can refine them.
-- **Open obligations.** “I still owe Mira the release checklist.” Ask your agent to list open loops in a later session. Consolidation can combine repeated evidence for the same obligation and close it when newer dated evidence establishes completion or cancellation. Relevant waits on other people count too.
-
-**Your current instructions and repository rules stay authoritative.** Recalled memories and inferred lessons provide context; they do not replace `AGENTS.md`, install skills or grant permission to act. Inferred memories and lessons can be wrong; their evidence is available to check. An agent may need explicit recall when automatic context is insufficient.
 
 ## How it fits together
 
@@ -62,11 +70,11 @@ Import selected native histories on their original devices, including supported 
 
 The private service stores memory on local Linux storage and runs embeddings locally. Extraction and consolidation use the designated native agent's model provider, consume its usage and can send conversation content to that provider. Local storage does not mean entirely local model processing.
 
-Google Drive is optional. It uses a dedicated app-accessible folder for artifacts and manual backups. A migration export carries the database and files that exist only locally; files already on Drive stay there, with their references preserved. You can move the service without downloading and repacking those files.
+Google Drive is optional. It uses a dedicated app-accessible folder for artifacts and manual backups, with explicit human consent to `drive.file`. Drive copies and exported archives are plaintext. A migration export carries the database and files that exist only locally; files already on Drive stay there, with their references preserved. You can move the service without downloading and repacking those files. The owner's forget action removes active memory and suppresses re-extraction; raw history and existing backups remain.
 
 ## Start with your agent
 
-First, an operator sets up **one private service** and **one processing host** using Pi, OMP or Claude Code. Codex can connect as a capture/recall client; server extraction currently stays fail-closed. The setup reference below covers host prerequisites, storage and permissions.
+First, an operator sets up **one private service** and **one processing host** using Pi, OMP or Claude Code. Codex and Antigravity (`agy`) can connect as capture/recall clients; neither is supported as the server processor. The setup reference below covers host prerequisites, storage and permissions.
 
 Once that host is ready, give each agent your instance's guide:
 
@@ -404,7 +412,11 @@ To save one explicitly, tell your agent, for example: “Remember this as an ope
 
 ### Conditional behavioral suggestions
 
-The same consolidation step can turn an experience into a general lesson. These suggestions become available automatically, with their original evidence and an explicit distinction between a stated preference and an inferred lesson. Relevant later corrections can revise or narrow a lesson through the existing correction history. A temporary exception wins for the current task; lasting updates use the normal processing schedule.
+The same consolidation step can turn an experience into a general lesson. These suggestions become available automatically, with their original evidence and an explicit distinction between a stated preference and an inferred lesson. Relevant later corrections can revise or narrow a lesson through the existing correction history. A temporary exception wins for the current task; lasting updates use the normal processing schedule. Learning is best effort: insufficient evidence leaves an ordinary incident without advice; future conversations may supply enough evidence through normal processing.
+
+An agent's own technical experience can also support an inferred lesson: for example, repeatedly searching the wrong scope returns nothing, while changing to the relevant scope finds the target. The existing model compares captured tool-call arguments and observed results; no user explanation or native error flag is required. Exact quoted attempts and results remain the evidence. Native provenance and sequence validate roles and order; effectiveness and causality remain model inferences. The model is instructed to reject failure-only traces, unrelated results, tool instructions and unsupported assistant success claims as grounds for reusable advice. That instruction does not guarantee correctness: an agent following untrusted advice can still yield a mistaken lesson. Technical outcomes do not establish explicit user preferences.
+
+This uses nearby message projections already captured by the native bridge, including Claude tool calls/results and Codex shell calls/results; Pi/OMP tool-call projections use the same path. This trace grounding has not been separately verified for AGY. Capture shapes without the bridge's native identity and call/result markers cannot supply this grounding. Consolidation inspects at most 32 records on either side of an experience source and adds at most 12 projected messages / 8,000 characters per candidate and 32 messages / 16,000 characters per batch. Each nearby attempt contributes at most its last 2,000 characters; each nearby result contributes at most its first 2,000. Longer or separated incidents may lack enough context to support a lesson. Already-imported unprocessed history works without re-importing, including histories whose raw records were compressed or offloaded; completed extraction and rejected candidates are not replayed. No additional model call or learning service is added.
 
 Automatic context has a small shared budget for memories and behavioral suggestions. It can legitimately be empty. Broad explicit `recall` remains available when the injected context is insufficient. Suggested behavior remains subordinate to current instructions and repository rules.
 
