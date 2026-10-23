@@ -23,6 +23,25 @@ _RAW_FRAMES = """CREATE TABLE IF NOT EXISTS raw_frames (
 _RAW_FRAMES_STATUS_INDEX = """CREATE INDEX IF NOT EXISTS raw_frames_status_cover_v1 ON raw_frames (
     source,record_count,raw_size,length(data))"""
 
+_CAPTURED_MEDIA = (
+    """CREATE TABLE IF NOT EXISTS captured_media (
+        sha256 TEXT PRIMARY KEY,kind TEXT,filename TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('waiting','ready','queued','indexed','unsupported','forgotten')),
+        job_id TEXT UNIQUE,node_id TEXT,error TEXT) STRICT""",
+    'CREATE INDEX IF NOT EXISTS captured_media_ready ON captured_media(state)',
+    'CREATE INDEX IF NOT EXISTS captured_media_node ON captured_media(node_id)',
+    """CREATE TABLE IF NOT EXISTS captured_media_refs (
+        sha256 TEXT NOT NULL,episode_id TEXT NOT NULL,start INTEGER NOT NULL,end INTEGER NOT NULL,
+        quote TEXT NOT NULL,PRIMARY KEY(sha256,episode_id)) STRICT""",
+    'CREATE INDEX IF NOT EXISTS captured_media_episode ON captured_media_refs(episode_id)',
+    """CREATE TABLE IF NOT EXISTS captured_media_progress (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),seq INTEGER NOT NULL) STRICT""",
+    'INSERT OR IGNORE INTO captured_media_progress VALUES(1,0)',
+    """CREATE TABLE IF NOT EXISTS media_representations (
+        node_id TEXT PRIMARY KEY,identity TEXT NOT NULL) STRICT""",
+    'CREATE INDEX IF NOT EXISTS media_representation_identity ON media_representations(identity)',
+)
+
 _EPISODES_NO_UPDATE = """CREATE TRIGGER episodes_no_update BEFORE UPDATE ON episodes
     WHEN NOT (raw_frame_write(OLD.seq,NEW.raw_frame,NEW.text_sha256)=1
         AND OLD.raw_frame IS NULL AND OLD.text_runs IS NULL AND NEW.text=''
@@ -275,6 +294,7 @@ def initialize(db):
     for statement in _SCHEMA:
         db.execute(statement)
     upgrade_status_index(db)
+    upgrade_captured_media(db)
     for table, predicate in _IMMUTABLE_KEYS.items():
         for operation in ("UPDATE", "DELETE"):
             db.execute(f"""CREATE TRIGGER {table}_no_{operation} BEFORE {operation} ON {table}
@@ -282,6 +302,12 @@ def initialize(db):
         db.execute(f"""CREATE TRIGGER {table}_no_replace BEFORE INSERT ON {table}
             WHEN EXISTS (SELECT 1 FROM {table} WHERE {predicate})
             BEGIN SELECT RAISE(ABORT, 'graph history is immutable'); END""")
+
+
+def upgrade_captured_media(db):
+    """Small durable discovery/admission state; historical work stays off startup."""
+    for statement in _CAPTURED_MEDIA:
+        db.execute(statement)
 
 
 def upgrade_episode_fts(db):

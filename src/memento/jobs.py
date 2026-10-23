@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from threading import Event, Thread
 from uuid import uuid4
 
+from .captured_media import active_source
 from .store import ConflictError
 
 
@@ -123,6 +124,9 @@ class Queue:
         # Exception messages can contain private evidence, credentials or signed URLs.
         code = type(error).__name__
         with self.store._mutex:
+            if code == 'CapturedSourceUnavailable' and job.kind == 'media' and job.payload.get('captured') is True:
+                # An occurrence captured after the source check saw only a leased job.
+                retryable = active_source(self.store._db, job.payload['sha256']) is not None
             self.store._db.execute('''UPDATE jobs SET state=?,available_at=?,error=?,
                 owner=NULL,lease_until=NULL WHERE id=? AND state='leased' AND owner=?''',
                 ('pending' if retryable else 'failed', time.time() + delay, code, job.id, job.owner))
@@ -141,7 +145,7 @@ class Worker:
             try:
                 maintained = self.maintenance()
             except Exception as error:
-                logging.getLogger(__name__).warning('Raw storage compression failed (%s); data retained',
+                logging.getLogger(__name__).warning('Background maintenance failed (%s); data retained',
                                                     type(error).__name__)
         job = self.queue.claim(self.handlers)
         if job is None:

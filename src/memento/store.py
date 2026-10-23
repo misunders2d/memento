@@ -19,9 +19,11 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from .schema import initialize, upgrade_episode_fts, upgrade_raw_text, upgrade_status_index
+from .schema import (initialize, upgrade_episode_fts, upgrade_raw_text, upgrade_status_index,
+                     upgrade_captured_media)
 from .blobs import BlobStore
 from .artifacts import Artifacts
+from .captured_media import references as media_references, record_references
 from .raw_text import (FRAME_BYTES, KINDS as RAW_KINDS, MIME as RAW_MIME,
                        RawTextUnavailable, decode_frame, elide, hydrate, hydrate_frames)
 from .portable import _connect
@@ -121,6 +123,7 @@ class Store:
                     upgrade_episode_fts(self._db)
                     upgrade_raw_text(self._db)
                     upgrade_status_index(self._db)
+                    upgrade_captured_media(self._db)
                     self._db.execute('COMMIT')
                 except BaseException:
                     self._db.execute('ROLLBACK')
@@ -225,6 +228,7 @@ print(json.dumps(dict(complete=checkpoint[0]==0,before=before,after=sizes(),
             if not same(old):
                 raise ConflictError('Event identifier already contains different evidence')
             return accepted(old), False
+        media_refs = media_references(fields['source'], fields['kind'], original, payload['metadata'])
         skeleton, references, full_sha, artifacts = (original, None, None, [])
         if fields['kind'] in RAW_KINDS and payload['metadata'].get('extraction_mode') == 'skip':
             # BlobStore fsyncs content before any SQLite reference is committed.
@@ -253,6 +257,7 @@ print(json.dumps(dict(complete=checkpoint[0]==0,before=before,after=sizes(),
                     VALUES (:id, :source, :event_id, :conversation_id, :kind, :text,
                             :occurred_at, :metadata, :captured_at, :text_runs, :text_sha256)""", fields,
                 )
+                record_references(self._db, fields['id'], media_refs)
                 self._db.execute('''INSERT INTO processing_progress
                     (source,conversation_id,latest_seq,latest_at) VALUES (?,?,?,?)
                     ON CONFLICT(source,conversation_id) DO UPDATE SET

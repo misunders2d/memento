@@ -512,14 +512,16 @@ class Graph:
 
     def recall_keywords(self, query, limit=20, *, scope=None, include_archived=True):
         """Literal keyword lookup, filtering before either FTS result limit."""
+        from .captured_media import visible_sql
         # Keep include_archived compatible; age affects ranking, not eligibility.
         if not 1 <= limit <= 100 or '\x00' in query or scope not in (None, 'personal', 'professional'):
             raise ValueError('Invalid recall limit, query or scope')
         match = ' '.join('"' + term.replace('"', '""') + '"' for term in query.split())
         if not match:
             return []
-        visible = '''n.state='active'
+        visible = f'''n.state='active'
             AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)
+            AND {visible_sql()}
             AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))'''
         with self.store._mutex:
             matches = [dict(row) for row in self.store._db.execute(f'''

@@ -3,12 +3,14 @@
 import time
 
 from .extraction import ACTIVE_CANDIDATE_SQL
+from .captured_media import status as captured_media_status
 
 
 _JOB_ERROR_CATEGORIES = frozenset({
     'cli_failed', 'invalid_output', 'service_rejected', 'night_window_closed',
     'ValueError', 'ConflictError', 'OSError', 'FileNotFoundError',
     'PermissionError', 'TimeoutError', 'RuntimeError',
+    'CapturedSourceUnavailable',
 })
 
 
@@ -100,6 +102,7 @@ def operational_status(state, source=None):
             seq AS cursor,offset,compact_through,latest_seq FROM processing_progress
             WHERE (? IS NULL OR source=?) ORDER BY source,conversation_id''', (source, source))]
         consolidation, media = jobs('consolidate'), jobs('media')
+        media['captured_attachments'] = captured_media_status(db, source)
         pending = db.execute(f'''SELECT count(*) AS pending_candidates,
             coalesce(sum(NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id
                 AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id)

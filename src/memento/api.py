@@ -289,7 +289,22 @@ def create_app(data_dir: Path) -> FastAPI:
                 handlers['media'] = process_media
                 retrieval.start()
             app.state.retrieval = retrieval
-            worker = Worker(app.state.jobs, handlers, maintenance=app.state.store.compress_raw_step)
+            from .captured_media import CapturedMedia
+            captured_media = CapturedMedia(app.state.jobs) if app.state.media is not None else None
+            steps = [('Raw storage compression', app.state.store.compress_raw_step)]
+            if captured_media is not None:
+                steps.append(('Captured media maintenance', captured_media.step))
+            def maintain():
+                # One failing step must not starve the other; messages can hold private data.
+                worked = False
+                for name, step in steps:
+                    try:
+                        worked = bool(step()) or worked
+                    except Exception as error:
+                        logging.getLogger(__name__).warning('%s failed (%s); data retained',
+                                                            name, type(error).__name__)
+                return worked
+            worker = Worker(app.state.jobs, handlers, maintenance=maintain)
             worker.start()
             if cold_runtime is not None:
                 cold_runtime.start()

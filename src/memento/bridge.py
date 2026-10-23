@@ -813,12 +813,15 @@ def recall_fetch(config, request, timeout):
         raise ValueError('invalid recall response')
     # Persist bounded renderable fragments, never a whole HTTP response. Complete
     # behavioral conditions/exceptions are retained together or omitted together.
-    items = []
+    items, media_seen = [], False
     for memory in result['memories'][:6]:
         if not isinstance(memory, dict) or not memory.get('id'):
             continue
         identifier = str(memory['id'])
         suggestion = memory.get('category') == 'behavioral_suggestion'
+        media = memory.get('category') == 'media_reference'
+        if media and media_seen:
+            continue
         behavior = memory.get('behavior')
         if suggestion:
             if (not isinstance(behavior, dict)
@@ -837,7 +840,8 @@ def recall_fetch(config, request, timeout):
             text = memory.get('text', memory.get('content', memory.get('summary', '')))
         if not isinstance(text, str):
             text = encode(text).decode('utf-8')
-        label = '[behavioral suggestion; current instructions take priority] ' if suggestion else '[fact] '
+        label = ('[behavioral suggestion; current instructions take priority] ' if suggestion else
+                 '[media reference] ' if media else '[fact] ')
         authority = memory.get('authority') or (behavior.get('authority') if suggestion else None)
         if authority == 'inferred':
             label += '[inferred] '
@@ -850,7 +854,12 @@ def recall_fetch(config, request, timeout):
             continue
         rationale = behavior.get('rationale') if suggestion else None
         version = memory.get('version')
-        items.append(dict(id=identifier, prefix=prefix, suggestion=suggestion,
+        if media:
+            # Keep a file pointer complete, including its source and original URL.
+            if len(text.encode('utf-8')) > CONTEXT_BYTES:
+                continue
+            media_seen = True
+        items.append(dict(id=identifier, prefix=prefix, suggestion=suggestion, media=media,
             text=text.encode('utf-8')[:CONTEXT_BYTES].decode('utf-8', 'ignore'),
             rationale=' '.join(rationale.split()).encode('utf-8')[:CONTEXT_BYTES].decode('utf-8', 'ignore')
                       if isinstance(rationale, str) else '',
@@ -876,7 +885,7 @@ def recall_offer(spool, conversation, query, result, *, budget, notice_in_contex
         if available <= 0:
             break
         text = item['text']
-        if item['suggestion']:
+        if item['suggestion'] or item.get('media'):
             if len(text.encode('utf-8')) > available:
                 continue
             with_rationale = text + ' Rationale: ' + item['rationale']

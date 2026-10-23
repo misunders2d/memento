@@ -8,12 +8,17 @@ from datetime import datetime, timezone
 from .extraction import ACTIVE_CANDIDATE_SQL
 
 HALF_LIFE_DAYS = 90
+_EVIDENCE_TIME = object()
 
 
-def query_recency(store, record, *, authority=None, now=None):
+def query_recency(store, record, *, authority=None, now=None, source_occurred_at=_EVIDENCE_TIME):
     """Rank bounded recall results from original evidence, without hydrating text."""
     db = store._db
-    if record.get('tier') == 'raw':
+    if source_occurred_at is not _EVIDENCE_TIME:
+        row = db.execute('''SELECT ? AS occurred_at,
+            (SELECT last_cited_at FROM node_stats WHERE node_id=?) AS last_cited_at''',
+            (source_occurred_at, record['id'])).fetchone()
+    elif record.get('tier') == 'raw':
         row = db.execute('''SELECT occurred_at,
             (SELECT last_cited_at FROM node_stats WHERE node_id=episodes.id) AS last_cited_at
             FROM episodes WHERE id=?''', (record['id'],)).fetchone()

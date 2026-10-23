@@ -295,7 +295,7 @@ def test_media_parent_and_raw_episode_use_original_source_recency(retrieval, rec
         index(r, name, cosine, kind=kind)
         ids.append(target)
     hits = r.recall('unmatchedword', effort='deep' if kind == 'episode' else 'cheap', automatic=automatic)
-    assert [item['id'] for item in hits] == ids[::-1]
+    assert [item['id'] for item in hits] == (ids[-1:] if automatic else ids[::-1])
     assert hits[0]['source_occurred_at'] == '2026-10-20T00:00:00+00:00'
     assert hits[0]['text'].startswith('Source 2026-10-20: ') is automatic
 
@@ -841,7 +841,11 @@ def test_source_status_work_does_not_scan_unrelated_raw_history(retrieval, monke
         r.store._db.execute('ROLLBACK')
         raise
     for position, source in enumerate(('selected', 'absent')):
-        assert operational_status(state, source) == before[source]
+        after = operational_status(state, source)
+        discovery = after['media']['captured_attachments']['discovery']
+        assert discovery == dict(scope='global', through_seq=0, latest_seq=2013)
+        before[source]['media']['captured_attachments']['discovery'] = discovery
+        assert after == before[source]
         # Count VM work, not wall time: unrelated large rows must not be visited.
         assert work[-1] <= baseline_work[position] + 1
     global_status = operational_status(state)

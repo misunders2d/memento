@@ -17,12 +17,13 @@ Keep using your native agents. There is no new chat app, and processing uses you
 | What it does | How it works | Why it helps |
 | --- | --- | --- |
 | **Shares context across agents and devices** | Connected clients contribute their conversations to one private service and recall from the same memory. | A decision made with one agent can inform work with another, without repeating the whole story. |
-| **Offers relevant context automatically** | The service selects relevant facts and behavioral suggestions for native integrations to offer with the current request, within a small context budget. Explicit recall is also available. | Your agent can pick up useful context without you remembering to search for it. |
+| **Offers relevant context automatically** | The service selects relevant facts, behavioral suggestions and at most one matching media reference for native integrations to offer with the current request, within a small context budget. Explicit recall is also available. | Your agent can pick up useful context without you remembering to search for it. |
 | **Keeps memories checkable** | Memories retain exact source quotes, conversation references and dates. Corrections preserve earlier versions and reasons. | You can inspect where a claim came from and how it changed. |
 | **Carries useful lessons forward** | Scheduled consolidation can turn supported experiences into conditional suggestions. Later evidence and corrections can refine them. | Another session can benefit from what worked before, with conditions and exceptions attached. |
 | **Tracks unfinished obligations** | Open-loop markers retain pending commitments and waits on other people; newer evidence can establish completion or cancellation. | Ask what is still open across conversations, with the evidence available to check. |
 | **Keeps capture queued during outages** | Conversations remain in a durable local queue until a later native activity or explicit upload retries them. | A temporary memory-host outage does not require you to stop chatting or re-import queued history. |
 | **Brings selected history into memory** | Import native histories on their original devices, including supported attachments, then process them through the same memory path. | Useful decisions and experiences from before installation can become available to your agents. |
+| **Finds files shared in conversations** | Supported captured attachments are indexed locally once their bytes and conversation references arrive. Search results retain the original file link and source. | Find an image, recording or document by relevant content instead of remembering its filename. |
 | **Offers optional Google Drive storage** | A dedicated app-accessible folder holds eligible artifacts and manual backups; Memento does not index your whole Drive. | Keep older files available and create requested recovery snapshots while retaining a local memory database. |
 | **Keeps the owner in control** | You host the private service, choose its connected agents and processor, and control owner-only review, forgetting and export. | You can inspect, correct and move your memory instead of leaving it tied to one chat session. |
 
@@ -60,7 +61,7 @@ flowchart TB
 
 Extraction starts after native compaction or conversation inactivity. Candidates remain visibly unconfirmed and can be recalled before promotion; deeper consolidation runs in the configured night window. Learning takes processing time.
 
-Relevant facts and eligible behavioral suggestions can appear automatically in later prompts, within a small shared context budget. They are labeled distinctly, and the result can legitimately be empty. The six memory tools let an agent explicitly recall, save, connect, correct or inspect memories and manage loop markers.
+Relevant facts, eligible behavioral suggestions and at most one matching media reference can appear automatically in later prompts, within a small shared context budget. They are labeled distinctly, and the result can legitimately be empty. A file match points to the original; it does not imply that facts or lessons were extracted from the image or recording. The six memory tools let an agent explicitly recall, save, connect, correct or inspect memories and manage loop markers.
 
 History retains exact source quotes, dates and changes. **Old conversations keep their original dates:** age affects recall ranking, without deleting memories or making imported history appear new. Age alone never closes a task. Reminder dates can be stored and listed; there is no proactive reminder delivery.
 
@@ -370,7 +371,13 @@ For each conversation, `extraction.progress` reports its processed `cursor`, par
 
 Each service response also labels `artifact_storage` as global: registered, local-only and verified-remote object/byte counts cover the whole instance. A verified remote object can still have a local cached copy. These counts show storage progress, not which objects are currently eligible or queued.
 
+`media.captured_attachments` distinguishes discovered files waiting for bytes, ready/queued work, indexed files and failures. Its discovery cursor is explicitly global, including in source-filtered status. Queue admission is not completed indexing: only committed media segments and vectors make a file searchable.
+
 ### Save and retrieve a file
+
+Supported attachments captured from user, assistant and tool messages are indexed automatically by the existing local media worker when both the bytes and a usable conversation reference are available. Existing stored projections are discovered in bounded batches, with a durable cursor; no history re-import is needed. At most two automatic jobs are outstanding, so a historical collection does not fill the explicit-save queue. Compatible completed media representations are reused across repeated captures and explicit saves.
+
+Captured files have no inferred personal/professional classification and appear only in unscoped searches; an explicit scoped save remains a separate classified record. Every captured occurrence is retained, while recall shows active sources and honors forgetting. Missing bytes, unsupported projections and path-only references cannot be recovered by scanning unrelated files or Drive. This is semantic file search, without an additional captioning or language-model pass. Update the native client with the normal `memento agent update HARNESS` flow to display automatic matches as **media references**; server indexing and explicit recall do not require that renderer update.
 
 ```sh
 memento media save /path/to/image.png --agent pi --scope personal

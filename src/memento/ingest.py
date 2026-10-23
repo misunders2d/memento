@@ -16,6 +16,31 @@ from .media import iter_audio_windows, keyframes
 from .store import ConflictError
 from .text_chunks import chunks
 
+MEDIA_DECODER_VERSION = 1
+
+
+class CapturedSourceUnavailable(ConflictError):
+    """A later active occurrence may reopen this source-only admission failure."""
+
+
+def _captured_source(db, sha256):
+    from .captured_media import active_source, _target_forgotten
+    source = active_source(db, sha256)
+    if source is None:
+        error = ConflictError if _target_forgotten(db, sha256) else CapturedSourceUnavailable
+        raise error('Captured media no longer has an active source')
+    return source
+
+
+def representation_identity(db, kind, filename):
+    """Compatibility for this decoder's complete media output, not a general cache."""
+    model = db.execute('SELECT model_id,revision,dimensions,text_encoding FROM vector_model').fetchone()
+    if model is None:
+        return None
+    return json.dumps(dict(decoder=MEDIA_DECODER_VERSION, kind=kind,
+        suffix=Path(filename).suffix.lower() if kind == 'document' else '',
+        model=dict(model)), sort_keys=True, separators=(',', ':'))
+
 
 class MediaIngest:
     def __init__(self, retrieval, artifacts):
@@ -101,34 +126,97 @@ class MediaIngest:
         else:
             raise ValueError('Media kind must be image, audio, video or document')
 
-    def ingest(self, *, command_id, actor, why, sha256, kind, filename, evidence, scope, lease=None):
-        scope = self.graph._scope('media', scope)
+    def _reuse(self, sha256, kind, filename, identity):
+        if identity is None:
+            return None
+        db = self.graph.store._db
+        rows = db.execute('''SELECT f.node_id,f.filename,f.kind,r.identity,g.request
+            FROM media_files f JOIN node_versions n ON n.id=f.node_id
+            JOIN graph_commits g ON g.id=f.commit_id
+            LEFT JOIN media_representations r ON r.node_id=f.node_id
+            WHERE f.sha256=? AND n.state='active'
+              AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+              AND NOT EXISTS (SELECT 1 FROM forgotten_targets t WHERE t.target=f.node_id)
+            ORDER BY f.rowid''', (sha256,)).fetchall()
+        for row in rows:
+            legacy = row['identity'] is None
+            if legacy:
+                # Prior releases used this same decoder and pinned model but had
+                # no completion marker. Only their actual media-ingest commits
+                # qualify; a marker with another identity is never legacy.
+                if MEDIA_DECODER_VERSION != 1:
+                    continue
+                command = json.loads(row['request']).get('command', {})
+                if (command.get('op') != 'media_ingest' or command.get('sha256') != sha256
+                        or representation_identity(db, row['kind'], row['filename']) != identity):
+                    continue
+            elif row['identity'] != identity:
+                continue
+            captured = db.execute('SELECT sha256 FROM captured_media WHERE node_id=?',
+                                  (row['node_id'],)).fetchone()
+            if captured is not None:
+                from .captured_media import active_source
+                if active_source(db, captured['sha256']) is None:
+                    continue
+            segments = db.execute('''SELECT s.*,v.embedding AS vector
+                FROM segments s
+                LEFT JOIN vector_items i ON i.target=s.id AND i.kind='segment' AND i.version=1
+                LEFT JOIN memory_vectors v ON v.rowid=i.seq AND v.current=1
+                WHERE s.node_id=? ORDER BY s.rowid''', (row['node_id'],)).fetchall()
+            if not segments or any(segment['vector'] is None for segment in segments):
+                continue
+            prepared = [dict(segment, vector=np.frombuffer(segment['vector'], dtype=np.float32))
+                        for segment in segments]
+            return prepared, row['node_id'] if legacy else None
+        return None
+
+    def ingest(self, *, command_id, actor, why, sha256, kind, filename, evidence, scope,
+               lease=None, captured=False):
+        if captured:
+            scope, evidence = [], []
+        else:
+            scope = self.graph._scope('media', scope)
         request = dict(op='media_ingest', sha256=sha256, kind=kind,
                        filename=filename, evidence=evidence, scope=scope)
+        if captured:
+            request['captured'] = True
         serialized = json.dumps(dict(actor=actor, why=why, command=request),
                                 sort_keys=True, ensure_ascii=False, allow_nan=False)
         with self.graph.store._mutex:
-            prior = self.graph.store._db.execute(
+            db = self.graph.store._db
+            prior = db.execute(
                 'SELECT request,result FROM graph_commits WHERE command_id=?', (command_id,)).fetchone()
             if prior:
                 if prior['request'] != serialized:
                     raise ConflictError('Command identifier already contains a different command')
                 return json.loads(prior['result'])
+            if captured:
+                _captured_source(db, sha256)
+            identity = representation_identity(db, kind, filename)
+            reused = self._reuse(sha256, kind, filename, identity)
         # Blob durability precedes every graph/vector reference, including previews.
         path = self.blobs.verify(sha256)
         self.artifacts.register(dict(sha256=sha256, size=path.stat().st_size),
                                 mimetypes.guess_type(filename)[0] or 'application/octet-stream')
-        try:
-            prepared = list(self._prepare(path, sha256, kind, filename))
-        except (SkipFile, FFmpegError) as error:
-            raise ValueError(f'Artifact cannot be decoded: {error}') from error
+        legacy = None
+        if reused is not None:
+            prepared, legacy = reused
+        else:
+            try:
+                prepared = list(self._prepare(path, sha256, kind, filename))
+            except (SkipFile, FFmpegError) as error:
+                raise ValueError(f'Artifact cannot be decoded: {error}') from error
         if not prepared:
             raise ValueError('No indexable media units; original artifact remains stored')
         def apply(commit):
             if lease is not None:
                 lease.check()
-            node = self.graph._insert_node(commit, dict(type='media', text=filename, evidence=evidence, scope=scope))
             db = self.graph.store._db
+            sources = evidence
+            if captured:
+                source = _captured_source(db, sha256)
+                sources = [dict(episode_id=source['episode_id'], quote=source['quote'], occurrence=0)]
+            node = self.graph._insert_node(commit, dict(type='media', text=filename, evidence=sources, scope=scope))
             db.execute('INSERT INTO media_files VALUES (?,?,?,?,?)',
                        (node['id'], sha256, filename, kind, commit))
             segments = []
@@ -145,5 +233,12 @@ class MediaIngest:
                     end_s=item['end_s'], page=item['page'],
                     char_start=item.get('char_start'), char_end=item.get('char_end'),
                     source_text_url=('/blobs/' + item['source_sha256']) if item.get('source_sha256') else None))
+            if identity is not None:
+                db.execute('INSERT INTO media_representations VALUES (?,?)', (node['id'], identity))
+                if legacy is not None:
+                    db.execute('INSERT OR IGNORE INTO media_representations VALUES (?,?)', (legacy, identity))
+            if captured:
+                db.execute("UPDATE captured_media SET node_id=?,state='indexed',error=NULL WHERE sha256=?",
+                           (node['id'], sha256))
             return dict(id=node['id'], blob_url='/blobs/' + sha256, segments=segments)
         return self.graph._command(command_id, actor, why, request, apply)
