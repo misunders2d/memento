@@ -803,7 +803,8 @@ def test_same_batch_duplicate_loops_share_one_promoted_obligation(extraction):
     assert all(current(graph, item['id'])['state'] == 'closed' for item in (first, repeat))
 
 
-def test_legacy_consolidation_lease_reprepares_same_job_before_loop_changes(extraction):
+@pytest.mark.parametrize('previous', [None, 'consolidate-v4'])
+def test_legacy_consolidation_lease_reprepares_same_job_before_loop_changes(extraction, previous):
     from memento.loops import current
     from memento.store import ConflictError
     store, graph, processing, episode, _, work, output = extraction
@@ -814,9 +815,12 @@ def test_legacy_consolidation_lease_reprepares_same_job_before_loop_changes(extr
     task = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
     action = _loop_action(task['input']['candidates'][0], episode, open_loop=False)
     legacy = dict(task['input'])
-    legacy.pop('loop_policy_version')
+    if previous is None:
+        legacy.pop('loop_policy_version')
+    else:
+        legacy['loop_policy_version'] = previous
     payload = json.loads(store._db.execute('SELECT payload FROM jobs WHERE id=?', (task['id'],)).fetchone()[0])
-    payload['version'] = 'consolidate-v3'
+    payload['version'] = previous or 'consolidate-v3'
     store._db.execute('UPDATE jobs SET payload=?,context=? WHERE id=?',
                       (json.dumps(payload), json.dumps(legacy), task['id']))
     commits = store._db.execute('SELECT count(*) FROM graph_commits').fetchone()[0]
@@ -827,7 +831,7 @@ def test_legacy_consolidation_lease_reprepares_same_job_before_loop_changes(extr
     store._db.execute('UPDATE jobs SET lease_until=0 WHERE id=?', (task['id'],))
     fresh = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
     assert fresh['id'] == task['id'] and fresh['owner'] != task['owner']
-    assert fresh['input']['loop_policy_version'] == 'consolidate-v4'
+    assert fresh['input']['loop_policy_version'] == 'consolidate-v5'
     result = processing.complete(id=fresh['id'], owner=fresh['owner'], agent='fixture', output=dict(actions=[action]))
     assert current(graph, result['results'][action['candidate_id']]['id']) is None
 
