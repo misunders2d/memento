@@ -1,9 +1,14 @@
 """Protected graph operations: proposals are public to processing, decisions are private admin only."""
 
+import hashlib
+import json
 import re
+from uuid import uuid4
 
-from .graph import ENTITY_TYPES
+from .graph import ENTITY_TYPES, identity_text
 from .store import ConflictError
+
+MAX_MERGE_PLAN = 32
 
 
 def propose(graph, commit, request):
@@ -102,7 +107,42 @@ def attach(graph, commit, target, evidence, *, approved=False, expected_version=
     return dict(id=target, version=version)
 
 
-def apply_review(graph, commit, request):
+def _union_evidence(db, target, version, sources):
+    """Copy current evidence rows into a new version; excluded sources never move."""
+    for source, source_version in sources:
+        db.execute('''INSERT INTO graph_evidence SELECT ?,?,g.episode_id,g.start,g.end,g.quote
+            FROM graph_evidence g WHERE g.target=? AND g.version=?
+            AND NOT EXISTS (SELECT 1 FROM graph_evidence x WHERE x.target=? AND x.version=?
+                AND x.episode_id=g.episode_id AND x.start=g.start AND x.end=g.end)
+            AND (g.target=? OR NOT EXISTS (SELECT 1 FROM episodes e JOIN forgotten_sources f
+                ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=g.episode_id))''',
+            (target, version, source, source_version, target, version, target))
+
+
+def _requeue_stale_reviews(graph, commit, targets, exclude=None):
+    """Return candidates of proposals a merge made stale to processing, never reject them."""
+    db = graph.store._db
+    placeholders = ','.join('?' for _ in targets)
+    proposals = db.execute(f'''SELECT DISTINCT p.id,p.base_versions FROM review_proposals p, json_each(p.base_versions) j
+        WHERE j.key IN ({placeholders}) AND p.id IS NOT ?
+        AND NOT EXISTS (SELECT 1 FROM review_decisions d WHERE d.proposal_id=p.id) ORDER BY p.id''',
+        (*targets, exclude)).fetchall()
+    requeued = []
+    for proposal in proposals:
+        bases = json.loads(proposal['base_versions'])
+        if all(graph._node(node)['version'] == version for node, version in bases.items()):
+            continue
+        for row in db.execute('''SELECT d.candidate_id FROM candidate_decisions d
+                WHERE d.decision='review' AND d.target_id=? AND d.rowid=(
+                    SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=d.candidate_id)
+                ORDER BY d.candidate_id''', (proposal['id'],)).fetchall():
+            db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)',
+                       (uuid4().hex, row['candidate_id'], commit, 'defer', None, None))
+            requeued.append(row['candidate_id'])
+    return requeued
+
+
+def apply_review(graph, commit, request, *, proposal_id=None):
     db = graph.store._db
     if request['op'] == 'register_type':
         validate_type(request)
@@ -129,24 +169,48 @@ def apply_review(graph, commit, request):
         FROM graph_evidence WHERE target=? AND version=?''', (version, a['id'], a['version']))
     db.execute('INSERT INTO entity_merges VALUES (?,?,?)', (a['id'], b['id'], commit))
     db.execute('INSERT INTO alias_fts(id,text) VALUES (?,?)', (a['id'], a['text']))
+    # The survivor's new version carries both identities' evidence and scopes,
+    # so ordinary recall, history and recency see the absorbed sources; the
+    # version change also fences plans and proposals based on the old survivor.
+    survivor = b['version'] + 1
+    scope = sorted(set(json.loads(a['scope'])) | set(json.loads(b['scope'])))
+    db.execute('INSERT INTO node_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        (b['id'], survivor, commit, b['type'], b['text'], b['state'], b['valid_from'], b['valid_to'],
+         b['superseded_by'], b['pinned'], json.dumps(scope)))
+    _union_evidence(db, b['id'], survivor, [(b['id'], b['version']), (a['id'], a['version'])])
+    _copy_vector(graph, b['id'], b['version'], survivor)
+    from .loops import transfer
     edges = db.execute('''SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active'
         AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)''', (a['id'], a['id'])).fetchall()
     for edge in edges:
         src = b['id'] if edge['src'] == a['id'] else edge['src']
         dst = b['id'] if edge['dst'] == a['id'] else edge['dst']
+        same = None if src == dst else db.execute('''SELECT e.* FROM edge_versions e
+            WHERE e.src=? AND e.rel=? AND e.dst=? AND e.id<>? AND e.state='active'
+            AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id LIMIT 1''',
+            (src, edge['rel'], dst, edge['id'])).fetchone()
         db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',
-            (edge['id'], edge['version'] + 1, commit, src, edge['rel'], dst, 'inactive' if src == dst else 'active'))
+            (edge['id'], edge['version'] + 1, commit, src, edge['rel'], dst,
+             'inactive' if src == dst or same is not None else 'active'))
         db.execute('''INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote
             FROM graph_evidence WHERE target=? AND version=?''', (edge['version'] + 1, edge['id'], edge['version']))
+        if same is not None:
+            # A redirected duplicate relation folds into the existing one.
+            db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',
+                (same['id'], same['version'] + 1, commit, same['src'], same['rel'], same['dst'], 'active'))
+            _union_evidence(db, same['id'], same['version'] + 1,
+                            [(same['id'], same['version']), (edge['id'], edge['version'])])
+            transfer(graph, commit, edge['id'], same['id'])
     db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN
         (SELECT seq FROM vector_items WHERE kind='node' AND target=?)''', (a['id'],))
     if a['pinned'] and not b['pinned']:
         pin(graph, commit, b['id'], True)
     from .importance import transfer_usage
     transfer_usage(graph.store, a['id'], b['id'])
-    from .loops import transfer
     transfer(graph, commit, a['id'], b['id'])
-    return dict(id=a['id'], version=version, merged_into=b['id'])
+    requeued = _requeue_stale_reviews(graph, commit, (a['id'], b['id']), exclude=proposal_id)
+    return dict(id=a['id'], version=version, merged_into=b['id'], survivor_version=graph._node(b['id'])['version'],
+                scope=scope, requeued_candidates=requeued)
 
 
 def canonical(graph, node_id):
@@ -156,3 +220,121 @@ def canonical(graph, node_id):
             return node
         node_id = node['superseded_by']
     raise ValueError('Entity merge chain is too deep')
+
+
+def _active_entities(db, condition, parameters):
+    rows = db.execute(f'''SELECT n.id,n.version,n.type,n.text,n.scope,n.pinned,
+        (SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS evidence,
+        (SELECT count(*) FROM edge_versions e WHERE (e.src=n.id OR e.dst=n.id) AND e.state='active'
+            AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)) AS relations,
+        (SELECT c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id
+            WHERE v.id=n.id AND v.version=1) AS created_at
+        FROM node_versions n LEFT JOIN memory_types t ON t.name=n.type
+        WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+        AND {condition} ORDER BY n.id''', parameters).fetchall()
+    return [dict(row, scope=json.loads(row['scope']), pinned=bool(row['pinned'])) for row in rows]
+
+
+def _survivor_order(item):
+    # Default survivor first: pinned, best evidenced, then oldest.
+    return (not item['pinned'], -item['evidence'], item['created_at'] or '', item['id'])
+
+
+def inventory(graph):
+    """Read-only suspicion: active same-type entities spelled alike up to case/whitespace.
+
+    Members of a cluster may legitimately be distinct; only an owner-selected
+    exact plan merges anything.
+    """
+    types = ','.join('?' for _ in ENTITY_TYPES)
+    groups = {}
+    for row in _active_entities(graph.store._db, f"(n.type IN ({types}) OR t.category='entity')", sorted(ENTITY_TYPES)):
+        groups.setdefault((row['type'], identity_text(row['text'])), []).append(row)
+    clusters = []
+    for (type, name), members in sorted(groups.items()):
+        if len(members) > 1:
+            members.sort(key=_survivor_order)
+            cluster = hashlib.sha256(json.dumps([type, name], ensure_ascii=False).encode()).hexdigest()[:12]
+            clusters.append(dict(cluster=cluster, type=type, name=name, members=members))
+    return dict(clusters=clusters, policy='suspicion_only')
+
+
+def merge_plan(graph, cluster, *, into=None, exclude=(), include=()):
+    """Exact version-bound plan; the token fences every original base before mutation.
+
+    include adds owner-chosen active spelling variants of the cluster's type;
+    the inventory never groups them automatically.
+    """
+    from .loops import snapshot
+    found = next((item for item in inventory(graph)['clusters'] if item['cluster'] == cluster), None)
+    if found is None:
+        raise ValueError('Unknown or already resolved duplicate cluster')
+    known = {member['id'] for member in found['members']}
+    include = sorted(set(include))
+    if set(include) & set(exclude):
+        raise ValueError('An identity cannot be both included and excluded')
+    if not set(exclude) <= known:
+        raise ValueError('Exclusions must be members of this cluster')
+    variants = [target for target in include if target not in known]
+    for target in variants:
+        try:
+            node = graph._node(target)
+        except ValueError:
+            raise ValueError('Included identity is unknown') from None
+        if node['state'] != 'active' or node['type'] != found['type']:
+            raise ValueError('Included identities must be active entities of the cluster type')
+    extra = _active_entities(graph.store._db, f"n.id IN ({','.join('?' for _ in variants)})", variants) if variants else []
+    members = sorted([member for member in found['members'] if member['id'] not in exclude] + extra,
+                     key=_survivor_order)
+    if into is not None and into not in {member['id'] for member in members}:
+        raise ValueError('Survivor must belong to the selected members')
+    if len(members) < 2:
+        raise ValueError('A merge plan needs a survivor and at least one absorbed member')
+    survivor = next(member for member in members if member['id'] == into) if into else members[0]
+    absorbed = [member for member in members if member['id'] != survivor['id']]
+    if len(absorbed) > MAX_MERGE_PLAN:
+        raise ValueError(f'A merge plan absorbs at most {MAX_MERGE_PLAN} members')
+    db = graph.store._db
+
+    def summary(member):
+        # Bounded original sources let the owner tell same-named identities apart;
+        # loop snapshots fence transferred obligations and manual loop choices.
+        sources = [dict(row) for row in db.execute('''SELECT g.episode_id,e.source,e.conversation_id,e.occurred_at,
+            CASE WHEN EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)
+                THEN NULL ELSE substr(g.quote,1,160) END AS quote_excerpt
+            FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?
+            ORDER BY julianday(e.occurred_at) DESC,g.episode_id,g.start LIMIT 3''', (member['id'], member['version']))]
+        return dict({key: member[key] for key in ('id', 'version', 'text', 'scope', 'pinned', 'evidence', 'relations')},
+                    sources=sources, loop=snapshot(graph, member['id'], member['version']))
+    ids = [member['id'] for member in members]
+    placeholders = ','.join('?' for _ in ids)
+    relations = {row['id']: dict(version=row['version'], loop=snapshot(graph, row['id'], row['version']))
+        for row in db.execute(f'''SELECT e.id,e.version FROM edge_versions e
+        WHERE (e.src IN ({placeholders}) OR e.dst IN ({placeholders})) AND e.state='active'
+        AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id''', (*ids, *ids))}
+    reviews = [row['id'] for row in db.execute(f'''SELECT DISTINCT p.id FROM review_proposals p, json_each(p.base_versions) j
+        WHERE j.key IN ({placeholders}) AND NOT EXISTS (SELECT 1 FROM review_decisions d WHERE d.proposal_id=p.id)
+        ORDER BY p.id''', ids)]
+    scope = sorted({label for member in members for label in member['scope']})
+    plan = dict(cluster=cluster, type=found['type'], name=found['name'], survivor=summary(survivor),
+        absorbed=[summary(member) for member in absorbed],
+        excluded=[summary(member) for member in found['members'] if member['id'] in exclude],
+        resulting_scope=scope, relations=relations, pending_reviews=reviews,
+        policy='owner_selected_exact_plan', raw_history='retained')
+    if variants:
+        # Their versions, evidence and loops are already in survivor/absorbed.
+        plan['included'] = variants
+    plan['token'] = hashlib.sha256(json.dumps(plan, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return plan
+
+
+def apply_merge_plan(graph, commit, cluster, into, exclude, token, include=()):
+    plan = merge_plan(graph, cluster, into=into, exclude=exclude, include=include)
+    if plan['token'] != token:
+        raise ConflictError('Merge plan is stale; preview and confirm the current plan')
+    # All original bases matched above; each pair then uses the reviewed merge.
+    merged = [apply_review(graph, commit, dict(op='merge', a=member['id'], b=plan['survivor']['id']))
+              for member in plan['absorbed']]
+    return dict(cluster=cluster, survivor=plan['survivor']['id'], survivor_version=merged[-1]['survivor_version'],
+                merged=[item['id'] for item in merged], scope=merged[-1]['scope'],
+                requeued_candidates=sorted({c for item in merged for c in item['requeued_candidates']}))

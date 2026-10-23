@@ -69,6 +69,35 @@ def test_owner_socket_compact_reclaims_disk_and_preserves_raw_fts_graph_vectors(
         store.close()
 
 
+def test_owner_socket_merge_preview_carries_included_variants(tmp_path):
+    store = Store(tmp_path)
+    graph = Graph(store)
+    try:
+        text = 'Orion and Orion warehouse.'
+        episode, _ = store.capture(dict(source='fixture', event_id='entities', conversation_id='thread',
+            kind='user', text=text, occurred_at=None, metadata={}))
+        ids = [graph.remember(command_id=f'entity-{index}', actor='fixture', why='Synthetic entity', type='project',
+            text=name, scope=['professional'], evidence=[dict(episode_id=episode['id'], quote=text)])['id']
+            for index, name in enumerate(('Orion', 'orion', 'Orion warehouse'))]
+        cluster = graph._merge_inventory()['clusters'][0]['cluster']
+        async def request():
+            server, path, connections = await admin.serve_admin(graph, tmp_path, SimpleNamespace(cold=None))
+            try:
+                return await asyncio.to_thread(admin._request, tmp_path, dict(operation='merge_preview',
+                    cluster=cluster, into=None, exclude=[], include=[ids[2]]))
+            finally:
+                server.close()
+                await server.wait_closed()
+                if connections:
+                    await asyncio.gather(*tuple(connections))
+                path.unlink(missing_ok=True)
+        result = asyncio.run(request())['result']
+        assert result['included'] == [ids[2]]
+        assert result == graph._merge_preview(cluster, include=[ids[2]])
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize('complete', [True, False])
 def test_compact_cli_requires_owner_socket_but_no_decision_tty(tmp_path, monkeypatch, capsys, complete):
     requests = []

@@ -2,7 +2,7 @@
 
 import time
 
-from .extraction import ACTIVE_CANDIDATE_SQL
+from .extraction import ACTIVE_CANDIDATE_SQL, AWAITING_DECISION_SQL
 from .captured_media import status as captured_media_status
 
 
@@ -106,7 +106,7 @@ def operational_status(state, source=None):
         pending = db.execute(f'''SELECT count(*) AS pending_candidates,
             coalesce(sum(NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id
                 AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id)
-                AND (d.decision='review' OR d.next_review_at>?))),0) AS ready_candidates
+                AND {AWAITING_DECISION_SQL})),0) AS ready_candidates
             FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}
             AND (? IS NULL OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
                 WHERE g.target=c.id AND e.source=?))''', (time.time(), source, source)).fetchone()

@@ -138,7 +138,8 @@ def test_legacy_raw_fts_migration_is_transactional_and_restarts_without_redeleti
         assert [item['id'] for item in store.search('opaqueuniquebinarytoken')] == [raw['id']]
         db.execute('BEGIN IMMEDIATE')
         upgrade_episode_fts(db)
-        assert store.search('opaqueuniquebinarytoken') == []
+        # The uncommitted upgrade is visible only on the writer connection itself.
+        assert store.search('opaqueuniquebinarytoken', db=db) == []
         db.execute('ROLLBACK')
         assert [item['id'] for item in store.search('opaqueuniquebinarytoken')] == [raw['id']]
     finally:
@@ -149,7 +150,7 @@ def test_legacy_raw_fts_migration_is_transactional_and_restarts_without_redeleti
             assert reopened.get(raw['id'])['text'] == 'opaqueuniquebinarytoken'
             assert reopened.search('opaqueuniquebinarytoken') == []
             assert [item['id'] for item in reopened.search('projection sentence')] == [text['id']]
-            assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 1
+            assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 2
         finally:
             reopened.close()
 

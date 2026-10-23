@@ -6,10 +6,14 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 
-def current(graph, id):
+def current(graph, id, db=None):
+    sql = '''SELECT target AS id,state,due_at,deferred_until
+        FROM loop_events WHERE target=? ORDER BY rowid DESC LIMIT 1'''
+    if db is not None:
+        row = db.execute(sql, (id,)).fetchone()
+        return dict(row) if row is not None else None
     with graph.store._mutex:
-        row = graph.store._db.execute('''SELECT target AS id,state,due_at,deferred_until
-            FROM loop_events WHERE target=? ORDER BY rowid DESC LIMIT 1''', (id,)).fetchone()
+        row = graph.store._db.execute(sql, (id,)).fetchone()
         return dict(row) if row is not None else None
 
 

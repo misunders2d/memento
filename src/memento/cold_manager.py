@@ -14,6 +14,7 @@ from uuid import uuid4
 import sqlite_vec
 
 from .cold import _hashes
+from .schema import check_version
 
 _PROTECTION = '''SELECT 1 FROM node_versions n
     LEFT JOIN node_stats s ON s.node_id=n.id
@@ -361,6 +362,8 @@ class ColdManager:
         (destination / 'memory.sqlite').chmod(0o600)
         restored = sqlite3.connect(destination / 'memory.sqlite')
         try:
+            # Refuse an unknown header before any artifact download or startup upgrade.
+            check_version(restored)
             artifacts = restored.execute("SELECT sha256,remote_id FROM blobs WHERE tier='hot'").fetchall()
             has_gaps = restored.execute("SELECT 1 FROM sqlite_schema WHERE name='backup_gaps'").fetchone()
             gaps = dict(restored.execute('SELECT sha256,error FROM backup_gaps WHERE backup_id=?',

@@ -11,9 +11,9 @@ HALF_LIFE_DAYS = 90
 _EVIDENCE_TIME = object()
 
 
-def query_recency(store, record, *, authority=None, now=None, source_occurred_at=_EVIDENCE_TIME):
+def query_recency(store, record, *, authority=None, now=None, source_occurred_at=_EVIDENCE_TIME, db=None):
     """Rank bounded recall results from original evidence, without hydrating text."""
-    db = store._db
+    db = store._db if db is None else db
     if source_occurred_at is not _EVIDENCE_TIME:
         row = db.execute('''SELECT ? AS occurred_at,
             (SELECT last_cited_at FROM node_stats WHERE node_id=?) AS last_cited_at''',

@@ -363,8 +363,8 @@ class Retrieval:
                    (cursor.lastrowid, vector.tobytes()))
         return 1
 
-    def _candidate_record(self, target):
-        row = self.store._db.execute(f'''SELECT c.id,c.type,substr(c.text,1,240) AS text,
+    def _candidate_record(self, target, db=None):
+        row = (self.store._db if db is None else db).execute(f'''SELECT c.id,c.type,substr(c.text,1,240) AS text,
             c.kind AS candidate_kind,c.src,c.dst,c.confidence,c.valid_from,c.valid_to,c.scope,
             coalesce((SELECT importance FROM node_stats WHERE node_id=c.id),0.5) AS importance,
             coalesce((SELECT decay FROM node_stats WHERE node_id=c.id),1) AS decay,
@@ -375,12 +375,13 @@ class Retrieval:
         return dict(row, scope=json.loads(row['scope']), version=1, tier='candidate',
                     state='candidate', confirmed=False, pinned=0) if row else None
 
-    def _episode_record(self, episode_id, start=0, end=None, chunk_id=None):
-        episode = self.store.get(episode_id)
+    def _episode_record(self, episode_id, start=0, end=None, chunk_id=None, db=None):
+        episode = self.store.get(episode_id, db=db)
         if episode is None:
             return None
-        if self.store._db.execute('SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1',
-                                  (episode['source'], episode['event_id'])).fetchone():
+        if (self.store._db if db is None else db).execute(
+                'SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1',
+                (episode['source'], episode['event_id'])).fetchone():
             return None
         end = len(episode['text']) if end is None else end
         quote = episode['text'][start:end][:240]
@@ -391,12 +392,13 @@ class Retrieval:
             source_url='/episodes/' + episode_id, change_count=1,
             last_change=dict(recorded_at=episode['captured_at'], actor=episode['source'], why='Immutable captured evidence'))
 
-    def related(self, node_id, hops, *, scope=None, include_archived=False):
+    def related(self, node_id, hops, *, scope=None, include_archived=False, db=None):
         # Retain the caller option; age-archived rows remain eligible.
         if hops not in (1, 2):
             raise ValueError('Related traversal is limited to one or two hops')
-        with self.store._mutex:
-            rows = self.store._db.execute(f'''WITH RECURSIVE
+
+        def run(db):
+            rows = db.execute(f'''WITH RECURSIVE
                 current_nodes AS (
                     SELECT n.* FROM node_versions n WHERE n.state='active'
                     AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)
@@ -426,19 +428,24 @@ class Retrieval:
                 FROM reached WHERE choice=1 ORDER BY hops,importance DESC,id LIMIT 16''',
                 (scope, scope, node_id, hops, node_id)).fetchall()
             from .loops import current
-            return [dict(row, scope=json.loads(row['scope']), loop=current(self.graph, row['id'])) for row in rows]
+            return [dict(row, scope=json.loads(row['scope']), loop=current(self.graph, row['id'], db=db)) for row in rows]
 
-    def _media_sources(self, record):
+        if db is not None:
+            return run(db)
+        with self.store._mutex:
+            return run(self.store._db)
+
+    def _media_sources(self, record, db=None):
         """Captured files are references, with current occurrence provenance."""
         if record['type'] != 'media':
             return True
-        active = active_references(self.store._db, record['id'])
+        active = active_references(self.store._db if db is None else db, record['id'])
         if active is None:
             return True  # An explicit save retains its own evidence and scope.
         references = active['references']
         if not references:
             return False
-        record.update(self.graph._recall_details(record['id'], record['version']))
+        record.update(self.graph._recall_details(record['id'], record['version'], db=db))
         first = active['origin']
         record.update(category='media_reference', tier='reference', confirmed=False,
             references=references,
@@ -449,19 +456,19 @@ class Retrieval:
             _source_occurred_at=active['occurred_at'])
         return True
 
-    def _recency(self, record, now, *, authority=None):
+    def _recency(self, record, now, *, authority=None, db=None):
         source = ({'source_occurred_at': record.pop('_source_occurred_at')}
                   if '_source_occurred_at' in record else {})
-        return query_recency(self.store, record, authority=authority, now=now, **source)
+        return query_recency(self.store, record, authority=authority, now=now, db=db, **source)
 
-    def _media_pointer(self, record):
+    def _media_pointer(self, record, db=None):
         # The model matched a file, not an inferred assertion about its contents.
         # JSON quoting keeps a captured filename from adding new context lines.
         text = (record['media_kind'].capitalize() + ' attachment ' + json.dumps(record['filename'], ensure_ascii=False)
                 + '; original ' + record['blob_url'] + '.')
         source = record.get('source')
         if not source:
-            row = self.store._db.execute('''SELECT e.source FROM graph_evidence g
+            row = (self.store._db if db is None else db).execute('''SELECT e.source FROM graph_evidence g
                 JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?
                 AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)
                 ORDER BY julianday(e.occurred_at) DESC,e.id LIMIT 1''', (record['id'], record['version'])).fetchone()
@@ -470,10 +477,10 @@ class Retrieval:
             text += ' From ' + json.dumps(source, ensure_ascii=False) + '.'
         record.update(text=text, category='media_reference')
 
-    def _automatic_record(self, row):
-        db = self.store._db
+    def _automatic_record(self, row, db=None):
+        db = self.store._db if db is None else db
         if row['kind'] == 'candidate':
-            return self._candidate_record(row['target'])
+            return self._candidate_record(row['target'], db=db)
         if row['kind'] == 'node':
             record = db.execute(f'''SELECT {NODE_SUMMARY} FROM node_versions n
                 WHERE n.id=? AND n.version=? AND n.state='active' ''',
@@ -491,11 +498,11 @@ class Retrieval:
             (row['target'],)).fetchone()
         return dict(record) if record else None
 
-    def _legacy_context_only(self, target, version):
+    def _legacy_context_only(self, target, version, db=None):
         # Indexed target/version lookup, independent of the five display spans.
         # Ordinary episode text is read directly; never hydrate cold/raw data.
         context_only = False
-        for episode in self.store._db.execute('''SELECT e.source,e.kind,e.metadata,
+        for episode in (self.store._db if db is None else db).execute('''SELECT e.source,e.kind,e.metadata,
             CASE WHEN e.kind='developer' AND e.source GLOB 'native:*:codex' THEN ''
                  WHEN e.kind='user' AND e.source GLOB 'native:*:codex'
                  AND (substr(e.text,1,?)=? OR substr(e.text,1,?)=?)
@@ -514,8 +521,9 @@ class Retrieval:
         with self._query_inference:
             vector = embed_query(self.model, _automatic_query(query, context))
         ranked_at = datetime.now(timezone.utc)
-        with self.store._mutex:
-            db = self.store._db
+        # One WAL snapshot serves every read of this request; the writer
+        # connection and its mutex stay free for capture, health and commits.
+        with self.store.read_snapshot() as db:
             rows = []
             for kind in ('node', 'candidate', 'segment'):
                 rows.extend(db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
@@ -531,7 +539,7 @@ class Retrieval:
             for row in sorted(rows, key=lambda item: (-item['cosine'], item['target'])):
                 if row['cosine'] < min(AUTOMATIC_COSINE_FLOOR, MEDIA_COSINE_FLOORS['audio']):
                     continue
-                record = self._automatic_record(row)
+                record = self._automatic_record(row, db=db)
                 if record is None or record['id'] in matches:
                     continue
                 media = record['type'] == 'media'
@@ -542,26 +550,26 @@ class Retrieval:
                     continue
                 identity = (record['id'], record['version'])
                 if identity not in context_only:
-                    context_only[identity] = self._legacy_context_only(*identity)
+                    context_only[identity] = self._legacy_context_only(*identity, db=db)
                 if context_only[identity]:
                     continue
                 if record.get('tier') == 'candidate':
-                    record.update(self._candidate_details(record['id']))
+                    record.update(self._candidate_details(record['id'], db=db))
                 else:
                     record.update(tier='durable', confirmed=True)
-                    record.update(self.graph._recall_details(record['id'], record['version']))
+                    record.update(self.graph._recall_details(record['id'], record['version'], db=db))
                     # Incidents remain explicitly searchable. Only consolidated
                     # reusable behavior enters automatic context as experience.
                     if record['type'] == 'experience' and not record.get('behavior'):
                         continue
-                if not self._media_sources(record):
+                if not self._media_sources(record, db=db):
                     continue
                 if media:
-                    self._media_pointer(record)
+                    self._media_pointer(record, db=db)
                 if isinstance(record.get('scope'), str):
                     record['scope'] = json.loads(record['scope'])
                 record.setdefault('category', 'memory')
-                record.update(self._recency(record, ranked_at, authority=record.get('authority')))
+                record.update(self._recency(record, ranked_at, authority=record.get('authority'), db=db))
                 if record.get('tier') == 'candidate':
                     full = db.execute('SELECT text FROM candidates WHERE id=?', (record['id'],)).fetchone()
                 else:
@@ -620,15 +628,17 @@ class Retrieval:
             raise ValueError('Invalid automatic recall context')
         if automatic:
             return self._automatic(query, limit, scope, context)
-        keywords = self.graph.recall_keywords(query, min(100, limit * 4),
-                                             scope=scope, include_archived=effort == 'deep')
-        matches = {row['id']: dict(row, score=TEXT_COSINE_FLOOR + 0.25, match='keyword') for row in keywords}
-        with self._query_inference:
-            query_vector = embed_query(self.model, query)
-        ranked_at = datetime.now(timezone.utc)
-        with self.store._mutex:
+        # One WAL snapshot serves every read of this request; the writer
+        # connection and its mutex stay free for capture, health and commits.
+        with self.store.read_snapshot() as db:
+            keywords = self.graph.recall_keywords(query, min(100, limit * 4),
+                                                 scope=scope, include_archived=effort == 'deep', db=db)
+            matches = {row['id']: dict(row, score=TEXT_COSINE_FLOOR + 0.25, match='keyword') for row in keywords}
+            with self._query_inference:
+                query_vector = embed_query(self.model, query)
+            ranked_at = datetime.now(timezone.utc)
             match = ' '.join('"' + term.replace('"', '""') + '"' for term in query.split())
-            segment_keywords = self.store._db.execute(f'''SELECT {NODE_SUMMARY},
+            segment_keywords = db.execute(f'''SELECT {NODE_SUMMARY},
                 s.id AS segment_id,s.modality,s.start_s,s.end_s,s.page,
                 s.char_start,s.char_end,'/blobs/'||s.source_sha256 AS source_text_url,
                 substr(s.text,1,240) AS match_text,'/blobs/'||f.sha256 AS blob_url,
@@ -647,26 +657,26 @@ class Retrieval:
                     continue
                 seen_segments.add(record['id'])
                 matches[record['id']] = dict(record, score=TEXT_COSINE_FLOOR + 0.25, match='keyword')
-            candidate_keywords = self.store._db.execute(f'''SELECT c.id FROM candidate_fts
+            candidate_keywords = db.execute(f'''SELECT c.id FROM candidate_fts
                 JOIN candidates c ON c.id=candidate_fts.id WHERE candidate_fts MATCH ?
                 AND {ACTIVE_CANDIDATE_SQL}
                 AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?))
                 ORDER BY bm25(candidate_fts),c.id LIMIT ?''',
                 (match, scope, scope, min(100, limit * 4))).fetchall()
             for candidate in candidate_keywords:
-                record = self._candidate_record(candidate['id'])
+                record = self._candidate_record(candidate['id'], db=db)
                 if record is not None:
                     matches[record['id']] = dict(record, score=TEXT_COSINE_FLOOR + 0.25, match='keyword')
             if effort == 'deep' and scope is None:
-                for episode in self.store.search(query, min(100, limit * 4)):
-                    record = self._episode_record(episode['id'])
+                for episode in self.store.search(query, min(100, limit * 4), db=db):
+                    record = self._episode_record(episode['id'], db=db)
                     if record is not None:
                         matches[record['id']] = dict(record, text=episode['excerpt'][:240],
                             score=TEXT_COSINE_FLOOR + 0.25, match='keyword')
             rows = []
             kinds = ('node', 'segment', 'candidate', 'episode') if effort == 'deep' and scope is None else ('node', 'segment', 'candidate')
             for kind in kinds:
-                rows.extend(self.store._db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
+                rows.extend(db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
                     FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
                     WHERE v.embedding MATCH ? AND k=? AND v.current=1
                     AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({_RECALL_ELIGIBLE}) a
@@ -678,12 +688,12 @@ class Retrieval:
             seen_raw = set()
             for row in rows:
                 if row['kind'] == 'node':
-                    record = self.store._db.execute(f'''SELECT {NODE_SUMMARY}
+                    record = db.execute(f'''SELECT {NODE_SUMMARY}
                         FROM node_versions n WHERE n.id=? AND n.version=? AND n.state='active' ''',
                         (row['target'], row['version'])).fetchone()
                     floor = TEXT_COSINE_FLOOR
                 elif row['kind'] == 'segment':
-                    record = self.store._db.execute(f'''SELECT {NODE_SUMMARY},s.id AS segment_id,
+                    record = db.execute(f'''SELECT {NODE_SUMMARY},s.id AS segment_id,
                         s.modality,s.start_s,s.end_s,s.page,substr(s.text,1,240) AS match_text,
                         s.char_start,s.char_end,'/blobs/'||s.source_sha256 AS source_text_url,
                         '/blobs/'||f.sha256 AS blob_url,
@@ -697,14 +707,15 @@ class Retrieval:
                     floor = MEDIA_COSINE_FLOORS.get(
                         record['modality'] if record else '', 1.0)
                 elif row['kind'] == 'candidate':
-                    record = self._candidate_record(row['target'])
+                    record = self._candidate_record(row['target'], db=db)
                     floor = TEXT_COSINE_FLOOR
                 elif row['kind'] == 'episode':
-                    passage = self.store._db.execute('SELECT * FROM episode_chunks WHERE id=?', (row['target'],)).fetchone()
+                    passage = db.execute('SELECT * FROM episode_chunks WHERE id=?', (row['target'],)).fetchone()
                     if passage is None or passage['episode_id'] in seen_raw:
                         continue
                     seen_raw.add(passage['episode_id'])
-                    record = self._episode_record(passage['episode_id'], passage['start'], passage['end'], passage['id'])
+                    record = self._episode_record(passage['episode_id'], passage['start'], passage['end'],
+                                                  passage['id'], db=db)
                     floor = TEXT_COSINE_FLOOR
                 else:
                     continue
@@ -719,12 +730,12 @@ class Retrieval:
                 previous = matches.get(item['id'])
                 if previous is None or 'cosine' not in previous or item['score'] > previous['score']:
                     matches[item['id']] = item
-            matches = {target: record for target, record in matches.items() if self._media_sources(record)}
+            matches = {target: record for target, record in matches.items() if self._media_sources(record, db=db)}
             feedback = {}
             if matches:
                 marks = ','.join('?' for _ in matches)
                 feedback = {row['target']: max(-1, min(1, (2 * row['cited'] - row['shown']) / max(1, row['shown'])))
-                    for row in self.store._db.execute(
+                    for row in db.execute(
                     f'SELECT target,shown,cited FROM query_feedback WHERE query_key=? AND target IN ({marks})',
                     (query_key(query), *matches))}
             for item in matches.values():
@@ -732,29 +743,27 @@ class Retrieval:
                     item['scope'] = json.loads(item['scope'])
                 item.setdefault('importance', .5)
                 item.setdefault('archived', 0)
-                behavior = self.graph._behavior(item['id']) if item['type'] == 'experience' else None
+                behavior = self.graph._behavior(item['id'], db=db) if item['type'] == 'experience' else None
                 item.update(self._recency(item, ranked_at,
-                    authority=behavior.get('authority') if behavior else None))
+                    authority=behavior.get('authority') if behavior else None, db=db))
                 item['score'] *= item['importance'] * item['decay'] * (1 + .1 * feedback.get(item['id'], 0))
-        results = sorted(matches.values(), key=lambda item: (-item['score'], item['id']))[:limit]
-        for item in results:
-            with self.store._mutex:
+            results = sorted(matches.values(), key=lambda item: (-item['score'], item['id']))[:limit]
+            for item in results:
                 if item.get('tier') == 'candidate':
-                    item.update(self._candidate_details(item['id']))
+                    item.update(self._candidate_details(item['id'], db=db))
                 elif item.get('tier') not in ('raw', 'reference'):
                     item['tier'], item['confirmed'] = 'durable', True
-                    item.update(self.graph._recall_details(item['id'], item['version']))
+                    item.update(self.graph._recall_details(item['id'], item['version'], db=db))
                 if item['type'] == 'media' and 'blob_url' not in item:
-                    file = self.store._db.execute('SELECT sha256 FROM media_files WHERE node_id=?',
-                                                  (item['id'],)).fetchone()
+                    file = db.execute('SELECT sha256 FROM media_files WHERE node_id=?', (item['id'],)).fetchone()
                     if file:
                         item['blob_url'] = '/blobs/' + file['sha256']
-            item['related'] = self.related(item['id'], 2 if effort == 'deep' else 1,
-                scope=scope, include_archived=effort == 'deep') if effort != 'cheap' and item['tier'] == 'durable' else []
+                item['related'] = self.related(item['id'], 2 if effort == 'deep' else 1, scope=scope,
+                    include_archived=effort == 'deep', db=db) if effort != 'cheap' and item['tier'] == 'durable' else []
         return results
 
-    def _candidate_details(self, target):
-        db = self.store._db
+    def _candidate_details(self, target, db=None):
+        db = self.store._db if db is None else db
         evidence = [dict(row) for row in db.execute('''SELECT episode_id,start,end,substr(quote,1,240) AS quote_excerpt
             FROM graph_evidence WHERE target=? AND version=1 ORDER BY episode_id,start LIMIT 5''', (target,))]
         run = db.execute('''SELECT g.recorded_at,g.actor,substr(g.why,1,240) AS why
@@ -767,7 +776,7 @@ class Retrieval:
                 SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) LIMIT 5''', (target,))]
         from .loops import current
         return dict(evidence=evidence, change_count=1, last_change=dict(run), entity_matches=matches,
-                    loop=current(self.graph, target))
+                    loop=current(self.graph, target, db=db))
 
     def start(self):
         if self._worker is not None:

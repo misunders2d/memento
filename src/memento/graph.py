@@ -13,6 +13,10 @@ NODE_TYPES = frozenset(('experience', 'knowledge', 'decision', 'media', 'person'
 ENTITY_TYPES = frozenset(('person', 'organization', 'project', 'concept', 'place', 'tool'))
 RELATIONS = frozenset(('belongs_to', 'follows_up_on', 'works_in', 'decided_by',
                       'supersedes', 'mentions', 'part_of', 'caused_by', 'owned_by', 'related_to'))
+# Over review_proposals p: a create-person review made only because built-in
+# person memories were once always human-gated. No current gate requires it.
+LEGACY_PERSON_REVIEW_SQL = '''(json_extract(p.command,'$.op')='remember'
+    AND json_extract(p.command,'$.type')='person' AND json_type(p.command,'$.identity') IS NULL)'''
 
 
 def behavior_ground_truth(episode, start=None, end=None):
@@ -68,6 +72,15 @@ def behavior_ground_truth(episode, start=None, end=None):
     return True
 
 
+def identity_text(text):
+    """Conservative identity spelling: case and whitespace only, never punctuation or type words.
+
+    str.lower keeps equal spellings inside the FTS tokenizer's own case folding,
+    so an FTS phrase lookup remains a superset of exact identity matches.
+    """
+    return ' '.join(text.lower().split())
+
+
 NODE_SUMMARY = ('n.id,n.version,n.type,substr(n.text,1,240) AS text,n.state,'
                 'n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,'
                 '(SELECT c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id '
@@ -107,14 +120,46 @@ class Graph:
             raise ValueError(f'Unknown node: {node_id}')
         return dict(row)
 
-    def _behavior(self, node_id):
+    def _exact_identities(self, type, text):
+        """Every active same-type node, or merged alias, spelled identically up to case/whitespace.
+
+        FTS only narrows the rows and has no rank LIMIT, so an exact identity cannot
+        disappear behind partial matches; stored text equality decides membership.
+        """
+        from .curation import canonical
+        key = identity_text(text)
+        db = self.store._db
+        latest = "n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)"
+        if re.search(r'[^\W_]', key):
+            phrase = '"' + key.replace('"', '""') + '"'
+            rows = db.execute(f'''SELECT n.id,n.version,n.text,n.commit_id FROM node_fts
+                JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version
+                WHERE node_fts MATCH ? AND n.type=? AND {latest}''', (phrase, type)).fetchall()
+            aliases = db.execute('SELECT id,text FROM alias_fts WHERE alias_fts MATCH ?', (phrase,)).fetchall()
+        else:
+            # No tokens for FTS to narrow: compare every active node of this type.
+            rows = db.execute(f'''SELECT n.id,n.version,n.text,n.commit_id FROM node_versions n
+                WHERE n.type=? AND {latest}''', (type,)).fetchall()
+            aliases = db.execute('SELECT id,text FROM alias_fts').fetchall()
+        matches = {row['id']: dict(id=row['id'], version=row['version'], commit_id=row['commit_id'])
+                   for row in rows if identity_text(row['text']) == key}
+        for alias in aliases:
+            if identity_text(alias['text']) != key:
+                continue
+            node = canonical(self, alias['id'])
+            if node['type'] == type and node['state'] == 'active':
+                matches.setdefault(node['id'], dict(id=node['id'], version=node['version'], commit_id=node['commit_id']))
+        return sorted(matches.values(), key=lambda item: item['id'])
+
+    def _behavior(self, node_id, db=None):
         """Read immutable creation metadata, independent of later citation/attach versions.
 
         One primary-key node lookup and one commit are sufficient. The existing
         consolidation result maps actions to newly created/replacement identities;
         evidence and ordinary assertion history remain in their original tables.
         """
-        row = self.store._db.execute('''SELECT g.request,g.result FROM node_versions n
+        db = self.store._db if db is None else db
+        row = db.execute('''SELECT g.request,g.result FROM node_versions n
             JOIN graph_commits g ON g.id=n.commit_id WHERE n.id=? AND n.version=1''',
             (node_id,)).fetchone()
         return None if row is None else commit_behaviors(row['request'], row['result']).get(node_id)
@@ -256,8 +301,6 @@ class Graph:
             'SELECT 1 FROM memory_types WHERE name=?', (name,)).fetchone() is not None
 
     def _sensitive_type(self, name):
-        if name == 'person':
-            return True
         row = self.store._db.execute('SELECT sensitive FROM memory_types WHERE name=?', (name,)).fetchone()
         return bool(row and row['sensitive'])
 
@@ -448,11 +491,18 @@ class Graph:
 
     def pending_reviews(self):
         with self.store._mutex:
-            return [dict(row) for row in self.store._db.execute('''
-                SELECT p.*,c.actor,c.why,c.recorded_at FROM review_proposals p
-                JOIN graph_commits c ON c.id=p.commit_id
+            rows = [dict(row) for row in self.store._db.execute(f'''
+                SELECT p.*,c.actor,c.why,c.recorded_at,({LEGACY_PERSON_REVIEW_SQL} AND EXISTS (
+                    SELECT 1 FROM candidate_decisions d WHERE d.decision='review' AND d.target_id=p.id)) AS legacy
+                FROM review_proposals p JOIN graph_commits c ON c.id=p.commit_id
                 WHERE NOT EXISTS (SELECT 1 FROM review_decisions d WHERE d.proposal_id=p.id)
                 ORDER BY c.recorded_at,p.id''')]
+            for row in rows:
+                # Stale proposals cannot be approved; a merge already requeued their candidates,
+                # and a legacy person review's candidate is consolidated again.
+                row['stale'] = bool(row.pop('legacy')) or any(self._node(node)['version'] != version
+                                   for node, version in json.loads(row['base_versions']).items())
+            return rows
 
     def _decide_review(self, *, command_id, actor, why, proposal_id, decision):
         """Called only by the private, OS-permission-gated admin transport."""
@@ -466,7 +516,14 @@ class Graph:
             if db.execute('SELECT 1 FROM review_decisions WHERE proposal_id=?', (proposal_id,)).fetchone():
                 raise ValueError('Proposal already decided')
             result = {'id': proposal_id, 'status': 'rejected'}
+            linked = db.execute("SELECT 1 FROM candidate_decisions WHERE decision='review' AND target_id=? LIMIT 1",
+                                (proposal_id,)).fetchone()
+            legacy = linked and db.execute(f'SELECT 1 FROM review_proposals p WHERE p.id=? AND {LEGACY_PERSON_REVIEW_SQL}',
+                                           (proposal_id,)).fetchone()
             if decision == 'approve':
+                if legacy:
+                    # Its candidate is consolidated again; approval could create a second identity.
+                    raise ConflictError('Legacy person proposal is stale; its candidate is consolidated again')
                 if db.execute('''SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
                     JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id
                     WHERE g.target=? LIMIT 1''', (proposal_id,)).fetchone():
@@ -483,7 +540,7 @@ class Graph:
                     result = self._apply_link(commit, request, approved=True)
                 elif request['op'] in ('pin', 'merge', 'register_type', 'attach'):
                     from .curation import apply_review
-                    result = apply_review(self, commit, request)
+                    result = apply_review(self, commit, request, proposal_id=proposal_id)
                 else:
                     raise ValueError('Unsupported proposal operation')
             db.execute('INSERT INTO review_decisions VALUES (?,?,?)', (proposal_id, commit, decision))
@@ -495,7 +552,8 @@ class Graph:
             if decision == 'reject':
                 target = None
             for candidate in candidates:
-                state = 'reject' if decision == 'reject' else ('promote' if target else 'defer')
+                # Rejecting a legacy person review closes only the proposal.
+                state = ('defer' if legacy else 'reject') if decision == 'reject' else ('promote' if target else 'defer')
                 db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)',
                     (uuid4().hex, candidate['candidate_id'], commit, state, target, None))
                 if state == 'promote' and target:
@@ -510,8 +568,11 @@ class Graph:
         return self._command(command_id, actor, why,
             dict(op='review', proposal_id=proposal_id, decision=decision), apply)
 
-    def recall_keywords(self, query, limit=20, *, scope=None, include_archived=True):
-        """Literal keyword lookup, filtering before either FTS result limit."""
+    def recall_keywords(self, query, limit=20, *, scope=None, include_archived=True, db=None):
+        """Literal keyword lookup, filtering before either FTS result limit.
+
+        db selects an open read snapshot; otherwise the writer is read under its mutex.
+        """
         from .captured_media import visible_sql
         # Keep include_archived compatible; age affects ranking, not eligibility.
         if not 1 <= limit <= 100 or '\x00' in query or scope not in (None, 'personal', 'professional'):
@@ -523,13 +584,13 @@ class Graph:
             AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)
             AND {visible_sql()}
             AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?))'''
-        with self.store._mutex:
-            matches = [dict(row) for row in self.store._db.execute(f'''
+        def run(db):
+            matches = [dict(row) for row in db.execute(f'''
                 SELECT {NODE_SUMMARY},bm25(node_fts) AS keyword_rank
                 FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version
                 WHERE node_fts MATCH ? AND {visible}
                 ORDER BY keyword_rank,n.id LIMIT ?''', (match, scope, scope, limit))]
-            aliases = self.store._db.execute(f'''WITH RECURSIVE canonical(source,target,depth) AS (
+            aliases = db.execute(f'''WITH RECURSIVE canonical(source,target,depth) AS (
                 SELECT source,target,0 FROM entity_merges
                 UNION ALL SELECT c.source,m.target,c.depth+1 FROM canonical c
                 JOIN entity_merges m ON m.source=c.target WHERE c.depth<64)
@@ -548,12 +609,17 @@ class Graph:
                 item['scope'] = json.loads(item['scope'])
             return sorted(matches, key=lambda item: (item['keyword_rank'], item['id']))[:limit]
 
+        if db is not None:
+            return run(db)
+        with self.store._mutex:
+            return run(self.store._db)
+
     def loop(self, **arguments):
         from .loops import command
         return command(self, **arguments)
 
-    def _recall_details(self, node_id, version):
-        db = self.store._db
+    def _recall_details(self, node_id, version, db=None):
+        db = self.store._db if db is None else db
         change = db.execute('''SELECT c.recorded_at,substr(c.actor,1,128) AS actor,
             substr(c.why,1,240) AS why,
             (SELECT count(*) FROM node_versions WHERE id=?) AS change_count
@@ -569,8 +635,8 @@ class Graph:
         result = dict(evidence=[dict(row) for row in sources],
                     change_count=change['change_count'],
                     last_change={key: change[key] for key in ('recorded_at', 'actor', 'why')},
-                    loop=current(self, node_id))
-        behavior = self._behavior(node_id)
+                    loop=current(self, node_id, db=db))
+        behavior = self._behavior(node_id, db=db)
         if behavior:
             result.update(behavior=behavior, authority=behavior['authority'], category='behavioral_suggestion')
         return result
@@ -584,3 +650,23 @@ class Graph:
         from .forgetting import apply
         return self._command(command_id, actor, why, dict(op='forget_active', target=target),
             lambda commit: apply(self, commit, target, token))
+
+    def _merge_inventory(self):
+        from .curation import inventory
+        with self.store._mutex:
+            return inventory(self)
+
+    def _merge_preview(self, cluster, into=None, exclude=(), include=()):
+        from .curation import merge_plan
+        with self.store._mutex:
+            return merge_plan(self, cluster, into=into, exclude=exclude, include=include)
+
+    def _merge(self, *, command_id, actor, why, cluster, into, exclude, token, include=()):
+        """Called only by the private admin transport after human confirmation."""
+        from .curation import apply_merge_plan
+        exclude, include = sorted(set(exclude)), sorted(set(include))
+        request = dict(op='merge_cluster', cluster=cluster, into=into, exclude=exclude, token=token)
+        if include:
+            request['include'] = include
+        return self._command(command_id, actor, why, request,
+            lambda commit: apply_merge_plan(self, commit, cluster, into, exclude, token, include))

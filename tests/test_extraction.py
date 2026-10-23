@@ -831,7 +831,7 @@ def test_legacy_consolidation_lease_reprepares_same_job_before_loop_changes(extr
     store._db.execute('UPDATE jobs SET lease_until=0 WHERE id=?', (task['id'],))
     fresh = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
     assert fresh['id'] == task['id'] and fresh['owner'] != task['owner']
-    assert fresh['input']['loop_policy_version'] == 'consolidate-v5'
+    assert fresh['input']['loop_policy_version'] == 'consolidate-v6'
     result = processing.complete(id=fresh['id'], owner=fresh['owner'], agent='fixture', output=dict(actions=[action]))
     assert current(graph, result['results'][action['candidate_id']]['id']) is None
 
@@ -1377,11 +1377,7 @@ def test_promotion_preserves_committed_citation_usage_and_feedback(tmp_path, nod
         result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=output)
         assert processing.consolidator.apply(job, context, output, agent='fixture') == result
         promoted = result['results'][candidate_id]
-        if kind == 'entity':
-            review = dict(command_id='approve-cited-person', actor='human-fixture',
-                why='Approve the explicit person evidence', proposal_id=promoted['id'], decision='approve')
-            promoted = graph._decide_review(**review)
-            assert graph._decide_review(**review) == promoted
+        assert promoted['decision'] == 'promote'
         target = promoted['id']
         processing.claim(**args, consolidate_now=True)
         hit = graph.recall_keywords('Alex')[0]

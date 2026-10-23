@@ -46,6 +46,16 @@ async def serve_admin(graph, data_dir: Path, services):
                     command_id=request['command_id'], actor=f'human:uid:{uid}',
                     why=request['why'], proposal_id=request['proposal_id'],
                     decision=request['operation'])
+            elif request['operation'] == 'inventory':
+                result = await asyncio.to_thread(graph._merge_inventory)
+            elif request['operation'] == 'merge_preview':
+                result = await asyncio.to_thread(graph._merge_preview, request['cluster'],
+                    request.get('into'), request.get('exclude', []), request.get('include', []))
+            elif request['operation'] == 'merge':
+                result = await asyncio.to_thread(graph._merge, command_id=request['command_id'],
+                    actor=f'human:uid:{uid}', why=request['why'], cluster=request['cluster'],
+                    into=request['into'], exclude=request['exclude'], token=request['token'],
+                    include=request.get('include', []))
             elif request['operation'] == 'forget_preview':
                 result = await asyncio.to_thread(graph._forget_preview, request['target'])
             elif request['operation'] == 'forget':
@@ -92,6 +102,15 @@ def main():
     parser.add_argument('--data-dir', type=Path, required=True)
     commands = parser.add_subparsers(dest='operation', required=True)
     commands.add_parser('list')
+    commands.add_parser('inventory', help='Read-only same-type entities spelled alike; suspicion, not identity')
+    merge = commands.add_parser('merge', help='Preview and confirm merging one inventory cluster')
+    merge.add_argument('cluster')
+    merge.add_argument('--into', default=None, help='Survivor member (default: first listed)')
+    merge.add_argument('--exclude', action='append', default=[], help='Member that stays a distinct identity')
+    merge.add_argument('--include', action='append', default=[],
+                       help='Active same-type spelling variant chosen to join this cluster')
+    merge.add_argument('--why', required=True)
+    merge.add_argument('--command-id', default=None)
     commands.add_parser('backup')
     commands.add_parser('compact', help='Reclaim free database pages; pauses service writes')
     export = commands.add_parser('export', help='Export database, Drive references and local-only payloads privately')
@@ -115,10 +134,21 @@ def main():
         if input(f'This plaintext archive contains private memory and Drive references; remote files stay on Drive. Type {expected!r} to confirm: ') != expected:
             parser.exit(1, 'Not confirmed; nothing changed.\n')
         request['output'] = str(output)
-    elif args.operation not in ('list', 'backup', 'compact'):
+    elif args.operation not in ('list', 'inventory', 'backup', 'compact'):
         if not sys.stdin.isatty():
             parser.error('Administrative decisions require an interactive human terminal')
-        if args.operation == 'forget':
+        if args.operation == 'merge':
+            preview = _request(args.data_dir, dict(operation='merge_preview', cluster=args.cluster,
+                                                   into=args.into, exclude=args.exclude, include=args.include))
+            if 'error' in preview:
+                parser.exit(1, preview['error'] + '\n')
+            plan = preview['result']
+            print(json.dumps(plan, ensure_ascii=False, indent=2))
+            expected = f"merge {len(plan['absorbed'])} into {plan['survivor']['id']}"
+            # Pin the previewed survivor so a changed default cannot alter the confirmed plan.
+            request.update(cluster=args.cluster, into=plan['survivor']['id'], exclude=args.exclude,
+                           include=args.include, token=plan['token'])
+        elif args.operation == 'forget':
             preview = _request(args.data_dir, dict(operation='forget_preview', target=args.target))
             if 'error' in preview:
                 parser.exit(1, preview['error'] + '\n')

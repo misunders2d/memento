@@ -17,6 +17,7 @@ import sqlite_vec
 
 from .blobs import BlobStore
 from .raw_text import runs, validate_frames
+from .schema import LEGACY_VERSION, VERSION as SCHEMA_VERSION, check_version
 from .drive_connect import public_binding, read_binding, check_binding, _publish
 
 _FORMAT = 'memento-portable'
@@ -57,8 +58,7 @@ def _connect(path, *, readonly=False):
 
 def _registered(db):
     """All registered payloads, including historical or currently unreferenced blobs."""
-    if db.execute('PRAGMA user_version').fetchone()[0] != 1:
-        raise ValueError('Unsupported portable database schema version')
+    check_version(db)
     if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
         raise ValueError('Portable database integrity check failed')
     result = {}
@@ -304,6 +304,8 @@ def import_archive(archive_path: Path, destination: Path):
                     raise ValueError('Truncated portable archive padding')
         db = _connect(stage / 'memory.sqlite')
         try:
+            # Refuse an unknown header before the staged copy is touched.
+            schema_version = check_version(db)
             # SQLite releases can round julianday() differently. Rebuild this
             # derived index only after archive hashes pass, in private staging.
             if db.execute("""SELECT 1 FROM sqlite_schema WHERE type='index'
@@ -333,6 +335,10 @@ def import_archive(archive_path: Path, destination: Path):
                 db.execute('DELETE FROM cold_transfers')
                 db.execute('DELETE FROM cold_failures')
                 db.execute('DELETE FROM backups')
+                # A legacy header restored by frame-aware code may already hold
+                # frames; mark it so a pre-frame image cannot serve it later.
+                if schema_version == LEGACY_VERSION:
+                    db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
             if db.execute('PRAGMA foreign_key_check').fetchone() is not None:
                 raise ValueError('Imported database foreign key check failed')
             if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
@@ -357,7 +363,8 @@ def import_archive(archive_path: Path, destination: Path):
                     included_blob_count=len(local), remote_reference_count=remote_count,
                     self_contained=not remote_count, drive=drive,
                     rebased=(['blobs.tier=hot', 'blobs.remote_id=NULL'] if version == 1 else ['blobs.tier']) +
-                            ['cold_transfers', 'cold_failures', 'backups'])
+                            ['cold_transfers', 'cold_failures', 'backups'] +
+                            (['user_version'] if schema_version == LEGACY_VERSION else []))
     finally:
         if stage.exists():
             shutil.rmtree(stage)

@@ -221,7 +221,7 @@ def test_offloaded_raw_cannot_enter_assertions_jobs_or_reviews(storage, operatio
                 sha256=sha256, kind='image', filename='original.png', scope=['personal'], evidence=evidence)
         else:
             graph.remember(command_id='refused', actor='fixture', why='Explicit save',
-                type='person' if operation == 'review' else 'knowledge', text=quote,
+                type='goal' if operation == 'review' else 'knowledge', text=quote,
                 scope=['personal'], evidence=evidence)
     for table in ('node_versions', 'jobs', 'review_proposals', 'graph_evidence', 'graph_commits'):
         assert store._db.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 0
@@ -523,7 +523,7 @@ def test_frame_status_cover_upgrade_is_atomic_and_preserves_physical_data(tmp_pa
     try:
         assert reopened.get(original['id']) == original
         assert [tuple(row) for row in reopened._db.execute('SELECT * FROM raw_frames ORDER BY id')] == frames
-        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 2
         assert not reopened._db.execute("SELECT 1 FROM sqlite_schema WHERE name='raw_frames_source'").fetchone()
         page = reopened._db.execute(
             "SELECT rootpage FROM sqlite_schema WHERE name='raw_frames_status_cover_v1'").fetchone()[0]

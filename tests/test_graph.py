@@ -123,28 +123,24 @@ def test_evidence_duplicates_are_collapsed(graph):
         dict(episode_id=episode, start=7, end=10, quote='old')]
 
 
-def test_person_proposal_is_not_an_assertion_until_human_review(graph):
+def test_person_memory_is_an_ordinary_evidence_backed_assertion(graph):
     g, episode = graph
-    proposal = g.remember(command_id='person', actor='agent', why='explicit mention',
+    person = g.remember(command_id='person', actor='agent', why='explicit mention',
         type='person', text='a person', scope=['personal'], evidence=[dict(episode_id=episode, quote='old')])
-    assert proposal['status'] == 'pending_review'
-    assert g.recall_keywords('person') == []
-    assert [row['id'] for row in g.pending_reviews()] == [proposal['id']]
-    approved = g._decide_review(command_id='approve', actor='human', why='checked evidence',
-        proposal_id=proposal['id'], decision='approve')
-    assert g.history(approved['id'])[0]['type'] == 'person'
-    assert g.history(approved['id'])[0]['actor'] == 'human'
+    assert g.history(person['id'])[0]['type'] == 'person'
+    assert [row['id'] for row in g.recall_keywords('person')] == [person['id']]
     assert g.pending_reviews() == []
 
 
 def test_stale_sensitive_proposal_cannot_overwrite_approved_correction(graph):
+    from memento.curation import propose
     g, episode = graph
-    p = g.remember(command_id='person', actor='agent', why='mention', type='person',
-        text='original person', scope=['personal'], evidence=[dict(episode_id=episode, quote='old')])
-    node = g._decide_review(command_id='approve', actor='human', why='checked',
-        proposal_id=p['id'], decision='approve')['id']
+    node = remember(graph, 'original', 'original belief', 'old')['id']
+    pin = dict(op='pin', node_id=node, pinned=True, evidence=[dict(episode_id=episode, quote='old')])
+    p = g._command('pin', 'agent', 'pin request', pin, lambda commit: propose(g, commit, pin))
+    g._decide_review(command_id='approve', actor='human', why='checked', proposal_id=p['id'], decision='approve')
     proposals = [g.supersede(command_id=f'correction-{i}', actor='agent', why='new evidence',
-        old=node, new=dict(type='person', text=f'corrected person {i}', scope=['personal']),
+        old=node, new=dict(type='knowledge', text=f'corrected belief {i}', scope=['personal']),
         evidence=[dict(episode_id=episode, quote='new')]) for i in range(2)]
     fixed = g._decide_review(command_id='fix', actor='human', why='checked',
         proposal_id=proposals[0]['id'], decision='approve')

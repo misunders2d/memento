@@ -104,6 +104,21 @@ def test_new_types_do_not_become_active_without_human_approval(curated):
     assert graph.history(event['id'])[-1]['state'] == 'active'
 
 
+def test_sensitive_custom_type_still_requires_review_for_memories_and_links(curated):
+    store, graph, evidence, remember, review, approve = curated
+    definition = review(dict(op='register_type', name='diagnosis', category='memory', sensitive=True), 'define')
+    approve(definition, 'define-yes')
+    pending = remember('diagnosis', 'diagnosis', 'Preserve this decision.')
+    assert pending['status'] == 'pending_review'
+    node = approve(pending, 'diagnosis-yes')
+    person = remember('person', 'person', 'Vega')
+    assert graph.history(person['id'])[-1]['state'] == 'active'
+    link = graph.link(command_id='link', actor='fixture', why='connect sensitive memory',
+                      a=node['id'], rel='related_to', b=person['id'], evidence=evidence)
+    assert link['status'] == 'pending_review'
+    assert store._db.execute('SELECT count(*) FROM edge_versions').fetchone()[0] == 0
+
+
 def test_pin_and_old_memories_remain_searchable_without_changing_evidence(curated):
     from datetime import datetime, timezone
     from memento.importance import refresh

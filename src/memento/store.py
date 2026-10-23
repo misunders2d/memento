@@ -19,8 +19,8 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from .schema import (initialize, upgrade_episode_fts, upgrade_raw_text, upgrade_status_index,
-                     upgrade_captured_media)
+from .schema import (SUPPORTED_VERSIONS, VERSION as SCHEMA_VERSION, initialize, upgrade_episode_fts,
+                     upgrade_raw_text, upgrade_status_index, upgrade_captured_media)
 from .blobs import BlobStore
 from .artifacts import Artifacts
 from .captured_media import references as media_references, record_references
@@ -99,24 +99,26 @@ class Store:
                 sqlite_vec.load(self._db)
             finally:
                 self._db.enable_load_extension(False)
+            # Read the header before the journal-mode change so an unknown
+            # future format is refused without touching the file.
+            version = self._db.execute('PRAGMA user_version').fetchone()[0]
+            if version != 0 and version not in SUPPORTED_VERSIONS:
+                raise RuntimeError(f'Unsupported database schema version: {version}')
             mode = self._db.execute('PRAGMA journal_mode=WAL').fetchone()[0]
             if mode != 'wal':
                 raise RuntimeError('Evidence storage requires SQLite WAL mode')
             self._db.execute('PRAGMA synchronous=FULL')
-            version = self._db.execute('PRAGMA user_version').fetchone()[0]
             if version == 0:
                 if self._db.execute("SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'").fetchone():
                     raise RuntimeError('Refusing to initialize an unversioned, nonempty database')
                 self._db.execute('BEGIN IMMEDIATE')
                 try:
                     initialize(self._db)
-                    self._db.execute('PRAGMA user_version=1')
+                    self._db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
                     self._db.execute('COMMIT')
                 except BaseException:
                     self._db.execute('ROLLBACK')
                     raise
-            elif version != 1:
-                raise RuntimeError(f'Unsupported database schema version: {version}')
             else:
                 self._db.execute('BEGIN IMMEDIATE')
                 try:
@@ -124,6 +126,10 @@ class Store:
                     upgrade_raw_text(self._db)
                     upgrade_status_index(self._db)
                     upgrade_captured_media(self._db)
+                    # The header marks frame-capable storage; it commits with the
+                    # physical upgrades so pre-frame readers refuse this file.
+                    if version != SCHEMA_VERSION:
+                        self._db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
                     self._db.execute('COMMIT')
                 except BaseException:
                     self._db.execute('ROLLBACK')
@@ -185,10 +191,9 @@ print(json.dumps(dict(complete=checkpoint[0]==0,before=before,after=sizes(),
     @contextmanager
     def read_snapshot(self):
         """Read one WAL snapshot without holding the capture mutex during queries."""
-        with self._mutex:
-            path = self._db.execute('PRAGMA database_list').fetchone()['file']
-        with closing(_connect(Path(path), readonly=True)) as db:
+        with closing(_connect(self._data_dir / 'memory.sqlite', readonly=True)) as db:
             db.row_factory = sqlite3.Row
+            db.create_function('legacy_native_context', 4, legacy_native_context, deterministic=True)
             db.execute('BEGIN')
             try:
                 yield db
@@ -271,33 +276,39 @@ print(json.dumps(dict(complete=checkpoint[0]==0,before=before,after=sizes(),
                     self._db.execute('ROLLBACK')
                 raise
 
-    def get(self, episode_id: str) -> dict | None:
-        with self._mutex:
-            row = self._db.execute(
-                'SELECT * FROM episodes WHERE id=?', (episode_id,),
-            ).fetchone()
-        return self.hydrate_episode(row)
+    def get(self, episode_id: str, db=None) -> dict | None:
+        """Read one episode; db selects an open read snapshot instead of the writer."""
+        if db is None:
+            with self._mutex:
+                row = self._db.execute('SELECT * FROM episodes WHERE id=?', (episode_id,)).fetchone()
+        else:
+            row = db.execute('SELECT * FROM episodes WHERE id=?', (episode_id,)).fetchone()
+        return self.hydrate_episode(row, db)
 
-    def hydrate_episode(self, row):
+    def hydrate_episode(self, row, db=None):
         episode = self._episode(row)
         if episode is not None:
-            episode['text'] = self.original_text(row)
+            episode['text'] = self.original_text(row, db)
         return episode
 
-    def _frame(self, identity):
-        with self._mutex:
-            row = self._db.execute('''SELECT source,conversation_id,raw_size,sha256,
-                CASE WHEN length(data)<=? THEN data END AS data FROM raw_frames WHERE id=?''',
-                (FRAME_BYTES + 1024, identity)).fetchone()
+    def _frame(self, identity, db=None):
+        sql = '''SELECT source,conversation_id,raw_size,sha256,
+            CASE WHEN length(data)<=? THEN data END AS data FROM raw_frames WHERE id=?'''
+        if db is None:
+            with self._mutex:
+                row = self._db.execute(sql, (FRAME_BYTES + 1024, identity)).fetchone()
+                frame = dict(row) if row is not None else None
+        else:
+            row = db.execute(sql, (FRAME_BYTES + 1024, identity)).fetchone()
             frame = dict(row) if row is not None else None
         if frame is not None:
             frame['decoded'] = decode_frame(frame.pop('data'), frame['raw_size'], frame['sha256'])
         return frame
 
-    def original_text(self, row):
+    def original_text(self, row, db=None):
         if row['raw_frame'] is not None:
             return hydrate_frames(row['raw_frame'], row['text_sha256'], row['source'],
-                                  row['conversation_id'], self._frame)
+                                  row['conversation_id'], lambda identity: self._frame(identity, db))
         if row['text_runs'] is not None:
             return hydrate(row['text'], row['text_runs'], row['text_sha256'], self.artifact_reader)
         return row['text']
@@ -400,7 +411,8 @@ print(json.dumps(dict(complete=checkpoint[0]==0,before=before,after=sizes(),
 
     def search(self, query: str | None = None, limit: int = 20,
                conversation_id: str | None = None, source: str | None = None,
-               since: str | None = None) -> list[dict]:
+               since: str | None = None, db=None) -> list[dict]:
+        """Literal raw search on a WAL read snapshot; the writer mutex is never held."""
         if not 1 <= limit <= 100:
             raise ValueError('Search limit must be between 1 and 100')
         if query is not None and (len(query) > 4096 or '\x00' in query):
@@ -415,39 +427,48 @@ print(json.dumps(dict(complete=checkpoint[0]==0,before=before,after=sizes(),
             since = instant.astimezone(timezone.utc).isoformat()
         # All user input is literal text, never FTS syntax (including AND/NEAR).
         terms = query.split() if query else []
-        params = []
+        filters, params = '', []
         columns = '''e.id, e.source, e.event_id, e.conversation_id, e.kind,
                      e.occurred_at, e.captured_at'''
+        if conversation_id is not None:
+            filters += ' AND e.conversation_id=?'
+            params.append(conversation_id)
+        if source is not None:
+            filters += ' AND e.source=?'
+            params.append(source)
+        if since is not None:
+            filters += ' AND julianday(coalesce(e.occurred_at,e.captured_at))>=julianday(?)'
+            params.append(since)
+        filters += ''' AND NOT EXISTS (SELECT 1 FROM forgotten_sources f
+            WHERE f.source=e.source AND f.event_id=e.event_id)'''
         if terms:
             # Implicit AND ignores token-less punctuation phrases, unlike explicit AND.
             match = ' '.join('"' + term.replace('"', '""') + '"' for term in terms)
+            # Rank every match from index data alone; snippets read each document
+            # body, so build them only for the rows that are actually returned.
             sql = f'''SELECT {columns},
                 substr(snippet(episodes_fts, 0, '', '', '…', 32), 1, 512) AS excerpt
                 FROM episodes_fts JOIN episodes e ON e.seq=episodes_fts.rowid
-                WHERE episodes_fts MATCH ?'''
-            params.append(match)
+                WHERE episodes_fts MATCH ? AND episodes_fts.rowid IN (
+                    SELECT episodes_fts.rowid FROM episodes_fts JOIN episodes e ON e.seq=episodes_fts.rowid
+                    WHERE episodes_fts MATCH ?{filters} ORDER BY bm25(episodes_fts), e.id LIMIT ?)
+                ORDER BY bm25(episodes_fts), e.id'''
+            params = [match, match, *params, limit]
         else:
             sql = f'''SELECT {columns},e.raw_frame,e.text_sha256, substr(e.text, 1, 512) AS excerpt
-                      FROM episodes e WHERE 1=1'''
-        if conversation_id is not None:
-            sql += ' AND e.conversation_id=?'
-            params.append(conversation_id)
-        if source is not None:
-            sql += ' AND e.source=?'
-            params.append(source)
-        if since is not None:
-            sql += ' AND julianday(coalesce(e.occurred_at,e.captured_at))>=julianday(?)'
-            params.append(since)
-        sql += ''' AND NOT EXISTS (SELECT 1 FROM forgotten_sources f
-            WHERE f.source=e.source AND f.event_id=e.event_id)'''
-        sql += (' ORDER BY bm25(episodes_fts), e.id' if terms else
-                ' ORDER BY julianday(coalesce(e.occurred_at,e.captured_at)) DESC, e.seq DESC')
-        sql += ' LIMIT ?'
-        params.append(limit)
-        with self._mutex:
-            result = [dict(row) for row in self._db.execute(sql, params).fetchall()]
-        for row in result:
-            if row.pop('raw_frame', None) is not None:
-                row['excerpt'] = self.get(row['id'])['text'][:512]
-            row.pop('text_sha256', None)
-        return result
+                      FROM episodes e WHERE 1=1{filters}
+                      ORDER BY julianday(coalesce(e.occurred_at,e.captured_at)) DESC, e.seq DESC LIMIT ?'''
+            params = [*params, limit]
+
+        def run(reader):
+            result = [dict(row) for row in reader.execute(sql, params).fetchall()]
+            for row in result:
+                if row.pop('raw_frame', None) is not None:
+                    row['excerpt'] = self.get(row['id'], db=reader)['text'][:512]
+                row.pop('text_sha256', None)
+            return result
+
+        if db is not None:
+            return run(db)
+        with self.read_snapshot() as reader:
+            return run(reader)

@@ -146,7 +146,7 @@ def run_process(argv, payload=b'', *, timeout=600, limit=MAX_OUTPUT, cwd=None, c
             process.stdin.close()
 
 
-def preset_flags(preset, directory):
+def preset_flags(preset, directory, schema=None):
     if preset == 'codex':
         # Native exec has no all-tools-off control. A read-only sandbox and
         # disabling shell_tool do not disable other builtins, MCP, or plugins.
@@ -163,8 +163,11 @@ def preset_flags(preset, directory):
                 '--no-extensions', '--no-skills', '--no-rules', '--no-title',
                 '--config', str(overlay), '--system-prompt', SYSTEM]
     if preset == 'claude':
-        return ['--print', '--output-format', 'json', '--tools', '', '--safe-mode',
-                '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+        # Native validation of a supplied task schema; evidence stays on stdin and
+        # the server still validates strictly.
+        native = [] if schema is None else ['--json-schema', encode(schema).decode('utf-8')]
+        return ['--print', '--output-format', 'json', *native,
+                '--tools', '', '--safe-mode', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
                 '--disable-slash-commands', '--no-chrome', '--no-session-persistence',
                 '--permission-prompts', 'none', '--system-prompt', SYSTEM]
     raise RunnerError('unsupported CLI preset')
@@ -186,6 +189,8 @@ def check_cli(command, preset):
                                 cwd=directory).decode('utf-8', errors='replace')
         flags = preset_flags(preset, directory)
     required = {arg for arg in flags if arg.startswith('--')}
+    if preset == 'claude':
+        required.add('--json-schema')  # consolidation output is natively validated
     if not all(flag in help_text for flag in required):
         raise RunnerError('native CLI lacks required safety flags; update the connected agent')
     return [str(Path(executable).absolute())]
@@ -638,8 +643,11 @@ def process_work(config, service, work, seconds, command):
                 if command is None or leases.is_lost(ident):
                     raise RunnerError('cli_failed')
                 payload = encode({key: item[key] for key in ('instruction', 'input', 'schema')})
+                # Claude's strict native validator rejects the extraction schema's
+                # discriminator keyword, so only consolidation is natively validated.
+                schema = item['schema'] if item['kind'] == 'consolidate' else None
                 with tempfile.TemporaryDirectory(prefix='memento-task-') as directory:
-                    raw = run_process(command + preset_flags(preset, directory), payload,
+                    raw = run_process(command + preset_flags(preset, directory, schema), payload,
                                       timeout=config['deadline_seconds'], cwd=directory,
                                       cancelled=lambda: leases.is_lost(ident))
                 output, model, usage = parse_result(raw, preset)

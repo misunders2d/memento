@@ -3,6 +3,23 @@
 import logging
 import time
 
+# Database header (PRAGMA user_version). Pre-frame readers accept only
+# LEGACY_VERSION and return empty text for frame-compressed records instead of
+# failing, so frame-aware code marks every database it opens with VERSION, which
+# those readers already refuse at startup, export, import and restore.
+LEGACY_VERSION = 1
+VERSION = 2
+SUPPORTED_VERSIONS = (LEGACY_VERSION, VERSION)
+
+
+def check_version(db):
+    """Reject an unknown header before any mutation; legacy headers stay readable."""
+    version = db.execute('PRAGMA user_version').fetchone()[0]
+    if version not in SUPPORTED_VERSIONS:
+        raise ValueError(f'Unsupported database schema version: {version}')
+    return version
+
+
 # TEXT removes the unused JSON subtype so SQLite 3.46 can substitute this
 # expression from the index; status only distinguishes the string 'skip'.
 _EPISODES_STATUS_INDEX = """CREATE INDEX IF NOT EXISTS episodes_status_cover_v1 ON episodes (

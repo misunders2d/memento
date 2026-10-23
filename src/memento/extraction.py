@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .graph import ENTITY_TYPES, RELATIONS
+from .graph import ENTITY_TYPES, LEGACY_PERSON_REVIEW_SQL, RELATIONS
 from .commands import Scope
 from .store import legacy_native_context
 
@@ -19,6 +19,18 @@ ACTIVE_CANDIDATE_SQL = '''NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.
         AND d.decision IN ('promote','reject'))
     AND NOT EXISTS (SELECT 1 FROM extraction_runs r JOIN episodes e ON e.id=r.episode_id
         JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE r.id=c.run_id)'''
+# The latest decision d still waits: a deferral not yet due, or a review awaiting
+# its human. An undecided automatic identity-context review whose colliding bases
+# changed can never be approved, so its candidate is derived again against current
+# memory; the proposal itself is neither approved nor rejected. The same holds for
+# an undecided legacy create-person review, which no current gate requires.
+AWAITING_DECISION_SQL = f'''(d.next_review_at>? OR (d.decision='review' AND NOT EXISTS (
+    SELECT 1 FROM review_proposals p WHERE p.id=d.target_id
+    AND NOT EXISTS (SELECT 1 FROM review_decisions r WHERE r.proposal_id=p.id)
+    AND ((json_extract(p.command,'$.identity.status')='exact_matches_not_supplied'
+        AND EXISTS (SELECT 1 FROM json_each(p.base_versions) j
+            WHERE j.value<>(SELECT max(n.version) FROM node_versions n WHERE n.id=j.key)))
+        OR {LEGACY_PERSON_REVIEW_SQL}))))'''
 
 
 def source_text_ranges(text):

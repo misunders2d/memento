@@ -303,6 +303,70 @@ def test_codex_cannot_substitute_readonly_sandbox_for_tools_disabled(tmp_path):
         runner.preset_flags('codex', tmp_path)
 
 
+def test_claude_natively_validates_consolidation_but_not_extraction(monkeypatch):
+    from pydantic import ValidationError
+    from memento.consolidation import Plan
+    from memento.extraction import BatchDrafts
+    schema = Plan.model_json_schema()
+    action = dict(candidate_id='c', operation='reject', type=None, text=None, scope=None, open_loop=None,
+                  target=None, src=None, dst=None, relation=None, change_kind=None, valid_at=None,
+                  valid_from=None, valid_to=None, category=None, sensitive=None, why='unsupported',
+                  evidence=[{'episode_id': 'e', 'quote': 'q', 'occurrence': 0, 'occurred_at': '2026-10-23T00:00:00Z'}])
+    # Observed native output copied a window field into evidence; the server still rejects it.
+    assert schema['$defs']['Source']['additionalProperties'] is False
+    with pytest.raises(ValidationError):
+        Plan.model_validate({'actions': [action]})
+    plan = {'actions': [{**action, 'evidence': []}]}
+    # Claude's strict validator rejects the extraction schema's discriminator keyword.
+    extract = {'id': 'extract', 'owner': 'lease', 'kind': 'extract', 'instruction': 'private',
+               'input': {'text': 'secret evidence'}, 'schema': BatchDrafts.model_json_schema()}
+    item = {'id': 'work', 'owner': 'lease', 'kind': 'consolidate', 'instruction': 'private',
+            'input': {'text': 'secret evidence'}, 'schema': schema}
+    observed, completed = [], []
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, path, value):
+            if path == '/work/complete':
+                completed.append(value)
+            return {'renewed': True, 'released': True}
+
+    def generate(argv, payload, **_kwargs):
+        observed.append((argv, runner.decode(payload)))
+        if '--json-schema' in argv:
+            return runner.encode({'subtype': 'success', 'is_error': False, 'result': '',
+                                  'structured_output': plan, 'modelUsage': {'claude-native': {}}})
+        return runner.encode({'subtype': 'success', 'is_error': False, 'result': '{"windows":[]}',
+                              'modelUsage': {'claude-native': {}}})
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'run_process', generate)
+    config = {'preset': 'claude', 'agent': 'claude', 'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2}
+    assert runner.process_work(config, Service(), [extract, item], 60, ['/native/claude']) == (0, ['/native/claude'])
+    (original, _), (argv, payload) = observed
+    assert '--json-schema' not in original
+    assert argv[argv.index('--json-schema') + 1] == runner.encode(schema).decode('utf-8')
+    for flags in (original, argv):
+        assert flags[flags.index('--tools') + 1] == '' and '--safe-mode' in flags and '--permission-prompts' in flags
+        assert 'secret evidence' not in ' '.join(flags)
+    assert payload['input'] == item['input']
+    assert [value['output'] for value in completed] == [{'windows': []}, plan]
+    assert completed[1]['model'] == 'claude-native'
+
+
+def test_claude_without_native_schema_validation_is_fatal(monkeypatch, tmp_path):
+    flags = [flag for flag in runner.preset_flags('claude', tmp_path) if flag.startswith('--')]
+    assert '--json-schema' not in flags
+    monkeypatch.setattr(runner.shutil, 'which', lambda _: '/native/claude')
+    monkeypatch.setattr(runner, 'run_process', lambda *a, **k: ' '.join(flags).encode())
+    with pytest.raises(runner.RunnerError):
+        runner.check_cli(['claude'], 'claude')
+    monkeypatch.setattr(runner, 'run_process', lambda *a, **k: ' '.join(flags + ['--json-schema']).encode())
+    assert runner.check_cli(['claude'], 'claude') == ['/native/claude']
+
+
 def test_subprocess_deadline_output_limit_and_no_stderr_disclosure():
     with pytest.raises(runner.RunnerError, match='^cli_failed$'):
         runner.run_process([sys.executable, '-c', 'import time; time.sleep(60)'], timeout=.1)

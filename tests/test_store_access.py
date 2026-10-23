@@ -51,7 +51,7 @@ def test_status_index_startup_upgrade_is_atomic_and_idempotent(tmp_path, monkeyp
         with pytest.raises(RuntimeError, match='Synthetic interruption'):
             Store(data)
     with sqlite3.connect(data / 'memory.sqlite') as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
         assert db.execute("SELECT 1 FROM sqlite_schema WHERE name='episodes_status_cover_v1'").fetchone() is None
         assert ('text_runs' in {row[1] for row in db.execute('PRAGMA table_info(episodes)')}) != old_physical_columns
     reopened = Store(data)
@@ -60,7 +60,7 @@ def test_status_index_startup_upgrade_is_atomic_and_idempotent(tmp_path, monkeyp
         schema_version = reopened._db.execute('PRAGMA schema_version').fetchone()[0]
         rootpage = reopened._db.execute(
             "SELECT rootpage FROM sqlite_schema WHERE name='episodes_status_cover_v1'").fetchone()[0]
-        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 2
     finally:
         reopened.close()
     caplog.clear()
