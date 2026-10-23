@@ -192,6 +192,8 @@ During a long import, a failed processing job can be retried after a 15-minute w
 
 Failed attempts write a JSON diagnostic to stderr, visible in `journalctl --user -u memento-runner.service`: job ID, work kind, error category and, when available, HTTP status with an allowlisted Memento rejection code or a safe failure cause. Diagnostics exclude memory text, model output, URLs and arbitrary server error messages.
 
+Requesting the next batch allows up to 60 seconds, because the server prepares the batch context before answering; renewals, completions, releases and foreground commands keep their 15-second bound. If that request fails, the run still exits with the generic `service_rejected` message, preceded by a `stage: claim` diagnostic with the same safe status or cause classification. The run does not retry the request; the next timer run claims again.
+
 ### Codex limitation
 
 Codex capture/import/recall/MCP client integration is available after **human `/hooks` trust and MCP permissions**. Setup never grants those permissions. Codex **server extraction is fail-closed**: the tested native CLI still exposed tool routing under its read-only/approval flags, so it did not meet tools-zero processing requirements. Use Pi, OMP or Claude Code as the processor; do not bypass a native refusal or claim Codex extraction acceptance.

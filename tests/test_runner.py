@@ -601,6 +601,123 @@ def test_drain_retries_same_failed_id_after_healthy_work_passes_retry_interval(m
     assert not active and not pending
 
 
+def test_only_claim_requests_get_the_longer_background_allowance(monkeypatch):
+    posts, created, lock = [], [], threading.Lock()
+    items = overlap_items()
+    claimed = []
+
+    class Service(runner.Service):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self.timeout)
+
+        def post(self, path, value):
+            with lock:
+                posts.append((self.timeout, path))
+            if path == '/work/claim':
+                work = [] if claimed else list(items)
+                claimed.extend(item['id'] for item in work)
+                return {'lease_seconds': 60, 'work': work}
+            return {'renewed': True, 'released': True}
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
+    monkeypatch.setattr(runner, 'run_process', lambda *a, **k: assistant_events())
+    assert runner.tick(OVERLAP_CONFIG) == 0
+    by_path = {}
+    for timeout, path in posts:
+        by_path.setdefault(path, set()).add(timeout)
+    assert runner.CLAIM_SECONDS == 60 and by_path['/work/claim'] == {60}
+    assert by_path['/work/complete'] == {15}
+    assert '/work/release' not in by_path
+    # Foreground, claim, heartbeat (min(15, 60 / (8 * 2 items))) and second-lane clients.
+    assert sorted(created) == [3.75, 15, 15, 60]
+
+
+@pytest.mark.parametrize('failure,status,body,diagnostic', [
+    ('timeout', None, b'', {'cause': 'timeout'}),
+    ('wrapped_timeout', None, b'', {'cause': 'timeout'}),
+    ('transport', None, b'', {'cause': 'transport_error'}),
+    ('invalid_response', None, b'secret invalid JSON', {'cause': 'invalid_response'}),
+    ('http', 422, runner.encode({'detail': 'timezone must be an installed IANA timezone name secret'}),
+     {'http_status': 422}),
+    ('http', 503, b'secret upstream page', {'http_status': 503}),
+    ('http', 422, runner.encode({'detail': 'candidate_quote_ambiguous'}),
+     {'http_status': 422, 'detail_code': 'candidate_quote_ambiguous'}),
+    ('broken_stderr', 503, b'', None),
+])
+def test_failed_claim_reports_safe_cause_without_changing_exit(
+        tmp_path, monkeypatch, capsys, failure, status, body, diagnostic):
+    opened = []
+
+    class Opener:
+        def open(self, request, *, timeout):
+            opened.append((request.full_url, timeout))
+            if failure == 'timeout':
+                raise TimeoutError('secret timeout')
+            if failure == 'wrapped_timeout':
+                raise runner.urllib.error.URLError(TimeoutError('secret wrapped timeout'))
+            if failure == 'transport':
+                raise runner.urllib.error.URLError('secret transport')
+            if failure == 'invalid_response':
+                return io.BytesIO(body)
+            raise runner.urllib.error.HTTPError('https://private.invalid/secret', status,
+                'secret status text', {'X-Private': 'secret'}, io.BytesIO(body))
+
+    class Service(runner.Service):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.opener = Opener()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('a failed claim must not inspect or execute a model CLI')
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'check_cli', forbidden)
+    monkeypatch.setattr(runner, 'run_process', forbidden)
+    config = tmp_path / 'runner.json'
+    native_config(config, 'pi', mode='server')
+    with monkeypatch.context() as logging_patch:
+        if failure == 'broken_stderr':
+            class BrokenStderr:
+                def write(self, _value):
+                    raise BrokenPipeError('secret broken stderr')
+            logging_patch.setattr(runner.sys, 'stderr', BrokenStderr())
+            with pytest.raises(runner.RunnerError, match='^service_rejected$'):
+                runner.tick(runner.load_config(config))
+        else:
+            assert runner.main(['--config', str(config), 'tick']) == 1
+    # Exactly one claim attempt, with the claim allowance; no retry loop was added.
+    assert opened == [('http://127.0.0.1:1/work/claim', runner.CLAIM_SECONDS)]
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    if diagnostic is None:
+        assert captured.err == ''
+    else:
+        receipt, exit_line = captured.err.splitlines()
+        assert json.loads(receipt) == {'stage': 'claim', 'error': 'service_rejected', **diagnostic}
+        assert exit_line == 'memento-runner: service_rejected'
+    assert 'secret' not in captured.out + captured.err
+
+
+def test_claim_receipt_never_echoes_exception_text(monkeypatch, capsys):
+    class Service:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, path, value):
+            assert path == '/work/claim'
+            raise runner.RunnerError('SENTINEL arbitrary runner text')
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'check_cli', lambda *a: pytest.fail('no model inspection after a failed claim'))
+    with pytest.raises(runner.RunnerError, match='^SENTINEL arbitrary runner text$'):
+        runner.tick(OVERLAP_CONFIG)
+    captured = capsys.readouterr()
+    assert json.loads(captured.err) == {'stage': 'claim', 'error': 'service_rejected', 'cause': 'unknown'}
+    assert 'SENTINEL' not in captured.err and captured.out == ''
+
+
 OVERLAP_CONFIG = {'preset': 'pi', 'agent': 'pi', 'command': ['pi'], 'timezone': 'Etc/UTC',
                   'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2, 'mode': 'server'}
 

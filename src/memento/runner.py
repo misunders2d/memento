@@ -40,6 +40,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 MAX_BODY = 1024 * 1024
 MAX_OUTPUT = 8 * MAX_BODY
 RETRY_SECONDS = 15 * 60
+# A background claim legitimately includes server-side batch preparation, so it
+# may wait longer than the 15-second foreground allowance while staying well
+# inside the 180-second lease. Renewal, completion and release keep their bounds.
+CLAIM_SECONDS = 60
 # Exact server codes only; arbitrary HTTP detail is never a host-log diagnostic.
 WORK_REJECTION_CODES = frozenset({
     'consolidation_schema_invalid', 'consolidation_candidate_coverage_invalid',
@@ -559,17 +563,24 @@ def tick(config, compaction=None, *, consolidate_now=False):
     if config.get('mode') != 'server':
         raise RunnerError('client mode never claims model work; run tick on the server')
     service = Service(config['url'])
+    claim_service = Service(config['url'], timeout=CLAIM_SECONDS)
     attempted = {}
     failures = 0
     command = False  # Not yet checked; None means the native safety check failed.
     while True:
         now = time.monotonic()
         attempted = {ident: stamp for ident, stamp in attempted.items() if now - stamp < RETRY_SECONDS}
-        claim = service.post('/work/claim', {
-            'agent': config['agent'], 'timezone': config['timezone'],
-            'compaction': compaction, 'exclude': sorted(attempted),
-            'consolidate_now': consolidate_now,
-        })
+        try:
+            claim = claim_service.post('/work/claim', {
+                'agent': config['agent'], 'timezone': config['timezone'],
+                'compaction': compaction, 'exclude': sorted(attempted),
+                'consolidate_now': consolidate_now,
+            })
+        except RunnerError as exc:
+            # The exit stays generic; the journal receipt names the safe cause.
+            with contextlib.suppress(Exception):
+                print(encode(claim_failure_receipt(exc)).decode('utf-8'), file=sys.stderr, flush=True)
+            raise
         compaction = None  # Persist the nudge once, not on each drain request.
         work = claim.get('work')
         seconds = claim.get('lease_seconds')
@@ -598,11 +609,25 @@ def tick(config, compaction=None, *, consolidate_now=False):
 
 def work_failure_receipt(ident, kind, error, exception):
     receipt = dict(id=ident, kind=kind, error=error)
-    if error != 'service_rejected':
-        return receipt
+    if error == 'service_rejected':
+        receipt.update(rejection_diagnostics(exception))
+    return receipt
+
+
+def claim_failure_receipt(exception):
+    """A failed claim returned no job identity (the server may still hold leases).
+
+    The category is the fixed service vocabulary, never the exception's text.
+    """
+    return dict(stage='claim', error='service_rejected', **rejection_diagnostics(exception))
+
+
+def rejection_diagnostics(exception):
+    """HTTP status plus allowlisted code, or a fixed cause class; never response text."""
+    fields = {}
     cause = exception.__cause__
     if isinstance(cause, urllib.error.HTTPError):
-        receipt['http_status'] = cause.code
+        fields['http_status'] = cause.code
         try:
             with cause:
                 body = cause.read(1025)
@@ -610,17 +635,17 @@ def work_failure_receipt(ident, kind, error, exception):
                 value = decode(body)
                 detail = value.get('detail') if isinstance(value, dict) else None
                 if isinstance(detail, str) and detail in WORK_REJECTION_CODES:
-                    receipt['detail_code'] = detail
+                    fields['detail_code'] = detail
         except (OSError, ValueError, RecursionError, http.client.HTTPException):
             pass
     else:
         if isinstance(cause, urllib.error.URLError) and isinstance(cause.reason, BaseException):
             cause = cause.reason
-        receipt['cause'] = ('timeout' if isinstance(cause, TimeoutError) else
-                            'transport_error' if isinstance(cause, (OSError, urllib.error.URLError)) else
-                            'invalid_response' if isinstance(cause, (ValueError, http.client.HTTPException)) else
-                            'unknown')
-    return receipt
+        fields['cause'] = ('timeout' if isinstance(cause, TimeoutError) else
+                           'transport_error' if isinstance(cause, (OSError, urllib.error.URLError)) else
+                           'invalid_response' if isinstance(cause, (ValueError, http.client.HTTPException)) else
+                           'unknown')
+    return fields
 
 
 def process_work(config, service, work, seconds, command):
