@@ -630,8 +630,8 @@ def test_only_claim_requests_get_the_longer_background_allowance(monkeypatch):
     assert runner.CLAIM_SECONDS == 60 and by_path['/work/claim'] == {60}
     assert by_path['/work/complete'] == {15}
     assert '/work/release' not in by_path
-    # Foreground, claim, heartbeat (min(15, 60 / (8 * 2 items))) and second-lane clients.
-    assert sorted(created) == [3.75, 15, 15, 60]
+    # Foreground, claim, one heartbeat per lane (min(15, 60 / (8 * 1 item))) and second-lane clients.
+    assert sorted(created) == [7.5, 7.5, 15, 15, 60]
 
 
 @pytest.mark.parametrize('failure,status,body,diagnostic', [
@@ -920,8 +920,12 @@ def test_tick_keeps_failure_exit_and_excludes_after_overlapped_batch(monkeypatch
     monkeypatch.setattr(runner, 'run_process', generate)
     assert runner.tick(OVERLAP_CONFIG) == 1
     assert completed == ['consolidate-1'] and releases == ['extract-1']
-    # Both IDs are excluded together only after the overlapped batch finished.
-    assert claims == [[], ['consolidate-1', 'extract-1']]
+    # Whichever lane finished first claimed again while the other still ran: that claim
+    # excluded both the finished ID (cooldown) and the running lease, and the final
+    # claim after the batch excludes both as well. Neither ID is ever reissued.
+    # If both lanes finish before the coordinator wakes, only the final claim follows.
+    assert claims[0] == [] and 2 <= len(claims) <= 3
+    assert all(claim == ['consolidate-1', 'extract-1'] for claim in claims[1:])
 
 
 @pytest.mark.parametrize('consolidate_now', [False, True])
@@ -1309,3 +1313,276 @@ def test_agent_update_interruption_retains_private_data_and_retry_completes(
     assert {path: (path.read_bytes(), path.stat().st_mode & 0o777)
             for path in protected} == protected
     assert command.resolve().stat().st_mode & 0o777 == 0o700
+
+
+class LaneServer:
+    """A server fake that leases one job per kind per claim, honoring exclusions and kinds."""
+
+    def __init__(self, pending, *, slow=(), complete_hook=None):
+        self.pending = dict(pending)  # id -> kind
+        self.claims, self.completed, self.releases, self.renewals = [], [], [], []
+        self.leased = {}
+        self.attempts = {ident: 0 for ident in pending}
+        self.lock = threading.Lock()
+        self.complete_hook = complete_hook
+
+    def post(self, path, value):
+        with self.lock:
+            if path == '/work/claim':
+                self.claims.append(value)
+                kinds = value.get('kinds') or ['extract', 'consolidate']
+                work = []
+                for kind in kinds:
+                    ident = next((ident for ident, pending_kind in self.pending.items()
+                                  if pending_kind == kind and ident not in value['exclude']
+                                  and ident not in self.leased), None)
+                    if ident is not None:
+                        self.attempts[ident] += 1
+                        owner = f'{ident}-{self.attempts[ident]}'
+                        self.leased[ident] = owner
+                        work.append({'id': ident, 'owner': owner, 'kind': kind, 'instruction': 'fixture',
+                                     'input': {'id': ident}, 'schema': {'type': 'object'}})
+                return {'lease_seconds': 60, 'work': work}
+            if path == '/work/complete':
+                assert self.leased.pop(value['id']) == value['owner']
+                self.pending.pop(value['id'])
+                self.completed.append(value['id'])
+                if self.complete_hook:
+                    self.complete_hook(value['id'])
+                return {}
+            if path == '/work/release':
+                assert self.leased.pop(value['id']) == value['owner']
+                self.releases.append(value)
+                return {'released': True}
+            assert path == '/work/renew'
+            self.renewals.append((time.monotonic(), value['id']))
+            return {'renewed': self.leased.get(value['id']) == value['owner']}
+
+
+def lane_server(monkeypatch, pending, **kwargs):
+    server = LaneServer(pending, **kwargs)
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, path, value):
+            return server.post(path, value)
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
+    return server
+
+
+def test_free_lane_replenishes_while_the_other_lane_is_still_running(monkeypatch):
+    extracts_done = threading.Event()
+    server = lane_server(monkeypatch, {'extract-1': 'extract', 'consolidate-1': 'consolidate',
+                                       'extract-2': 'extract', 'extract-3': 'extract'},
+                         complete_hook=lambda ident: extracts_done.set() if ident == 'extract-3' else None)
+    active, peak, lock = {}, [0], threading.Lock()
+
+    def generate(argv, payload, *, cancelled, **kwargs):
+        ident = runner.decode(payload)['input']['id']
+        kind = ident.split('-')[0]
+        with lock:
+            assert kind not in active, 'same-kind work overlapped'
+            active[kind] = True
+            peak[0] = max(peak[0], len(active))
+        try:
+            if ident == 'consolidate-1':
+                # The slow lane finishes only after every extraction completed.
+                assert extracts_done.wait(5), 'fast lane waited for the slow lane'
+            return assistant_events()
+        finally:
+            with lock:
+                del active[kind]
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    before = threading.active_count()
+    assert runner.tick(OVERLAP_CONFIG) == 0
+    assert server.completed == ['extract-1', 'extract-2', 'extract-3', 'consolidate-1']
+    assert peak[0] == 2
+    # First request keeps the old shape (no kinds); replenishment asks only for the free kind
+    # while excluding the running lease; a drained kind is not asked again until a completion.
+    assert 'kinds' not in server.claims[0] and server.claims[0]['exclude'] == []
+    assert [claim.get('kinds') for claim in server.claims] == [None, ['extract'], ['extract'], ['extract'], None]
+    assert server.claims[1]['exclude'] == ['consolidate-1', 'extract-1']
+    assert server.claims[3]['exclude'] == ['consolidate-1', 'extract-1', 'extract-2', 'extract-3']
+    assert server.claims[4]['exclude'] == ['consolidate-1', 'extract-1', 'extract-2', 'extract-3']
+    assert set(server.attempts.values()) == {1}
+    assert threading.active_count() == before
+
+
+def test_failed_job_cooldown_starts_at_its_own_completion_not_the_batch(monkeypatch, capsys):
+    release_seen = threading.Event()
+    server = lane_server(monkeypatch, {'extract-1': 'extract', 'consolidate-1': 'consolidate'})
+    original_post = server.post
+
+    def post(path, value):
+        result = original_post(path, value)
+        if path == '/work/release':
+            release_seen.set()
+        return result
+    server.post = post
+
+    def generate(argv, payload, **kwargs):
+        ident = runner.decode(payload)['input']['id']
+        if ident == 'extract-1':
+            raise runner.RunnerError('invalid_output')
+        assert release_seen.wait(5), 'failed fast lane never released'
+        # Give the coordinator time to claim again for the freed lane before finishing.
+        deadline = time.monotonic() + 5
+        while len(server.claims) < 2 and time.monotonic() < deadline:
+            time.sleep(.01)
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    assert runner.tick(OVERLAP_CONFIG) == 1
+    assert server.completed == ['consolidate-1']
+    assert server.releases == [{'id': 'extract-1', 'owner': 'extract-1-1', 'error': 'invalid_output'}]
+    # The failed ID was excluded from the very next claim, made while the slow lane still ran.
+    assert server.claims[1].get('kinds') == ['extract'] and 'extract-1' in server.claims[1]['exclude']
+    assert server.attempts['extract-1'] == 1
+    assert json.loads(capsys.readouterr().err) == {'id': 'extract-1', 'kind': 'extract', 'error': 'invalid_output'}
+
+
+def test_running_lease_renews_while_the_coordinator_blocks_on_a_claim(monkeypatch):
+    server = lane_server(monkeypatch, {'extract-1': 'extract', 'consolidate-1': 'consolidate'})
+    blocking = {}
+    original_post = server.post
+
+    def post(path, value):
+        if path == '/work/claim' and value.get('kinds') == ['extract']:
+            blocking['start'] = time.monotonic()
+            time.sleep(.5)  # the claim is slow while consolidate-1 is still running
+            blocking['end'] = time.monotonic()
+        result = original_post(path, value)
+        if path == '/work/claim':
+            result['lease_seconds'] = .4
+        return result
+    server.post = post
+
+    def generate(argv, payload, **kwargs):
+        if runner.decode(payload)['input']['id'] == 'consolidate-1':
+            deadline = time.monotonic() + 5
+            while 'end' not in blocking and time.monotonic() < deadline:
+                time.sleep(.01)
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    assert runner.tick(OVERLAP_CONFIG) == 0
+    during = [ident for stamp, ident in server.renewals
+              if ident == 'consolidate-1' and blocking['start'] < stamp < blocking['end']]
+    assert during, 'no renewal reached the server while the claim blocked'
+    assert server.completed == ['extract-1', 'consolidate-1']
+
+
+@pytest.mark.parametrize('interruption', ['claim_error', 'keyboard_interrupt'])
+def test_claim_failure_or_interrupt_cancels_running_work_and_joins_everything(monkeypatch, capsys, interruption):
+    server = lane_server(monkeypatch, {'extract-1': 'extract', 'consolidate-1': 'consolidate'})
+    original_post = server.post
+
+    def post(path, value):
+        if path == '/work/claim' and value.get('kinds') == ['extract']:
+            if interruption == 'keyboard_interrupt':
+                raise KeyboardInterrupt
+            raise runner.RunnerError('service_rejected')
+        return original_post(path, value)
+    server.post = post
+    saw_cancel = threading.Event()
+
+    def generate(argv, payload, *, cancelled, **kwargs):
+        if runner.decode(payload)['input']['id'] == 'consolidate-1':
+            limit = time.monotonic() + 5
+            while not cancelled():
+                assert time.monotonic() < limit, 'running work was never cancelled'
+                time.sleep(.01)
+            saw_cancel.set()
+            raise runner.RunnerError('cli_failed')
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    before = threading.active_count()
+    with pytest.raises(KeyboardInterrupt if interruption == 'keyboard_interrupt' else runner.RunnerError):
+        runner.tick(OVERLAP_CONFIG)
+    assert saw_cancel.is_set()
+    assert server.completed == ['extract-1']
+    assert server.releases == [{'id': 'consolidate-1', 'owner': 'consolidate-1-1', 'error': 'cli_failed'}]
+    assert not server.leased and threading.active_count() == before
+    receipts = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    expected = [{'id': 'consolidate-1', 'kind': 'consolidate', 'error': 'cli_failed'}]
+    if interruption == 'claim_error':
+        expected.insert(0, {'stage': 'claim', 'error': 'service_rejected', 'cause': 'unknown'})
+    assert receipts == expected
+
+
+@pytest.mark.parametrize('defect', ['malformed', 'duplicate', 'other_kind', 'running_id', 'excluded_id'])
+def test_unexpected_claim_response_is_rejected_and_cancels_running_work(monkeypatch, defect):
+    server = lane_server(monkeypatch, {'extract-1': 'extract', 'consolidate-1': 'consolidate', 'extract-2': 'extract'})
+    original_post = server.post
+
+    def post(path, value):
+        result = original_post(path, value)
+        if path == '/work/claim' and value.get('kinds') == ['extract']:
+            item = dict(result['work'][0]) if result['work'] else None
+            if defect == 'malformed':
+                result['work'] = [dict(item, input='not an object')]
+            elif defect == 'duplicate':
+                result['work'] = [item, dict(item)]
+            elif defect == 'other_kind':
+                result['work'] = [dict(item, kind='consolidate')]
+            elif defect == 'running_id':
+                result['work'] = [dict(item, id='consolidate-1')]
+            else:
+                result['work'] = [dict(item, id='extract-1')]
+        return result
+    server.post = post
+
+    def generate(argv, payload, *, cancelled, **kwargs):
+        if runner.decode(payload)['input']['id'] == 'consolidate-1':
+            limit = time.monotonic() + 5
+            while not cancelled():
+                assert time.monotonic() < limit, 'running work was never cancelled'
+                time.sleep(.01)
+            raise runner.RunnerError('cli_failed')
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'run_process', generate)
+    before = threading.active_count()
+    with pytest.raises(runner.RunnerError, match='^service_rejected$'):
+        runner.tick(OVERLAP_CONFIG)
+    assert server.completed == ['extract-1'] and 'extract-2' not in server.completed
+    assert [release['id'] for release in server.releases] == ['consolidate-1']
+    assert threading.active_count() == before
+
+
+def test_cli_check_runs_once_after_heartbeats_start_and_keeps_both_leases_alive(monkeypatch):
+    server = lane_server(monkeypatch, {'extract-1': 'extract', 'consolidate-1': 'consolidate'})
+    original_post = server.post
+
+    def post(path, value):
+        result = original_post(path, value)
+        if path == '/work/claim':
+            result['lease_seconds'] = .4
+        return result
+    server.post = post
+    checks, finished = [], {}
+
+    def slow_check(command, preset):
+        checks.append((command, preset, time.monotonic()))
+        time.sleep(1.0)  # longer than two lease periods
+        finished['at'] = time.monotonic()
+        return ['/native/pi']
+
+    def generate(argv, payload, **kwargs):
+        assert 'at' in finished, 'native generation started before the safety check passed'
+        return assistant_events()
+
+    monkeypatch.setattr(runner, 'check_cli', slow_check)
+    monkeypatch.setattr(runner, 'run_process', generate)
+    assert runner.tick(OVERLAP_CONFIG) == 0
+    assert len(checks) == 1 and checks[0][:2] == (['pi'], 'pi')
+    assert sorted(server.completed) == ['consolidate-1', 'extract-1'] and not server.releases
+    # Both leases were renewed while the single check was still blocking.
+    renewed_during = {ident for stamp, ident in server.renewals if checks[0][2] < stamp < finished['at']}
+    assert renewed_during == {'consolidate-1', 'extract-1'}

@@ -9,6 +9,7 @@ Scheduling belongs to /work/claim, not this process. No generation credentials a
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import base64
 import fcntl
@@ -52,6 +53,7 @@ WORK_REJECTION_CODES = frozenset({
     'consolidation_loop_target_not_supplied', 'consolidation_loop_state_contradictory',
     'consolidation_behavior_requires_experience', 'consolidation_behavior_exception_invalid',
     'consolidation_behavior_requires_user_ground_truth', 'consolidation_world_interval_invalid',
+    'consolidation_technical_evidence_invalid',
     'consolidation_remember_invalid', 'consolidation_supersede_invalid',
     'consolidation_change_time_required', 'consolidation_duplicate_target_required',
     'consolidation_relation_endpoints_required', 'consolidation_relation_invalid',
@@ -558,53 +560,125 @@ class Leases:
             self.active.pop(ident, None)
 
 
+KINDS = ('extract', 'consolidate')
+
+
 def tick(config, compaction=None, *, consolidate_now=False):
-    """Drain due work, spacing repeated IDs by the existing polling cadence."""
+    """Drain due work, spacing repeated IDs by the existing polling cadence.
+
+    One future per work kind keeps at most two native processes alive. A lane that
+    finishes claims only its own free kind while the other lane is still running, so
+    the faster kind never waits for the slower one. A kind offered nothing is not
+    asked again until some job completes; nothing spins on an empty lane.
+    """
     if config.get('mode') != 'server':
         raise RunnerError('client mode never claims model work; run tick on the server')
     service = Service(config['url'])
     claim_service = Service(config['url'], timeout=CLAIM_SECONDS)
+    lane_services = {}
     attempted = {}
     failures = 0
-    command = False  # Not yet checked; None means the native safety check failed.
-    while True:
-        now = time.monotonic()
-        attempted = {ident: stamp for ident, stamp in attempted.items() if now - stamp < RETRY_SECONDS}
+    # Native isolation flags are checked once per tick, lazily by the first lane
+    # after its lease heartbeat is running; both lanes share the cached result.
+    command = command_resolver(config)
+    cancel = threading.Event()
+    running = {}  # kind -> (future, claimed ids)
+    drained = set()  # kinds offered nothing since the last completion
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(KINDS), thread_name_prefix='memento-lane') as pool:
         try:
-            claim = claim_service.post('/work/claim', {
-                'agent': config['agent'], 'timezone': config['timezone'],
-                'compaction': compaction, 'exclude': sorted(attempted),
-                'consolidate_now': consolidate_now,
-            })
-        except RunnerError as exc:
-            # The exit stays generic; the journal receipt names the safe cause.
-            with contextlib.suppress(Exception):
-                print(encode(claim_failure_receipt(exc)).decode('utf-8'), file=sys.stderr, flush=True)
+            while True:
+                free = [kind for kind in KINDS if kind not in running and kind not in drained]
+                if free:
+                    now = time.monotonic()
+                    attempted = {ident: stamp for ident, stamp in attempted.items() if now - stamp < RETRY_SECONDS}
+                    # Running leases are excluded too: a reissued running ID is never a second run.
+                    exclude = sorted(set(attempted) | {ident for _, ids in running.values() for ident in ids})
+                    request = {'agent': config['agent'], 'timezone': config['timezone'],
+                               'compaction': compaction, 'exclude': exclude, 'consolidate_now': consolidate_now}
+                    if len(free) < len(KINDS):
+                        # Old servers know no kinds filter; the full request keeps its old shape.
+                        request['kinds'] = free
+                    try:
+                        claim = claim_service.post('/work/claim', request)
+                    except RunnerError as exc:
+                        # The exit stays generic; the journal receipt names the safe cause.
+                        with contextlib.suppress(Exception):
+                            print(encode(claim_failure_receipt(exc)).decode('utf-8'), file=sys.stderr, flush=True)
+                        raise
+                    compaction = None  # Persist the nudge once, not on each drain request.
+                    work, seconds = claimed_work(claim, free, exclude)
+                    if 'backlog' in claim:
+                        print(encode({'backlog': claim['backlog']}).decode('utf-8'), flush=True)
+                    for kind in free:
+                        items = [item for item in work if item['kind'] == kind]
+                        if not items:
+                            drained.add(kind)
+                            continue
+                        if kind not in lane_services:
+                            lane_services[kind] = service if not lane_services else Service(config['url'])
+                        running[kind] = (pool.submit(process_work, config, lane_services[kind], items, seconds,
+                                                     command, cancel), [item['id'] for item in items])
+                if not running:
+                    return 1 if failures else 0
+                done, _ = concurrent.futures.wait([future for future, _ in running.values()],
+                                                  return_when=concurrent.futures.FIRST_COMPLETED)
+                for kind, (future, ids) in list(running.items()):
+                    if future not in done:
+                        continue
+                    del running[kind]
+                    count, _ = future.result()  # Unexpected lane errors propagate after cleanup below.
+                    failures += count
+                    # The cooldown starts when this job finished, not when the whole tick does.
+                    attempted.update(dict.fromkeys(ids, time.monotonic()))
+                    drained.clear()
+        except BaseException:
+            # A failed claim, a rejected response, Ctrl-C or a lane error stops the
+            # other lane too: shared cancellation, then every lane joins its heartbeat.
+            cancel.set()
+            futures = [future for future, _ in running.values()]
+            concurrent.futures.wait(futures)
             raise
-        compaction = None  # Persist the nudge once, not on each drain request.
-        work = claim.get('work')
-        seconds = claim.get('lease_seconds')
-        if (not isinstance(work, list) or not isinstance(seconds, (float, int))
-                or isinstance(seconds, bool) or not math.isfinite(seconds) or seconds <= 0):
+
+
+def command_resolver(config):
+    """Resolve the native command once per tick; None records a failed safety check.
+
+    The check can take many seconds, so a lane calls this only after its lease
+    heartbeat has started. The lock makes the second lane wait for the first
+    lane's result instead of running a second check.
+    """
+    lock, state = threading.Lock(), {}
+
+    def resolve():
+        with lock:
+            if 'command' not in state:
+                try:
+                    state['command'] = check_cli(config['command'], config['preset'])
+                except (RunnerError, OSError):
+                    state['command'] = None
+            return state['command']
+    return resolve
+
+
+def claimed_work(claim, requested, exclude):
+    """Validate a claim response against what this tick asked for; never run a surprise."""
+    work = claim.get('work')
+    seconds = claim.get('lease_seconds')
+    if (not isinstance(work, list) or not isinstance(seconds, (float, int))
+            or isinstance(seconds, bool) or not math.isfinite(seconds) or seconds <= 0):
+        raise RunnerError('service_rejected')
+    batch_ids = set()
+    for item in work:
+        if (not isinstance(item, dict) or not isinstance(item.get('id'), str)
+                or not isinstance(item.get('owner'), str) or item.get('kind') not in requested
+                or not isinstance(item.get('instruction'), str) or not isinstance(item.get('input'), dict)
+                or not isinstance(item.get('schema'), dict)):
             raise RunnerError('service_rejected')
-        if 'backlog' in claim:
-            print(encode({'backlog': claim['backlog']}).decode('utf-8'), flush=True)
-        batch_ids = set()
-        for item in work:
-            if (not isinstance(item, dict) or not isinstance(item.get('id'), str)
-                    or not isinstance(item.get('owner'), str) or item.get('kind') not in ('extract', 'consolidate')
-                    or not isinstance(item.get('instruction'), str) or not isinstance(item.get('input'), dict)
-                    or not isinstance(item.get('schema'), dict)):
-                raise RunnerError('service_rejected')
-            if item['id'] in attempted or item['id'] in batch_ids:
-                # Never turn an ignored exclusion into a model retry or spin loop.
-                raise RunnerError('service_rejected')
-            batch_ids.add(item['id'])
-        if not work:
-            return 1 if failures else 0
-        count, command = process_work(config, service, work, seconds, command)
-        failures += count
-        attempted.update(dict.fromkeys(batch_ids, time.monotonic()))
+        if item['id'] in exclude or item['id'] in batch_ids:
+            # Never turn an ignored exclusion into a model retry or spin loop.
+            raise RunnerError('service_rejected')
+        batch_ids.add(item['id'])
+    return work, seconds
 
 
 def work_failure_receipt(ident, kind, error, exception):
@@ -648,14 +722,18 @@ def rejection_diagnostics(exception):
     return fields
 
 
-def process_work(config, service, work, seconds, command):
-    """Run one extraction alongside one consolidation; same-kind work stays sequential."""
+def process_work(config, service, work, seconds, command, cancel=None):
+    """Run one extraction alongside one consolidation; same-kind work stays sequential.
+
+    A shared cancel event lets the tick coordinator stop this batch together with
+    the other lane; without one the batch owns its own event.
+    """
     preset = config['preset']
     # Bound each renewal timeout relative to the lease and number of claimed jobs.
     heartbeat_service = Service(config['url'], timeout=min(15, seconds / (8 * len(work))))
     leases = Leases(heartbeat_service, work, seconds)
     leases.thread.start()
-    cancel = threading.Event()
+    cancel = cancel if cancel is not None else threading.Event()
     started, outcomes = [], []
     try:
         if command is False:
@@ -664,6 +742,10 @@ def process_work(config, service, work, seconds, command):
                 command = check_cli(config['command'], preset)
             except (RunnerError, OSError):
                 command = None
+        elif callable(command):
+            # The tick's shared once-only check runs here, after this batch's
+            # heartbeat started, so a slow check never lets leases lapse.
+            command = command()
         # One lane per work kind bounds native executions to two, each with its own
         # child process, temporary directory, schema flags and service client.
         for index, kind in enumerate(dict.fromkeys(item['kind'] for item in work)):

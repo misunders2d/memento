@@ -45,7 +45,8 @@ def test_pin_requires_review_preserves_evidence_and_reuses_unchanged_vector(cura
     assert history[0]['evidence'] == history[1]['evidence']
     indexed = store._db.execute('''SELECT i.version,v.current,v.embedding FROM vector_items i
         JOIN memory_vectors v ON v.rowid=i.seq WHERE i.target=? ORDER BY i.version''', (node['id'],)).fetchall()
-    assert [(row['version'], row['current']) for row in indexed] == [(1, 0), (2, 1)]
+    # The unchanged text's single derived vector row moves to the new version.
+    assert [(row['version'], row['current']) for row in indexed] == [(2, 1)]
     assert indexed[-1]['embedding'] == vector
     correction = graph.supersede(command_id='correct', actor='fixture', why='explicit corrected decision',
         old=node['id'], new=dict(type='knowledge', text='Preserve the corrected decision.',

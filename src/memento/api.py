@@ -142,6 +142,14 @@ class ClaimInput(WorkInput):
     compaction: CompactionInput | None = None
     exclude: list[str] = Field(default_factory=list)
     consolidate_now: bool = False
+    # Optional lane filter for a runner whose other lane is still busy; omitted means both.
+    kinds: list[Literal['extract', 'consolidate']] | None = Field(default=None, min_length=1, max_length=2)
+
+    @model_validator(mode='after')
+    def distinct_kinds(self):
+        if self.kinds is not None and len(set(self.kinds)) != len(self.kinds):
+            raise ValueError('kinds must be distinct')
+        return self
 
     def arguments(self):
         values = super().arguments()

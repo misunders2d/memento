@@ -3,6 +3,7 @@
 import time
 
 from .extraction import ACTIVE_CANDIDATE_SQL, AWAITING_DECISION_SQL
+from .consolidation import CONSOLIDATION_ELIGIBLE_SQL
 from .captured_media import status as captured_media_status
 
 
@@ -103,13 +104,23 @@ def operational_status(state, source=None):
             WHERE (? IS NULL OR source=?) ORDER BY source,conversation_id''', (source, source))]
         consolidation, media = jobs('consolidate'), jobs('media')
         media['captured_attachments'] = captured_media_status(db, source)
-        pending = db.execute(f'''SELECT count(*) AS pending_candidates,
-            coalesce(sum(NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id
-                AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id)
-                AND {AWAITING_DECISION_SQL})),0) AS ready_candidates
+        # Pending/ready count what consolidation can still admit. Active candidates whose
+        # only evidence is legacy Codex instruction text are reported separately: they
+        # stay stored, searchable and in history, and never reach a model call.
+        # MATERIALIZED keeps SQLite from flattening the subquery and evaluating the
+        # eligibility predicate once per output column (measured 3x UDF calls otherwise).
+        pending = db.execute(f'''WITH candidate_status AS MATERIALIZED (
+            SELECT ({CONSOLIDATION_ELIGIBLE_SQL}) AS eligible,
+                NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id
+                    AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id)
+                    AND {AWAITING_DECISION_SQL}) AS ready
             FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}
             AND (? IS NULL OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
-                WHERE g.target=c.id AND e.source=?))''', (time.time(), source, source)).fetchone()
+                WHERE g.target=c.id AND e.source=?)))
+            SELECT coalesce(sum(eligible),0) AS pending_candidates,
+            coalesce(sum(eligible AND ready),0) AS ready_candidates,
+            coalesce(sum(NOT eligible),0) AS excluded_legacy_candidates
+            FROM candidate_status''', (time.time(), source, source)).fetchone()
         consolidation.update(dict(pending))
         indexing = (state.retrieval._status(db, source) if state.retrieval is not None else
                     dict(available=False, reason='embedding_runtime_disabled'))

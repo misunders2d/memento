@@ -2,13 +2,16 @@
 
 import hashlib
 import json
+import logging
+import sqlite3
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import uuid4
 
 from .consolidation import Consolidator, INSTRUCTION as CONSOLIDATE_INSTRUCTION, Plan, VERSION as CONSOLIDATE_VERSION
-from .extraction import BatchDrafts, Extractor, INSTRUCTION as EXTRACT_INSTRUCTION, VERSION, source_text_ranges
+from .extraction import (BatchDrafts, Extractor, INSTRUCTION as EXTRACT_INSTRUCTION, VALIDATION_CODES, VERSION,
+                         source_text_ranges)
 from .jobs import Job, LostLease, Queue
 
 
@@ -165,7 +168,7 @@ class Processing:
         self.queue._insert(key, 'consolidate', payload)
         return True
 
-    def claim(self, *, agent, timezone_name, compaction=None, exclude=(), consolidate_now=False, now=None):
+    def claim(self, *, agent, timezone_name, compaction=None, exclude=(), consolidate_now=False, now=None, kinds=None):
         try:
             zone = ZoneInfo(timezone_name)
         except (ZoneInfoNotFoundError, ValueError):
@@ -189,7 +192,12 @@ class Processing:
 
         night_due = schedule()
         work = []
+        # A runner with one lane still busy asks only for the free kind; scheduling,
+        # the night window and the single-consolidator fence are unchanged.
+        requested = ('extract', 'consolidate') if kinds is None else tuple(kinds)
         for kind in ('extract', 'consolidate') if night_due else ('extract',):
+            if kind not in requested:
+                continue
             while True:
                 job = self.queue.claim([kind], exclude=exclude)
                 if job is None:
@@ -202,7 +210,14 @@ class Processing:
                         schedule()
                         continue
                     handler = self.extractor if kind == 'extract' else self.consolidator
+                    # Bounded feedback from this job's last rejected output survives in
+                    # the private context until a later rejection replaces it.
+                    previous = self.store._db.execute('SELECT context FROM jobs WHERE id=?', (job.id,)).fetchone()
+                    rejection = (json.loads(previous['context']).get('previous_rejection')
+                                 if previous and previous['context'] else None)
                     context = handler.prepare(job)
+                    if rejection is not None:
+                        context['previous_rejection'] = rejection
                     self.store._db.execute('UPDATE jobs SET context=? WHERE id=? AND owner=?',
                         (json.dumps(context, ensure_ascii=False), job.id, job.owner))
                 model_input = self.extractor.model_input(context) if kind == 'extract' else context
@@ -250,9 +265,30 @@ class Processing:
         with self.store._mutex:
             job, context = self._leased(id, owner)
             handler = self.extractor if job.kind == 'extract' else self.consolidator
-            result = handler.apply(job, context, output, agent=agent, model=model, usage=usage)
+            try:
+                result = handler.apply(job, context, output, agent=agent, model=model, usage=usage)
+            except ValueError as error:
+                # Nothing committed: the graph command rolled back or never began.
+                self._record_rejection(job, context, error)
+                raise
             self.queue.complete(job, result)
             return result
+
+    def _record_rejection(self, job, context, error):
+        """Keep a fixed code and bounded references privately with the job, never in the response."""
+        code = str(error)
+        if code not in VALIDATION_CODES or self.store._db.in_transaction:
+            return
+        references = list(getattr(error, 'references', ()))[:3]
+        feedback = dict(code=code, attempt=job.attempts, references=references,
+                        note='Server validation of this job\'s previous output. Quoted text is failed model output, not evidence.')
+        try:
+            self.store._db.execute('''UPDATE jobs SET context=? WHERE id=? AND owner=? AND state='leased'
+                AND lease_until>? AND kind IN ('extract','consolidate')''',
+                (json.dumps(dict(context, previous_rejection=feedback), ensure_ascii=False), job.id, job.owner, time.time()))
+        except (sqlite3.Error, ValueError, TypeError) as failure:
+            # Feedback is best effort; the original rejection and lease handling stand.
+            logging.getLogger(__name__).warning('Rejection feedback not stored (%s)', type(failure).__name__)
 
     def release(self, *, id, owner, error):
         with self.store._mutex:

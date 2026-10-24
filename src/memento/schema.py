@@ -59,6 +59,21 @@ _CAPTURED_MEDIA = (
     'CREATE INDEX IF NOT EXISTS media_representation_identity ON media_representations(identity)',
 )
 
+# node_fts is a derived current-node index: one document per node identity,
+# keyed by a small stable mapping (INTEGER PRIMARY KEY survives VACUUM, unlike the
+# implicit rowid of node_versions). Canonical node_versions history is untouched.
+_NODE_FTS_DOCUMENTS = """CREATE TABLE IF NOT EXISTS node_fts_documents (
+    seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE) STRICT"""
+
+_NODE_FTS_INDEX = """CREATE TRIGGER node_index_current_v1 AFTER INSERT ON node_versions
+    WHEN NEW.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=NEW.id)
+    BEGIN
+        INSERT OR IGNORE INTO node_fts_documents(id) VALUES (NEW.id);
+        DELETE FROM node_fts WHERE rowid=(SELECT d.seq FROM node_fts_documents d WHERE d.id=NEW.id);
+        INSERT INTO node_fts(rowid,id,version,text)
+            SELECT d.seq,NEW.id,NEW.version,NEW.text FROM node_fts_documents d WHERE d.id=NEW.id;
+    END"""
+
 _EPISODES_NO_UPDATE = """CREATE TRIGGER episodes_no_update BEFORE UPDATE ON episodes
     WHEN NOT (raw_frame_write(OLD.seq,NEW.raw_frame,NEW.text_sha256)=1
         AND OLD.raw_frame IS NULL AND OLD.text_runs IS NULL AND NEW.text=''
@@ -136,9 +151,8 @@ _SCHEMA = (
        PRIMARY KEY(target,version,episode_id,start,end)) STRICT""",
     """CREATE VIRTUAL TABLE node_fts USING
        fts5(id UNINDEXED, version UNINDEXED, text, tokenize='unicode61')""",
-    """CREATE TRIGGER node_index AFTER INSERT ON node_versions
-       BEGIN INSERT INTO node_fts(id,version,text)
-       VALUES (NEW.id,NEW.version,NEW.text); END""",
+    _NODE_FTS_DOCUMENTS,
+    _NODE_FTS_INDEX,
     'CREATE INDEX edge_src ON edge_versions(src,rel)',
     'CREATE INDEX edge_dst ON edge_versions(dst,rel)',
     """CREATE TABLE vector_model (
@@ -342,6 +356,30 @@ def upgrade_episode_fts(db):
         OR coalesce(json_extract(metadata,'$.extraction_mode'),'message')='skip' ''')
     db.execute('DROP TRIGGER IF EXISTS episodes_index')
     db.execute(_EPISODES_TEXT_INDEX)
+
+
+def upgrade_node_fts(db):
+    """Caller owns the transaction; index only the latest version of each node.
+
+    The versioned trigger is the migration marker: the mapping table, the
+    rebuilt derived index and the trigger commit together, so an interruption
+    leaves the legacy all-version index and trigger in place for the next start.
+    No canonical table, header or portable format changes.
+    """
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name='node_index_current_v1'").fetchone():
+        return
+    log = logging.getLogger(__name__)
+    log.warning('Rebuilding current-node text index')
+    started = time.perf_counter()
+    db.execute(_NODE_FTS_DOCUMENTS)
+    db.execute('INSERT OR IGNORE INTO node_fts_documents(id) SELECT DISTINCT id FROM node_versions')
+    db.execute('DELETE FROM node_fts')
+    db.execute('''INSERT INTO node_fts(rowid,id,version,text)
+        SELECT d.seq,n.id,n.version,n.text FROM node_fts_documents d JOIN node_versions n ON n.id=d.id
+        WHERE n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)''')
+    db.execute('DROP TRIGGER IF EXISTS node_index')
+    db.execute(_NODE_FTS_INDEX)
+    log.warning('Current-node text index rebuild completed in %.3f seconds', time.perf_counter() - started)
 
 
 def upgrade_raw_text(db):

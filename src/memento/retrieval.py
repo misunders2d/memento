@@ -1084,8 +1084,9 @@ class Retrieval:
     def health(self):
         if self.index_error is not None:
             raise RuntimeError('Native indexing failed; work remains pending')
-        with self.store._mutex:
-            db = self.store._db
+        # One WAL snapshot for every failure eligibility read; the writer mutex
+        # is never taken, so health does not queue behind context preparation.
+        with self.store.read_snapshot() as db:
             failures = db.execute('SELECT target,version FROM index_failures WHERE resolved=0').fetchall()
             for failure in failures:
                 if db.execute(f'''WITH indexable AS ({_INDEXABLE})

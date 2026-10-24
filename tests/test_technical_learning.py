@@ -392,3 +392,90 @@ def test_thinking_and_native_notifications_do_not_hide_nearby_attempts(tmp_path,
         assert Graph(store)._behavior(learned)['authority'] == 'inferred'
     finally:
         store.close()
+
+
+def reported_trace(harness='claude', *, acknowledged=False):
+    """Two actual attempt/result pairs, then the assistant's own report tool call."""
+    records = []
+    for index, (arguments, output) in enumerate(((ATTEMPTS[0], RESULTS[0]), (ATTEMPTS[2], RESULTS[2]))):
+        call = f'call-{index}'
+        records.extend([
+            dict(type='assistant', uuid=call, message=dict(role='assistant', content=[
+                dict(type='tool_use', id=call, name='shell', input=json.loads(arguments))])),
+            dict(type='user', uuid=f'result-{index}', message=dict(role='user', content=[
+                dict(type='tool_result', tool_use_id=call, content=output)])),
+        ])
+    records.append(dict(type='assistant', uuid='report', message=dict(role='assistant', content=[
+        dict(type='tool_use', id='report', name='advise', input=dict(
+            lesson='Current-scope search failed; archive scope found the report.'))])))
+    if acknowledged:
+        records.append(dict(type='user', uuid='ack', message=dict(role='user', content=[
+            dict(type='tool_result', tool_use_id='report', content='queued')])))
+    return records
+
+
+@pytest.mark.parametrize('case', ['selected', 'legacy_all_cited', 'report_selected', 'results_only',
+                                  'uncited', 'unknown', 'duplicate', 'explicit_user', 'explicit_user_selected',
+                                  'mixed_source'])
+def test_later_report_source_needs_explicit_actual_support(tmp_path, case):
+    store = Store(tmp_path / 'store')
+    try:
+        processing = Processing(Graph(store))
+        _, episodes = captured_trace(tmp_path, store, records=reported_trace())
+        trace, report = episodes[:4], episodes[4]
+        args = extract_trace(processing, report)
+        task = processing.claim(**args, consolidate_now=True)['work'][0]
+        windows = {window['episode_id']: window for window in task['input']['raw_windows']}
+        assert windows[report['id']]['native_trace'] == 'attempt'
+        assert [windows[episode['id']]['native_trace'] for episode in trace] == ['attempt', 'result'] * 2
+        output = proposal(task, report, episodes)
+        output['technical_evidence'] = [episode['id'] for episode in trace]
+        expected = None
+        if case == 'legacy_all_cited':
+            # Old plans keep the all-cited rule: the report is the latest attempt.
+            output.pop('technical_evidence')
+            expected = 'behavior_requires_user_ground_truth'
+        elif case == 'report_selected':
+            output['technical_evidence'].append(report['id'])
+            expected = 'behavior_requires_user_ground_truth'
+        elif case == 'results_only':
+            output['technical_evidence'] = [trace[1]['id'], trace[3]['id']]
+            expected = 'behavior_requires_user_ground_truth'
+        elif case == 'uncited':
+            output['evidence'] = [ref for ref in output['evidence'] if ref['episode_id'] != trace[0]['id']]
+            expected = 'technical_evidence_invalid'
+        elif case == 'unknown':
+            output['technical_evidence'] = ['unknown-episode']
+            expected = 'technical_evidence_invalid'
+        elif case == 'duplicate':
+            output['technical_evidence'] = [trace[0]['id'], trace[0]['id'], trace[1]['id']]
+            expected = 'technical_evidence_invalid'
+        elif case == 'explicit_user':
+            output.pop('technical_evidence')
+            output['behavior']['authority'] = 'explicit_user'
+            expected = 'behavior_requires_user_ground_truth'
+        elif case == 'explicit_user_selected':
+            output['behavior']['authority'] = 'explicit_user'
+            expected = 'technical_evidence_invalid'
+        elif case == 'mixed_source':
+            foreign = store.capture(dict(trace[0], id=None, event_id='foreign', source='native:other-device:claude',
+                                         captured_at=None))[0]
+            window = dict(windows[trace[0]['id']], episode_id=foreign['id'], source=foreign['source'])
+            store._db.execute('UPDATE jobs SET context=? WHERE id=?', (json.dumps(dict(task['input'],
+                raw_windows=[*task['input']['raw_windows'], window])), task['id']))
+            output['evidence'].append(dict(episode_id=foreign['id'], quote=foreign['text'], occurrence=None))
+            output['technical_evidence'].append(foreign['id'])
+            expected = 'behavior_requires_user_ground_truth'
+        if expected:
+            with pytest.raises(ValueError, match=expected):
+                complete(processing, task, output)
+            assert store._db.execute('SELECT count(*) FROM node_versions').fetchone()[0] == 0
+            return
+        learned = complete(processing, task, output)['id']
+        history = Graph(store).history(learned)[0]
+        assert history['authority'] == 'inferred'
+        # The required later report is ordinary supporting evidence; no acknowledgment was captured.
+        assert report['text'] in {ref['quote'] for ref in history['evidence']}
+        assert not any(window.get('text') == 'queued' for window in task['input']['raw_windows'])
+    finally:
+        store.close()

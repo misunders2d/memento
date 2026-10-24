@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+import json
+
 import pytest
 
 from memento.graph import Graph
@@ -231,11 +233,25 @@ def test_preexisting_legacy_native_instructions_cannot_authorize_behavior(tmp_pa
                 valid_from=None, valid_to=None, scope=['professional'], open_loop=False, confidence=.8)
             processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
                 output=dict(windows=[dict(id=task['input']['windows'][0]['id'], candidates=[item])]))
+        # A context leased under the old admission still names the candidate.
+        stale = processing.claim(**args, consolidate_now=True)['work'][0]
+        assert stale['input']['raw_windows'][0]['behavior_ground_truth'] is False
         store._db.create_function('legacy_native_context', 4, legacy_native_context, deterministic=True)
-        task = processing.claim(**args, consolidate_now=True)['work'][0]
-        assert task['input']['raw_windows'][0]['behavior_ground_truth'] is False
-        with pytest.raises(ValueError, match='consolidation_behavior_requires_user_ground_truth'):
-            complete(processing, task, action(task, episode, quote=incident, behavior=dict(BEHAVIOR, authority=authority)))
+        from memento.store import ConflictError
+        # Rederive comes before schema validation: malformed output is not a 422 for a stale batch.
+        with pytest.raises(ConflictError, match='eligibility changed'):
+            processing.complete(id=stale['id'], owner=stale['owner'], agent='fixture', output=dict(actions='nonsense'))
+        with pytest.raises(ConflictError, match='eligibility changed'):
+            complete(processing, stale, action(stale, episode, quote=incident, behavior=dict(BEHAVIOR, authority=authority)))
+        assert json.loads(store._db.execute('SELECT context FROM jobs WHERE id=?', (stale['id'],)).fetchone()[0]).get(
+            'previous_rejection') is None
+        processing.release(id=stale['id'], owner=stale['owner'], error='service_rejected')
+        store._db.execute('UPDATE jobs SET available_at=0')
+        # Instruction-only candidates are no longer admitted; the stored row stays active.
+        assert processing.claim(**args, consolidate_now=True)['work'] == []
+        assert store._db.execute("SELECT state FROM jobs WHERE kind='consolidate'").fetchone()[0] == 'done'
+        assert store._db.execute('SELECT count(*) FROM candidates').fetchone()[0] == 1
+        assert not store._db.execute('SELECT 1 FROM candidate_decisions').fetchone()
         assert not store._db.execute('SELECT 1 FROM node_versions').fetchone()
     finally:
         store.close()

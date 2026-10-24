@@ -61,16 +61,22 @@ def pin(graph, commit, node_id, pinned):
 
 
 def _copy_vector(graph, node_id, old_version, new_version):
+    """Carry the unchanged text's derived vector to the new version without duplicating it.
+
+    Callers copy a node version whose text is identical, so the existing
+    vector_items row moves to the new version and its stored embedding bytes stay
+    exactly as indexed. Changed text never comes here (supersede invalidates and
+    the new identity is indexed afresh). Without an indexed vector the new version
+    simply stays pending for ordinary indexing.
+    """
     db = graph.store._db
     db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN
         (SELECT seq FROM vector_items WHERE kind='node' AND target=?)''', (node_id,))
     previous = db.execute('''SELECT i.seq FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
         WHERE i.target=? AND i.kind='node' AND i.version=?''', (node_id, old_version)).fetchone()
     if previous is not None:
-        seq = db.execute('INSERT INTO vector_items(target,kind,version) VALUES (?,?,?)',
-                         (node_id, 'node', new_version)).lastrowid
-        db.execute('''INSERT INTO memory_vectors(rowid,embedding,current)
-            SELECT ?,embedding,1 FROM memory_vectors WHERE rowid=?''', (seq, previous['seq']))
+        db.execute('UPDATE vector_items SET version=? WHERE seq=?', (new_version, previous['seq']))
+        db.execute('UPDATE memory_vectors SET current=1 WHERE rowid=?', (previous['seq'],))
 
 
 def attach(graph, commit, target, evidence, *, approved=False, expected_version=None):

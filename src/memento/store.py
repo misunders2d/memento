@@ -20,7 +20,7 @@ from threading import RLock
 from uuid import uuid4
 
 from .schema import (SUPPORTED_VERSIONS, VERSION as SCHEMA_VERSION, initialize, upgrade_episode_fts,
-                     upgrade_raw_text, upgrade_status_index, upgrade_captured_media)
+                     upgrade_node_fts, upgrade_raw_text, upgrade_status_index, upgrade_captured_media)
 from .blobs import BlobStore
 from .artifacts import Artifacts
 from .captured_media import references as media_references, record_references
@@ -126,6 +126,7 @@ class Store:
                     upgrade_raw_text(self._db)
                     upgrade_status_index(self._db)
                     upgrade_captured_media(self._db)
+                    upgrade_node_fts(self._db)
                     # The header marks frame-capable storage; it commits with the
                     # physical upgrades so pre-frame readers refuse this file.
                     if version != SCHEMA_VERSION:
@@ -148,14 +149,30 @@ class Store:
                 self._db = None
             self._writer_lock.close()
 
+    # Bounded SQLite busy wait for the health probe; real writer contention
+    # beyond this is reported as unhealthy rather than waited out.
+    HEALTH_BUSY_SECONDS = 0.25
+
     def health(self):
         """Check database accessibility and ability to acquire the writer transaction.
 
-        This is not a guarantee against disk-full errors at the next commit.
+        The probe is a separate short-lived connection, so health never waits on the
+        application mutex while a request merely prepares context without a SQLite
+        write transaction. It still fails on a closed store, an inaccessible or
+        missing database file (mode=rw never creates one) and on actual writer
+        contention past the bounded busy wait. Nothing is written or committed.
+        This is not a guarantee against disk-full errors at the next commit; the
+        closed-store guard is a plain attribute check, not a shutdown fence.
         """
-        with self._mutex:
-            self._db.execute('BEGIN IMMEDIATE')
-            self._db.execute('ROLLBACK')
+        if self._db is None:
+            raise RuntimeError('Evidence storage is closed')
+        probe = sqlite3.connect((self._data_dir / 'memory.sqlite').as_uri() + '?mode=rw', uri=True,
+                                timeout=self.HEALTH_BUSY_SECONDS, isolation_level=None)
+        try:
+            probe.execute('BEGIN IMMEDIATE')
+            probe.execute('ROLLBACK')
+        finally:
+            probe.close()
 
     def compact(self):
         """Owner-only physical maintenance; a fresh child keeps SQLite scratch off tmpfs."""

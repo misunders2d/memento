@@ -196,3 +196,117 @@ def test_developer_backed_memories_remain_explicit_but_need_genuine_evidence_for
         assert [hit['id'] for hit in automatic] == ([target] if mixed else [])
     finally:
         store.close()
+
+
+def reject_action(candidate_id):
+    return dict(candidate_id=candidate_id, operation='reject', type=None, text=None, scope=None, open_loop=None,
+        target=None, src=None, dst=None, relation=None, change_kind=None, valid_at=None, valid_from=None,
+        valid_to=None, category=None, sensitive=None, evidence=[], why='Instruction text is not a durable user fact.')
+
+
+def test_instruction_only_candidates_leave_consolidation_but_stay_stored_and_counted(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from memento.api import create_app
+    from memento.extraction import ACTIVE_CANDIDATE_SQL
+    monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
+    with TestClient(create_app(tmp_path)) as client:
+        store, processing = client.app.state.store, client.app.state.processing
+        capture(store, 'first')
+        second = capture(store, 'second', text='The second synthetic policy forbids silent merges.')
+        genuine = capture(store, 'genuine', source='native:synthetic-device:claude', kind='user',
+                          text='Silent merges are forbidden here.')
+        processing.compact(SOURCE, 'c')
+        # Seed the pre-fix derivation pathway without rewriting any evidence.
+        store._db.create_function('legacy_native_context', 4, lambda *_: False, deterministic=True)
+        with monkeypatch.context() as old:
+            old.setattr('memento.extraction.legacy_native_context', lambda *_: False)
+            [work] = processing.claim(agent='fixture', timezone_name='UTC', now=NOW)['work']
+            assert complete(processing, work)['candidate_count'] == 2
+        store._db.create_function('legacy_native_context', 4, legacy_native_context, deterministic=True)
+        ids = {row['text']: row['id'] for row in store._db.execute('SELECT id,text FROM candidates')}
+        legacy_only, mixed = ids[TEXT], ids[second['text']]
+        store._db.execute('INSERT INTO graph_evidence VALUES (?,?,?,?,?,?)',
+                          (mixed, 1, genuine['id'], 0, len(genuine['text']), genuine['text']))
+        counts = client.get('/status').json()['consolidation']
+        assert (counts['pending_candidates'], counts['ready_candidates'], counts['excluded_legacy_candidates']) == (1, 1, 1)
+        assert client.get('/status', params={'source': SOURCE}).json()['consolidation']['excluded_legacy_candidates'] == 1
+        assert client.get('/status', params={'source': 'other'}).json()['consolidation']['excluded_legacy_candidates'] == 0
+        [task] = processing.claim(agent='fixture', timezone_name='UTC', now=NOW, consolidate_now=True)['work']
+        assert [item['id'] for item in task['input']['candidates']] == [mixed]
+        assert {window['episode_id'] for window in task['input']['raw_windows']} == {second['id'], genuine['id']}
+        result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture',
+                                     output=dict(actions=[reject_action(mixed)]))
+        assert result['results'][mixed]['decision'] == 'reject'
+        # The instruction-only row is untouched, undecided and still an active (explicitly searchable) candidate.
+        assert store._db.execute(f'SELECT c.id FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}').fetchone()[0] == legacy_only
+        assert not store._db.execute('SELECT 1 FROM candidate_decisions WHERE candidate_id=?', (legacy_only,)).fetchone()
+        counts = client.get('/status').json()['consolidation']
+        assert (counts['pending_candidates'], counts['ready_candidates'], counts['excluded_legacy_candidates']) == (0, 0, 1)
+        assert processing.claim(agent='fixture', timezone_name='UTC', now=NOW, consolidate_now=True)['work'] == []
+
+
+def test_eligibility_predicate_reads_bodies_only_for_codex_user_rows(tmp_path):
+    from memento.consolidation import Consolidator
+    store = Store(tmp_path)
+    try:
+        consolidator = Consolidator(Graph(store))
+        rows = dict(
+            developer=capture(store, 'developer'),
+            codex_user=capture(store, 'codex-user', kind='user', text='Genuine Codex user text.'),
+            other_user=capture(store, 'other-user', source='native:synthetic-device:claude', kind='user',
+                               text='Claude user text.'),
+            tool=capture(store, 'tool', kind='tool', text='tool output body'),
+        )
+        for name, episode in rows.items():
+            store._db.execute('INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)',
+                (f'run-{name}', 'commit', episode['id'], 'extract-v2', 'fixture', '[]', 'null', NOW.isoformat()))
+            store._db.execute('''INSERT INTO candidates (id,run_id,kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''', (f'c_{name}', f'run-{name}', 'memory', 'knowledge', episode['text'],
+                'fixture', None, None, .8, None, None, '["professional"]'))
+            store._db.execute('INSERT INTO graph_evidence VALUES (?,?,?,?,?,?)',
+                              (f'c_{name}', 1, episode['id'], 0, len(episode['text']), episode['text']))
+        calls = []
+
+        def recording(source, kind, text, metadata):
+            calls.append((source, kind, text))
+            return legacy_native_context(source, kind, text, metadata)
+        store._db.create_function('legacy_native_context', 4, recording, deterministic=True)
+        admitted = {item['id'] for item in consolidator.pending()}
+        assert admitted == {'c_codex_user', 'c_other_user', 'c_tool'}
+        assert consolidator._ineligible([f'c_{name}' for name in rows]) == ['c_developer']
+        # Developer rows decide without their body; non-Codex and tool rows never reach the function.
+        assert calls and all(text is None for source, kind, text in calls if kind == 'developer')
+        assert all(kind in ('developer', 'user') and source == SOURCE for source, kind, text in calls)
+        assert any(kind == 'user' and text == rows['codex_user']['text'] for source, kind, text in calls)
+    finally:
+        store.close()
+
+
+def test_status_evaluates_the_eligibility_predicate_once_per_candidate(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from memento.api import create_app
+    monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
+    calls = []
+
+    def recording(source, kind, text, metadata):
+        calls.append((source, kind))
+        return legacy_native_context(source, kind, text, metadata)
+    monkeypatch.setattr('memento.store.legacy_native_context', recording)
+    with TestClient(create_app(tmp_path)) as client:
+        store = client.app.state.store
+        episodes = [capture(store, f'developer-{index}', text=f'Instruction {index}.') for index in range(3)]
+        episodes.append(capture(store, 'claude', source='native:synthetic-device:claude', kind='user', text='Genuine.'))
+        for index, episode in enumerate(episodes):
+            store._db.execute('INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)',
+                (f'run-{index}', 'commit', episode['id'], 'extract-v2', 'fixture', '[]', 'null', NOW.isoformat()))
+            store._db.execute('''INSERT INTO candidates (id,run_id,kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''', (f'c_{index}', f'run-{index}', 'memory', 'knowledge', episode['text'],
+                'fixture', None, None, .8, None, None, '["professional"]'))
+            store._db.execute('INSERT INTO graph_evidence VALUES (?,?,?,?,?,?)',
+                              (f'c_{index}', 1, episode['id'], 0, len(episode['text']), episode['text']))
+        store._db.commit()
+        calls.clear()
+        counts = client.get('/status').json()['consolidation']
+        assert (counts['pending_candidates'], counts['ready_candidates'], counts['excluded_legacy_candidates']) == (1, 1, 3)
+        # One evaluation per Codex row; the Claude row never reaches the function.
+        assert sorted(calls) == [(SOURCE, 'developer')] * 3
