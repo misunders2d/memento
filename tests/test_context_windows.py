@@ -8,6 +8,8 @@ import pytest
 from memento.graph import Graph
 from memento.processing import Processing
 from memento.store import Store
+from test_behavioral_learning import complete
+from test_technical_learning import BEHAVIOR, captured_trace, extract_trace, proposal, reported_trace
 
 SOURCE = 'native:synthetic-device:claude'
 POLICY = 'The synthetic approval policy requires explicit operator consent.'
@@ -153,6 +155,74 @@ def test_old_lease_context_with_existing_memory_windows_still_applies(tmp_path):
         result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
         assert result['results'][task['input']['candidates'][0]['id']]['id'] == existing
         assert graph._node(existing)['version'] == 2
+    finally:
+        store.close()
+
+
+INCIDENT = 'Current-scope lookup missed an archived report.'  # the candidate text extract_trace derives
+
+
+def compact_trace(tmp_path, store):
+    """Two actual attempt/result pairs, then enough later records to push them beyond the
+    nearby-record bound, then the assistant's own later report of the lesson."""
+    records = reported_trace()
+    fillers = [dict(type='user', uuid=f'note-{index}', message=dict(role='user', content=f'Progress note {index}.'))
+               for index in range(40)]
+    _, episodes = captured_trace(tmp_path, store, records=[*records[:4], *fillers, *records[4:]])
+    trace, report = episodes[:4], episodes[-1]
+    assert [episode['kind'] for episode in trace] == ['assistant', 'tool'] * 2 and report['kind'] == 'assistant'
+    return trace, report
+
+
+@pytest.mark.parametrize('case', ['supported', 'later_attempt_without_result'])
+def test_compact_existing_attempt_and_result_refs_ground_a_later_report(tmp_path, case):
+    store = Store(tmp_path / 'store')
+    try:
+        graph, processing = Graph(store), Processing(Graph(store))
+        trace, report = compact_trace(tmp_path, store)
+        # An earlier same-type experience already quotes the actual attempts and results.
+        existing = graph.remember(command_id='incident', actor='user', why='Observed incident', type='experience',
+                                  text=INCIDENT, scope=['professional'],
+                                  evidence=[dict(episode_id=episode['id'], quote=episode['text']) for episode in trace])['id']
+        args = extract_trace(processing, report)
+        task = processing.claim(**args, consolidate_now=True)['work'][0]
+        [candidate] = task['input']['candidates']
+        assert candidate['identity']['exact'] == [existing]
+        [node] = [item for item in task['input']['existing_nodes'] if item['id'] == existing]
+        assert {ref['episode_id'] for ref in node['evidence']} == {episode['id'] for episode in trace}
+        # Beyond the nearby bound: only the report has a raw window, and the compact
+        # existing references are the only supply of the attempts and results.
+        assert {window['episode_id'] for window in task['input']['raw_windows']} == {report['id']}
+        output = proposal(task, report, [report, *trace])
+        output.update(operation='supersede', target=existing, change_kind='refinement')
+        selected = trace if case == 'supported' else trace[:3]
+        output['technical_evidence'] = [episode['id'] for episode in selected]
+        if case != 'supported':
+            # attempt, result, attempt: the latest cited attempt has no observed result.
+            with pytest.raises(ValueError, match='behavior_requires_user_ground_truth'):
+                complete(processing, task, output)
+            assert graph._node(existing)['state'] == 'active' and graph._node(existing)['version'] == 1
+            assert not store._db.execute('SELECT 1 FROM candidate_decisions').fetchone()
+            return
+        outcome = complete(processing, task, output)
+        assert outcome['decision'] == 'promote'
+        learned = outcome['superseded_by']
+        # History carries the whole supersession lineage, so select the learned row itself.
+        [history] = [row for row in graph.history(learned) if row['id'] == learned and row['version'] == 1]
+        assert history['authority'] == 'inferred' and history['behavior'] == BEHAVIOR
+        assert {ref['quote'] for ref in history['evidence']} == {episode['text'] for episode in [report, *trace]}
+        assert graph._node(existing)['state'] == 'refined'
+        # The references carry only bounded trace metadata, never surrounding source text.
+        refs = {ref['episode_id']: ref for ref in node['evidence']}
+        assert [refs[episode['id']]['native_trace'] for episode in trace] == ['attempt', 'result'] * 2
+        sequences = [refs[episode['id']]['sequence'] for episode in trace]
+        [report_window] = task['input']['raw_windows']
+        assert sequences == sorted(sequences) and sequences[-1] < report_window['sequence']
+        assert all((ref['source'], ref['conversation_id']) == (report['source'], report['conversation_id'])
+                   for ref in refs.values())
+        assert set(refs[trace[0]['id']]) == {'episode_id', 'quote', 'occurrence', 'start', 'end',
+                                             'behavior_ground_truth', 'source', 'conversation_id',
+                                             'sequence', 'native_trace'}
     finally:
         store.close()
 

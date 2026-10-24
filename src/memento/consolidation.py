@@ -319,7 +319,9 @@ class Consolidator:
                 added_rows, added_chars = added_rows + 1, added_chars + len(text)
 
     @staticmethod
-    def _technical_grounding(action, candidate, episodes, windows):
+    def _technical_grounding(action, candidate, episodes, traces):
+        """traces: raw windows plus supplied existing references, each a dict with
+        episode_id, source, conversation_id, sequence and native_trace when native."""
         if action.behavior.authority != 'inferred':
             return False
         for source in action.evidence:
@@ -342,9 +344,9 @@ class Consolidator:
             if any((episodes[identity]['source'], episodes[identity]['conversation_id']) !=
                    (episode['source'], episode['conversation_id']) for identity in cited):
                 continue
-            trace = {window['episode_id']: window for window in windows
-                     if window['episode_id'] in selected and window.get('native_trace')
-                     and (window['source'], window['conversation_id']) == (episode['source'], episode['conversation_id'])}
+            trace = {item['episode_id']: item for item in traces
+                     if item['episode_id'] in selected and item.get('native_trace')
+                     and (item['source'], item['conversation_id']) == (episode['source'], episode['conversation_id'])}
             if action.technical_evidence is not None and set(trace) != selected:
                 # Every explicitly selected episode must be a native attempt or result
                 # projection of this conversation; legacy plans only ignore other quotes.
@@ -379,12 +381,15 @@ class Consolidator:
             candidate['scope'] = json.loads(candidate['scope'])
             candidate['loop'] = current(self.graph, candidate['id'])
         episodes, windows, nodes, edges, resolutions = {}, {}, {}, {}, {}
-        context_versions, exposures, offer_cache = set(), {}, {}
+        context_versions, exposures, offer_cache, sequences = set(), {}, {}, {}
         def evidence(target, version, *, add_window=True):
             # Existing nodes/relations keep their exact supplied references (quote,
             # offsets, occurrence, ground-truth flag) without a surrounding raw window;
             # apply accepts a citation at exactly such a span. Candidate evidence and
-            # the bounded technical trace still receive raw windows.
+            # the bounded technical trace still receive raw windows. A reference to a
+            # native attempt/result projection also carries the bounded trace metadata
+            # (source, conversation, sequence, marker) so an already-supplied exact
+            # attempt or result beyond the nearby bound can still ground a lesson.
             refs = []
             for row in db.execute('SELECT * FROM graph_evidence WHERE target=? AND version=? ORDER BY episode_id,start LIMIT 8',
                                   (target, version)):
@@ -409,9 +414,18 @@ class Consolidator:
                         behavior_ground_truth=behavior_ground_truth(episodes[episode_id]))
                 # The window marker describes the episode; apply validates the exact span,
                 # so each reference carries the same per-quote predicate the validator runs.
-                refs.append(dict(episode_id=episode_id, quote=row['quote'], occurrence=occurrence,
-                                 start=row['start'], end=row['end'],
-                                 behavior_ground_truth=behavior_ground_truth(episodes[episode_id], row['start'], row['end'])))
+                ref = dict(episode_id=episode_id, quote=row['quote'], occurrence=occurrence,
+                           start=row['start'], end=row['end'],
+                           behavior_ground_truth=behavior_ground_truth(episodes[episode_id], row['start'], row['end']))
+                marker = native_trace(episodes[episode_id])
+                if marker in ('attempt', 'result'):
+                    if episode_id not in sequences:
+                        sequences[episode_id] = db.execute('SELECT seq FROM episodes WHERE id=?',
+                                                           (episode_id,)).fetchone()[0]
+                    ref.update(source=episodes[episode_id]['source'],
+                               conversation_id=episodes[episode_id]['conversation_id'],
+                               sequence=sequences[episode_id], native_trace=marker)
+                refs.append(ref)
             return refs
         def add_node(target):
             if target in nodes:
@@ -584,9 +598,16 @@ class Consolidator:
         # Supplied existing-evidence spans are citable without a raw window: the exact
         # quote or any verbatim subspan inside it, never text beyond the supplied quote.
         spans = {}
+        # Technical grounding reads native attempt/result traces from the raw windows
+        # and from supplied existing references that carry the same bounded metadata;
+        # the span/window authorization above is unchanged, and references from a
+        # context leased before that metadata existed simply carry no trace.
+        traces = list(windows)
         for item in (*nodes.values(), *edges.values()):
             for ref in item['evidence']:
                 spans.setdefault(ref['episode_id'], []).append((ref['start'], ref['end']))
+                if ref.get('native_trace'):
+                    traces.append(ref)
         supplied = {item['episode_id'] for item in windows} | set(spans)
         cited = {source.episode_id for action in plan.actions for source in action.evidence}
         if not cited <= supplied:
@@ -648,7 +669,7 @@ class Consolidator:
                         span = source_span(episodes[source.episode_id]['text'], source.quote, source.occurrence)
                         if behavior_ground_truth(episodes[source.episode_id], *span):
                             grounded.append(source)
-                if not grounded and not self._technical_grounding(action, selected[action.candidate_id], episodes, windows):
+                if not grounded and not self._technical_grounding(action, selected[action.candidate_id], episodes, traces):
                     raise reject('consolidation_behavior_requires_user_ground_truth', action)
             for field in ('valid_from', 'valid_to', 'valid_at'):
                 setattr(action, field, self.graph._time(getattr(action, field)))
