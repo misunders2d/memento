@@ -177,9 +177,12 @@ class Processing:
             if not frontier:
                 db.execute("UPDATE repair_groups SET state='done' WHERE id=?", (row['id'],))
                 continue
+            reviewed = json.loads(row['reviewed_ids'])
+            # A repeated anchor compares the remaining seed survivors together;
+            # ordinary maintenance still admits eight seeds per page.
+            limit = 48 if frontier[0] in reviewed else 8
             payload = dict(version=CONSOLIDATE_VERSION, night=None, candidate_ids=[], next_cursor=0,
-                repair_group_id=row['id'], maintenance_ids=frontier[:8],
-                reviewed_ids=json.loads(row['reviewed_ids']))
+                repair_group_id=row['id'], maintenance_ids=frontier[:limit], reviewed_ids=reviewed)
             job = self.queue._insert('consolidate/repair/' + row['id'] + '/' + str(row['generation']),
                                      'consolidate', payload)
             db.execute('UPDATE repair_groups SET active_job=? WHERE id=?', (job, row['id']))

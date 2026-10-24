@@ -294,6 +294,91 @@ def test_dense_subject_continuation_is_bounded_and_stops_without_progress(world)
                              (request['repair_group_id'],)).fetchone()[0] == 'done'
 
 
+@pytest.mark.parametrize('kind', ['tool', 'knowledge'])
+@pytest.mark.parametrize('coalesce_final', [True, False])
+def test_separate_page_survivors_get_one_joint_comparison_then_stop(world, kind, coalesce_final):
+    store, graph, processing, node = world
+    meaning = ('Aster and Blythe name the same tool and shipping cadence.' if coalesce_final else
+               'Aster and Blythe name different tools and independently changing shipping cadences.')
+    a, ea = node('Aster weekly cadence', kind, quote=meaning)
+    aa, eaa = node('Aster weekly cadence detail', kind, quote=meaning)
+    b, eb = node('Blythe weekly cadence', kind, quote=meaning)
+    bb, ebb = node('Blythe weekly cadence detail', kind, quote=meaning)
+    request = seed(processing, [a, aa, b, bb])
+    first, = claim(processing)
+    complete(processing, first, [repair('absorb', a, [ea, eaa], absorbed=[aa])], continuation=[b])
+    second, = claim(processing)
+    assert a not in {item['id'] for item in second['input']['existing_nodes']}
+    complete(processing, second, [repair('absorb', b, [eb, ebb], absorbed=[bb])])
+    third, = claim(processing)
+    assert {a, b} <= {item['id'] for item in third['input']['existing_nodes']}
+    assert len(third['input']['existing_nodes']) <= 48
+    output = [repair('absorb', a, [ea, eb], absorbed=[b])] if coalesce_final else []
+    complete(processing, third, output)
+    assert graph._node(b)['state'] == ('merged' if coalesce_final else 'active')
+    assert claim(processing) == []
+    assert store._db.execute('SELECT state FROM repair_groups WHERE id=?',
+                             (request['repair_group_id'],)).fetchone()[0] == 'done'
+
+
+@pytest.mark.parametrize('kind', ['tool', 'knowledge'])
+def test_survivor_comparison_keeps_more_than_eight_nonlexical_seed_survivors(world, kind):
+    store, graph, processing, node = world
+    members = [node('Handle' + chr(97 + number), kind,
+                    quote='Every fixture handle denotes the same synthetic tool or equivalent claim.')
+               for number in range(19)]
+    sources = dict(members)
+    request = seed(processing, sources)
+    for _ in range(2):
+        task, = claim(processing)
+        assert len(task['input']['existing_nodes']) == 8
+        complete(processing, task)
+    task, = claim(processing)
+    supplied = [item['id'] for item in task['input']['existing_nodes']]
+    assert len(supplied) == 3
+    target, absorbed = supplied[:2]
+    missing = set(sources) - set(supplied)
+    complete(processing, task, [repair('absorb', target, [sources[target], sources[absorbed]],
+                                       absorbed=[absorbed])])
+    comparison, = claim(processing)
+    compared = {item['id'] for item in comparison['input']['existing_nodes']}
+    assert {target, *missing} <= compared
+    assert len(compared) <= 48
+    complete(processing, comparison)
+    assert claim(processing) == []
+    assert store._db.execute('SELECT state FROM repair_groups WHERE id=?',
+                             (request['repair_group_id'],)).fetchone()[0] == 'done'
+
+
+@pytest.mark.parametrize('refine_other', [False, True])
+def test_already_cosupplied_heterogeneous_survivors_need_no_extra_page(world, refine_other):
+    store, graph, processing, node = world
+    a, ea = node('Aster tool', 'tool')
+    aa, eaa = node('Aster tool alias', 'tool')
+    b, eb = node('Different Blythe tool', 'tool', quote='Different Blythe is the deployment tool.')
+    bb, ebb = node('Different Blythe tool alias', 'tool')
+    seed(processing, [a, aa, b, bb])
+    task, = claim(processing)
+    other = (repair('supersede', b, [eb], type='tool', text=eb['quote'], change_kind='refinement')
+             if refine_other else repair('absorb', b, [eb, ebb], absorbed=[bb]))
+    result = complete(processing, task, [repair('absorb', a, [ea, eaa], absorbed=[aa]), other])
+    current_b = result['repair_results'][b]['superseded_by'] if refine_other else b
+    assert graph._node(a)['state'] == graph._node(current_b)['state'] == 'active'
+    assert claim(processing) == []
+
+
+def test_refinement_without_coalescence_does_not_requeue_other_seed_survivors(world):
+    store, graph, processing, node = world
+    a, ea = node('Aster weekly cadence')
+    b, eb = node('Blythe independent cadence')
+    seed(processing, [a, b])
+    task, = claim(processing)
+    complete(processing, task, [repair('supersede', a, [ea], type='knowledge',
+        text='Aster weekly cadence with its supported name retained.', change_kind='refinement')])
+    assert graph._node(a)['state'] == 'refined' and graph._node(b)['state'] == 'active'
+    assert claim(processing) == []
+
+
 def test_absorbed_manual_open_choice_survives_occupied_survivor(world):
     store, graph, processing, node = world
     survivor, a = node('A pending warehouse report.')

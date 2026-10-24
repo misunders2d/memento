@@ -1230,6 +1230,31 @@ class Consolidator:
         # A previously reviewed anchor is supplied only alongside genuinely unseen
         # work. No unchanged 48-node page can continually rediscover itself.
         frontier = list(dict.fromkeys([*anchors, *frontier]))
+        reviewed.difference_update(frontier)
+        if group is not None:
+            # A page can form a local survivor while an earlier one is absent.
+            # Actual coalescence, rather than a text/version rewrite, warrants
+            # one joint comparison with missing same-type seed survivors.
+            survivors = {}
+            for seed in json.loads(group['seed_ids']):
+                node = canonical(self.graph, seed)
+                if node['state'] == 'active':
+                    survivors[node['id']] = node
+            merged_into = {canonical(self.graph, row['superseded_by'])['id'] for row in db.execute(
+                "SELECT DISTINCT superseded_by FROM node_versions WHERE commit_id=? AND state='merged'", (commit,))}
+            supplied = {canonical(self.graph, target)['id'] for target in nodes}
+            comparison = []
+            for target in sorted(merged_into & survivors.keys()):
+                missing = [identity for identity, node in survivors.items()
+                           if identity != target and identity not in supplied and node['type'] == survivors[target]['type']]
+                if missing:
+                    comparison = list(dict.fromkeys([*comparison, target, *missing]))
+            if comparison:
+                reviewed.difference_update(comparison)
+                # A repeated reviewed anchor marks this bounded seed comparison;
+                # ordinary pending work stays outside reviewed until supplied.
+                reviewed.update(merged_into.intersection(comparison))
+                frontier = [*comparison, *(target for target in frontier if target not in comparison)]
         resolved = []
         for target in frontier:
             node = canonical(self.graph, target)
