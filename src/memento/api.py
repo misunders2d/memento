@@ -144,11 +144,17 @@ class ClaimInput(WorkInput):
     consolidate_now: bool = False
     # Optional lane filter for a runner whose other lane is still busy; omitted means both.
     kinds: list[Literal['extract', 'consolidate']] | None = Field(default=None, min_length=1, max_length=2)
+    # The runner's configured local-time consolidation window; an older runner omits
+    # both and keeps the default. Rejected here, before the claim touches anything.
+    consolidation_start: str | None = Field(default=None, max_length=5)
+    consolidation_end: str | None = Field(default=None, max_length=5)
 
     @model_validator(mode='after')
     def distinct_kinds(self):
         if self.kinds is not None and len(set(self.kinds)) != len(self.kinds):
             raise ValueError('kinds must be distinct')
+        from .processing import night_window
+        night_window(self.consolidation_start, self.consolidation_end)
         return self
 
     def arguments(self):

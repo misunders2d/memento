@@ -2,7 +2,8 @@
 """Standalone host-user runner; only the Python standard library is required.
 
 Connect a native client with ``memento agent add claude --url PRIVATE_SERVICE_URL``.
-The designated processor uses ``python3 runner.py setup --agent pi --timezone Europe/Berlin``.
+The designated processor uses ``python3 runner.py setup --agent pi --timezone Europe/Berlin``,
+optionally with ``--consolidation-start HH:MM --consolidation-end HH:MM`` (default 02:00-07:00 local).
 For isolated setup use --no-activate plus temporary --config, --unit-dir and --native-config-dir.
 Scheduling belongs to /work/claim, not this process. No generation credentials are stored.
 """
@@ -595,6 +596,8 @@ def tick(config, compaction=None, *, consolidate_now=False):
                     exclude = sorted(set(attempted) | {ident for _, ids in running.values() for ident in ids})
                     request = {'agent': config['agent'], 'timezone': config['timezone'],
                                'compaction': compaction, 'exclude': exclude, 'consolidate_now': consolidate_now}
+                    # Only a configured window travels; an unconfigured runner keeps its old request shape.
+                    request.update({key: config[key] for key in WINDOW_KEYS if key in config})
                     if len(free) < len(KINDS):
                         # Old servers know no kinds filter; the full request keeps its old shape.
                         request['kinds'] = free
@@ -825,6 +828,26 @@ def timezone_name(value):
     return value
 
 
+WINDOW_KEYS = ('consolidation_start', 'consolidation_end')
+
+
+def consolidation_window(start, end):
+    """Both strict HH:MM local-time endpoints, or both omitted for the service default (02:00-07:00)."""
+    if start is None and end is None:
+        return {}
+    if start is None or end is None:
+        raise RunnerError('--consolidation-start and --consolidation-end must be given together')
+    for value in (start, end):
+        # ASCII digits only: the service's strict HH:MM check rejects other Unicode digits.
+        if (not isinstance(value, str) or len(value) != 5 or value[2] != ':'
+                or not all(char in '0123456789' for char in value[:2] + value[3:])
+                or int(value[:2]) > 23 or int(value[3:]) > 59):
+            raise RunnerError('consolidation window endpoints must be HH:MM in the configured timezone')
+    if start == end:
+        raise RunnerError('consolidation window endpoints must differ')
+    return dict(zip(WINDOW_KEYS, (start, end)))
+
+
 def default_config():
     return Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'memento' / 'runner.json'
 
@@ -892,6 +915,9 @@ def setup(args):
     """
     if not args.client and args.timezone is None:
         raise RunnerError('server setup requires an explicit --timezone')
+    # Explicit window flags are validated before any native execution or file write.
+    flags = [getattr(args, key, None) for key in WINDOW_KEYS]
+    window = consolidation_window(*flags) if any(value is not None for value in flags) else None
     preset = args.custom_preset if args.agent == 'custom' else args.agent
     if args.agent == 'custom':
         if not preset or not args.command_json:
@@ -914,6 +940,9 @@ def setup(args):
         raise RunnerError('client setup cannot replace a server config; reuse server setup or choose a separate --config')
     # Clients never schedule work; do not ask the human for a processing timezone.
     zone = timezone_name(args.timezone if args.timezone is not None else (previous['timezone'] if previous else 'Etc/UTC'))
+    # A reinstall without the flags keeps the stored window; clients never carry one.
+    if window is None:
+        window = {key: previous[key] for key in WINDOW_KEYS if previous and key in previous}
     Service(args.url)
     deadline = args.deadline_seconds
     if not math.isfinite(deadline) or deadline <= 0:
@@ -922,7 +951,7 @@ def setup(args):
     config = {'uid': os.getuid(), 'client_uid': client_uid,
               'agent': args.agent, 'preset': preset, 'command': command,
               'mode': 'client' if args.client else 'server',
-              'timezone': zone, 'url': args.url, 'deadline_seconds': deadline}
+              'timezone': zone, 'url': args.url, 'deadline_seconds': deadline, **window}
     runner = Path(__file__).resolve()
     if not args.client:
         unit_dir = args.unit_dir.expanduser().absolute()
@@ -1189,6 +1218,8 @@ def load_config(path):
         deadline = config['deadline_seconds']
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline) or deadline <= 0:
             raise RunnerError('deadline must be finite and positive')
+        # Legacy configs omit the window and keep the service default.
+        consolidation_window(*(config.get(key) for key in WINDOW_KEYS))
         return config
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise RunnerError('invalid runner config') from exc
@@ -1212,6 +1243,10 @@ def main(argv=None):
     install.add_argument('--custom-preset', choices=('pi', 'omp', 'claude', 'codex'))
     install.add_argument('--command-json', help='custom native executable as a one-element JSON argv')
     install.add_argument('--timezone', help='explicit IANA timezone required for server processing')
+    install.add_argument('--consolidation-start', metavar='HH:MM',
+                         help='server consolidation window start in the configured timezone (default 02:00)')
+    install.add_argument('--consolidation-end', metavar='HH:MM',
+                         help='server consolidation window end, exclusive; may cross midnight (default 07:00)')
     install.set_defaults(client=False)
     install.add_argument('--native-config-dir', type=Path, help='override selected harness config root for isolated setup')
     install.add_argument('--url', default='http://127.0.0.1:8765')

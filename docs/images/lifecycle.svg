@@ -43,7 +43,7 @@
   <text class="small" x="282" y="178">  kinds filter)</text>
   <text class="small" x="282" y="198">• Extraction: &lt;=64 windows / 48k</text>
   <text class="small" x="282" y="216">  chars (live + cited demand spans)</text>
-  <text class="small" x="282" y="236">• Consolidation: 02:00–07:00 window,</text>
+  <text class="small" x="282" y="236">• Consolidation: configured window,</text>
   <text class="small" x="282" y="254">  compact existing-node refs (-49%)</text>
 
   <!-- Stage 3: Whole-Batch Validation Gate -->

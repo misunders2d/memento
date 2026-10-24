@@ -85,7 +85,7 @@
   <!-- Durable Graph Box -->
   <rect class="accent" x="684" y="334" width="256" height="162" rx="10"/>
   <text class="label" x="700" y="360">Durable versioned graph</text>
-  <text x="700" y="383">02:00–07:00 consolidation</text>
+  <text x="700" y="383">Configured night window</text>
   <text class="small" x="700" y="405">Compact existing-evidence spans</text>
   <text class="small" x="700" y="425">Explicit user vs. inferred trace</text>
   <text class="small" x="700" y="443">(attempt → result) lessons</text>

@@ -4,9 +4,12 @@ import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
+from fastapi.testclient import TestClient
 
+from memento.api import create_app
 from memento.graph import Graph
 from memento.processing import Processing
 from memento.store import Store
@@ -234,6 +237,124 @@ def test_forced_catch_up_skips_reserved_candidates_and_normal_close_keeps_them_e
         assert job(store, d['id'])['payload']['night'] == 'UTC/2026-10-19'
     finally:
         store.close()
+
+
+KYIV = ZoneInfo('Europe/Kiev')  # UTC+3 on 2026-10-18/19
+
+
+def kyiv(day, hour, minute):
+    # Aware Kyiv wall-clock time converted to UTC: the predicate must read the configured zone.
+    return datetime(2026, 10, day, hour, minute, tzinfo=KYIV).astimezone(timezone.utc)
+
+
+def local_claim(processing, now, window=None, **extra):
+    schedule = dict(zip(('consolidation_start', 'consolidation_end'), window)) if window else {}
+    return processing.claim(agent='fixture', timezone_name='Europe/Kiev', now=now, **schedule, **extra)['work']
+
+
+def check_window(store, processing, window, before, first, last, after, night_id):
+    """Start-inclusive, end-exclusive admission at the configured Kyiv wall-clock boundaries."""
+    assert local_claim(processing, before, window) == [] and night(store, night_id) is None
+    a, = local_claim(processing, first, window)
+    assert job(store, a['id'])['payload']['night'] == night_id and len(ids(a)) == 16
+    reject_all(processing, a)
+    # The last in-window minute still admits; that batch is left pending for the close sweep.
+    b, = local_claim(processing, last, window)
+    assert ids(b).isdisjoint(ids(a)) and len(ids(b)) == 16
+    assert job(store, b['id'])['payload']['night'] == night_id
+    processing.release(id=b['id'], owner=b['owner'], error='service_rejected')
+    store._db.execute('UPDATE jobs SET available_at=0 WHERE id=?', (b['id'],))
+    assert local_claim(processing, after, window) == []
+    assert job(store, b['id'])['state'] == 'failed' and job(store, b['id'])['error'] == 'night_window_closed'
+    assert consolidate_jobs(store) == 2 and night(store, night_id)['finished_at'] is None
+
+
+def test_configured_01_to_08_window_is_read_in_kyiv_local_time(tmp_path):
+    store, processing = seeded(tmp_path)
+    try:
+        # 01:00 Kyiv is 22:00 UTC the day before and 08:00 Kyiv is 05:00 UTC: a UTC-hour
+        # comparison would invert both decisions.
+        assert kyiv(18, 1, 0).hour == 22 and kyiv(18, 8, 0).hour == 5
+        check_window(store, processing, ('01:00', '08:00'), before=kyiv(18, 0, 59), first=kyiv(18, 1, 0),
+                     last=kyiv(18, 7, 59), after=kyiv(18, 8, 0), night_id='Europe/Kiev/2026-10-18')
+    finally:
+        store.close()
+
+
+def test_omitted_window_keeps_the_original_02_to_07_default(tmp_path):
+    store, processing = seeded(tmp_path)
+    try:
+        check_window(store, processing, None, before=kyiv(18, 1, 59), first=kyiv(18, 2, 0),
+                     last=kyiv(18, 6, 59), after=kyiv(18, 7, 0), night_id='Europe/Kiev/2026-10-18')
+    finally:
+        store.close()
+
+
+def test_cross_midnight_window_with_minutes_keeps_one_night_identity(tmp_path):
+    store, processing = seeded(tmp_path)
+    try:
+        window = ('23:30', '00:15')
+        assert local_claim(processing, kyiv(18, 23, 29), window) == []
+        a, = local_claim(processing, kyiv(18, 23, 30), window)
+        assert job(store, a['id'])['payload']['night'] == 'Europe/Kiev/2026-10-18'
+        frozen = night(store, 'Europe/Kiev/2026-10-18')['through_rowid']
+        reject_all(processing, a)
+        # After midnight the same night continues: same identity, same frozen boundary, next batch.
+        b, = local_claim(processing, kyiv(19, 0, 14), window)
+        assert job(store, b['id'])['payload']['night'] == 'Europe/Kiev/2026-10-18'
+        assert ids(b).isdisjoint(ids(a)) and night(store, 'Europe/Kiev/2026-10-19') is None
+        assert night(store, 'Europe/Kiev/2026-10-18')['through_rowid'] == frozen
+        processing.release(id=b['id'], owner=b['owner'], error='service_rejected')
+        store._db.execute('UPDATE jobs SET available_at=0 WHERE id=?', (b['id'],))
+        # The end minute closes the night and retires the pending batch; force still bypasses.
+        assert local_claim(processing, kyiv(19, 0, 15), window) == []
+        assert job(store, b['id'])['error'] == 'night_window_closed'
+        forced, = local_claim(processing, kyiv(19, 12, 0), window, consolidate_now=True)
+        assert job(store, forced['id'])['payload']['night'] is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('window', [('1:00', '08:00'), ('01:00', '24:00'), ('01:60', '08:00'), ('02:00', '02:00'),
+                                    ('01:00', None), (None, '08:00'), ('0100', '0800'), ('01:00', '08:00\n'),
+                                    ('٠١:00', '08:00')])
+def test_invalid_window_is_rejected_before_any_mutation(tmp_path, window):
+    store, processing = seeded(tmp_path)
+
+    def snapshot():
+        progress = store._db.execute('''SELECT compact_through FROM processing_progress
+            WHERE source='schedule-fixture' AND conversation_id='c' ''').fetchone()[0]
+        return store._db.execute('SELECT count(*) FROM jobs').fetchone()[0], night(store, 'Europe/Kiev/2026-10-18'), progress
+
+    try:
+        store.capture(dict(source='schedule-fixture', event_id='later', conversation_id='c', kind='user',
+                           text='A later message that compaction would make extractable.', occurred_at=None, metadata={}))
+        before = snapshot()
+        with pytest.raises(ValueError):
+            processing.claim(agent='fixture', timezone_name='Europe/Kiev', now=kyiv(18, 3, 0),
+                             consolidation_start=window[0], consolidation_end=window[1],
+                             compaction=dict(source='schedule-fixture', conversation_id='c'))
+        # No job, no night row and no compaction boundary moved: the compaction nudge was never applied.
+        assert snapshot() == before
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize('schedule,status', [({}, 200), (dict(consolidation_start='01:00', consolidation_end='08:00'), 200),
+                                             (dict(consolidation_start='23:30', consolidation_end='00:15'), 200),
+                                             (dict(consolidation_start='01:00'), 422),
+                                             (dict(consolidation_start='02:00', consolidation_end='02:00'), 422),
+                                             (dict(consolidation_start='1:00', consolidation_end='08:00'), 422),
+                                             (dict(consolidation_start='01:00', consolidation_end='08:00:00'), 422),
+                                             (dict(consolidation_start='01:00', consolidation_end='8:00\n'), 422),
+                                             (dict(consolidation_start='٠١:00', consolidation_end='08:00'), 422)])
+def test_claim_api_accepts_omitted_or_strict_window_only(tmp_path, monkeypatch, schedule, status):
+    monkeypatch.setenv('MEMENTO_EMBEDDINGS', '0')
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post('/work/claim', json=dict(agent='fixture', timezone='Europe/Kiev', **schedule))
+        assert response.status_code == status
+        if status == 200:
+            assert response.json()['work'] == []
 
 
 def test_all_candidates_reserved_by_excluded_batch_leaves_night_open_until_decided(tmp_path):

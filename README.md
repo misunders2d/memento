@@ -59,7 +59,7 @@ flowchart TB
     accDescr: Raw episodes are losslessly compressed and chunked. New captures flow through the independent two-lane processor, while an optional one-time historical cutover parks older backlog as searchable unverified history that promotes on demand when cited.
     H["Raw Episodes & Media (Immutable + raw_frame compressed)"] --> E["Extraction Lane (Live captures + cited historical chunks)"]
     E --> C["Unconfirmed Candidates (Span-verified, legacy instructions filtered)"]
-    C --> N["Nightly Consolidation Lane (02:00-07:00, compact existing-evidence spans)"]
+    C --> N["Nightly Consolidation Lane (configured local window, default 02:00-07:00, compact existing-evidence spans)"]
     N --> V{"Whole-Batch Validation Gate (Exact spans + technical_evidence trace)"}
     V -->|"Valid: atomic commit"| M["Durable Versioned Graph (Current-node FTS5 + reused vec0 vectors)"]
     V -.->|"Rejected: rollback + bounded previous_rejection"| N
@@ -201,6 +201,8 @@ Replace the timezone with the actual **IANA timezone**. Choose `--agent pi`, `om
 
 Default config: `${XDG_CONFIG_HOME:-$HOME/.config}/memento/runner.json`. Use `--config PATH` consistently when choosing another location. `--no-activate` installs without starting the timer.
 
+Consolidation runs in a per-installation **local-time window** of the configured timezone, start inclusive and end exclusive. The default is 02:00–07:00. Set another with both `--consolidation-start HH:MM --consolidation-end HH:MM`; minutes are honored and the window may cross midnight, in which case the night is named after the date it started. Rerunning setup without the flags keeps the stored window. Clients take no schedule; the server runner sends its window with every claim, and the service rejects an invalid or empty one before doing any work.
+
 The user timer starts roughly two minutes after boot and then **15 minutes after each completed run**. For unattended processing after logout, the human/operator enables lingering:
 
 ```sh
@@ -337,13 +339,13 @@ python3 "$HOME/.local/share/memento/runner.py" \
   --config "${XDG_CONFIG_HOME:-$HOME/.config}/memento/runner.json" tick --consolidate-now
 ```
 
-That flag bypasses **only the consolidation night window**, not extraction eligibility, and does not change the schedule. It is **not proof of normal 2 a.m. execution**.
+That flag bypasses **only the consolidation night window**, not extraction eligibility, and does not change the schedule. It is **not proof of normal in-window execution**.
 
 ### Verify the normal overnight schedule
 
-Leave an evidence-backed candidate pending before 02:00 in the server config's timezone. Keep the host awake and the timer enabled. Observe the normal service journal and memory history after the first completed in-window tick, without running a forced tick or modifying the clock.
+Leave an evidence-backed candidate pending before the window starts in the server config's timezone (02:00 unless you configured `--consolidation-start`). Keep the host awake and the timer enabled. Observe the normal service journal and memory history after the first completed in-window tick, without running a forced tick or modifying the clock.
 
-The window is **02:00–07:00**, not exactly 02:00. The first in-window claim freezes that night's eligible-candidate boundary; later candidates wait for another night. Processing duration shifts the next tick. Give pending extraction/consolidation time to finish before calling a miss a failure. There is no daytime catch-up for a missed night window.
+The window is the whole configured span (**02:00–07:00** by default), not exactly its first minute. The first in-window claim freezes that night's eligible-candidate boundary; later candidates wait for another night. Processing duration shifts the next tick. Give pending extraction/consolidation time to finish before calling a miss a failure. There is no daytime catch-up for a missed night window.
 
 </details>
 

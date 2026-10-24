@@ -3,9 +3,10 @@
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import uuid4
 
@@ -30,6 +31,30 @@ PARKED_ERROR = 'historical_parked'
 # A legacy episode-id citation may demand at most one ordinary extraction window;
 # a longer episode needs the chunk reference that new raw results carry.
 DEMAND_EPISODE_LIMIT = 12000
+
+# The consolidation night window a runner that sends no schedule still gets.
+DEFAULT_CONSOLIDATION_WINDOW = ('02:00', '07:00')
+_CLOCK = re.compile(r'^([01][0-9]|2[0-3]):([0-5][0-9])$')
+
+
+def night_window(start=None, end=None):
+    """Validate a local-time window into minutes since midnight: (start, end), start-inclusive, end-exclusive.
+
+    Both endpoints are strict HH:MM or both omitted; a window never covers zero or every minute.
+    """
+    if (start is None) != (end is None):
+        raise ValueError('consolidation_start and consolidation_end must be given together')
+    if start is None:
+        start, end = DEFAULT_CONSOLIDATION_WINDOW
+    values = []
+    for value in (start, end):
+        match = _CLOCK.fullmatch(value) if isinstance(value, str) else None
+        if match is None:
+            raise ValueError('consolidation window endpoints must be HH:MM local time')
+        values.append(int(match.group(1)) * 60 + int(match.group(2)))
+    if values[0] == values[1]:
+        raise ValueError('consolidation window endpoints must differ')
+    return tuple(values)
 
 
 def demand_extract(graph, episode, start=None, end=None):
@@ -247,11 +272,20 @@ class Processing:
             self.queue._insert(key, 'extract', dict(payload, order=order))
             return
 
-    def _enqueue_night(self, now, zone, force=False, exclude=()):
+    def _enqueue_night(self, now, zone, window=None, force=False, exclude=()):
         db = self.store._db
         local = now.astimezone(zone)
-        night = zone.key + '/' + local.date().isoformat()
-        within = 2 <= local.hour < 7
+        start, end = window or night_window()
+        minute = local.hour * 60 + local.minute
+        if start < end:
+            within = start <= minute < end
+            anchor = local.date()
+        else:
+            # A window across midnight is one night named after the date it started on,
+            # so passing midnight neither reopens nor refreezes the candidate boundary.
+            within = minute >= start or minute < end
+            anchor = local.date() if minute >= start else local.date() - timedelta(days=1)
+        night = zone.key + '/' + anchor.isoformat()
         db.execute('''UPDATE jobs SET state='failed',error='night_window_closed',owner=NULL,lease_until=NULL
             WHERE kind='consolidate' AND (state='pending' OR (state='leased' AND lease_until<=?))
             AND json_extract(payload,'$.night') IS NOT NULL
@@ -303,11 +337,14 @@ class Processing:
         self.queue._insert(key, 'consolidate', payload)
         return True
 
-    def claim(self, *, agent, timezone_name, compaction=None, exclude=(), consolidate_now=False, now=None, kinds=None):
+    def claim(self, *, agent, timezone_name, compaction=None, exclude=(), consolidate_now=False, now=None, kinds=None,
+              consolidation_start=None, consolidation_end=None):
         try:
             zone = ZoneInfo(timezone_name)
         except (ZoneInfoNotFoundError, ValueError):
             raise ValueError('timezone must be an installed IANA timezone name') from None
+        # The schedule is validated before compaction or any other mutation.
+        window = night_window(consolidation_start, consolidation_end)
         now = now or datetime.now(timezone.utc)
         if compaction:
             self.compact(**compaction)
@@ -318,7 +355,7 @@ class Processing:
                 db.execute('BEGIN IMMEDIATE')
                 try:
                     self._enqueue_extract(now)
-                    night_due = self._enqueue_night(now, zone, force=consolidate_now, exclude=exclude)
+                    night_due = self._enqueue_night(now, zone, window, force=consolidate_now, exclude=exclude)
                     db.execute('COMMIT')
                     return night_due
                 except BaseException:

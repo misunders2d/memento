@@ -991,6 +991,67 @@ def test_setup_temporary_locations_never_activate_timer(tmp_path, monkeypatch):
     assert config.stat().st_mode & 0o077 == 0
 
 
+def test_setup_consolidation_window_is_validated_persisted_and_preserved_on_reinstall(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
+    monkeypatch.setattr(runner, 'install_native', lambda *a: {})
+    monkeypatch.setattr(runner, 'run_process', lambda *a, **k: pytest.fail('no systemctl with --no-activate'))
+    config = tmp_path / 'private' / 'runner.json'
+    base = ['setup', '--agent', 'pi', '--timezone', 'Europe/Kiev', '--config', str(config),
+            '--unit-dir', str(tmp_path / 'units'), '--no-activate']
+    # A legacy server config without the window loads and keeps the service default.
+    assert runner.main(base) == 0
+    assert not {'consolidation_start', 'consolidation_end'} & set(runner.load_config(config))
+    assert runner.main(base + ['--consolidation-start', '01:00', '--consolidation-end', '08:00']) == 0
+    stored = runner.load_config(config)
+    assert (stored['consolidation_start'], stored['consolidation_end']) == ('01:00', '08:00')
+    # Reinstall without the flags preserves the stored window along with the identity.
+    assert runner.main(base) == 0
+    assert runner.load_config(config) == stored
+    for invalid in (['--consolidation-start', '1:00', '--consolidation-end', '08:00'],
+                    ['--consolidation-start', '01:00', '--consolidation-end', '24:00'],
+                    ['--consolidation-start', '02:00', '--consolidation-end', '02:00'],
+                    ['--consolidation-start', '01:00', '--consolidation-end', '08:00\n'],
+                    ['--consolidation-start', '٠١:00', '--consolidation-end', '08:00'],
+                    ['--consolidation-start', '01:00']):
+        assert runner.main(base + invalid) == 1
+        assert runner.load_config(config) == stored
+    # A client never carries a schedule, and a damaged half-window fails to load.
+    client = tmp_path / 'client' / 'runner.json'
+    assert runner.main(['agent', 'add', 'pi', '--config', str(client), '--url', 'https://private-service.example']) == 0
+    assert not {'consolidation_start', 'consolidation_end'} & set(runner.load_config(client))
+    runner.private_write(config, runner.encode({key: value for key, value in stored.items() if key != 'consolidation_end'}))
+    with pytest.raises(runner.RunnerError):
+        runner.load_config(config)
+
+
+@pytest.mark.parametrize('window', [None, ('01:00', '08:00')])
+def test_tick_forwards_only_a_configured_consolidation_window(monkeypatch, window):
+    claims = []
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, path, value):
+            assert path == '/work/claim'
+            claims.append(value)
+            return {'lease_seconds': 60, 'work': []}
+
+    monkeypatch.setattr(runner, 'Service', Service)
+    monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
+    config = {'mode': 'server', 'preset': 'pi', 'agent': 'pi', 'command': ['pi'],
+              'timezone': 'Europe/Kiev', 'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2}
+    if window:
+        config.update(consolidation_start=window[0], consolidation_end=window[1])
+    assert runner.tick(config) == 0
+    [claim] = claims
+    assert claim['timezone'] == 'Europe/Kiev'
+    if window:
+        assert (claim['consolidation_start'], claim['consolidation_end']) == window
+    else:
+        assert not {'consolidation_start', 'consolidation_end'} & set(claim)
+
+
 def test_setup_persists_distinct_client_identity_across_same_uid_installs(tmp_path, monkeypatch):
     monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
     monkeypatch.setattr(runner, 'install_native', lambda *a: {})
