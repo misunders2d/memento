@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from .schema import (SUPPORTED_VERSIONS, VERSION as SCHEMA_VERSION, header_target, initialize, upgrade_episode_fts,
                      upgrade_historical_pool, upgrade_node_fts, upgrade_raw_text, upgrade_status_index,
-                     upgrade_captured_media)
+                     upgrade_captured_media, upgrade_repair_groups)
 from .blobs import BlobStore
 from .artifacts import Artifacts
 from .captured_media import references as media_references, record_references
@@ -129,6 +129,7 @@ class Store:
                     upgrade_captured_media(self._db)
                     upgrade_node_fts(self._db)
                     upgrade_historical_pool(self._db)
+                    upgrade_repair_groups(self._db)
                     # The header marks frame-capable storage; it commits with the
                     # physical upgrades so pre-frame readers refuse this file. A
                     # database that ever activated historical parking keeps header 3;

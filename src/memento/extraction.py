@@ -56,6 +56,11 @@ VALIDATION_CODES = frozenset({
     'consolidation_relation_invalid', 'consolidation_remember_invalid', 'consolidation_schema_invalid',
     'consolidation_supersede_invalid', 'consolidation_technical_evidence_invalid',
     'consolidation_type_definition_invalid', 'consolidation_world_interval_invalid',
+    'consolidation_absorb_member_invalid', 'consolidation_absorb_type_mismatch',
+    'consolidation_absorb_scope_mismatch', 'consolidation_absorb_validity_mismatch',
+    'consolidation_absorb_behavior_mismatch', 'consolidation_absorb_loop_conflict',
+    'consolidation_retire_context_incomplete',
+    'consolidation_retire_target_invalid', 'consolidation_retire_type_invalid', 'consolidation_retire_evidence_invalid',
     # Fixed graph/curation rule sentences that can also reject a completed batch.
     # They are exact constants, never an exception message built from data.
     'World time must be an aware ISO timestamp', 'scope requires distinct personal/professional labels',
@@ -63,7 +68,7 @@ VALIDATION_CODES = frozenset({
     'Merge requires distinct active entities of the same type', 'Relations require active endpoints',
     'Supersession requires an active node', 'Change must follow the previous valid_from',
 })
-REFERENCE_FIELDS = frozenset({'candidate_id', 'window_id', 'key', 'operation', 'episode_id', 'occurrence', 'quote'})
+REFERENCE_FIELDS = frozenset({'candidate_id', 'window_id', 'target', 'key', 'operation', 'episode_id', 'occurrence', 'quote'})
 
 
 class WorkRejected(ValueError):
@@ -164,6 +169,10 @@ Transient turn narration is not durable memory: "the user asked/authorized the a
 other descriptions of an in-session request that is already complete are not standalone knowledge, decision or experience candidates.
 Keep such material only as an unresolved cross-session obligation (open_loop true), a lasting decision or policy, a durable finding, or a
 supported lesson, and state that durable subject or obligation itself rather than the turn envelope around it.
+Also retain explicit completion or cancellation of a specifically identified previously outstanding obligation as lifecycle evidence,
+with open_loop false, even without a separate lasting fact. Name the same concrete task and preserve its exact source quote; ordinary
+tool success and generic completed-command receipts do not qualify. Consolidation can close the matching loop and reject an otherwise
+non-durable candidate without storing a new assertion.
 Standing approval requirements, policies or conditional workflow steps are not by themselves pending obligations: open_loop needs
 evidence of a concrete instance that is currently outstanding.
 previous_rejection, when supplied, is this server's validation result for this batch's earlier output: fix exactly the named window,

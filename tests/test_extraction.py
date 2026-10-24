@@ -831,7 +831,8 @@ def test_legacy_consolidation_lease_reprepares_same_job_before_loop_changes(extr
     store._db.execute('UPDATE jobs SET lease_until=0 WHERE id=?', (task['id'],))
     fresh = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work'][0]
     assert fresh['id'] == task['id'] and fresh['owner'] != task['owner']
-    assert fresh['input']['loop_policy_version'] == 'consolidate-v6'
+    from memento.consolidation import VERSION as CONSOLIDATE_VERSION
+    assert fresh['input']['loop_policy_version'] == CONSOLIDATE_VERSION
     result = processing.complete(id=fresh['id'], owner=fresh['owner'], agent='fixture', output=dict(actions=[action]))
     assert current(graph, result['results'][action['candidate_id']]['id']) is None
 
@@ -946,6 +947,25 @@ def test_consolidation_closes_only_from_strictly_newer_original_outcomes(
     else:
         assert current(graph, target) == before
     assert store.get(source['id'])['text'] == text
+
+
+@pytest.mark.parametrize('text,closing', [
+    ('I sent Alex the report I owed him.', True),
+    ('I cancelled the report I owed Alex.', True),
+    ('The unrelated tool status command completed successfully.', False),
+])
+def test_lifecycle_evidence_can_close_without_promoting_completed_turn_clutter(loop_completion, text, closing):
+    from memento.extraction import INSTRUCTION
+    from memento.loops import current
+    assert 'previously outstanding obligation as lifecycle evidence' in INSTRUCTION
+    store, graph, processing, target, source, task = loop_completion(text=text)
+    count = store._db.execute('SELECT count(DISTINCT id) FROM node_versions').fetchone()[0]
+    action = _loop_action(task['input']['candidates'][0], source, operation='reject', open_loop=False,
+                          closed_targets=[target] if closing else [])
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=[action]))
+    assert result['results'][action['candidate_id']]['decision'] == 'reject'
+    assert current(graph, target)['state'] == ('closed' if closing else 'open')
+    assert store._db.execute('SELECT count(DISTINCT id) FROM node_versions').fetchone()[0] == count
     assert graph.history(target)[-1]['evidence'][-1]['quote'] in (text, 'I owe Alex the report.')
 
 

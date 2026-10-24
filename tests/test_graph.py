@@ -259,7 +259,9 @@ def test_refinement_history_is_complete_from_every_lineage_member(graph):
     assert [row['id'] for row in introduced] == ids
     assert [row['text'] for row in introduced] == texts
     assert [row['why'] for row in introduced] == reasons
-    assert [row['evidence'][0]['quote'] for row in introduced] == texts
+    # Each refinement keeps its own quote and carries every earlier premise forward.
+    assert [{item['quote'] for item in row['evidence']} for row in introduced] == [
+        set(texts[:index + 1]) for index in range(len(texts))]
     for target in ids[:-1]:
         own = [row for row in lineage if row['id'] == target]
         assert [(row['version'], row['state']) for row in own] == [(1, 'active'), (2, 'refined')]

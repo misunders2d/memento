@@ -168,6 +168,20 @@ class LeaseInput(WorkInput):
     owner: str = Field(min_length=1, max_length=128)
 
 
+class MaintenanceInput(WorkInput):
+    command_id: str = Field(min_length=1, max_length=512)
+    actor: str = Field(min_length=1, max_length=256)
+    why: str = Field(min_length=1, pattern=r'\S')
+    target_ids: list[str] = Field(min_length=1, max_length=48)
+    origin: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode='after')
+    def distinct_targets(self):
+        if len(set(self.target_ids)) != len(self.target_ids) or any(not value or len(value) > 64 for value in self.target_ids):
+            raise ValueError('target_ids must be distinct existing identifiers')
+        return self
+
+
 class CompleteInput(LeaseInput):
     agent: str = Field(min_length=1, max_length=64)
     output: dict[str, JsonValue]
@@ -668,6 +682,10 @@ Drive is connected. Complete these steps when the human requests Drive:
     @app.post('/work/claim')
     def claim_work(command: ClaimInput):
         return graph_command(app.state.processing.claim, command)
+
+    @app.post('/work/maintenance')
+    def seed_maintenance(command: MaintenanceInput):
+        return graph_command(app.state.processing.maintain, command)
 
     @app.post('/work/renew')
     def renew_work(command: LeaseInput):

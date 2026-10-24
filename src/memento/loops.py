@@ -33,7 +33,30 @@ def _transferred_from(graph, target, commit):
 
 
 def _closed_at(graph, id):
-    """Find the explicit close behind copied state, not the later transfer time."""
+    """Latest effective closure boundary behind copied/coalesced marker state."""
+    db = graph.store._db
+    boundaries = []
+    for target in _loop_lineage(graph, id):
+        for event in db.execute('''SELECT l.commit_id,l.state,c.request,c.result,c.recorded_at
+            FROM loop_events l LEFT JOIN graph_commits c ON c.id=l.commit_id
+            WHERE l.target=? ORDER BY l.rowid DESC''', (target,)):
+            if event['state'] != 'closed':
+                break  # A later open supersedes an older closure in this branch.
+            request = json.loads(event['request'])['command'] if event['request'] else {}
+            if request.get('op') == 'loop' and request.get('action') == 'close':
+                boundaries.append(event['recorded_at'])
+                break
+            if request.get('op') == 'consolidate' and event['result']:
+                closure = next((item for item in json.loads(event['result']).get('loop_closures', [])
+                    if item.get('target') == target and item.get('status') == 'closed'), None)
+                if closure:
+                    boundaries.append(closure['source_occurred_at'])
+                    break
+    return max(boundaries, key=datetime.fromisoformat) if boundaries else None
+
+
+def _loop_lineage(graph, id):
+    """Actual incoming identity/promotion history, including an occupied survivor."""
     db = graph.store._db
     pending, seen = [id], set()
     while pending:
@@ -41,20 +64,11 @@ def _closed_at(graph, id):
         if target in seen:
             continue
         seen.add(target)
-        event = db.execute('''SELECT l.commit_id,l.state,c.request,c.result,c.recorded_at
-            FROM loop_events l LEFT JOIN graph_commits c ON c.id=l.commit_id
-            WHERE l.target=? ORDER BY l.rowid DESC LIMIT 1''', (target,)).fetchone()
-        if event is None or event['state'] != 'closed':
-            continue
-        request = json.loads(event['request'])['command'] if event['request'] else {}
-        if request.get('op') == 'loop' and request.get('action') == 'close':
-            return event['recorded_at']
-        if request.get('op') == 'consolidate' and event['result']:
-            for closure in json.loads(event['result']).get('loop_closures', []):
-                if closure.get('target') == target and closure.get('status') == 'closed':
-                    return closure['source_occurred_at']
-        pending.extend(reversed(_transferred_from(graph, target, event['commit_id'])))
-    return None
+        yield target
+        pending.extend(row['id'] for row in db.execute('''SELECT DISTINCT n.id FROM node_versions n
+            WHERE n.superseded_by=? AND EXISTS (SELECT 1 FROM loop_events l WHERE l.target=n.id)
+            UNION SELECT d.candidate_id FROM candidate_decisions d WHERE d.target_id=? AND d.decision='promote'
+            AND EXISTS (SELECT 1 FROM loop_events l WHERE l.target=d.candidate_id)''', (target, target)))
 
 
 def _append(graph, commit, id, state, due_at, deferred_until):
@@ -114,27 +128,34 @@ def decline_extracted(graph, commit, id):
     return True
 
 
+def decline_automatic(graph, commit, id, expected):
+    """Retract an automatic non-obligation marker, preserving every manual choice."""
+    from .store import ConflictError
+    node = graph._node(id)
+    live = snapshot(graph, id, node['version'])
+    if live != expected:
+        raise ConflictError('Consolidation loop state changed; derive a fresh plan')
+    previous = current(graph, id)
+    if (node['state'] != 'active' or node['pinned'] or live['manual_choice_at'] is not None
+            or previous is None or previous['state'] != 'open'
+            or previous['due_at'] is not None or previous['deferred_until'] is not None):
+        return dict(id=id, status='protected_loop_choice')
+    _append(graph, commit, id, 'closed', None, None)
+    return dict(id=id, status='declined_not_obligation')
+
+
 def snapshot(graph, id, version):
     """Freeze marker identity and original chronology for a consolidation plan."""
     db = graph.store._db
     row = db.execute('''SELECT id,state,due_at,deferred_until FROM loop_events
         WHERE target=? ORDER BY rowid DESC LIMIT 1''', (id,)).fetchone()
-    pending, seen, manual_dates = [id], set(), []
-    while pending:
-        target = pending.pop()
-        if target in seen:
-            continue
-        seen.add(target)
+    manual_dates = []
+    for target in _loop_lineage(graph, id):
         manual = db.execute('''SELECT c.recorded_at FROM loop_events l
             JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=?
             AND json_extract(c.request,'$.command.op')='loop' ORDER BY l.rowid DESC LIMIT 1''', (target,)).fetchone()
         if manual:
             manual_dates.append(manual['recorded_at'])
-        else:
-            first = db.execute('SELECT commit_id FROM loop_events WHERE target=? ORDER BY rowid LIMIT 1',
-                               (target,)).fetchone()
-            if first:
-                pending.extend(_transferred_from(graph, target, first['commit_id']))
     dates = [item[0] for item in db.execute('''SELECT DISTINCT e.occurred_at
         FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
         WHERE g.target=? AND g.version=?''', (id, version))]

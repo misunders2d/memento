@@ -145,6 +145,9 @@ def operational_status(state, source=None):
             coalesce(sum(eligible AND parked),0) AS parked_candidates
             FROM candidate_status''', (time.time(), source, source)).fetchone()
         consolidation.update(dict(pending))
+        consolidation['repair_groups'] = dict(scope='global', **dict(db.execute('''SELECT
+            coalesce(sum(state='pending'),0) AS pending,coalesce(sum(state='done'),0) AS done
+            FROM repair_groups''').fetchone()))
         # Parking is one database-wide cutover, so this section is global even in
         # source-filtered status; the consolidation counts above stay scoped.
         historical = dict(scope='global', **historical_status(db))

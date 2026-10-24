@@ -97,13 +97,22 @@ def commit_behaviors(request, result):
     command = json.loads(request).get('command', {})
     if command.get('op') != 'consolidate':
         return {}
-    results, behaviors = json.loads(result).get('results', {}), {}
+    outcomes = json.loads(result)
+    results, behaviors = outcomes.get('results', {}), {}
     for action in command.get('output', {}).get('actions', []):
         outcome = results.get(action.get('candidate_id'), {})
         target = outcome.get('superseded_by') or outcome.get('id')
         if (target and action.get('operation') in ('remember', 'supersede')
                 and action.get('type') == 'experience' and action.get('behavior')):
             behaviors.setdefault(target, action['behavior'])
+    # Existing-node repairs are keyed by their target; only an explicitly
+    # re-emitted behavior survives a repair supersede, and null retires it.
+    repair_results = outcomes.get('repair_results', {})
+    for repair in command.get('output', {}).get('repairs', []):
+        target = repair_results.get(repair.get('target'), {}).get('superseded_by')
+        if (target and repair.get('operation') == 'supersede'
+                and repair.get('type') == 'experience' and repair.get('behavior')):
+            behaviors.setdefault(target, repair['behavior'])
     return behaviors
 
 
@@ -474,9 +483,13 @@ class Graph:
                                   (new['type'], 'memory', 1, commit))
         if kind == 'change' and previous['valid_from'] is not None and valid_at <= previous['valid_from']:
             raise ValueError('Change must follow the previous valid_from')
+        # A refinement keeps the known world interval; a correction may replace a
+        # wrong one and leaves it unknown rather than inventing it.
+        interval = ((valid_at, None) if kind == 'change' else
+                    (previous['valid_from'], previous['valid_to']) if kind == 'refinement' else (None, None))
         replacement = self._insert_node(commit, dict(type=new['type'], text=new['text'],
-            scope=new['scope'],
-            valid_from=valid_at if kind == 'change' else None, evidence=evidence, pinned=previous['pinned']))
+            scope=new['scope'], valid_from=interval[0], valid_to=interval[1],
+            evidence=evidence, pinned=previous['pinned']))
         replacement_id = replacement['id']
         version = previous['version'] + 1
         self.store._db.execute('INSERT INTO node_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)',
@@ -493,6 +506,14 @@ class Graph:
         self.store._db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',
             (edge_id, 1, commit, replacement_id, 'supersedes', old, 'active'))
         self._evidence(edge_id, 1, evidence)
+        if kind == 'refinement':
+            # The same identity gains supported detail: its current relations and,
+            # when no scope widens, its earlier premises continue on the replacement.
+            # A correction or world change keeps them with the historical assertion.
+            from .curation import _union_evidence, redirect_edges
+            if set(new['scope']) <= set(json.loads(previous['scope'])):
+                _union_evidence(self.store._db, replacement_id, 1, [(old, previous['version'])])
+            redirect_edges(self, commit, old, replacement_id)
         from .loops import transfer
         transfer(self, commit, old, replacement_id)
         from .importance import transfer_usage
@@ -548,7 +569,7 @@ class Graph:
                     result = self._apply_supersede(commit, request, approved=True)
                 elif request['op'] == 'link':
                     result = self._apply_link(commit, request, approved=True)
-                elif request['op'] in ('pin', 'merge', 'register_type', 'attach'):
+                elif request['op'] in ('pin', 'merge', 'absorb', 'register_type', 'attach'):
                     from .curation import apply_review
                     result = apply_review(self, commit, request, proposal_id=proposal_id)
                 else:
@@ -600,10 +621,13 @@ class Graph:
                 FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version
                 WHERE node_fts MATCH ? AND {visible}
                 ORDER BY keyword_rank,n.id LIMIT ?''', (match, scope, scope, limit))]
+            # A merged alias follows its survivor through later merges and refinements.
             aliases = db.execute(f'''WITH RECURSIVE canonical(source,target,depth) AS (
                 SELECT source,target,0 FROM entity_merges
-                UNION ALL SELECT c.source,m.target,c.depth+1 FROM canonical c
-                JOIN entity_merges m ON m.source=c.target WHERE c.depth<64)
+                UNION ALL SELECT c.source,m.superseded_by,c.depth+1 FROM canonical c
+                JOIN node_versions m ON m.id=c.target AND m.state IN ('merged','refined')
+                AND m.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=m.id)
+                WHERE m.superseded_by IS NOT NULL AND c.depth<64)
                 SELECT {NODE_SUMMARY},bm25(alias_fts) AS keyword_rank
                 FROM alias_fts JOIN canonical a ON a.source=alias_fts.id
                 JOIN node_versions n ON n.id=a.target

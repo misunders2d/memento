@@ -715,10 +715,13 @@ class Retrieval:
                 WHERE node_fts MATCH ? AND {visible} ORDER BY bm25(node_fts),n.id LIMIT 64''', (match, scope, scope)):
             if _name_in_request(row['text'], request_tokens):
                 found.setdefault(row['id'], dict(row))
+        # A merged alias follows its survivor through later merges and refinements.
         for row in db.execute(f'''WITH RECURSIVE canonical(source,target,depth) AS (
                 SELECT source,target,0 FROM entity_merges
-                UNION ALL SELECT c.source,m.target,c.depth+1 FROM canonical c
-                JOIN entity_merges m ON m.source=c.target WHERE c.depth<64)
+                UNION ALL SELECT c.source,m.superseded_by,c.depth+1 FROM canonical c
+                JOIN node_versions m ON m.id=c.target AND m.state IN ('merged','refined')
+                AND m.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=m.id)
+                WHERE m.superseded_by IS NOT NULL AND c.depth<64)
                 SELECT {NODE_SUMMARY},{evidence_count},alias_fts.text AS alias,'durable' AS tier
                 FROM alias_fts JOIN canonical a ON a.source=alias_fts.id JOIN node_versions n ON n.id=a.target
                 WHERE alias_fts MATCH ? AND {visible} ORDER BY bm25(alias_fts),n.id LIMIT 64''', (match, scope, scope)):
@@ -821,7 +824,7 @@ class Retrieval:
         """The other end of a pending relation, as it currently stands.
 
         An active candidate is shown as pending; a promoted one resolves through
-        the existing merge chain to its current durable survivor under the same
+        the merge/refinement chain to its current durable survivor under the same
         active/visible/scope checks; anything else (rejected, forgotten, out of
         scope, or a chain ending in no active survivor) yields None.
         """
@@ -836,11 +839,14 @@ class Retrieval:
             AND d.decision='promote' AND d.target_id IS NOT NULL''', (candidate_id, candidate_id)).fetchone()
         if promoted is None:
             return None
-        # The promotion target keeps its recorded ID after a reviewed merge; follow
-        # the existing bounded merge chain to the current survivor before checking it.
+        # The promotion target keeps its recorded ID after a merge or refinement;
+        # follow that bounded identity chain to the current survivor before checking
+        # it. Corrections and world changes end the chain.
         row = db.execute(f'''WITH RECURSIVE canonical(id,depth) AS (
-                SELECT ?,0 UNION ALL SELECT m.target,c.depth+1 FROM canonical c
-                JOIN entity_merges m ON m.source=c.id WHERE c.depth<64)
+                SELECT ?,0 UNION ALL SELECT m.superseded_by,c.depth+1 FROM canonical c
+                JOIN node_versions m ON m.id=c.id AND m.state IN ('merged','refined')
+                AND m.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=m.id)
+                WHERE m.superseded_by IS NOT NULL AND c.depth<64)
             SELECT n.id,n.type,substr(n.text,1,160) AS text FROM node_versions n
             WHERE n.id=(SELECT id FROM canonical ORDER BY depth DESC LIMIT 1)
             AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)

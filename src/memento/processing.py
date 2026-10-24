@@ -128,6 +128,64 @@ class Processing:
         self.queue = Queue(graph)
         self.extractor, self.consolidator = Extractor(graph), Consolidator(graph)
 
+    def maintain(self, *, command_id, actor, why, target_ids, origin=None):
+        """Durably seed only explicitly selected subjects, never the historical pool."""
+        if (not isinstance(target_ids, list) or not 1 <= len(target_ids) <= 48
+                or any(not isinstance(value, str) or not value or len(value) > 64 for value in target_ids)
+                or len(set(target_ids)) != len(target_ids)):
+            raise ValueError('target_ids must be 1..48 distinct existing identifiers')
+        target_ids = sorted(target_ids)
+        request = dict(op='maintenance', target_ids=target_ids, origin=origin)
+        def seed(commit):
+            from .captured_media import visible_sql
+            db = self.store._db
+            for target in target_ids:
+                if db.execute(f'''SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active'
+                    AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+                    AND {visible_sql()}''', (target,)).fetchone() is None:
+                    raise ValueError('Maintenance requires active visible existing nodes')
+            stamp = datetime.now(timezone.utc).isoformat()
+            existing = db.execute("SELECT id,state FROM repair_groups WHERE seed_ids=? AND state='pending' LIMIT 1",
+                                  (json.dumps(target_ids),)).fetchone()
+            if existing:
+                return dict(repair_group_id=existing['id'], status=existing['state'], target_ids=target_ids)
+            group = 'r_' + uuid4().hex[:24]
+            db.execute('''INSERT INTO repair_groups
+                (id,seed_ids,frontier,reviewed_ids,state,origin,created_at,updated_at)
+                VALUES (?,?,?,'[]','pending',?,?,?)''',
+                (group, json.dumps(target_ids), json.dumps(target_ids), origin, stamp, stamp))
+            return dict(repair_group_id=group, status='pending', target_ids=target_ids)
+        return self.graph._command(command_id, actor, why, request, seed)
+
+    def _enqueue_repair(self, exclude=()):
+        """Admit one bounded page, retaining groups even if a job fails permanently."""
+        db = self.store._db
+        for row in db.execute("SELECT * FROM repair_groups WHERE state='pending' ORDER BY created_at,id").fetchall():
+            if row['active_job'] is not None:
+                job = db.execute('SELECT state FROM jobs WHERE id=?', (row['active_job'],)).fetchone()
+                if job and job['state'] in ('pending', 'leased'):
+                    continue
+                # A failed job has no candidate cursor to rederive it. Keep its group
+                # and wait a full retry interval before giving it a new job identity.
+                db.execute('''UPDATE repair_groups SET active_job=NULL,generation=generation+1,
+                    available_at=?,updated_at=? WHERE id=?''',
+                    (time.time() + 900, datetime.now(timezone.utc).isoformat(), row['id']))
+                continue
+            if row['available_at'] > time.time():
+                continue
+            frontier = json.loads(row['frontier'])
+            if not frontier:
+                db.execute("UPDATE repair_groups SET state='done' WHERE id=?", (row['id'],))
+                continue
+            payload = dict(version=CONSOLIDATE_VERSION, night=None, candidate_ids=[], next_cursor=0,
+                repair_group_id=row['id'], maintenance_ids=frontier[:8],
+                reviewed_ids=json.loads(row['reviewed_ids']))
+            job = self.queue._insert('consolidate/repair/' + row['id'] + '/' + str(row['generation']),
+                                     'consolidate', payload)
+            db.execute('UPDATE repair_groups SET active_job=? WHERE id=?', (job, row['id']))
+            return True
+        return False
+
     def compact(self, source, conversation_id):
         with self.store._mutex:
             self.store._db.execute('''INSERT INTO processing_progress(source,conversation_id,compact_through)
@@ -306,21 +364,27 @@ class Processing:
         # identities, payloads and candidates; a disjoint batch may proceed around them.
         reserved = db.execute("SELECT 1 FROM jobs WHERE kind='consolidate' AND state IN ('pending','leased') LIMIT 1").fetchone()
         row = db.execute('SELECT * FROM consolidation_nights WHERE id=?', (night,)).fetchone()
+        previous = db.execute("SELECT payload FROM jobs WHERE kind='consolidate' ORDER BY rowid DESC LIMIT 1").fetchone()
+        prefer_repair = previous is None or not json.loads(previous['payload']).get('repair_group_id')
+        if prefer_repair and self._enqueue_repair(exclude):
+            return True
         if force:
             night, cursor = None, 0
             through = db.execute('SELECT coalesce(max(rowid),0) FROM candidates').fetchone()[0]
         elif row is None:
             through = db.execute('SELECT coalesce(max(rowid),0) FROM candidates').fetchone()[0]
             if through == 0:
-                return False
+                return self._enqueue_repair(exclude)
             db.execute('INSERT INTO consolidation_nights(id,through_rowid) VALUES (?,?)', (night, through))
             cursor = 0
         else:
             if row['finished_at'] is not None:
-                return False
+                return self._enqueue_repair(exclude)
             cursor, through = row['cursor'], row['through_rowid']
         candidates = self.consolidator.pending(limit=16, after=cursor, through=through, unreserved=True)
         if not candidates:
+            if self._enqueue_repair(exclude):
+                return True
             if reserved:
                 # Excluded batches still hold undecided candidates: nothing new is admitted,
                 # and the night is not finished until they are decided or retired.
@@ -392,10 +456,10 @@ class Processing:
                         context['previous_rejection'] = rejection
                     self.store._db.execute('UPDATE jobs SET context=? WHERE id=? AND owner=?',
                         (json.dumps(context, ensure_ascii=False), job.id, job.owner))
-                model_input = self.extractor.model_input(context) if kind == 'extract' else context
+                model_input = handler.model_input(context)
                 if kind == 'extract' and not any(item['text'] for item in context['windows']):
                     output = dict(windows=[dict(id=item['id'], candidates=[]) for item in model_input['windows']])
-                elif kind == 'consolidate' and not context['candidates']:
+                elif kind == 'consolidate' and not context['candidates'] and not context.get('maintenance_ids'):
                     output = dict(actions=[])
                 else:
                     instruction = EXTRACT_INSTRUCTION if kind == 'extract' else CONSOLIDATE_INSTRUCTION

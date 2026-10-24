@@ -56,6 +56,16 @@ def upgrade_historical_pool(db):
         db.execute(statement)
 
 
+def upgrade_repair_groups(db):
+    """Explicit bounded maintenance requests; startup never seeds graph work."""
+    db.execute('''CREATE TABLE IF NOT EXISTS repair_groups (
+        id TEXT PRIMARY KEY,seed_ids TEXT NOT NULL,frontier TEXT NOT NULL,reviewed_ids TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending','done')),generation INTEGER NOT NULL DEFAULT 0,
+        active_job TEXT,available_at REAL NOT NULL DEFAULT 0,origin TEXT,
+        created_at TEXT NOT NULL,updated_at TEXT NOT NULL) STRICT''')
+    db.execute('CREATE INDEX IF NOT EXISTS repair_groups_pending ON repair_groups(state,available_at,created_at)')
+
+
 # TEXT removes the unused JSON subtype so SQLite 3.46 can substitute this
 # expression from the index; status only distinguishes the string 'skip'.
 _EPISODES_STATUS_INDEX = """CREATE INDEX IF NOT EXISTS episodes_status_cover_v1 ON episodes (
@@ -363,6 +373,7 @@ def initialize(db):
     upgrade_status_index(db)
     upgrade_captured_media(db)
     upgrade_historical_pool(db)
+    upgrade_repair_groups(db)
     for table, predicate in _IMMUTABLE_KEYS.items():
         for operation in ("UPDATE", "DELETE"):
             db.execute(f"""CREATE TRIGGER {table}_no_{operation} BEFORE {operation} ON {table}

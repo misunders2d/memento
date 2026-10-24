@@ -304,8 +304,8 @@ def test_same_batch_supersession_dependents_follow_only_a_continuing_identity(wo
     replacement = result['results'][fix['id']]['superseded_by']
     assert result['results'][fix['id']]['decision'] == 'promote'
     relations = store._db.execute("SELECT src,dst FROM edge_versions WHERE rel='owned_by'").fetchall()
-    if kind == 'change':
-        # The original stays historical: the relation waits for a fresh plan.
+    if kind in ('correction', 'change'):
+        # Mistaken identity and world changes cannot silently inherit a relation.
         assert result['results'][relation_candidate['id']]['decision'] == 'defer' and relations == []
     else:
         assert result['results'][relation_candidate['id']]['decision'] == 'promote'
@@ -390,7 +390,11 @@ def test_merge_unions_survivor_evidence_scope_recency_and_folds_duplicate_relati
     links = [graph.link(command_id=f'link-{identity}', actor='fixture', why='Explicit synthetic ownership',
                         a=identity, rel='owned_by', b=vega, evidence=[dict(episode_id=episode['id'], quote=TEXT)])['id']
              for identity, episode in ((absorbed, new), (survivor, old))]
-    graph.loop(action='open', id=links[0], command_id='absorbed-relation-loop')
+    # An automatic marker folds with its relation; a manual choice the fold would
+    # lose keeps its own relation instead (tests/test_retire.py).
+    from memento.loops import _append
+    graph._command('absorbed-relation-loop', 'fixture/extractor', 'Synthetic automatic marker', dict(op='fixture'),
+                   lambda commit: _append(graph, commit, links[0], 'open', None, None) and {})
     def stable(rows):
         return [(row['version'], row['state'], row['scope'], row['evidence']) for row in rows]
     before = stable(graph.history(absorbed))

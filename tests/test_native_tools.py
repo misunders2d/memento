@@ -99,7 +99,8 @@ def test_mcp_empty_optional_command_dates_and_episode_preserve_exact_evidence(to
             history = state.graph.history(refined['superseded_by'])
             assert history == state.graph.history(saved['id'])
             assert [row['state'] for row in history] == ['active', 'refined', 'active']
-            assert history[-1]['evidence'][0]['quote'] == 'Refined technical fact with detail.'
+            assert {(ref['episode_id'], ref['quote']) for ref in history[-1]['evidence']} == {
+                (episode, 'Original technical fact.'), (episode, 'Refined technical fact with detail.')}
 
     asyncio.run(scenario())
 

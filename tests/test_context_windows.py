@@ -62,7 +62,8 @@ def test_existing_memory_is_supplied_as_exact_references_without_raw_windows(tmp
         [ref] = node['evidence']
         start = PRIOR_TEXT.index(POLICY)
         assert ref == dict(episode_id=prior['id'], quote=POLICY, occurrence=0, start=start, end=start + len(POLICY),
-                           behavior_ground_truth=True)
+                           behavior_ground_truth=True, source=SOURCE, kind='user', occurred_at=None,
+                           conversation_id='earlier', event_id='prior', native_id=None)
         assert task['input']['candidates'][0]['identity']['exact'] == [existing]
         # Only the candidate's own evidence receives a surrounding raw window.
         assert {window['episode_id'] for window in task['input']['raw_windows']} == {later['id']}
@@ -222,7 +223,13 @@ def test_compact_existing_attempt_and_result_refs_ground_a_later_report(tmp_path
                    for ref in refs.values())
         assert set(refs[trace[0]['id']]) == {'episode_id', 'quote', 'occurrence', 'start', 'end',
                                              'behavior_ground_truth', 'source', 'conversation_id',
-                                             'sequence', 'native_trace'}
+                                             'sequence', 'native_trace', 'kind', 'occurred_at', 'event_id', 'native_id'}
+        for episode in trace:
+            ref = refs[episode['id']]
+            assert ref['kind'] == episode['kind']
+            assert ref['occurred_at'] == episode['occurred_at']
+            assert ref['event_id'] == episode['event_id']
+            assert ref['native_id'] == episode['metadata']['native_id']
     finally:
         store.close()
 

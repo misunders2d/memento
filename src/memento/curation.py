@@ -5,10 +5,12 @@ import json
 import re
 from uuid import uuid4
 
+from .extraction import MEMORY_TYPES
 from .graph import ENTITY_TYPES, identity_text
 from .store import ConflictError
 
 MAX_MERGE_PLAN = 32
+MAX_ABSORB = 8
 
 
 def propose(graph, commit, request):
@@ -162,9 +164,69 @@ def apply_review(graph, commit, request, *, proposal_id=None):
     if request['op'] == 'attach':
         return attach(graph, commit, request['target'], request['evidence'], approved=True,
                       expected_version=request['expected_version'])
+    if request['op'] == 'absorb':
+        return absorb(graph, commit, request['survivor'], request['absorbed'], evidence=request['evidence'],
+                      approved=True, proposal_id=proposal_id)
     if request['op'] != 'merge':
         raise ValueError('Unknown protected operation')
-    a, b = graph._node(request['a']), graph._node(request['b'])
+    return _absorb_one(graph, commit, request['a'], request['b'], entity=True, proposal_id=proposal_id)
+
+
+def redirect_edges(graph, commit, old, new, *, edge_ids=None):
+    """Move old's current relations onto new; lineage edges stay with their history.
+
+    A relation that would join new to itself becomes inactive, and one that
+    already exists on new folds its evidence and loop marker into that relation
+    when their markers and manual-choice chronology agree; a differing marker or
+    a manual choice the fold would lose keeps its own relation.
+    """
+    if old == new:
+        return []
+    from .loops import snapshot, transfer
+    db = graph.store._db
+    selected = '' if edge_ids is None else ' AND e.id IN (SELECT value FROM json_each(?))'
+    arguments = (old, old) if edge_ids is None else (old, old, json.dumps(list(edge_ids)))
+    edges = db.execute('''SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active'
+        AND e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)
+        ''' + selected + ' ORDER BY e.id', arguments).fetchall()
+    moved = []
+    for edge in edges:
+        src = new if edge['src'] == old else edge['src']
+        dst = new if edge['dst'] == old else edge['dst']
+        # Fold only into a relation whose loop marker cannot hide this one's; a
+        # differing obligation stays on its own relation rather than disappearing.
+        # A transferred marker is not a manual choice, so this relation's manual
+        # chronology must already be the survivor's.
+        def marker(row):
+            choice = _loop_choice(graph, row['id'])
+            return None if choice is None else (choice, snapshot(graph, row['id'], row['version'])['manual_choice_at'])
+        mine = marker(edge)
+        same = None if src == dst else next((row for row in db.execute('''SELECT e.* FROM edge_versions e
+            WHERE e.src=? AND e.rel=? AND e.dst=? AND e.id<>? AND e.state='active'
+            AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id''',
+            (src, edge['rel'], dst, edge['id'])).fetchall()
+            if mine is None or mine == marker(row) or marker(row) is None and mine[1] is None), None)
+        state = 'inactive' if src == dst or same is not None else 'active'
+        db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',
+            (edge['id'], edge['version'] + 1, commit, src, edge['rel'], dst, state))
+        db.execute('''INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote
+            FROM graph_evidence WHERE target=? AND version=?''', (edge['version'] + 1, edge['id'], edge['version']))
+        if same is not None:
+            # A redirected duplicate relation folds into the existing one.
+            db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',
+                (same['id'], same['version'] + 1, commit, same['src'], same['rel'], same['dst'], 'active'))
+            _union_evidence(db, same['id'], same['version'] + 1,
+                            [(same['id'], same['version']), (edge['id'], edge['version'])])
+            transfer(graph, commit, edge['id'], same['id'])
+        moved.append(dict(id=edge['id'], version=edge['version'] + 1, src=src, dst=dst, state=state,
+                          folded_into=same['id'] if same is not None else None))
+    return moved
+
+
+def _absorb_one(graph, commit, source, target, *, entity, proposal_id=None):
+    """Absorb one active identity into a survivor of the same type; history stays append-only."""
+    db = graph.store._db
+    a, b = graph._node(source), graph._node(target)
     if a['state'] != 'active' or b['state'] != 'active' or a['id'] == b['id'] or a['type'] != b['type']:
         raise ConflictError('Entity merge is no longer applicable')
     version = a['version'] + 1
@@ -174,7 +236,9 @@ def apply_review(graph, commit, request, *, proposal_id=None):
     db.execute('''INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote
         FROM graph_evidence WHERE target=? AND version=?''', (version, a['id'], a['version']))
     db.execute('INSERT INTO entity_merges VALUES (?,?,?)', (a['id'], b['id'], commit))
-    db.execute('INSERT INTO alias_fts(id,text) VALUES (?,?)', (a['id'], a['text']))
+    if entity:
+        # Only an entity name is an alternate spelling; an absorbed claim's text is not.
+        db.execute('INSERT INTO alias_fts(id,text) VALUES (?,?)', (a['id'], a['text']))
     # The survivor's new version carries both identities' evidence and scopes,
     # so ordinary recall, history and recency see the absorbed sources; the
     # version change also fences plans and proposals based on the old survivor.
@@ -185,33 +249,13 @@ def apply_review(graph, commit, request, *, proposal_id=None):
          b['superseded_by'], b['pinned'], json.dumps(scope)))
     _union_evidence(db, b['id'], survivor, [(b['id'], b['version']), (a['id'], a['version'])])
     _copy_vector(graph, b['id'], b['version'], survivor)
-    from .loops import transfer
-    edges = db.execute('''SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active'
-        AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)''', (a['id'], a['id'])).fetchall()
-    for edge in edges:
-        src = b['id'] if edge['src'] == a['id'] else edge['src']
-        dst = b['id'] if edge['dst'] == a['id'] else edge['dst']
-        same = None if src == dst else db.execute('''SELECT e.* FROM edge_versions e
-            WHERE e.src=? AND e.rel=? AND e.dst=? AND e.id<>? AND e.state='active'
-            AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id LIMIT 1''',
-            (src, edge['rel'], dst, edge['id'])).fetchone()
-        db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',
-            (edge['id'], edge['version'] + 1, commit, src, edge['rel'], dst,
-             'inactive' if src == dst or same is not None else 'active'))
-        db.execute('''INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote
-            FROM graph_evidence WHERE target=? AND version=?''', (edge['version'] + 1, edge['id'], edge['version']))
-        if same is not None:
-            # A redirected duplicate relation folds into the existing one.
-            db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',
-                (same['id'], same['version'] + 1, commit, same['src'], same['rel'], same['dst'], 'active'))
-            _union_evidence(db, same['id'], same['version'] + 1,
-                            [(same['id'], same['version']), (edge['id'], edge['version'])])
-            transfer(graph, commit, edge['id'], same['id'])
+    redirect_edges(graph, commit, a['id'], b['id'])
     db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN
         (SELECT seq FROM vector_items WHERE kind='node' AND target=?)''', (a['id'],))
     if a['pinned'] and not b['pinned']:
         pin(graph, commit, b['id'], True)
     from .importance import transfer_usage
+    from .loops import transfer
     transfer_usage(graph.store, a['id'], b['id'])
     transfer(graph, commit, a['id'], b['id'])
     requeued = _requeue_stale_reviews(graph, commit, (a['id'], b['id']), exclude=proposal_id)
@@ -219,10 +263,228 @@ def apply_review(graph, commit, request, *, proposal_id=None):
                 scope=scope, requeued_candidates=requeued)
 
 
+def _entity_type(graph, type):
+    if type in ENTITY_TYPES:
+        return True
+    row = graph.store._db.execute('SELECT category FROM memory_types WHERE name=?', (type,)).fetchone()
+    return bool(row and row['category'] == 'entity')
+
+
+def _absorb_members(graph, survivor, absorbed):
+    """Current survivor and absorbed versions, or a fixed validation code."""
+    if (not isinstance(survivor, str) or not isinstance(absorbed, (list, tuple))
+            or not 1 <= len(absorbed) <= MAX_ABSORB or any(not isinstance(item, str) for item in absorbed)
+            or len(set(absorbed)) != len(absorbed) or survivor in absorbed):
+        return None, 'consolidation_absorb_member_invalid'
+    try:
+        nodes = [graph._node(target) for target in (survivor, *absorbed)]
+    except ValueError:
+        return None, 'consolidation_absorb_member_invalid'
+    if any(node['state'] != 'active' for node in nodes):
+        return None, 'consolidation_absorb_member_invalid'
+    if any(node['type'] != nodes[0]['type'] for node in nodes):
+        return None, 'consolidation_absorb_type_mismatch'
+    return nodes, None
+
+
+def _loop_choice(graph, target):
+    from .loops import current
+    marker = current(graph, target)
+    if marker is None:
+        return None
+    return ('closed',) if marker['state'] == 'closed' else (marker['state'], marker['due_at'], marker['deferred_until'])
+
+
+def absorb_check(graph, survivor, absorbed):
+    """Fixed code when absorbed cannot coalesce into survivor; None when absorb may proceed.
+
+    Pinned, sensitive and differently scoped entities are protected rather than
+    invalid: they return None and absorb proposes a human review. A claim keeps
+    its single scope, world validity and behavior authority, so mismatches there
+    are not duplicates. Differing loop markers on members or on relations that
+    would fold together would be silently lost by transfer, so they refuse.
+    """
+    nodes, code = _absorb_members(graph, survivor, absorbed)
+    if code is not None:
+        return code
+    if not _entity_type(graph, nodes[0]['type']):
+        if any(set(json.loads(node['scope'])) != set(json.loads(nodes[0]['scope'])) for node in nodes):
+            return 'consolidation_absorb_scope_mismatch'
+        if any((node['valid_from'], node['valid_to']) != (nodes[0]['valid_from'], nodes[0]['valid_to'])
+               for node in nodes):
+            return 'consolidation_absorb_validity_mismatch'
+        # The survivor keeps its own creation behavior; an absorbed one must be
+        # absent or identical, so no suggestion or explicit_user authority is dropped.
+        behavior = graph._behavior(survivor)
+        if any(graph._behavior(target) not in (None, behavior) for target in absorbed):
+            return 'consolidation_absorb_behavior_mismatch'
+    if (len({choice for choice in (_loop_choice(graph, node['id']) for node in nodes) if choice is not None}) > 1
+            or _relation_loop_conflict(graph, survivor, absorbed)):
+        return 'consolidation_absorb_loop_conflict'
+    return None
+
+
+def _relation_loop_conflict(graph, survivor, absorbed):
+    """Would absorbing fold relations with differing loop markers, or hide an open one in a self relation?"""
+    members = set(absorbed)
+    ids = [survivor, *absorbed]
+    placeholders = ','.join('?' for _ in ids)
+    groups = {}
+    for row in graph.store._db.execute(f'''SELECT e.id,e.src,e.rel,e.dst FROM edge_versions e
+            WHERE (e.src IN ({placeholders}) OR e.dst IN ({placeholders})) AND e.state='active'
+            AND e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)''',
+            (*ids, *ids)):
+        src = survivor if row['src'] in members else row['src']
+        dst = survivor if row['dst'] in members else row['dst']
+        choice = _loop_choice(graph, row['id'])
+        if src == dst and members & {row['src'], row['dst']}:
+            if choice is not None and choice[0] == 'open':
+                return True
+            continue
+        groups.setdefault((src, row['rel'], dst), set()).add(choice)
+    return any(len(choices - {None}) > 1 for choices in groups.values())
+
+
+def absorb(graph, commit, survivor, absorbed, *, evidence=None, approved=False, proposal_id=None):
+    """Coalesce same-referent entities or equivalent claims into survivor (the target ID).
+
+    Absorbed identities become merged versions pointing at survivor; the survivor's
+    new version carries their evidence, relations, usage and loop markers. Pinned,
+    sensitive or differently scoped entities become an absorb review proposal
+    fenced by every member version; only the private review transport approves it.
+    """
+    code = absorb_check(graph, survivor, absorbed)
+    if code is not None:
+        raise ConflictError(code)
+    nodes, _ = _absorb_members(graph, survivor, absorbed)
+    absorbed = list(absorbed)
+    protected = (any(node['pinned'] or graph._sensitive_type(node['type']) for node in nodes)
+                 or any(set(json.loads(node['scope'])) != set(json.loads(nodes[0]['scope'])) for node in nodes))
+    if protected and not approved:
+        if not evidence:
+            raise ValueError('A protected absorb requires evidence for human review')
+        return graph._propose(commit, dict(op='absorb', survivor=survivor, absorbed=absorbed, evidence=list(evidence)),
+                              {node['id']: node['version'] for node in nodes})
+    entity = _entity_type(graph, nodes[0]['type'])
+    merged = [_absorb_one(graph, commit, target, survivor, entity=entity, proposal_id=proposal_id)
+              for target in absorbed]
+    if evidence:
+        graph._evidence(survivor, merged[-1]['survivor_version'], evidence)
+    return dict(id=survivor, version=merged[-1]['survivor_version'], absorbed=absorbed,
+                scope=merged[-1]['scope'], status='absorbed',
+                requeued_candidates=sorted({c for item in merged for c in item['requeued_candidates']}))
+
+
+def _memory_type(graph, type):
+    if type in MEMORY_TYPES:
+        return True
+    row = graph.store._db.execute('SELECT category FROM memory_types WHERE name=?', (type,)).fetchone()
+    return bool(row and row['category'] == 'memory')
+
+
+def _incident_edges(graph, node_id):
+    """Current active relations touching node_id; supersedes lineage is history, not a relation."""
+    return graph.store._db.execute('''SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?)
+        AND e.state='active' AND e.rel<>'supersedes'
+        AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id''',
+        (node_id, node_id)).fetchall()
+
+
+def retire_check(graph, target, evidence):
+    """Fixed code when target cannot be retired; None when retire may proceed or is protected.
+
+    Only a current active memory-category record is retirable, never an entity,
+    alias or media file, and only on its own current original evidence: a
+    retirement adds no authority beyond the sources already behind the record.
+    """
+    try:
+        node = graph._node(target) if isinstance(target, str) else None
+    except ValueError:
+        node = None
+    if node is None or node['state'] != 'active':
+        return 'consolidation_retire_target_invalid'
+    if not _memory_type(graph, node['type']):
+        return 'consolidation_retire_type_invalid'
+    rows = graph.store._db.execute('SELECT episode_id,quote FROM graph_evidence WHERE target=? AND version=?',
+                                   (target, node['version'])).fetchall()
+    if (not isinstance(evidence, (list, tuple)) or not evidence
+            or any(not isinstance(item, dict) or not isinstance(item.get('quote'), str) or not item['quote']
+                   or not any(row['episode_id'] == item.get('episode_id') and item['quote'] in row['quote']
+                              for row in rows) for item in evidence)):
+        return 'consolidation_retire_evidence_invalid'
+    return None
+
+
+def _retire_protection(graph, node):
+    """Status naming why a retirable record stays untouched, or None."""
+    from .loops import current, snapshot
+    if node['pinned']:
+        return 'protected_pin'
+    if graph._sensitive_type(node['type']):
+        return 'protected_sensitive'
+    behavior = graph._behavior(node['id'])
+    if behavior and behavior['authority'] == 'explicit_user':
+        return 'protected_explicit_user'
+    for id, version in [(node['id'], node['version'])] + [
+            (edge['id'], edge['version']) for edge in _incident_edges(graph, node['id'])]:
+        marker = current(graph, id)
+        if (snapshot(graph, id, version)['manual_choice_at'] is not None
+                or marker is not None and (marker['due_at'] is not None or marker['deferred_until'] is not None)):
+            return 'protected_loop_choice'
+    return None
+
+
+def retire(graph, commit, target, evidence):
+    """Take proven noise or one-off scaffolding out of active memory; nothing is deleted.
+
+    The record gains a retired version with its unchanged assertion and evidence,
+    its vectors leave recall, and its active relations gain inactive versions.
+    Raw history, sources and search/history rows stay; no source is suppressed,
+    so the same evidence can still support other memory. Untouched automatic
+    loop markers close as never-an-obligation, without a completion date. Pins,
+    sensitive types, explicit user authority and any manual or dated loop choice
+    on the record or its relations protect it: those return a protected status
+    and change nothing.
+    """
+    from .loops import _append, current
+    code = retire_check(graph, target, evidence)
+    if code is not None:
+        raise ConflictError(code)
+    db = graph.store._db
+    node = graph._node(target)
+    status = _retire_protection(graph, node)
+    if status is not None:
+        return dict(id=target, version=node['version'], status=status)
+    edges = _incident_edges(graph, target)
+    version = node['version'] + 1
+    db.execute('INSERT INTO node_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        (target, version, commit, node['type'], node['text'], 'retired', node['valid_from'], node['valid_to'],
+         None, node['pinned'], node['scope']))
+    db.execute('''INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote
+        FROM graph_evidence WHERE target=? AND version=?''', (version, target, node['version']))
+    db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN (
+        SELECT seq FROM vector_items WHERE (kind='node' AND target=?)
+        OR (kind='segment' AND target IN (SELECT id FROM segments WHERE node_id=?)))''', (target, target))
+    relations, declined = [], []
+    for edge in edges:
+        db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',
+            (edge['id'], edge['version'] + 1, commit, edge['src'], edge['rel'], edge['dst'], 'inactive'))
+        db.execute('''INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote
+            FROM graph_evidence WHERE target=? AND version=?''', (edge['version'] + 1, edge['id'], edge['version']))
+        relations.append(dict(id=edge['id'], version=edge['version'] + 1))
+    for id in [target, *(edge['id'] for edge in edges)]:
+        marker = current(graph, id)
+        if marker is not None and marker['state'] == 'open':
+            _append(graph, commit, id, 'closed', None, None)
+            declined.append(id)
+    return dict(id=target, version=version, status='retired', relations=relations, declined_loops=declined)
+
+
 def canonical(graph, node_id):
+    """Follow identity-continuing merges and refinements, never corrections or world changes."""
     for _ in range(64):
         node = graph._node(node_id)
-        if node['state'] != 'merged':
+        if node['state'] not in ('merged', 'refined') or not node['superseded_by']:
             return node
         node_id = node['superseded_by']
     raise ValueError('Entity merge chain is too deep')
@@ -344,3 +606,27 @@ def apply_merge_plan(graph, commit, cluster, into, exclude, token, include=()):
     return dict(cluster=cluster, survivor=plan['survivor']['id'], survivor_version=merged[-1]['survivor_version'],
                 merged=[item['id'] for item in merged], scope=merged[-1]['scope'],
                 requeued_candidates=sorted({c for item in merged for c in item['requeued_candidates']}))
+
+
+def _continuation(graph, node_id):
+    """Exact identity chain through refinements and merges, or None at any other step."""
+    db = graph.store._db
+    chain = [node_id]
+    for _ in range(64):
+        node = graph._node(chain[-1])
+        if node['state'] == 'active':
+            return chain
+        following = node['superseded_by']
+        if node['state'] == 'refined':
+            # The atomic supersede wrote exactly this lineage edge.
+            proven = following and db.execute('''SELECT 1 FROM edge_versions WHERE src=? AND rel='supersedes'
+                AND dst=? AND version=1''', (following, node['id'])).fetchone()
+        elif node['state'] == 'merged':
+            proven = following and db.execute('SELECT 1 FROM entity_merges WHERE source=? AND target=?',
+                                              (node['id'], following)).fetchone()
+        else:
+            return None
+        if not proven or following in chain:
+            return None
+        chain.append(following)
+    return None
