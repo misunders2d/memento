@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 540" role="img" aria-labelledby="title desc" style="color-scheme:light dark">
+  <title id="title">Memento processing, validation and learning lifecycle</title>
+  <desc id="desc">Step-by-step lifecycle from raw conversation capture, lossless compression and optional historical-backlog parking through independent two-lane extraction and consolidation, whole-batch quote/span and technical-trace validation with bounded rejection feedback, to versioned durable graph nodes, open loops and hybrid recall with citation-triggered historical promotion.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 9 5 1 9" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    </marker>
+    <style>
+      text { fill:currentColor; font-family:system-ui,-apple-system,sans-serif; font-size:13.5px }
+      .heading { font-size:21px; font-weight:650 }
+      .subhead { font-size:13.5px; opacity:.78 }
+      .stage { font-size:15px; font-weight:650 }
+      .small { font-size:12.5px; opacity:.74 }
+      .pill { fill:currentColor; fill-opacity:.06; stroke:currentColor; stroke-opacity:.58; stroke-width:1.2 }
+      .box { fill:none; stroke:currentColor; stroke-opacity:.56; stroke-width:1.2 }
+      .gate { fill:currentColor; fill-opacity:.05; stroke:currentColor; stroke-opacity:.76; stroke-width:1.4 }
+      .flow { fill:none; stroke:currentColor; stroke-opacity:.76; stroke-width:1.5; marker-end:url(#arrow) }
+      .retry { fill:none; stroke:currentColor; stroke-opacity:.6; stroke-width:1.3; stroke-dasharray:4 3; marker-end:url(#arrow) }
+    </style>
+  </defs>
+
+  <text class="heading" x="20" y="28">From raw conversation to verified memory — without hallucination</text>
+  <text class="subhead" x="20" y="50">Independent two-lane runner · optional historical pool · strict span &amp; trace gates · bounded retry feedback</text>
+
+  <!-- Stage 1: Raw Capture & Storage -->
+  <rect class="box" x="20" y="74" width="210" height="190" rx="10"/>
+  <text class="stage" x="34" y="100">1. Raw evidence</text>
+  <text class="small" x="34" y="122">• Native turns &amp; attachments</text>
+  <text class="small" x="34" y="142">• Durable client outbox</text>
+  <text class="small" x="34" y="162">• Lossless raw_frame SQLite</text>
+  <text class="small" x="34" y="180">  compression in background</text>
+  <text class="small" x="34" y="200">• Optional 1-time historical</text>
+  <text class="small" x="34" y="218">  cutover: old backlog searchable,</text>
+  <text class="small" x="34" y="236">  new captures fully processed</text>
+  <text class="small" x="34" y="254">• Cited historical chunks extract</text>
+
+  <!-- Stage 2: Two-Lane Coordinator -->
+  <rect class="box" x="268" y="74" width="228" height="190" rx="10"/>
+  <text class="stage" x="282" y="100">2. Two-lane processor</text>
+  <text class="small" x="282" y="122">• Max 2 tool-free CLI calls</text>
+  <text class="small" x="282" y="142">• Extract &amp; consolidate lanes</text>
+  <text class="small" x="282" y="160">  refill independently (/work/claim</text>
+  <text class="small" x="282" y="178">  kinds filter)</text>
+  <text class="small" x="282" y="198">• Extraction: &lt;=64 windows / 48k</text>
+  <text class="small" x="282" y="216">  chars (live + cited demand spans)</text>
+  <text class="small" x="282" y="236">• Consolidation: 02:00–07:00 window,</text>
+  <text class="small" x="282" y="254">  compact existing-node refs (-49%)</text>
+
+  <!-- Stage 3: Whole-Batch Validation Gate -->
+  <rect class="gate" x="534" y="74" width="214" height="190" rx="10"/>
+  <text class="stage" x="548" y="100">3. Validation gate</text>
+  <text class="small" x="548" y="122">• Exact verbatim quote &amp; occurrence</text>
+  <text class="small" x="548" y="140">  matched against source_span</text>
+  <text class="small" x="548" y="160">• Candidate &amp; supplied-span</text>
+  <text class="small" x="548" y="178">  coverage verified</text>
+  <text class="small" x="548" y="198">• Authority check: explicit_user</text>
+  <text class="small" x="548" y="216">  vs. inferred technical_evidence</text>
+  <text class="small" x="548" y="234">  (attempt → later result)</text>
+  <text class="small" x="548" y="254">• Whole-batch atomic transaction</text>
+
+  <!-- Stage 4: Durable Graph & Indexing -->
+  <rect class="pill" x="786" y="74" width="174" height="190" rx="10"/>
+  <text class="stage" x="800" y="100">4. Durable graph</text>
+  <text class="small" x="800" y="122">• Versioned nodes &amp; edges</text>
+  <text class="small" x="800" y="142">• Single-row current-node</text>
+  <text class="small" x="800" y="160">  FTS5 (VACUUM-safe)</text>
+  <text class="small" x="800" y="180">• Reused vec0 vectors on</text>
+  <text class="small" x="800" y="198">  unchanged attach / pin</text>
+  <text class="small" x="800" y="218">• Evidence-dated loop</text>
+  <text class="small" x="800" y="236">  open / close boundaries</text>
+
+  <!-- Top Horizontal Flows -->
+  <path class="flow" d="M230 168H268"/>
+  <path class="flow" d="M496 168H534"/>
+  <path class="flow" d="M748 168H786"/>
+
+  <!-- Retry Feedback Loop -->
+  <path class="retry" d="M641 264V306H382V264"/>
+  <text class="small" x="315" y="298">On rejection: rollback + private previous_rejection (fixed code, &lt;=3 refs, quote&lt;=300c) → 15m retry</text>
+
+  <!-- Bottom Half: Two Epistemic Grounding Paths + Recall -->
+  <rect class="box" x="20" y="336" width="460" height="176" rx="10"/>
+  <text class="stage" x="36" y="362">Dual-path behavioral &amp; technical learning</text>
+  <text class="small" x="36" y="386">• Explicit user guidance (authority = "explicit_user"):</text>
+  <text class="small" x="48" y="404">Requires direct user ground-truth quote; exempt from 90-day age decay.</text>
+  <text class="small" x="36" y="428">• Inferred technical lesson (authority = "inferred"):</text>
+  <text class="small" x="48" y="446">Grounded by captured native attempt → observed result in one conversation.</text>
+  <text class="small" x="48" y="464">technical_evidence selects the causal attempt/result episodes; refinements</text>
+  <text class="small" x="48" y="482">retain evidenced failed approaches to avoid; completed turn narration and</text>
+  <text class="small" x="48" y="500">standing policies without an active instance do not become open loops.</text>
+
+  <rect class="box" x="500" y="336" width="460" height="176" rx="10"/>
+  <text class="stage" x="516" y="362">Recall, historical fallback &amp; citation promotion</text>
+  <text class="small" x="516" y="386">• Automatic prompt context: exact entity anchors + current facts/lessons;</text>
+  <text class="small" x="528" y="404">when no current fact/lesson matches, offers &lt;=1 parked candidate + &lt;=1</text>
+  <text class="small" x="528" y="422">unverified historical passage. Explicit 6 MCP tools always available.</text>
+  <text class="small" x="516" y="446">• Citation-driven promotion: citing a parked candidate releases it to</text>
+  <text class="small" x="528" y="464">consolidation; citing a parked raw chunk queues 1 bounded demand extract.</text>
+  <text class="small" x="516" y="488">• Silent compliance on behavioral lessons is neutral in query feedback.</text>
+</svg>

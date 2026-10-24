@@ -12,7 +12,7 @@ import numpy as np
 
 from .embedder import EMBED_DIM, embed_query, embed_texts, load_model
 from .graph import Graph, NODE_SUMMARY, ENTITY_TYPES, identity_text
-from .extraction import ACTIVE_CANDIDATE_SQL, source_text_ranges
+from .extraction import ACTIVE_CANDIDATE_SQL, UNPARKED_CANDIDATE_SQL, source_text_ranges
 from .text_chunks import TextChunk, chunks
 from .importance import query_key, query_recency
 from .captured_media import active_references, visible_sql
@@ -66,6 +66,17 @@ def _recall_eligible(indexable):
 
 _RECALL_ELIGIBLE = _recall_eligible(_INDEXABLE)
 
+# Parked raw history (alias e): captured at or before an explicit cutover boundary,
+# ordinary projected text only. Hooks, instructions, tool-call projections, native
+# raw records and forgotten sources never become fallback context.
+HISTORICAL_RAW_SQL = '''EXISTS (SELECT 1 FROM historical_parking h WHERE h.source=e.source
+        AND h.conversation_id=e.conversation_id AND e.seq<=h.parked_through)
+    AND e.kind NOT IN ('developer','native_record','native_live_record','native_hook')
+    AND coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip'
+    AND coalesce(json_extract(e.metadata,'$.evidence_eligible'),1)<>0
+    AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)'''
+HISTORICAL_PREFIX = 'Unverified historical source'
+
 _ENTITY_SQL = ','.join("'" + kind + "'" for kind in sorted(ENTITY_TYPES))
 _AUTOMATIC_ELIGIBLE = f'''SELECT n.id,'node' AS kind,n.version,n.scope,n.id AS rank_target
     FROM node_versions n WHERE n.state='active'
@@ -75,7 +86,7 @@ _AUTOMATIC_ELIGIBLE = f'''SELECT n.id,'node' AS kind,n.version,n.scope,n.id AS r
     UNION ALL SELECT c.id,'candidate',1,c.scope,c.id FROM candidates c
     WHERE c.kind='memory' AND c.type NOT IN ({_ENTITY_SQL},'experience')
     AND NOT EXISTS (SELECT 1 FROM memory_types t WHERE t.name=c.type AND t.category='entity')
-    AND {ACTIVE_CANDIDATE_SQL}
+    AND {ACTIVE_CANDIDATE_SQL} AND {UNPARKED_CANDIDATE_SQL}
     UNION ALL SELECT s.id,'segment',1,n.scope,n.id FROM segments s JOIN node_versions n ON n.id=s.node_id
     WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
     AND {visible_sql()}'''
@@ -411,10 +422,20 @@ class Retrieval:
             substr(c.why,1,240) AS why,r.episode_id,r.recorded_at AS created_at
             FROM candidates c JOIN extraction_runs r ON r.id=c.run_id
             WHERE c.id=? AND {ACTIVE_CANDIDATE_SQL}''', (target,)).fetchone()
+        if row is None:
+            return None
+        parked = (self.store._db if db is None else db).execute(
+            'SELECT 1 FROM historical_parked_candidates WHERE candidate_id=? AND released_at IS NULL', (target,)).fetchone()
         return dict(row, scope=json.loads(row['scope']), version=1, tier='candidate',
-                    state='candidate', confirmed=False, pinned=0) if row else None
+                    state='candidate', confirmed=False, pinned=0, historical=parked is not None)
 
-    def _episode_record(self, episode_id, start=0, end=None, chunk_id=None, db=None):
+    def _episode_record(self, episode_id, start=0, end=None, chunk_id=None, db=None, *, historical=False, focus=None):
+        """A raw passage. Its id is the stable chunk reference when one exists, never a whole huge episode.
+
+        The shown excerpt is a 240-character window of the span; focus moves that
+        window so a literal hit late in the span is visible. Identity and evidence
+        span are unchanged.
+        """
         episode = self.store.get(episode_id, db=db)
         if episode is None:
             return None
@@ -422,14 +443,122 @@ class Retrieval:
                 'SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1',
                 (episode['source'], episode['event_id'])).fetchone():
             return None
+        if historical and legacy_native_context(episode['source'], episode['kind'], episode['text'], episode['metadata']):
+            return None
         end = len(episode['text']) if end is None else end
-        quote = episode['text'][start:end][:240]
-        return dict(id=episode_id, type='raw_episode', tier='raw', version=1, state='raw', confirmed=False,
-            text=quote, source=episode['source'], source_kind=episode['kind'], pinned=0,
+        left = start if focus is None else max(start, min(focus - 80, end - 240))
+        quote = episode['text'][left:min(end, left + 240)]
+        return dict(id=chunk_id or episode_id, episode_id=episode_id, type='raw_episode', tier='raw', version=1,
+            state='raw', confirmed=False, historical=historical,
+            text=quote, source=episode['source'], source_kind=episode['kind'], conversation_id=episode['conversation_id'],
+            occurred_at=episode['occurred_at'], pinned=0,
             created_at=episode['captured_at'], valid_from=None, valid_to=None, chunk_id=chunk_id,
-            evidence=[dict(episode_id=episode_id, start=start, end=end, quote_excerpt=quote)],
+            evidence=[dict(episode_id=episode_id, start=start, end=end, quote_excerpt=episode['text'][start:end][:240])],
             source_url='/episodes/' + episode_id, change_count=1,
             last_change=dict(recorded_at=episode['captured_at'], actor=episode['source'], why='Immutable captured evidence'))
+
+    def _matched_passage(self, episode_id, query, db, *, historical=False):
+        """The chunk containing the first literal query term, so a late match is not reported as the prefix."""
+        episode = self.store.get(episode_id, db=db)
+        if episode is None:
+            return None
+        # Case-insensitive search on the original string: a folded copy could change
+        # lengths and shift offsets.
+        hits = [found.start() for found in (re.search(re.escape(term), episode['text'], re.IGNORECASE)
+                                            for term in query.split()) if found is not None]
+        position = min(hits) if hits else 0
+        passage = db.execute('''SELECT id,start,end FROM episode_chunks WHERE episode_id=? AND start<=? AND end>?
+            ORDER BY start LIMIT 1''', (episode_id, position, position)).fetchone()
+        if passage is not None:
+            return self._episode_record(episode_id, passage['start'], passage['end'], passage['id'], db=db,
+                                        historical=historical, focus=position)
+        # Not yet chunked: cite the bounded matched span under the episode id.
+        start = max(0, position - 200)
+        return self._episode_record(episode_id, start, min(len(episode['text']), start + 1000), db=db,
+                                    historical=historical, focus=position)
+
+    def _meaningful(self, record, db):
+        """A current fact or lesson: not an entity, media, raw passage or parked candidate."""
+        if record.get('tier') in ('raw', 'reference') or record.get('historical'):
+            return False
+        kind = record['type']
+        if kind == 'media' or kind in ENTITY_TYPES or db.execute(
+                "SELECT 1 FROM memory_types WHERE name=? AND category='entity'", (kind,)).fetchone():
+            return False
+        if record.get('tier') == 'candidate':
+            return record.get('candidate_kind') == 'memory'
+        return True
+
+    def _historical_passages(self, query, vector, limit, db, *, keyword=True):
+        """Bounded unverified passages from parked raw history: existing chunk vectors, existing floor, literal FTS."""
+        found = {}
+        rows = db.execute(f'''SELECT i.target,1-v.distance AS cosine
+            FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
+            WHERE v.embedding MATCH ? AND k=? AND v.current=1
+            AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target
+                JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode' AND {HISTORICAL_RAW_SQL})
+            ORDER BY v.distance''', (vector.tobytes(), max(8, limit * 4))).fetchall()
+        for row in rows:
+            if row['cosine'] < TEXT_COSINE_FLOOR:
+                continue
+            passage = db.execute('SELECT * FROM episode_chunks WHERE id=?', (row['target'],)).fetchone()
+            record = self._episode_record(passage['episode_id'], passage['start'], passage['end'], passage['id'],
+                                          db=db, historical=True)
+            if record is not None and record['id'] not in found:
+                found[record['id']] = dict(record, cosine=float(row['cosine']), score=float(row['cosine']), match='semantic')
+        if keyword:
+            for episode in self.store.search(query, min(100, limit * 4), db=db):
+                if db.execute(f'SELECT 1 FROM episodes e WHERE e.id=? AND {HISTORICAL_RAW_SQL}', (episode['id'],)).fetchone() is None:
+                    continue
+                record = self._matched_passage(episode['id'], query, db, historical=True)
+                if record is None:
+                    continue
+                previous = found.get(record['id'])
+                if previous is None:
+                    found[record['id']] = dict(record, score=TEXT_COSINE_FLOOR + 0.25, match='keyword')
+                else:
+                    previous.update(score=previous['cosine'] + 0.25, match='hybrid')
+        return sorted(found.values(), key=lambda item: (-item['score'], item['id']))[:limit]
+
+    def _automatic_fallback(self, query, vector, ranked_at, limit, db):
+        """No meaningful current memory: at most one parked candidate and one unverified passage."""
+        items = []
+        rows = db.execute(f'''SELECT i.target,1-v.distance AS cosine
+            FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
+            WHERE v.embedding MATCH ? AND k=4 AND v.current=1
+            AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN candidates c ON c.id=i.target
+                JOIN historical_parked_candidates h ON h.candidate_id=c.id AND h.released_at IS NULL
+                WHERE i.kind='candidate' AND c.kind='memory' AND c.type NOT IN ({_ENTITY_SQL})
+                AND {ACTIVE_CANDIDATE_SQL})
+            ORDER BY v.distance''', (vector.tobytes(),)).fetchall()
+        for row in rows:
+            if row['cosine'] < AUTOMATIC_COSINE_FLOOR:
+                break
+            record = self._candidate_record(row['target'], db=db)
+            # The same exclusions as the primary pool: instruction-only evidence never
+            # re-enters automatic context through the historical path.
+            if (record is None or not _automatic_content(record['text'])
+                    or self._legacy_context_only(record['id'], 1, db=db)):
+                continue
+            record.update(self._candidate_details(record['id'], db=db))
+            record.update(category='memory', cosine=float(row['cosine']), match='semantic', related=[], duplicate_ids=[])
+            record.update(self._recency(record, ranked_at, db=db))
+            date = (record['source_occurred_at'] or '')[:10]
+            record.update(score=float(row['cosine']) * record['decay'],
+                          text='Unverified historical candidate' + (' (source ' + date + ')' if date else '') + ': ' + record['text'])
+            items.append(record)
+            break
+        for record in self._historical_passages(query, vector, 1, db, keyword=False):
+            if not _automatic_content(record['text']):
+                continue
+            record.update(category='historical_raw', related=[], duplicate_ids=[], importance=.5, archived=0)
+            record.update(self._recency(record, ranked_at, db=db))
+            date = (record['source_occurred_at'] or '')[:10]
+            full = self.store.get(record['episode_id'], db=db)['text'][record['evidence'][0]['start']:record['evidence'][0]['end']]
+            record.update(score=record['cosine'] * record['decay'],
+                          text=HISTORICAL_PREFIX + (' ' + date if date else '') + ': ' + ' '.join(full.split())[:480])
+            items.append(record)
+        return items[:limit]
 
     def related(self, node_id, hops, *, scope=None, include_archived=False, db=None):
         # Retain the caller option; age-archived rows remain eligible.
@@ -853,6 +982,12 @@ class Retrieval:
                 results.append(record)
                 if len(results) == limit:
                     break
+            # Named-entity anchors and a media pointer alone are not meaningful current
+            # memory: without any fact or lesson, parked history may offer bounded
+            # unverified context in the remaining budget. Raw history has no scope, so a
+            # scoped request gets none.
+            if scope is None and len(results) < limit and not any(self._meaningful(item, db) for item in results):
+                results.extend(self._automatic_fallback(query, vector, ranked_at, limit - len(results), db))
             return anchors + results
 
     def recall(self, query, effort='normal', limit=10, *, scope=None, automatic=False, context=''):
@@ -905,10 +1040,9 @@ class Retrieval:
                     matches[record['id']] = dict(record, score=TEXT_COSINE_FLOOR + 0.25, match='keyword')
             if effort == 'deep' and scope is None:
                 for episode in self.store.search(query, min(100, limit * 4), db=db):
-                    record = self._episode_record(episode['id'], db=db)
+                    record = self._matched_passage(episode['id'], query, db)
                     if record is not None:
-                        matches[record['id']] = dict(record, text=episode['excerpt'][:240],
-                            score=TEXT_COSINE_FLOOR + 0.25, match='keyword')
+                        matches[record['id']] = dict(record, score=TEXT_COSINE_FLOOR + 0.25, match='keyword')
             rows = []
             kinds = ('node', 'segment', 'candidate', 'episode') if effort == 'deep' and scope is None else ('node', 'segment', 'candidate')
             for kind in kinds:
@@ -966,6 +1100,11 @@ class Retrieval:
                 previous = matches.get(item['id'])
                 if previous is None or 'cosine' not in previous or item['score'] > previous['score']:
                     matches[item['id']] = item
+            # Explicit cheap/normal recall falls back to parked raw history only when no
+            # current fact or lesson matched; deep keeps its broad raw lookup above.
+            if effort != 'deep' and scope is None and not any(self._meaningful(item, db) for item in matches.values()):
+                for record in self._historical_passages(query, query_vector, limit, db):
+                    matches.setdefault(record['id'], record)
             matches = {target: record for target, record in matches.items() if self._media_sources(record, db=db)}
             feedback = {}
             if matches:
@@ -982,7 +1121,13 @@ class Retrieval:
                 behavior = self.graph._behavior(item['id'], db=db) if item['type'] == 'experience' else None
                 item.update(self._recency(item, ranked_at,
                     authority=behavior.get('authority') if behavior else None, db=db))
-                item['score'] *= item['importance'] * item['decay'] * (1 + .1 * feedback.get(item['id'], 0))
+                # A behavioral lesson is conditional guidance: not being cited for a query
+                # does not make it wrong, so negative explicit-query feedback is neutral for
+                # it. Citation reward, ordinary facts and incidents keep the full signal.
+                signal = feedback.get(item['id'], 0)
+                if behavior:
+                    signal = max(0, signal)
+                item['score'] *= item['importance'] * item['decay'] * (1 + .1 * signal)
             results = sorted(matches.values(), key=lambda item: (-item['score'], item['id']))[:limit]
             for item in results:
                 if item.get('tier') == 'candidate':

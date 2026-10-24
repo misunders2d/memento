@@ -9,7 +9,11 @@ import time
 # those readers already refuse at startup, export, import and restore.
 LEGACY_VERSION = 1
 VERSION = 2
-SUPPORTED_VERSIONS = (LEGACY_VERSION, VERSION)
+# Header 3 is written by an explicit historical-pool activation. Images that know
+# only headers 1/2 would ignore the parking policy and resume bulk extraction of
+# the parked backlog, so they must refuse the file. Nothing ever lowers a header.
+PARKING_VERSION = 3
+SUPPORTED_VERSIONS = (LEGACY_VERSION, VERSION, PARKING_VERSION)
 
 
 def check_version(db):
@@ -18,6 +22,38 @@ def check_version(db):
     if version not in SUPPORTED_VERSIONS:
         raise ValueError(f'Unsupported database schema version: {version}')
     return version
+
+
+def header_target(db, current):
+    """The header this database must carry: never lower, 3 once parking was activated."""
+    parked = db.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='historical_activation'").fetchone() and \
+        db.execute('SELECT 1 FROM historical_activation LIMIT 1').fetchone()
+    return max(current, PARKING_VERSION if parked else VERSION)
+
+
+_HISTORICAL_POOL = (
+    # The one explicit cutover receipt. Repeating the operation is a no-op.
+    """CREATE TABLE IF NOT EXISTS historical_activation (
+           singleton INTEGER PRIMARY KEY CHECK(singleton=1), activated_at TEXT NOT NULL) STRICT""",
+    # Parked remaining backlog per conversation: (processing_progress.seq, parked_through]
+    # is parked raw history; live_seq/live_offset is the separate cursor for history
+    # captured after activation. processing_progress.seq keeps its exact meaning.
+    """CREATE TABLE IF NOT EXISTS historical_parking (
+           source TEXT NOT NULL, conversation_id TEXT NOT NULL,
+           parked_through INTEGER NOT NULL, live_seq INTEGER NOT NULL,
+           live_offset INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY(source, conversation_id)) STRICT""",
+    # Candidates parked out of consolidation admission at activation. Actual use
+    # records a release; rows are never deleted.
+    """CREATE TABLE IF NOT EXISTS historical_parked_candidates (
+           candidate_id TEXT PRIMARY KEY, released_at TEXT) STRICT""",
+)
+
+
+def upgrade_historical_pool(db):
+    """Small durable policy tables; creating them never parks anything."""
+    for statement in _HISTORICAL_POOL:
+        db.execute(statement)
 
 
 # TEXT removes the unused JSON subtype so SQLite 3.46 can substitute this
@@ -326,6 +362,7 @@ def initialize(db):
         db.execute(statement)
     upgrade_status_index(db)
     upgrade_captured_media(db)
+    upgrade_historical_pool(db)
     for table, predicate in _IMMUTABLE_KEYS.items():
         for operation in ("UPDATE", "DELETE"):
             db.execute(f"""CREATE TRIGGER {table}_no_{operation} BEFORE {operation} ON {table}

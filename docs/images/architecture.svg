@@ -1,65 +1,117 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 620" role="img" aria-labelledby="title desc" style="color-scheme:light dark">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 680" role="img" aria-labelledby="title desc" style="color-scheme:light dark">
   <title id="title">Memento architecture and trust boundaries</title>
-  <desc id="desc">Ordinary-user native agents send raw conversations to a private service under a separate identity. Local retrieval injects relevant cited memories into new prompts. One native processor extracts candidates using its existing login. Nightly consolidation promotes supported memories. Optional Google Drive holds cold artifacts and owner-requested backups.</desc>
+  <desc id="desc">Ordinary-user native agents (Pi, OMP, Claude Code, Codex, AGY) capture conversations and receive automatic recall and 6 MCP tools from a private service running under dedicated UID 10001. One native processor runs an independent two-lane coordinator (one extraction and one consolidation) with tool-free model calls. The service stores compressed raw evidence, current-node FTS5 and reused vec0 embeddings, validates exact source spans and technical traces with bounded retry feedback, and optionally offloads cold artifacts and manual backups to an app-owned Google Drive folder.</desc>
   <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 9 5 1 9" fill="none" stroke="currentColor" stroke-width="1.5"/></marker>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 9 5 1 9" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    </marker>
     <style>
-      text { fill:currentColor; font-family:system-ui,-apple-system,sans-serif; font-size:15px }
-      .heading { font-size:23px; font-weight:650 }
-      .label { font-size:17px; font-weight:650 }
-      .small { font-size:14px; opacity:.72 }
-      .zone { fill:none; stroke:currentColor; stroke-opacity:.24; stroke-dasharray:5 5 }
-      .box { fill:none; stroke:currentColor; stroke-opacity:.55; stroke-width:1.2 }
-      .flow { fill:none; stroke:currentColor; stroke-opacity:.72; stroke-width:1.5; marker-end:url(#arrow) }
+      text { fill:currentColor; font-family:system-ui,-apple-system,sans-serif; font-size:14px }
+      .heading { font-size:22px; font-weight:650 }
+      .subhead { font-size:14px; opacity:.78 }
+      .label { font-size:16px; font-weight:650 }
+      .small { font-size:13px; opacity:.74 }
+      .badge { font-size:12px; font-weight:600; opacity:.85 }
+      .zone { fill:none; stroke:currentColor; stroke-opacity:.26; stroke-dasharray:5 5; stroke-width:1.2 }
+      .box { fill:none; stroke:currentColor; stroke-opacity:.58; stroke-width:1.2 }
+      .accent { fill:currentColor; fill-opacity:.05; stroke:currentColor; stroke-opacity:.68; stroke-width:1.3 }
+      .flow { fill:none; stroke:currentColor; stroke-opacity:.75; stroke-width:1.5; marker-end:url(#arrow) }
+      .feedback { fill:none; stroke:currentColor; stroke-opacity:.58; stroke-width:1.3; stroke-dasharray:4 3; marker-end:url(#arrow) }
     </style>
   </defs>
-  <text class="heading" x="20" y="30">A shared memory. Separate trust boundaries.</text>
-  <rect class="zone" x="20" y="88" width="272" height="482" rx="14"/>
-  <rect class="zone" x="340" y="88" width="600" height="482" rx="14"/>
-  <text class="label" x="40" y="117">Native host · ordinary user</text>
-  <text class="label" x="370" y="117">Private service · dedicated identity</text>
-  <rect class="box" x="40" y="145" width="232" height="86" rx="10"/>
-  <text class="label" x="56" y="173">Your native agents</text>
-  <text x="56" y="198">Pi · OMP · Claude · Codex</text>
-  <text class="small" x="56" y="219">Capture + automatic recall</text>
-  <rect class="box" x="370" y="145" width="230" height="86" rx="10"/>
-  <text class="label" x="386" y="173">Raw evidence</text>
-  <text x="386" y="198">SQLite + original artifacts</text>
-  <text class="small" x="386" y="219">Exact text, sources and offsets</text>
-  <rect class="box" x="670" y="145" width="240" height="86" rx="10"/>
-  <text class="label" x="686" y="173">Semantic retrieval</text>
-  <text x="686" y="198">Local embedding model</text>
-  <text class="small" x="686" y="219">Citations + unconfirmed labels</text>
-  <path class="flow" d="M272 181H370"/>
-  <text class="small" x="282" y="167">capture</text>
-  <path class="flow" d="M600 181H670"/>
-  <text class="small" x="608" y="167">index</text>
-  <path class="flow" d="M790 231V278H156V231"/>
-  <text class="small" x="295" y="265">Relevant memories into the next prompt</text>
-  <text class="small" x="56" y="310">Raw user text stays original.</text>
-  <rect class="box" x="40" y="350" width="232" height="114" rx="10"/>
-  <text class="label" x="56" y="379">One native processor</text>
-  <text x="56" y="405">Pi, OMP or Claude</text>
-  <text class="small" x="56" y="429">Existing login · queued jobs</text>
-  <text class="small" x="56" y="450">Tool-free model calls</text>
-  <rect class="box" x="370" y="350" width="230" height="114" rx="10"/>
-  <text class="label" x="386" y="379">Candidate memories</text>
-  <text x="386" y="405">Backed by raw source spans</text>
-  <text class="small" x="386" y="429">Visible before promotion</text>
-  <text class="small" x="386" y="450">30 min inactive / compaction</text>
-  <rect class="box" x="670" y="350" width="240" height="114" rx="10"/>
-  <text class="label" x="686" y="379">Durable memories</text>
-  <text x="686" y="405">Consolidated + versioned</text>
-  <text class="small" x="686" y="429">02:00–07:00 local window</text>
-  <text class="small" x="686" y="450">Human review when required</text>
-  <path class="flow" d="M272 395H370"/>
-  <text class="small" x="283" y="381">extract</text>
-  <path class="flow" d="M600 395H670"/>
-  <text class="small" x="607" y="381">night</text>
-  <text class="small" x="56" y="501">Model usage follows your</text>
-  <text class="small" x="56" y="522">native provider's terms.</text>
-  <rect class="box" x="370" y="491" width="540" height="59" rx="10"/>
-  <text class="label" x="386" y="515">Optional Google Drive · app-owned folder</text>
-  <text class="small" x="386" y="537">Cold artifacts + owner-requested backups · plaintext copies</text>
-  <text class="small" x="20" y="603">Loopback or restricted tailnet HTTPS only. The public information website is separate.</text>
+
+  <text class="heading" x="20" y="30">Shared memory across agents. Strict trust and evidence boundaries.</text>
+  <text class="subhead" x="20" y="54">One owner · loopback or tailnet HTTPS · separate service UID (10001) · exact source spans and version history</text>
+
+  <!-- Zones -->
+  <rect class="zone" x="20" y="76" width="286" height="560" rx="14"/>
+  <rect class="zone" x="356" y="76" width="604" height="560" rx="14"/>
+  <text class="label" x="38" y="104">Native host · ordinary user</text>
+  <text class="label" x="380" y="104">Private service · dedicated identity (UID 10001)</text>
+
+  <!-- Native Agents Box -->
+  <rect class="box" x="38" y="124" width="250" height="122" rx="10"/>
+  <text class="label" x="54" y="150">Your native agents</text>
+  <text x="54" y="173">Pi · OMP · Claude · Codex · AGY</text>
+  <text class="small" x="54" y="195">Durable local outbox + auto recall</text>
+  <text class="small" x="54" y="214">6 MCP tools: recall · remember · link</text>
+  <text class="small" x="54" y="232">supersede · history · loop</text>
+
+  <!-- Raw Evidence Box -->
+  <rect class="box" x="380" y="124" width="256" height="122" rx="10"/>
+  <text class="label" x="396" y="150">Immutable raw evidence</text>
+  <text x="396" y="173">SQLite WAL + artifact blobs</text>
+  <text class="small" x="396" y="195">Lossless raw_frame compression</text>
+  <text class="small" x="396" y="214">Exact quotes, char spans &amp; dates</text>
+  <text class="small" x="396" y="232">Captured media + 64 KiB+ offload</text>
+
+  <!-- Retrieval Box -->
+  <rect class="accent" x="684" y="124" width="256" height="122" rx="10"/>
+  <text class="label" x="700" y="150">Hybrid semantic recall</text>
+  <text x="700" y="173">EmbeddingGemma-2 + FTS5</text>
+  <text class="small" x="700" y="195">Single-row current-node FTS</text>
+  <text class="small" x="700" y="214">Reused vec0 embeddings + entities</text>
+  <text class="small" x="700" y="232">90-day recency decay + citations</text>
+
+  <!-- Top flows -->
+  <path class="flow" d="M288 168H380"/>
+  <text class="small" x="304" y="158">capture</text>
+  <path class="flow" d="M636 168H684"/>
+  <text class="small" x="643" y="158">index</text>
+  <path class="flow" d="M812 246V282H163V246"/>
+  <text class="small" x="382" y="274">Automatic context (3s foreground / 15s detached) + explicit MCP recall</text>
+  <text class="small" x="48" y="308">Injected context never pollutes persisted raw history.</text>
+
+  <!-- Processor Box -->
+  <rect class="box" x="38" y="334" width="250" height="162" rx="10"/>
+  <text class="label" x="54" y="360">One designated processor</text>
+  <text x="54" y="383">Pi, OMP or Claude Code</text>
+  <text class="small" x="54" y="405">Existing CLI login · tool-free calls</text>
+  <text class="small" x="54" y="425">2-lane coordinator (extract +</text>
+  <text class="small" x="54" y="443">consolidate refill independently)</text>
+  <text class="small" x="54" y="463">Lease heartbeats · 15m retry wait</text>
+  <text class="small" x="54" y="481">(Codex &amp; AGY are client-only)</text>
+
+  <!-- Candidates Box -->
+  <rect class="box" x="380" y="334" width="256" height="162" rx="10"/>
+  <text class="label" x="396" y="360">Candidate memories</text>
+  <text x="396" y="383">Unconfirmed · span-verified</text>
+  <text class="small" x="396" y="405">30m inactivity or compaction</text>
+  <text class="small" x="396" y="425">Alternates oldest &amp; newest chats</text>
+  <text class="small" x="396" y="443">Searchable before promotion</text>
+  <text class="small" x="396" y="463">Excludes legacy instruction-only</text>
+  <text class="small" x="396" y="481">envelopes from consolidation</text>
+
+  <!-- Durable Graph Box -->
+  <rect class="accent" x="684" y="334" width="256" height="162" rx="10"/>
+  <text class="label" x="700" y="360">Durable versioned graph</text>
+  <text x="700" y="383">02:00–07:00 consolidation</text>
+  <text class="small" x="700" y="405">Compact existing-evidence spans</text>
+  <text class="small" x="700" y="425">Explicit user vs. inferred trace</text>
+  <text class="small" x="700" y="443">(attempt → result) lessons</text>
+  <text class="small" x="700" y="463">Open loops · entity relations</text>
+  <text class="small" x="700" y="481">Owner review &amp; version history</text>
+
+  <!-- Middle flows -->
+  <path class="flow" d="M288 392H380"/>
+  <text class="small" x="303" y="382">extract</text>
+  <path class="flow" d="M636 392H684"/>
+  <text class="small" x="644" y="382">night</text>
+  <path class="flow" d="M812 334V246"/>
+  <path class="flow" d="M508 334V246"/>
+  <path class="feedback" d="M508 496V522H163V496"/>
+  <text class="small" x="225" y="516">Private bounded previous_rejection feedback on validation failure (atomic rollback)</text>
+
+  <!-- Bottom Row: Health/UI and Drive -->
+  <rect class="box" x="38" y="544" width="250" height="72" rx="10"/>
+  <text class="label" x="54" y="569">Observability &amp; control</text>
+  <text class="small" x="54" y="590">Read-only /ui/ graph viewer</text>
+  <text class="small" x="54" y="607">Owner-only admin socket</text>
+
+  <rect class="box" x="380" y="544" width="560" height="72" rx="10"/>
+  <text class="label" x="396" y="569">Optional Google Drive (drive.file) &amp; non-blocking health</text>
+  <text class="small" x="396" y="590">App-owned folder: cold artifacts (&gt;=10 MiB / media / 90d) + manual verified backups</text>
+  <text class="small" x="396" y="607">/health: 0.25s SQLite writer probe + WAL failure snapshot (never blocks on read prep)</text>
+
+  <text class="small" x="20" y="662">Loopback (127.0.0.1:8765) or ACL-restricted Tailscale Serve HTTPS only. Public static info site is completely separate.</text>
 </svg>

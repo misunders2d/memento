@@ -41,6 +41,10 @@ async def serve_admin(graph, data_dir: Path, services):
                                                  cold=services.cold)
             elif request['operation'] == 'compact':
                 result = await asyncio.to_thread(graph.store.compact)
+            elif request['operation'] == 'history_status':
+                result = await asyncio.to_thread(services.processing.history_status)
+            elif request['operation'] == 'history_park':
+                result = await asyncio.to_thread(services.processing.park_history)
             elif request['operation'] in ('approve', 'reject'):
                 result = await asyncio.to_thread(graph._decide_review,
                     command_id=request['command_id'], actor=f'human:uid:{uid}',
@@ -90,8 +94,8 @@ def _request(data_dir, request):
         client.settimeout(30)
         client.connect(str(data_dir / 'admin.sock'))
         client.sendall(json.dumps(request).encode() + b'\n')
-        if request['operation'] in ('backup', 'export', 'compact'):
-            # Verified snapshots, downloads and uploads may exceed decision timeouts.
+        if request['operation'] in ('backup', 'export', 'compact', 'history_park'):
+            # Verified snapshots, downloads, uploads and whole-backlog parking may exceed decision timeouts.
             client.settimeout(None)
         with client.makefile('rb') as response:
             return json.loads(response.readline(4 * 1024 * 1024))
@@ -113,6 +117,9 @@ def main():
     merge.add_argument('--command-id', default=None)
     commands.add_parser('backup')
     commands.add_parser('compact', help='Reclaim free database pages; pauses service writes')
+    history = commands.add_parser('history', help='One-time cutover: park the current unprocessed backlog as '
+                                                  'searchable raw history, or read the parking state')
+    history.add_argument('action', choices=['park', 'status'])
     export = commands.add_parser('export', help='Export database, Drive references and local-only payloads privately')
     export.add_argument('--output', type=Path, required=True, help='New file in an owner-private directory')
     for operation in ('approve', 'reject'):
@@ -134,6 +141,10 @@ def main():
         if input(f'This plaintext archive contains private memory and Drive references; remote files stay on Drive. Type {expected!r} to confirm: ') != expected:
             parser.exit(1, 'Not confirmed; nothing changed.\n')
         request['output'] = str(output)
+    elif args.operation == 'history':
+        # An operational policy change on the owner socket, like compact: no review
+        # confirmation. Park is a one-time cutover with no undo command.
+        request['operation'] = 'history_' + args.action
     elif args.operation not in ('list', 'inventory', 'backup', 'compact'):
         if not sys.stdin.isatty():
             parser.error('Administrative decisions require an interactive human terminal')

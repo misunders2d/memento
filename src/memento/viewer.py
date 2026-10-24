@@ -215,10 +215,17 @@ def install(app, allowed_hosts):
     def conversations(request: Request, offset: Annotated[int, Query(ge=0)] = 0,
                       limit: Annotated[int, Query(ge=1, le=100)] = 50):
         with app.state.store.read_snapshot() as db:
+            # Unextracted history stays visible. A parked conversation is labelled: its
+            # parked range is not queued work, and live_cursor shows where new history resumes.
             total = db.execute('SELECT count(*) FROM processing_progress WHERE latest_seq>seq').fetchone()[0]
-            rows = [dict(row) for row in db.execute('''SELECT source,conversation_id,seq AS cursor,latest_at
-                FROM processing_progress WHERE latest_seq>seq ORDER BY latest_at DESC,source,conversation_id
+            rows = [dict(row) for row in db.execute('''SELECT p.source,p.conversation_id,p.seq AS cursor,p.latest_at,
+                h.parked_through,h.live_seq AS live_cursor,(h.source IS NOT NULL) AS parked
+                FROM processing_progress p LEFT JOIN historical_parking h
+                ON h.source=p.source AND h.conversation_id=p.conversation_id
+                WHERE p.latest_seq>p.seq ORDER BY p.latest_at DESC,p.source,p.conversation_id
                 LIMIT ? OFFSET ?''', (limit, offset))]
+            for row in rows:
+                row['parked'] = bool(row['parked'])
         return _json(request, dict(total=total, items=rows))
 
     @router.get('/api/conversation')

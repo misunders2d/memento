@@ -5,13 +5,14 @@ import time
 from .extraction import ACTIVE_CANDIDATE_SQL, AWAITING_DECISION_SQL
 from .consolidation import CONSOLIDATION_ELIGIBLE_SQL
 from .captured_media import status as captured_media_status
+from .processing import PARKED_ERROR, historical_status, pending_conversations_sql
 
 
 _JOB_ERROR_CATEGORIES = frozenset({
     'cli_failed', 'invalid_output', 'service_rejected', 'night_window_closed',
     'ValueError', 'ConflictError', 'OSError', 'FileNotFoundError',
     'PermissionError', 'TimeoutError', 'RuntimeError',
-    'CapturedSourceUnavailable',
+    'CapturedSourceUnavailable', PARKED_ERROR,
 })
 
 
@@ -80,10 +81,15 @@ def operational_status(state, source=None):
                 WHERE kind=? AND (? IS NULL OR {origin}) GROUP BY state,error''',
                 (kind, source, source)).fetchall()
             result = dict(available=True, pending_jobs=0, leased_jobs=0, completed_jobs=0,
-                          failed_jobs=0, retrying_jobs=0)
+                          failed_jobs=0, retrying_jobs=0, parked_jobs=0)
             fields = dict(pending='pending_jobs', leased='leased_jobs', done='completed_jobs', failed='failed_jobs')
             errors = {}
             for row in rows:
+                if row['state'] == 'failed' and row['error'] == PARKED_ERROR:
+                    # Fenced by the historical cutover, not an operational failure; the
+                    # stored job state and its diagnostic code stay as they are.
+                    result['parked_jobs'] += row['count']
+                    continue
                 result[fields[row['state']]] += row['count']
                 if row['state'] == 'pending' and row['error'] is not None:
                     result['retrying_jobs'] += row['count']
@@ -97,11 +103,22 @@ def operational_status(state, source=None):
             return result
 
         extraction = jobs('extract')
-        extraction['pending_conversations'] = db.execute('''SELECT count(*) FROM processing_progress
-            WHERE latest_seq>seq AND (? IS NULL OR source=?)''', (source, source)).fetchone()[0]
-        extraction['progress'] = [dict(row) for row in db.execute('''SELECT source,conversation_id,
-            seq AS cursor,offset,compact_through,latest_seq FROM processing_progress
-            WHERE (? IS NULL OR source=?) ORDER BY source,conversation_id''', (source, source))]
+        # Pending counts what admission can still extract. A parked conversation is
+        # pending only beyond its live cursor; its parked range is reported separately.
+        extraction['pending_conversations'] = db.execute(
+            pending_conversations_sql('AND (? IS NULL OR p.source=?)'), (source, source)).fetchone()[0]
+        extraction['parked_conversations'] = db.execute('''SELECT count(*) FROM historical_parking h
+            WHERE (? IS NULL OR h.source=?)''', (source, source)).fetchone()[0]
+        # Rows without parking keep their exact previous shape; in every row cursor >=
+        # compact_through remains the prefix-extracted proof, parked ranges are explicit.
+        extraction['progress'] = [
+            {key: value for key, value in dict(row).items()
+             if row['parked_through'] is not None or key not in ('parked_through', 'live_cursor', 'live_offset')}
+            for row in db.execute('''SELECT p.source,p.conversation_id,p.seq AS cursor,p.offset,p.compact_through,
+                p.latest_seq,h.parked_through,h.live_seq AS live_cursor,h.live_offset
+                FROM processing_progress p LEFT JOIN historical_parking h
+                ON h.source=p.source AND h.conversation_id=p.conversation_id
+                WHERE (? IS NULL OR p.source=?) ORDER BY p.source,p.conversation_id''', (source, source))]
         consolidation, media = jobs('consolidate'), jobs('media')
         media['captured_attachments'] = captured_media_status(db, source)
         # Pending/ready count what consolidation can still admit. Active candidates whose
@@ -109,25 +126,34 @@ def operational_status(state, source=None):
         # stay stored, searchable and in history, and never reach a model call.
         # MATERIALIZED keeps SQLite from flattening the subquery and evaluating the
         # eligibility predicate once per output column (measured 3x UDF calls otherwise).
+        # Parked candidates (explicit historical activation) are counted apart from
+        # pending/ready and from the legacy exclusion: a drop in pending is parking,
+        # not model completion. They stay stored, searchable and in history.
         pending = db.execute(f'''WITH candidate_status AS MATERIALIZED (
             SELECT ({CONSOLIDATION_ELIGIBLE_SQL}) AS eligible,
                 NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id
                     AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id)
-                    AND {AWAITING_DECISION_SQL}) AS ready
+                    AND {AWAITING_DECISION_SQL}) AS ready,
+                EXISTS (SELECT 1 FROM historical_parked_candidates h
+                    WHERE h.candidate_id=c.id AND h.released_at IS NULL) AS parked
             FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}
             AND (? IS NULL OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
                 WHERE g.target=c.id AND e.source=?)))
-            SELECT coalesce(sum(eligible),0) AS pending_candidates,
-            coalesce(sum(eligible AND ready),0) AS ready_candidates,
-            coalesce(sum(NOT eligible),0) AS excluded_legacy_candidates
+            SELECT coalesce(sum(eligible AND NOT parked),0) AS pending_candidates,
+            coalesce(sum(eligible AND ready AND NOT parked),0) AS ready_candidates,
+            coalesce(sum(NOT eligible),0) AS excluded_legacy_candidates,
+            coalesce(sum(eligible AND parked),0) AS parked_candidates
             FROM candidate_status''', (time.time(), source, source)).fetchone()
         consolidation.update(dict(pending))
+        # Parking is one database-wide cutover, so this section is global even in
+        # source-filtered status; the consolidation counts above stay scoped.
+        historical = dict(scope='global', **historical_status(db))
         indexing = (state.retrieval._status(db, source) if state.retrieval is not None else
                     dict(available=False, reason='embedding_runtime_disabled'))
     cold = state.cold_runtime
     return dict(source=source, captured=captured, raw_storage=raw_storage, artifact_storage=artifact_storage,
                 indexing=indexing, extraction=extraction,
-                consolidation=consolidation, media=media,
+                consolidation=consolidation, historical=historical, media=media,
                 drive=dict(connected=state.cold is not None,
                            reauthorization_required=state.drive_reauthorization_required,
                            archive_failure_count=cold.sweep_failure_count if cold is not None else None,

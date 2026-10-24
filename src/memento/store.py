@@ -19,8 +19,9 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from .schema import (SUPPORTED_VERSIONS, VERSION as SCHEMA_VERSION, initialize, upgrade_episode_fts,
-                     upgrade_node_fts, upgrade_raw_text, upgrade_status_index, upgrade_captured_media)
+from .schema import (SUPPORTED_VERSIONS, VERSION as SCHEMA_VERSION, header_target, initialize, upgrade_episode_fts,
+                     upgrade_historical_pool, upgrade_node_fts, upgrade_raw_text, upgrade_status_index,
+                     upgrade_captured_media)
 from .blobs import BlobStore
 from .artifacts import Artifacts
 from .captured_media import references as media_references, record_references
@@ -127,10 +128,14 @@ class Store:
                     upgrade_status_index(self._db)
                     upgrade_captured_media(self._db)
                     upgrade_node_fts(self._db)
+                    upgrade_historical_pool(self._db)
                     # The header marks frame-capable storage; it commits with the
-                    # physical upgrades so pre-frame readers refuse this file.
-                    if version != SCHEMA_VERSION:
-                        self._db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+                    # physical upgrades so pre-frame readers refuse this file. A
+                    # database that ever activated historical parking keeps header 3;
+                    # startup never lowers a header.
+                    target = header_target(self._db, version)
+                    if version != target:
+                        self._db.execute(f'PRAGMA user_version={target}')
                     self._db.execute('COMMIT')
                 except BaseException:
                     self._db.execute('ROLLBACK')

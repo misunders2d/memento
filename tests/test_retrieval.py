@@ -296,8 +296,8 @@ def test_media_parent_and_raw_episode_use_original_source_recency(retrieval, rec
         else:
             episode, _ = r.store.capture(dict(source='raw-time', event_id=name, conversation_id='c',
                 kind='tool', text=f'The Cedar {name} observation.', occurred_at=occurred_at, metadata={}))
-            target = episode['id']
-            r.store._db.execute('INSERT INTO episode_chunks VALUES (?,?,0,?)', (name, target, len(episode['text'])))
+            r.store._db.execute('INSERT INTO episode_chunks VALUES (?,?,0,?)', (name, episode['id'], len(episode['text'])))
+            target = name  # raw results carry their stable chunk reference as id
         index(r, name, cosine, kind=kind)
         ids.append(target)
     hits = r.recall('unmatchedword', effort='deep' if kind == 'episode' else 'cheap', automatic=automatic)
@@ -1399,11 +1399,14 @@ def test_episode_vectors_reach_exact_unicode_spans_only_in_deep_recall(retrieval
     assert r.recall('Comet', effort='cheap') == []
     hit = r.recall('Comet', effort='deep')[0]
     span = hit['evidence'][0]
-    assert hit['id'] == episode['id'] and hit['tier'] == 'raw' and hit['confirmed'] is False
+    assert hit['id'] == hit['chunk_id'] != episode['id'] and hit['episode_id'] == episode['id']
+    assert hit['tier'] == 'raw' and hit['confirmed'] is False and hit['historical'] is False
     assert 'Comet' in text[span['start']:span['end']]
     assert span['quote_excerpt'] == text[span['start']:span['end']][:240]
     assert hit['valid_from'] is None
     assert r.graph.history(episode['id'])[0]['text'] == text
+    resolved = r.graph.history(hit['id'])[0]
+    assert resolved['episode_id'] == episode['id'] and resolved['evidence'][0]['quote'] == text[span['start']:span['end']]
 
 
 def test_candidate_entity_matching_is_tentative_and_never_merges_identities(retrieval, monkeypatch):
@@ -1554,7 +1557,9 @@ def test_transport_skip_projection_is_not_a_semantic_raw_memory(retrieval, monke
     while r.index_pending():
         pass
     hits = r.recall('unmatchedword', effort='deep')
-    assert {hit['id'] for hit in hits} == {message['id']}
+    # Raw results carry their chunk reference as id; the transport envelope stays out.
+    assert {hit['episode_id'] for hit in hits} == {message['id']}
+    assert all(hit['id'] == hit['chunk_id'] != transport['id'] for hit in hits)
     assert r.graph.history(transport['id'])[0]['text'] == transport['text']
 
 

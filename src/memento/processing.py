@@ -10,9 +10,91 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import uuid4
 
 from .consolidation import Consolidator, INSTRUCTION as CONSOLIDATE_INSTRUCTION, Plan, VERSION as CONSOLIDATE_VERSION
-from .extraction import (BatchDrafts, Extractor, INSTRUCTION as EXTRACT_INSTRUCTION, VALIDATION_CODES, VERSION,
-                         source_text_ranges)
+from .extraction import (ACTIVE_CANDIDATE_SQL, BatchDrafts, Extractor, INSTRUCTION as EXTRACT_INSTRUCTION,
+                         VALIDATION_CODES, VERSION, source_text_ranges)
 from .jobs import Job, LostLease, Queue
+from .schema import PARKING_VERSION
+
+# The extraction cursor a conversation admits from. A parked conversation (a
+# historical_parking row) admits only history after its separate live cursor, so
+# processing_progress.seq keeps meaning "extracted prefix" and the parked range
+# (seq, parked_through] is never admitted sequentially again.
+_CURSOR_SQL = 'coalesce(h.live_seq,p.seq)'
+_OFFSET_SQL = 'coalesce(h.live_offset,p.offset)'
+_PROGRESS_SQL = '''FROM processing_progress p LEFT JOIN historical_parking h
+    ON h.source=p.source AND h.conversation_id=p.conversation_id'''
+# The cutover fence uses one fixed error code; status reports only known categories.
+PARKED_ERROR = 'historical_parked'
+
+
+# A legacy episode-id citation may demand at most one ordinary extraction window;
+# a longer episode needs the chunk reference that new raw results carry.
+DEMAND_EPISODE_LIMIT = 12000
+
+
+def demand_extract(graph, episode, start=None, end=None):
+    """Caller holds the writer transaction. One deterministic extract job for a used parked span.
+
+    Only parked history (after the extracted prefix, at or before the cutover boundary)
+    is demanded: everything else is covered by ordinary extraction or already done.
+    Repeated use of the same span resolves to the same job, whatever its state, so
+    nothing is replayed; completion never touches a conversation cursor.
+    """
+    from .store import legacy_native_context
+    db = graph.store._db
+    row = db.execute('''SELECT p.seq AS cursor,h.parked_through FROM historical_parking h
+        JOIN processing_progress p ON p.source=h.source AND p.conversation_id=h.conversation_id
+        WHERE h.source=? AND h.conversation_id=?''', (episode['source'], episode['conversation_id'])).fetchone()
+    if row is None or not row['cursor'] < episode['seq'] <= row['parked_through']:
+        return None
+    metadata = json.loads(episode['metadata']) if isinstance(episode['metadata'], str) else episode['metadata']
+    if (metadata.get('extraction_mode') == 'skip'
+            or episode['kind'] in ('developer', 'native_record', 'native_live_record', 'native_hook')):
+        return None
+    text = graph.store.get(episode['id'])['text']
+    if legacy_native_context(episode['source'], episode['kind'], text, metadata):
+        return None
+    if start is None or end is None:
+        if len(text) > DEMAND_EPISODE_LIMIT:
+            return None
+        start, end = 0, len(text)
+    tool = metadata.get('extraction_mode') == 'tool_output' or episode['kind'] == 'tool'
+    windows = []
+    for left, right in source_text_ranges(text):
+        left, right = max(left, start), min(right, end)
+        if left >= right:
+            continue
+        at = left
+        while True:
+            stop = right if tool else min(right, at + 12000)
+            windows.append(dict(id=f"{episode['id']}:{at}", episode_id=episode['id'], start=at, end=stop))
+            if stop >= right or len(windows) == 64:
+                break
+            at = max(left, stop - 1000)
+    if not windows:
+        return None
+    payload = dict(version=VERSION, mode='demand', source=episode['source'], conversation_id=episode['conversation_id'],
+                   episode_id=episode['id'], start=start, end=end, windows=windows)
+    key = 'extract/demand/' + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return Queue(graph)._insert(key, 'extract', payload)
+
+
+def pending_conversations_sql(source_filter=''):
+    """Conversations with capture beyond their effective extraction cursor."""
+    return f'''SELECT count(*) {_PROGRESS_SQL} WHERE p.latest_seq>p.seq AND p.latest_seq>{_CURSOR_SQL} {source_filter}'''
+
+
+def historical_status(db):
+    """Honest parking state for status and the owner console; reads only."""
+    activation = db.execute('SELECT activated_at FROM historical_activation').fetchone()
+    parking = db.execute('''SELECT count(*) AS parked_conversations,
+        coalesce(sum(p.latest_seq>h.live_seq),0) AS live_pending_conversations
+        FROM historical_parking h JOIN processing_progress p
+        ON p.source=h.source AND p.conversation_id=h.conversation_id''').fetchone()
+    candidates = db.execute('''SELECT coalesce(sum(released_at IS NULL),0) AS parked_candidates,
+        coalesce(sum(released_at IS NOT NULL),0) AS released_candidates FROM historical_parked_candidates''').fetchone()
+    return dict(active=activation is not None, activated_at=activation['activated_at'] if activation else None,
+                header=db.execute('PRAGMA user_version').fetchone()[0], **dict(parking), **dict(candidates))
 
 
 class Processing:
@@ -29,21 +111,69 @@ class Processing:
                 (source, conversation_id, source, conversation_id))
         return dict(status='noted')
 
+    def history_status(self):
+        with self.store._mutex:
+            return historical_status(self.store._db)
+
+    def park_history(self, now=None):
+        """One explicit cutover: the CURRENT remaining backlog becomes parked history.
+
+        One transaction: the singleton activation receipt, one parking row per
+        conversation with unextracted history (parked range (seq, latest_seq], live
+        cursor at latest_seq), fences on pending/leased extraction inside those
+        ranges and on every pending or leased consolidation batch, every active
+        undecided candidate parked, and the header raised to 3. Repeating is a
+        no-op: the boundary never extends to newer captures. Everything captured
+        afterwards, including delayed offline records of old conversations, processes
+        normally through the live cursor. Raw history and the ordinary cursor are untouched.
+        """
+        stamp = (now or datetime.now(timezone.utc)).isoformat()
+        with self.store._mutex:
+            db = self.store._db
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                if db.execute('SELECT 1 FROM historical_activation').fetchone() is None:
+                    db.execute('INSERT INTO historical_activation(singleton,activated_at) VALUES (1,?)', (stamp,))
+                    db.execute('''INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset)
+                        SELECT p.source,p.conversation_id,p.latest_seq,p.latest_seq,0 FROM processing_progress p
+                        WHERE p.latest_seq>p.seq''')
+                    # Ordinary extraction inside a parked range: no stale completion may
+                    # bypass the cutover. Existing jobs at activation are exactly those.
+                    db.execute(f'''UPDATE jobs SET state='failed',error='{PARKED_ERROR}',owner=NULL,lease_until=NULL
+                        WHERE kind='extract' AND state IN ('pending','leased')
+                        AND json_extract(payload,'$.mode') IS NULL AND json_extract(payload,'$.cursor') IS NULL
+                        AND EXISTS (SELECT 1 FROM historical_parking h
+                            WHERE h.source=json_extract(jobs.payload,'$.source')
+                            AND h.conversation_id=json_extract(jobs.payload,'$.conversation_id')
+                            AND json_extract(jobs.payload,'$.next_seq')<=h.parked_through)''')
+                    db.execute(f'''UPDATE jobs SET state='failed',error='{PARKED_ERROR}',owner=NULL,lease_until=NULL
+                        WHERE kind='consolidate' AND state IN ('pending','leased')''')
+                    db.execute(f'''INSERT INTO historical_parked_candidates(candidate_id)
+                        SELECT c.id FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}''')
+                    db.execute(f'PRAGMA user_version={PARKING_VERSION}')
+                result = historical_status(db)
+                db.execute('COMMIT')
+                return result
+            except BaseException:
+                db.execute('ROLLBACK')
+                raise
+
     def _enqueue_extract(self, now):
         db = self.store._db
         last = db.execute("""SELECT json_extract(payload,'$.order') AS admission_order
             FROM jobs WHERE kind='extract' ORDER BY rowid DESC LIMIT 1""").fetchone()
         # Start fresh with recent work; legacy admissions count as newest.
         order = 'newest' if last is None or last['admission_order'] == 'oldest' else 'oldest'
-        ordering = 'p.latest_seq DESC' if order == 'newest' else '''(
+        ordering = 'p.latest_seq DESC' if order == 'newest' else f'''(
             SELECT e.seq FROM episodes e WHERE e.source=p.source AND e.conversation_id=p.conversation_id
-                AND e.seq>p.seq ORDER BY e.seq LIMIT 1)'''
-        groups = db.execute(f'''SELECT source,conversation_id,latest_seq,latest_at,
-            seq AS cursor,offset,compact_through FROM processing_progress p
-            WHERE latest_seq>seq ORDER BY {ordering}''').fetchall()
+                AND e.seq>{_CURSOR_SQL} ORDER BY e.seq LIMIT 1)'''
+        groups = db.execute(f'''SELECT p.source,p.conversation_id,p.latest_seq,p.latest_at,p.compact_through,
+            {_CURSOR_SQL} AS cursor,{_OFFSET_SQL} AS offset,(h.source IS NOT NULL) AS live
+            {_PROGRESS_SQL} WHERE p.latest_seq>p.seq AND p.latest_seq>{_CURSOR_SQL} ORDER BY {ordering}''').fetchall()
         for group in groups:
             if db.execute('''SELECT 1 FROM jobs WHERE kind='extract' AND state IN ('pending','leased')
-                AND json_extract(payload,'$.source')=? AND json_extract(payload,'$.conversation_id')=? LIMIT 1''',
+                AND json_extract(payload,'$.source')=? AND json_extract(payload,'$.conversation_id')=?
+                AND json_extract(payload,'$.mode') IS NULL LIMIT 1''',
                 (group['source'], group['conversation_id'])).fetchone():
                 continue
             idle = (now - datetime.fromisoformat(group['latest_at'])).total_seconds() >= 1800
@@ -99,12 +229,17 @@ class Processing:
                 # No eligible evidence remains inside this immutable capture boundary.
                 next_seq, next_offset = through, 0
             if not windows:
-                db.execute('''UPDATE processing_progress SET seq=?,offset=?
-                    WHERE source=? AND conversation_id=?''',
+                db.execute('''UPDATE historical_parking SET live_seq=?,live_offset=?
+                    WHERE source=? AND conversation_id=?''' if group['live'] else
+                    '''UPDATE processing_progress SET seq=?,offset=? WHERE source=? AND conversation_id=?''',
                     (next_seq, next_offset, group['source'], group['conversation_id']))
                 continue
             payload = dict(version=VERSION, source=group['source'], conversation_id=group['conversation_id'],
                 windows=windows, next_seq=next_seq, next_offset=next_offset)
+            if group['live']:
+                # Ordinary payloads and identities are unchanged; only parked
+                # conversations report into the separate live cursor.
+                payload['cursor'] = 'live'
             key = 'extract/' + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             # Admission metadata must not change existing identities or retry payloads.
             if db.execute('SELECT 1 FROM jobs WHERE job_key=?', (key,)).fetchone():
@@ -237,8 +372,7 @@ class Processing:
                 schedule()
         with self.store._mutex:
             db = self.store._db
-            backlog = dict(pending_extract_conversations=db.execute(
-                'SELECT count(*) FROM processing_progress WHERE latest_seq>seq').fetchone()[0],
+            backlog = dict(pending_extract_conversations=db.execute(pending_conversations_sql()).fetchone()[0],
                 pending_extract_jobs=db.execute(
                     "SELECT count(*) FROM jobs WHERE state='pending' AND kind='extract'").fetchone()[0],
                 leased_extract_jobs=db.execute(

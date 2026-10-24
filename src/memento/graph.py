@@ -355,17 +355,27 @@ class Graph:
 
     def history(self, node_id):
         with self.store._mutex:
-            raw = self.store._db.execute('SELECT * FROM episodes WHERE id=?', (node_id,)).fetchone()
+            # A raw chunk reference resolves to its bounded span of the real episode.
+            chunk = self.store._db.execute('SELECT episode_id,start,end FROM episode_chunks WHERE id=?', (node_id,)).fetchone()
+            raw = self.store._db.execute('SELECT * FROM episodes WHERE id=?',
+                                         (chunk['episode_id'] if chunk else node_id,)).fetchone()
             blocked = raw is not None and self.store._db.execute(
                 'SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1',
                 (raw['source'], raw['event_id'])).fetchone() is not None
+            parked = raw is not None and self.store._db.execute('''SELECT 1 FROM historical_parking h
+                WHERE h.source=? AND h.conversation_id=? AND ?<=h.parked_through''',
+                (raw['source'], raw['conversation_id'], raw['seq'])).fetchone() is not None
         if raw is not None:
             episode = self.store.hydrate_episode(raw)
-            return [dict(episode, version=1, type='raw_episode', state='raw', confirmed=False,
+            start, end = (chunk['start'], chunk['end']) if chunk else (0, len(episode['text']))
+            # A chunk reference returns exactly its span; an episode id keeps the whole text.
+            return [dict(episode, id=node_id, episode_id=episode['id'], chunk_id=chunk and node_id, version=1,
+                text=episode['text'][start:end],
+                type='raw_episode', state='raw', confirmed=False, historical=parked,
                 actor=episode['source'], why='Immutable captured evidence',
                 recorded_at=episode['captured_at'], recorded_until=None, valid_from=None, valid_to=None,
-                forgotten=blocked, evidence=[dict(episode_id=node_id, start=0, end=len(episode['text']),
-                                                  quote=episode['text'])])]
+                forgotten=blocked, evidence=[dict(episode_id=episode['id'], start=start, end=end,
+                                                  quote=episode['text'][start:end])])]
         with self.store._mutex:
             rows = self.store._db.execute('''WITH RECURSIVE lineage(id) AS (
                 SELECT id FROM node_versions WHERE id=?

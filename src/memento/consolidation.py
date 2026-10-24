@@ -10,7 +10,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .curation import canonical, propose
-from .extraction import ACTIVE_CANDIDATE_SQL, AWAITING_DECISION_SQL, WorkRejected, source_span
+from .extraction import ACTIVE_CANDIDATE_SQL, AWAITING_DECISION_SQL, UNPARKED_CANDIDATE_SQL, WorkRejected, source_span
 from .graph import RELATIONS, behavior_ground_truth, identity_text
 from .store import ConflictError
 from .commands import Scope
@@ -50,6 +50,17 @@ Preserve or correct scope labels from original evidence. Set open_loop true for 
 Set false when original evidence shows the candidate's automatic flag is wrong: completed, cancelled, hypothetical or an unrelated task.
 Use null for uncertainty. Age or inactivity alone never proves completion. False declines only an untouched extraction flag;
 it does not close an existing target or override an explicit open, close, deferred or reminder choice.
+Reject a candidate that only narrates an already-completed in-session request ("the user asked the assistant to…", "the assistant
+inspected…"); promote the durable subject it concerns only as an unresolved cross-session obligation, a lasting decision or policy,
+a durable finding or a supported lesson, worded as that subject or obligation rather than as turn narration. Standing approval
+requirements, policies or conditional workflow steps are not by themselves pending obligations: an open loop needs evidence of a
+concrete instance that is currently outstanding.
+When a candidate adds compatible detail or conditions to a supplied existing assertion about the same specific claim or subtopic,
+prefer supersede with change_kind refinement over a second remember; keep independently changing atomic facts as separate nodes and
+never fold every fact about a person or project into one assertion. This is guidance for judgment, not a deduplication guarantee.
+When you supersede or refine a decision or behavioral experience, or distill an experience lesson from a failed attempt followed by a
+working result, keep the concrete failed approach or pitfall to avoid in the active assertion text when the supplied evidence shows it;
+a refinement does not by itself mean an earlier approach failed.
 Use closed_targets only when this candidate's exact evidence unambiguously completes or cancels the SAME supplied obligation.
 Name only supplied existing targets or same-batch candidates, preserving who owes what to whom. Relevant waits on other people
 and assistant commitments remain valid pending work. Hypotheticals, another task's outcome and age alone never close a loop.
@@ -184,7 +195,7 @@ class Consolidator:
             return [dict(row) for row in self.store._db.execute(f'''SELECT c.*,c.rowid AS position,r.recorded_at AS extracted_at,
                 (SELECT d.id FROM candidate_decisions d WHERE d.candidate_id=c.id ORDER BY d.rowid DESC LIMIT 1) AS decision_id
                 FROM candidates c JOIN extraction_runs r ON r.id=c.run_id WHERE {ACTIVE_CANDIDATE_SQL}
-                AND {CONSOLIDATION_ELIGIBLE_SQL}
+                AND {CONSOLIDATION_ELIGIBLE_SQL} AND {UNPARKED_CANDIDATE_SQL}
                 AND c.rowid>? AND c.rowid<=? {reserved}
                 AND NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id
                     AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id)
@@ -364,7 +375,8 @@ class Consolidator:
         ids = list(ids)
         with self.store._mutex:
             return [row['id'] for row in self.store._db.execute(f'''SELECT c.id FROM candidates c
-                WHERE c.id IN ({','.join('?' for _ in ids)}) AND NOT {CONSOLIDATION_ELIGIBLE_SQL}''', ids)]
+                WHERE c.id IN ({','.join('?' for _ in ids)})
+                AND NOT ({CONSOLIDATION_ELIGIBLE_SQL} AND {UNPARKED_CANDIDATE_SQL})''', ids)]
 
 
     def _snapshot(self, ids):
@@ -375,7 +387,7 @@ class Consolidator:
         candidates = [dict(row) for row in db.execute(f'''SELECT c.*,c.rowid AS position,
             (SELECT d.id FROM candidate_decisions d WHERE d.candidate_id=c.id ORDER BY d.rowid DESC LIMIT 1) AS decision_id
             FROM candidates c WHERE c.id IN ({','.join('?' for _ in ids)}) AND {ACTIVE_CANDIDATE_SQL}
-            AND {CONSOLIDATION_ELIGIBLE_SQL}
+            AND {CONSOLIDATION_ELIGIBLE_SQL} AND {UNPARKED_CANDIDATE_SQL}
             ORDER BY c.rowid''', ids)]
         for candidate in candidates:
             candidate['scope'] = json.loads(candidate['scope'])

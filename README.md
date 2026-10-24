@@ -33,35 +33,56 @@ For example, “I still owe Mira the release checklist” can become an open loo
 
 ## One owner, several agents, shared context
 
+![Memento architecture: native capture and automatic recall across Pi, OMP, Claude Code, Codex and AGY, separate service identity, independent two-lane processor, strict validation gate with bounded feedback, and optional Drive storage](docs/images/architecture.svg)
+
 ```mermaid
-flowchart TB
+flowchart LR
     accTitle: Shared memory across your agents and devices
-    accDescr: Native agents on two computers capture conversations and retrieve context from one private Memento service. Optional Google Drive holds artifacts and manual backups.
-    L["Laptop<br/>Pi · Codex"] <-->|"Capture / recall"| M["Private memory<br/>Facts · lessons · loops"]
-    W["Other computer<br/>Claude Code · OMP"] <-->|"Capture / recall"| M
-    M --> D["Optional Drive<br/>Files · manual backups"]
+    accDescr: Native agents across your machines capture conversations and retrieve context from one private Memento service over loopback or Tailscale Serve HTTPS. Optional Google Drive holds cold artifacts and manual backups.
+    L["Laptop (Pi · Codex · AGY)"] <-->|"Capture + auto recall + 6 MCP tools"| M["Private Memento Service (UID 10001)"]
+    W["Workstation (Claude Code · OMP)"] <-->|"Capture + auto recall + 6 MCP tools"| M
+    P["Designated Processor (Pi / OMP / Claude)"] <-->|"2-lane tool-free extract & consolidate"| M
+    M --> D["Optional Google Drive (drive.file)"]
 ```
 
 Each device contributes its own conversations and can retrieve relevant memories from the same service. This shares context across your agents; each native conversation and device keeps its own identity.
 
 ## How it fits together
 
-The automatic learning path keeps original conversations separate from inferred memory:
+The automatic learning path keeps original conversations separate from inferred memory, validates every quote and technical trace before committing, and reuses derived vectors and current-node keyword indexes:
+
+![Memento processing, validation and learning lifecycle](docs/images/lifecycle.svg)
 
 ```mermaid
 flowchart TB
-    accTitle: From original conversation to useful context
-    accDescr: Conversations produce unconfirmed candidates. Nightly consolidation can keep, refine or combine them into memories, lessons and loop markers. Relevant recall can return candidates as well as durable memories.
-    H["Conversations"] --> C["Candidates<br/>Unconfirmed"]
-    C --> N["Nightly<br/>consolidation"]
-    N --> M["Memories<br/>Lessons · loops"]
-    C --> R["Relevant recall"]
+    accTitle: From original conversation to verified memory and recall
+    accDescr: Raw episodes are losslessly compressed and chunked. New captures flow through the independent two-lane processor, while an optional one-time historical cutover parks older backlog as searchable unverified history that promotes on demand when cited.
+    H["Raw Episodes & Media (Immutable + raw_frame compressed)"] --> E["Extraction Lane (Live captures + cited historical chunks)"]
+    E --> C["Unconfirmed Candidates (Span-verified, legacy instructions filtered)"]
+    C --> N["Nightly Consolidation Lane (02:00-07:00, compact existing-evidence spans)"]
+    N --> V{"Whole-Batch Validation Gate (Exact spans + technical_evidence trace)"}
+    V -->|"Valid: atomic commit"| M["Durable Versioned Graph (Current-node FTS5 + reused vec0 vectors)"]
+    V -.->|"Rejected: rollback + bounded previous_rejection"| N
+    C --> R["Hybrid Recall (Auto injection + 6 MCP tools)"]
     M --> R
+    H -->|"Deep recall / unverified historical fallback"| R
+    R -.->|"Citation of parked chunk/candidate"| E
 ```
+
+| Stage | How it works in the current architecture |
+| --- | --- |
+| **Independent 2-lane processing** | The runner maintains one extraction lane and one consolidation lane (at most two tool-free native CLI calls). When the faster lane finishes, it claims its next job (`kinds` filter on `/work/claim`) without waiting for the slower lane. |
+| **Optional historical pool & on-demand promotion** | A one-time owner cutover (`memento-admin --data-dir /data history park`) parks the remaining historical backlog and pending candidates in place without deleting history or falsifying extraction cursors, while all subsequent captures continue full extraction and consolidation. When no current fact or lesson matches an unscoped query, recall can surface bounded unverified historical context; citing a parked chunk or candidate promotes it into the normal extraction/consolidation pipeline on demand. |
+| **Compact consolidation context** | Existing graph nodes and relations supply their exact stored quotes, character spans and native trace metadata without repeating surrounding `±400`-character raw windows (`~49%` smaller consolidation payloads). |
+| **Self-correcting validation feedback** | Every batch is validated atomically. If a batch fails a quote, span, coverage or grounding check, nothing commits; the job records a bounded private `previous_rejection` (fixed code + up to 3 offending quote references) so the next retry can fix the exact error instead of repeating it blind. |
+| **Dual-path behavioral & technical learning** | User-stated rules (`authority="explicit_user"`) require direct user ground-truth quotes. Inferred technical lessons (`authority="inferred"`) require captured native `attempt → result` sequences in one conversation (`technical_evidence`), even when the lesson was first articulated in a later reporting tool call, and retain evidenced pitfalls to avoid when refining earlier approaches. |
+| **Legacy instruction filtering** | Historical candidates whose only evidence is a legacy developer/instruction envelope stay preserved and searchable in history, but are excluded from consolidation model calls (`excluded_legacy_candidates`). |
+| **Zero-bloat FTS & vector reuse** | `node_fts` indexes only the latest version of each node identity via a `VACUUM`-safe integer key mapping (`node_fts_documents`), and corroborating or pinning unchanged text (`attach` / `pin`) reuses the existing `vec0` embedding in place. |
+| **Non-blocking health checks** | `/health` probes SQLite writer availability on a dedicated short-lived connection (`0.25s` bound) and reads indexing failures from a `WAL` snapshot, never queuing behind read-only context preparation. |
 
 Extraction starts after native compaction or conversation inactivity. Candidates remain visibly unconfirmed and can be recalled before promotion; deeper consolidation runs in the configured night window. Learning takes processing time.
 
-Relevant facts, eligible behavioral suggestions and at most one matching media reference can appear automatically in later prompts, within a small shared context budget. They are labeled distinctly, and the result can legitimately be empty. A file match points to the original; it does not imply that facts or lessons were extracted from the image or recording. The six memory tools let an agent explicitly recall, save, connect, correct or inspect memories and manage loop markers.
+Relevant facts, eligible behavioral suggestions and at most one matching media reference can appear automatically in later prompts, within a small shared context budget. They are labeled distinctly, and the result can legitimately be empty. A file match points to the original; it does not imply that facts or lessons were extracted from the image or recording. The six memory tools (`recall`, `remember`, `link`, `supersede`, `history`, `loop`) let an agent explicitly recall, save, connect, correct or inspect memories and manage loop markers.
 
 History retains exact source quotes, dates and changes. **Old conversations keep their original dates:** age affects recall ranking, without deleting memories or making imported history appear new. Age alone never closes a task. Reminder dates can be stored and listed; there is no proactive reminder delivery.
 

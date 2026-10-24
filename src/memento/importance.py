@@ -20,8 +20,8 @@ def query_recency(store, record, *, authority=None, now=None, source_occurred_at
             (source_occurred_at, record['id'])).fetchone()
     elif record.get('tier') == 'raw':
         row = db.execute('''SELECT occurred_at,
-            (SELECT last_cited_at FROM node_stats WHERE node_id=episodes.id) AS last_cited_at
-            FROM episodes WHERE id=?''', (record['id'],)).fetchone()
+            (SELECT last_cited_at FROM node_stats WHERE node_id=?) AS last_cited_at
+            FROM episodes WHERE id=?''', (record['id'], record.get('episode_id') or record['id'])).fetchone()
     else:
         row = db.execute('''SELECT (SELECT e.occurred_at FROM graph_evidence g
             JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?
@@ -117,26 +117,44 @@ def cite(graph, *, event_id, ids, query=None, shown=()):
     request = dict(op='cite', ids=ids, query=query, shown=shown)
 
     def apply(commit):
+        from .processing import demand_extract
         db = graph.store._db
-        accepted = []
+        accepted, demand_jobs, demand_skipped = [], [], []
         now = datetime.now(timezone.utc).isoformat()
         for target in ids:
             node = db.execute('''SELECT state FROM node_versions WHERE id=? ORDER BY version DESC LIMIT 1''', (target,)).fetchone()
-            candidate = db.execute(f'SELECT 1 FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE_SQL}', (target,)).fetchone()
-            episode = db.execute('''SELECT 1 FROM episodes e WHERE e.id=? AND NOT EXISTS (
-                SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)''', (target,)).fetchone()
+            candidate = db.execute(f'SELECT c.id,c.src,c.dst FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE_SQL}',
+                                   (target,)).fetchone()
+            # A raw citation names a stable chunk reference or, for legacy results, an episode.
+            chunk = db.execute('SELECT episode_id,start,end FROM episode_chunks WHERE id=?', (target,)).fetchone()
+            episode = db.execute('''SELECT e.* FROM episodes e WHERE e.id=? AND NOT EXISTS (
+                SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)''',
+                (chunk['episode_id'] if chunk else target,)).fetchone()
             if not ((node and node['state'] == 'active') or candidate or episode):
                 continue
             db.execute('''INSERT INTO node_stats(node_id,access_count,last_cited_at) VALUES (?,1,?)
                 ON CONFLICT(node_id) DO UPDATE SET access_count=access_count+1,last_cited_at=excluded.last_cited_at,
                 archived=0,decay=1,importance=min(1,importance+0.05)''', (target, now))
             accepted.append(target)
+            if candidate:
+                # Actual use releases a parked candidate together with the endpoints a
+                # relation needs, instead of re-extracting the same evidence.
+                released = [item for item in (candidate['id'], candidate['src'], candidate['dst']) if item]
+                db.execute(f'''UPDATE historical_parked_candidates SET released_at=? WHERE released_at IS NULL
+                    AND candidate_id IN ({','.join('?' for _ in released)})''', (now, *released))
+            if episode:
+                job_id = demand_extract(graph, episode, chunk['start'] if chunk else None, chunk['end'] if chunk else None)
+                if job_id is None:
+                    demand_skipped.append(target)
+                elif job_id not in demand_jobs:
+                    demand_jobs.append(job_id)
         if query:
             key = query_key(query)
             for target in sorted(set(shown) | set(accepted)):
                 db.execute('''INSERT INTO query_feedback(query_key,target,shown,cited) VALUES (?,?,?,?)
                     ON CONFLICT(query_key,target) DO UPDATE SET shown=shown+excluded.shown,cited=cited+excluded.cited''',
                     (key, target, int(target in shown), int(target in accepted)))
-        return dict(cited=accepted, unknown_or_inactive=sorted(set(ids) - set(accepted)))
+        return dict(cited=accepted, unknown_or_inactive=sorted(set(ids) - set(accepted)),
+                    demand_jobs=demand_jobs, demand_skipped=demand_skipped)
 
     return graph._command('cite/' + event_id, 'harness/citation', 'Memory citations in committed assistant output', request, apply)

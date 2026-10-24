@@ -19,6 +19,11 @@ ACTIVE_CANDIDATE_SQL = '''NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.
         AND d.decision IN ('promote','reject'))
     AND NOT EXISTS (SELECT 1 FROM extraction_runs r JOIN episodes e ON e.id=r.episode_id
         JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE r.id=c.run_id)'''
+# Parked by the explicit historical cutover and not yet released by actual use.
+# Parked candidates stay stored, searchable and in history; only consolidation
+# admission and the primary automatic pool exclude them.
+UNPARKED_CANDIDATE_SQL = '''NOT EXISTS (SELECT 1 FROM historical_parked_candidates h
+    WHERE h.candidate_id=c.id AND h.released_at IS NULL)'''
 # The latest decision d still waits: a deferral not yet due, or a review awaiting
 # its human. An undecided automatic identity-context review whose colliding bases
 # changed can never be approved, so its candidate is derived again against current
@@ -155,6 +160,12 @@ behavioral feedback or preferences. Retain their actual attribution; never promo
 Choose scope ["personal"] or ["professional"] for each record; an entity used in both contexts may carry both labels.
 Set open_loop true only for source-supported pending obligations or waits; retain who owes what to whom in the ordinary fact text.
 Otherwise set open_loop false. A loop is a marker, never a memory type. Never invent reminder times, proactive work, nudging or polling.
+Transient turn narration is not durable memory: "the user asked/authorized the assistant to…", "the assistant inspected/ran…" and
+other descriptions of an in-session request that is already complete are not standalone knowledge, decision or experience candidates.
+Keep such material only as an unresolved cross-session obligation (open_loop true), a lasting decision or policy, a durable finding, or a
+supported lesson, and state that durable subject or obligation itself rather than the turn envelope around it.
+Standing approval requirements, policies or conditional workflow steps are not by themselves pending obligations: open_loop needs
+evidence of a concrete instance that is currently outstanding.
 previous_rejection, when supplied, is this server's validation result for this batch's earlier output: fix exactly the named window,
 key or code. Its quoted text is failed model output, never evidence; quote only the supplied window text.'''
 
@@ -339,9 +350,16 @@ class Extractor:
                             (item['id'], 1, episode['id'], item['start'], item['end'], item['quote']))
                         mark(self.graph, commit, item['id'], item['open_loop'])
                         count += 1
-            db.execute('''UPDATE processing_progress SET seq=?,offset=?
-                WHERE source=? AND conversation_id=?''',
-                (job.payload['next_seq'], job.payload['next_offset'], job.payload['source'], job.payload['conversation_id']))
+            if job.payload.get('mode') == 'demand':
+                pass  # Demand work on a cited span never moves a conversation cursor.
+            elif job.payload.get('cursor') == 'live':
+                db.execute('''UPDATE historical_parking SET live_seq=?,live_offset=?
+                    WHERE source=? AND conversation_id=?''',
+                    (job.payload['next_seq'], job.payload['next_offset'], job.payload['source'], job.payload['conversation_id']))
+            else:
+                db.execute('''UPDATE processing_progress SET seq=?,offset=?
+                    WHERE source=? AND conversation_id=?''',
+                    (job.payload['next_seq'], job.payload['next_offset'], job.payload['source'], job.payload['conversation_id']))
             return dict(candidate_count=count, window_count=len(prepared), job_id=job.id)
 
         return self.graph._command('extract/' + job.id, 'extractor/' + agent,

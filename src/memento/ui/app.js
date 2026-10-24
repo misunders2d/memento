@@ -348,7 +348,8 @@ async function loadConversations() {
   $('conv-total').textContent = `(${total.toLocaleString()})`;
   $('conversations').replaceChildren(...items.map(item => el('li', {onclick: () => showConversation(item)},
     el('span', {class: 'badge'}, harness(item.source)), item.conversation_id,
-    el('div', {class: 'meta'}, `last activity ${when(item.latest_at)}`))));
+    el('div', {class: 'meta'}, `last activity ${when(item.latest_at)}` +
+      (item.parked ? ` · parked historical, not queued (live cursor ${item.live_cursor})` : '')))));
   $('conv-prev').disabled = state.conv === 0;
   $('conv-next').disabled = state.conv + page >= total;
 }
