@@ -86,6 +86,14 @@ def read_config(path):
     return config
 
 
+class BridgeResponseError(ValueError):
+    """A fixed response category, never a response body or parser message."""
+
+    def __init__(self, *, oversized=False):
+        self.category = 'response_too_large' if oversized else 'invalid_response'
+        super().__init__(self.category)
+
+
 def http(config, endpoint, body=None, timeout=1, *, content_type=None):
     data = body if isinstance(body, bytes) else None if body is None else encode(body)
     if data is not None and len(data) > (MAX_ATTACHMENT if content_type else MAX_BODY):
@@ -97,8 +105,11 @@ def http(config, endpoint, body=None, timeout=1, *, content_type=None):
     with opener.open(request, timeout=timeout) as response:
         raw = response.read(4 * MAX_BODY + 1)
     if len(raw) > 4 * MAX_BODY:
-        raise ValueError('response too large')
-    return json.loads(raw)
+        raise BridgeResponseError(oversized=True)
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise BridgeResponseError() from None
 
 
 def upload_error(error):
@@ -1720,7 +1731,12 @@ def main(argv=None):
             print('{"status":"error","error":"capture_pending","action":"Run memento upload, then retry the same media save."}')
             return 1
         if args.operation == 'native':
-            print('{"context":"","shown":[],"error":"bridge_failed"}')
+            failure = upload_error(exc)
+            diagnostic = {key: failure[key] for key in ('category', 'http_status') if key in failure}
+            if isinstance(exc, BridgeResponseError):
+                diagnostic = {'category': exc.category}
+            print(json.dumps({'context': '', 'shown': [], 'error': 'bridge_failed',
+                              'diagnostic': diagnostic}))
         elif args.operation == 'agy':
             print('{}')
         return 1 if args.operation == 'native' else 0

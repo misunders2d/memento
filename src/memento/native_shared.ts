@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -75,15 +75,45 @@ function load(api: NativeAPI): Loader {
   };
 }
 
+const TOOL_FAILURES: Record<string, string> = {
+  timeout: "Memento tool failed (timeout). Check service responsiveness, then retry the same tool call.",
+  network: "Memento tool failed (connection). Check the configured service connection, then retry the same tool call.",
+  lock: "Memento tool failed (local lock). Wait for local capture to finish, then retry the same tool call.",
+  validation: "Memento tool failed (invalid data). Check tool arguments and bridge configuration, then retry the same tool call.",
+  invalid_response: "Memento tool failed (invalid response). Check the configured service and bridge installation, then retry the same tool call.",
+  response_too_large: "Memento tool failed (response too large). Narrow the request, then retry the same tool call.",
+};
+
+function toolFailure(output: string): Error {
+  try {
+    const value = parseObject(output);
+    const detail = value.diagnostic;
+    if (value.error === "bridge_failed" && detail !== null && typeof detail === "object" && !Array.isArray(detail)) {
+      const { category, http_status } = detail as RecordValue;
+      if (category === "http" && typeof http_status === "number" && Number.isInteger(http_status) && http_status >= 100 && http_status <= 599) {
+        return new Error(`Memento tool failed (HTTP ${http_status}). Check the configured service and tool arguments, then retry the same tool call.`);
+      }
+      if (typeof category === "string" && Object.hasOwn(TOOL_FAILURES, category)) return new Error(TOOL_FAILURES[category]);
+    }
+  } catch { /* Legacy or malformed diagnostics retain the safe fallback. */ }
+  return new Error("Memento bridge failed");
+}
+
 function bridge(loader: Loader, input: RecordValue, timeout: number, signal?: AbortSignal): Promise<RecordValue> {
   const { promise, resolve, reject } = Promise.withResolvers<RecordValue>();
   if (signal?.aborted) {
     reject(new Error("Memento request aborted"));
     return promise;
   }
-  const child = spawn(loader.python!, [loader.bridge, "native", "--config", loader.config], {
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn(loader.python!, [loader.bridge, "native", "--config", loader.config], {
       stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
     });
+  } catch {
+    reject(new Error("Memento bridge could not start. Check the configured Python and bridge installation."));
+    return promise;
+  }
     let output = "";
     let settled = false;
     const finish = (error?: Error, result?: RecordValue) => {
@@ -94,26 +124,26 @@ function bridge(loader: Loader, input: RecordValue, timeout: number, signal?: Ab
       if (error) reject(error); else resolve(result!);
     };
     const abort = () => { child.kill(); finish(new Error("Memento request aborted")); };
-    const timer = setTimeout(() => { child.kill(); finish(new Error("Memento bridge deadline exceeded")); }, timeout);
+    const timer = setTimeout(() => { child.kill(); finish(new Error(input.action === "tool" ? TOOL_FAILURES.timeout : "Memento bridge deadline exceeded")); }, timeout);
     signal?.addEventListener("abort", abort, { once: true });
-    child.on("error", (error) => finish(error));
+    child.on("error", () => finish(new Error("Memento bridge could not start. Check the configured Python and bridge installation.")));
     // Never echo captured prompts, native records or subprocess diagnostics.
     child.stderr.resume();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (part: string) => {
       output += part;
-      if (output.length > 2_000_000) { child.kill(); finish(new Error("Memento bridge response too large")); }
+      if (output.length > 2_000_000) { child.kill(); finish(new Error(input.action === "tool" ? TOOL_FAILURES.response_too_large : "Memento bridge response too large")); }
     });
-    child.stdin.on("error", (error) => finish(error));
+    child.stdin.on("error", () => finish(new Error("Memento bridge input failed. Check the bridge installation, then retry the same tool call.")));
     child.on("close", (code) => {
       if (settled) return;
-      if (code !== 0) return finish(new Error("Memento bridge failed"));
+      if (code !== 0) return finish(input.action === "tool" ? toolFailure(output) : new Error("Memento bridge failed"));
       try {
         const value = input.action === "tool" ? { result: JSON.parse(output || "null") as unknown }
           : parseObject(output || "{}");
         finish(undefined, value);
       }
-      catch { finish(new Error("Memento bridge returned invalid JSON")); }
+      catch { finish(new Error(input.action === "tool" ? TOOL_FAILURES.invalid_response : "Memento bridge returned invalid JSON")); }
     });
     child.stdin.end(JSON.stringify(input));
   return promise;
