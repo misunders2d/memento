@@ -1,0 +1,19 @@
+[package]
+name = "memento-domain"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+memento-core = { path = "../core" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
