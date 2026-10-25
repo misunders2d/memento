@@ -37,6 +37,12 @@ ENTITY_ANCHOR_TERMS = 64
 MEDIA_COSINE_FLOORS = {'image': 0.67, 'audio': 0.645, 'text': TEXT_COSINE_FLOOR}
 
 
+def _relevance_order(record, feedback=0):
+    """Age and usage distinguish equal query relevance; neither can replace it."""
+    return (-record['score'], -record.get('decay', 1), -record.get('importance', .5),
+            -feedback, record['id'])
+
+
 def _episode_units(episodes='episodes'):
     return f'''SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,
         x.episode_id,x.start,x.end,2 AS priority,NULL AS scope,x.rowid AS position
@@ -489,7 +495,7 @@ class Retrieval:
             return record.get('candidate_kind') == 'memory'
         return True
 
-    def _historical_passages(self, query, vector, limit, db, *, keyword=True):
+    def _historical_passages(self, query, vector, limit, db, *, keyword=True, ranked_at=None):
         """Bounded unverified passages from parked raw history: existing chunk vectors, existing floor, literal FTS."""
         found = {}
         rows = db.execute(f'''SELECT i.target,1-v.distance AS cosine
@@ -518,11 +524,15 @@ class Retrieval:
                     found[record['id']] = dict(record, score=TEXT_COSINE_FLOOR + 0.25, match='keyword')
                 else:
                     previous.update(score=previous['cosine'] + 0.25, match='hybrid')
-        return sorted(found.values(), key=lambda item: (-item['score'], item['id']))[:limit]
+        ranked_at = ranked_at or datetime.now(timezone.utc)
+        for record in found.values():
+            record.update(self._recency(record, ranked_at, db=db))
+        return sorted(found.values(), key=_relevance_order)[:limit]
 
     def _automatic_fallback(self, query, vector, ranked_at, limit, db):
         """No meaningful current memory: at most one parked candidate and one unverified passage."""
         items = []
+        candidates = []
         rows = db.execute(f'''SELECT i.target,1-v.distance AS cosine
             FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
             WHERE v.embedding MATCH ? AND k=4 AND v.current=1
@@ -540,25 +550,25 @@ class Retrieval:
             if (record is None or not _automatic_content(record['text'])
                     or self._legacy_context_only(record['id'], 1, db=db)):
                 continue
-            record.update(self._candidate_details(record['id'], db=db))
             record.update(category='memory', cosine=float(row['cosine']), match='semantic', related=[], duplicate_ids=[])
             record.update(self._recency(record, ranked_at, db=db))
+            record['score'] = float(row['cosine'])
+            candidates.append(record)
+        if candidates:
+            record = min(candidates, key=_relevance_order)
+            record.update(self._candidate_details(record['id'], db=db))
             date = (record['source_occurred_at'] or '')[:10]
-            record.update(score=float(row['cosine']) * record['decay'],
-                          text='Unverified historical candidate' + (' (source ' + date + ')' if date else '') + ': ' + record['text'])
+            record['text'] = 'Unverified historical candidate' + (' (source ' + date + ')' if date else '') + ': ' + record['text']
             items.append(record)
-            break
-        for record in self._historical_passages(query, vector, 1, db, keyword=False):
+        for record in self._historical_passages(query, vector, 1, db, keyword=False, ranked_at=ranked_at):
             if not _automatic_content(record['text']):
                 continue
             record.update(category='historical_raw', related=[], duplicate_ids=[], importance=.5, archived=0)
-            record.update(self._recency(record, ranked_at, db=db))
             date = (record['source_occurred_at'] or '')[:10]
             full = self.store.get(record['episode_id'], db=db)['text'][record['evidence'][0]['start']:record['evidence'][0]['end']]
-            record.update(score=record['cosine'] * record['decay'],
-                          text=HISTORICAL_PREFIX + (' ' + date if date else '') + ': ' + ' '.join(full.split())[:480])
+            record['text'] = HISTORICAL_PREFIX + (' ' + date if date else '') + ': ' + ' '.join(full.split())[:480]
             items.append(record)
-        return items[:limit]
+        return sorted(items, key=_relevance_order)[:limit]
 
     def related(self, node_id, hops, *, scope=None, include_archived=False, db=None):
         # Retain the caller option; age-archived rows remain eligible.
@@ -946,13 +956,13 @@ class Retrieval:
                 else:
                     full = db.execute('SELECT text FROM node_versions WHERE id=? AND version=?',
                                       (record['id'], record['version'])).fetchone()
-                record.update(cosine=float(row['cosine']), score=float(row['cosine']) * record['decay'],
+                record.update(cosine=float(row['cosine']), score=float(row['cosine']),
                               match='semantic', related=[], _full_text=full['text'] if full else record['text'])
                 matches[record['id']] = record
             # Collapse equivalent assertions while retaining every returned source
             # identity and evidence span. Similar but different facts stay separate.
             grouped = {}
-            for record in sorted(matches.values(), key=lambda item: (-item['score'], item['id'])):
+            for record in sorted(matches.values(), key=_relevance_order):
                 signature = (record['category'], record.get('authority'), tuple(record['scope']),
                              record['sha256'] if record['type'] == 'media' else
                              ' '.join(record['_full_text'].casefold().split()).rstrip('.!'))
@@ -1109,7 +1119,7 @@ class Retrieval:
             # Explicit cheap/normal recall falls back to parked raw history only when no
             # current fact or lesson matched; deep keeps its broad raw lookup above.
             if effort != 'deep' and scope is None and not any(self._meaningful(item, db) for item in matches.values()):
-                for record in self._historical_passages(query, query_vector, limit, db):
+                for record in self._historical_passages(query, query_vector, limit, db, ranked_at=ranked_at):
                     matches.setdefault(record['id'], record)
             matches = {target: record for target, record in matches.items() if self._media_sources(record, db=db)}
             feedback = {}
@@ -1130,11 +1140,10 @@ class Retrieval:
                 # A behavioral lesson is conditional guidance: not being cited for a query
                 # does not make it wrong, so negative explicit-query feedback is neutral for
                 # it. Citation reward, ordinary facts and incidents keep the full signal.
-                signal = feedback.get(item['id'], 0)
                 if behavior:
-                    signal = max(0, signal)
-                item['score'] *= item['importance'] * item['decay'] * (1 + .1 * signal)
-            results = sorted(matches.values(), key=lambda item: (-item['score'], item['id']))[:limit]
+                    feedback[item['id']] = max(0, feedback.get(item['id'], 0))
+            results = sorted(matches.values(), key=lambda item: _relevance_order(
+                item, feedback.get(item['id'], 0)))[:limit]
             for item in results:
                 if item.get('tier') == 'candidate':
                     item.update(self._candidate_details(item['id'], db=db))

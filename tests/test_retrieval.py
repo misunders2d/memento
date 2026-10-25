@@ -153,7 +153,7 @@ def recency_clock(monkeypatch):
 
 @pytest.mark.parametrize('tier', ['candidate', 'durable'])
 @pytest.mark.parametrize('automatic', [False, True])
-def test_original_source_recency_ranks_without_hiding_old_imports(
+def test_original_source_recency_breaks_relevance_ties_without_hiding_old_imports(
         retrieval, recency_clock, monkeypatch, tier, automatic):
     r = retrieval
     make = candidate if tier == 'candidate' else assertion
@@ -161,7 +161,7 @@ def test_original_source_recency_ranks_without_hiding_old_imports(
     old, _ = make(r, 'The Cedar task used the earlier report.', occurred_at='2026-05-23T07:30:02Z')
     kind = 'candidate' if tier == 'candidate' else 'node'
     index(r, old, .90, kind=kind)
-    index(r, fresh, .89, kind=kind)
+    index(r, fresh, .90, kind=kind)
     r.store._db.execute('INSERT INTO node_stats(node_id,archived) VALUES (?,1) '
                         'ON CONFLICT(node_id) DO UPDATE SET archived=1', (old,))
     before = r.graph.history(old)
@@ -216,7 +216,7 @@ def test_citation_renews_recency_without_redating_original_evidence(retrieval, r
     old, _ = assertion(r, 'The Cedar task used an earlier report.', occurred_at='2026-05-23T07:30:02Z')
     fresh, _ = assertion(r, 'The Cedar task uses a recent report.', occurred_at='2026-10-20T00:00:00Z')
     index(r, old, .90)
-    index(r, fresh, .89)
+    index(r, fresh, .90)
     options = dict(automatic=automatic, effort='cheap')
     assert r.recall('unmatchedword', limit=1, **options)[0]['id'] == fresh
     before = r.graph.history(old)
@@ -274,7 +274,7 @@ def test_unknown_source_time_is_neutral_and_duplicate_keeps_best_recency_rank(re
     old, _ = assertion(r, 'The Cedar task uses the supported report.', occurred_at='2026-01-01T00:00:00Z')
     unknown, _ = assertion(r, 'The Cedar task uses the supported report!')
     index(r, old, .95)
-    index(r, unknown, .85)
+    index(r, unknown, .95)
     hit = r.recall('unmatchedword', automatic=True, limit=1)[0]
     assert hit['id'] == unknown and hit['duplicate_ids'] == [old]
     assert hit['source_occurred_at'] is None and hit['ranking_anchor'] is None and hit['decay'] == 1
@@ -287,7 +287,7 @@ def test_media_parent_and_raw_episode_use_original_source_recency(retrieval, rec
     r = retrieval
     ids = []
     for name, occurred_at, cosine in [('old', '2026-01-01T00:00:00Z', .90),
-                                      ('fresh', '2026-10-20T00:00:00Z', .89)]:
+                                      ('fresh', '2026-10-20T00:00:00Z', .90)]:
         if kind == 'segment':
             target, _ = assertion(r, f'The Cedar {name} document.', type='media', occurred_at=occurred_at)
             r.store._db.execute('INSERT INTO media_files VALUES (?,?,?,?,?)', (target, 'a' * 64, 'fixture.txt', 'text', 'fixture'))
@@ -330,6 +330,85 @@ def test_recency_metadata_work_is_bounded_by_target_evidence(retrieval, recency_
         r.graph._evidence('unrelated-' + str(number), 1, [dict(episode_id=episode['id'], quote=episode['text'])])
     after, later_work = measure()
     assert after == before and later_work < work * 2
+
+
+@pytest.mark.parametrize('automatic', [False, True])
+@pytest.mark.parametrize('reverse_ages', [False, True])
+def test_query_relevance_precedes_age_importance_and_feedback(
+        retrieval, recency_clock, automatic, reverse_ages):
+    from memento.importance import query_key
+    r = retrieval
+    dates = ['2025-01-01T00:00:00Z', '2026-10-20T00:00:00Z']
+    if reverse_ages:
+        dates.reverse()
+    relevant, _ = assertion(r, 'The Alder report describes the requested family record.', occurred_at=dates[0])
+    hub, _ = assertion(r, 'The unrelated deployment tool has many recent connections.', occurred_at=dates[1])
+    index(r, relevant, .90)
+    index(r, hub, .89)
+    r.store._db.execute('UPDATE node_stats SET importance=? WHERE node_id=?', (.1, relevant))
+    r.store._db.execute('UPDATE node_stats SET importance=? WHERE node_id=?', (1, hub))
+    for target, cited in [(relevant, 0), (hub, 10)]:
+        r.store._db.execute('INSERT INTO query_feedback VALUES (?,?,10,?)',
+                            (query_key('unmatchedword'), target, cited))
+    history = r.graph.history(relevant)
+    feedback = [tuple(row) for row in r.store._db.execute('SELECT * FROM query_feedback ORDER BY target')]
+    options = dict(automatic=automatic, effort='normal')
+    [hit] = r.recall('unmatchedword', limit=1, **options)
+    assert hit['id'] == relevant and hit['score'] == pytest.approx(.90)
+    assert hit['importance'] == .1 and hit['source_occurred_at'] == dates[0].replace('Z', '+00:00')
+    hits = r.recall('unmatchedword', limit=2, **options)
+    assert [row['id'] for row in hits] == [relevant, hub]
+    assert [row['score'] for row in hits] == pytest.approx([.90, .89])
+    assert r.graph.history(relevant) == history
+    assert [tuple(row) for row in r.store._db.execute('SELECT * FROM query_feedback ORDER BY target')] == feedback
+
+
+@pytest.mark.parametrize('automatic', [False, True])
+def test_equal_relevance_orders_by_age_then_importance_then_feedback_and_id(
+        retrieval, recency_clock, automatic):
+    from memento.importance import query_key
+    r = retrieval
+    ids = []
+    for label, date, importance in [
+            ('old', '2025-01-01T00:00:00Z', 1),
+            ('lower importance', '2026-10-20T00:00:00Z', .3),
+            ('first', '2026-10-20T00:00:00Z', .8),
+            ('second', '2026-10-20T00:00:00Z', .8)]:
+        target, _ = assertion(r, 'The Alder report has ' + label + ' source details.', occurred_at=date)
+        index(r, target, .90)
+        r.store._db.execute('UPDATE node_stats SET importance=? WHERE node_id=?', (importance, target))
+        ids.append(target)
+    first, second = sorted(ids[2:])
+    options = dict(automatic=automatic, effort='normal', limit=4)
+    assert [hit['id'] for hit in r.recall('unmatchedword', **options)] == [first, second, ids[1], ids[0]]
+    r.store._db.execute('INSERT INTO query_feedback VALUES (?,?,1,1)', (query_key('unmatchedword'), second))
+    expected = [first, second] if automatic else [second, first]
+    assert [hit['id'] for hit in r.recall('unmatchedword', **options)] == expected + [ids[1], ids[0]]
+
+
+@pytest.mark.parametrize('query', ['Rowan', 'Who is Rowan?'])
+def test_normal_name_and_question_recall_keep_entity_and_family_fact_before_recent_hubs(
+        retrieval, recency_clock, query):
+    r = retrieval
+    person, evidence = assertion(r, 'Rowan Vale', type='person', scope=['personal'],
+                                occurred_at='2026-01-01T00:00:00Z')
+    biography, _ = assertion(r, 'Rowan Vale is the synthetic user\'s child.', scope=['personal'],
+                             occurred_at='2025-01-01T00:00:00Z')
+    parent, _ = assertion(r, 'Robin Vale', type='person', scope=['personal'])
+    r.graph.link(command_id='family-link', actor='fixture', why='Recorded family connection',
+                 a=person, rel='related_to', b=parent, evidence=evidence)
+    hub, _ = assertion(r, 'The unrelated deployment tool has recent source evidence.',
+                       occurred_at='2026-10-20T00:00:00Z')
+    for target, cosine, importance in [(person, .80, .2), (biography, .78, .1), (hub, .74, 1)]:
+        index(r, target, cosine)
+        r.store._db.execute('UPDATE node_stats SET importance=? WHERE node_id=?', (importance, target))
+    history = r.graph.history(person)
+    hits = r.recall(query, effort='normal', limit=2)
+    assert [hit['id'] for hit in hits] == [person, biography]
+    assert [row['score'] for row in hits] == pytest.approx([1.05, 1.03] if query == 'Rowan' else [.80, .78])
+    assert parent in {related['id'] for related in hits[0]['related']}
+    assert biography not in {related['id'] for related in hits[0]['related']}
+    assert r.graph.history(person) == history
 
 
 def test_automatic_followup_uses_context_but_independent_request_does_not(retrieval, monkeypatch):
@@ -1494,14 +1573,15 @@ def test_dual_scope_entity_is_visible_in_both_scopes_and_default_recall(retrieva
     assert r.graph.history(shared)[0]['scope'] == ['personal', 'professional']
 
 
-def test_committed_citation_is_idempotent_and_changes_rank_not_assertions(retrieval):
+def test_committed_citation_is_idempotent_and_changes_rank_not_assertions(retrieval, recency_clock):
     from memento.importance import cite, refresh
 
     r = retrieval
-    cited, evidence = assertion(r, 'Orion cited assertion')
-    other, _ = assertion(r, 'Orion other assertion')
+    cited, evidence = assertion(r, 'Orion cited assertion', occurred_at='2026-10-20T00:00:00Z')
+    other, _ = assertion(r, 'Orion other assertion', occurred_at='2026-10-20T00:00:00Z')
     index(r, cited, .80)
-    index(r, other, .81)
+    index(r, other, .80)
+    r.store._db.execute('UPDATE node_stats SET importance=.51 WHERE node_id=?', (other,))
     history = r.graph.history(cited)
     raw = r.store.get(evidence[0]['episode_id'])
     assert r.recall('unmatchedword', effort='cheap')[0]['id'] == other

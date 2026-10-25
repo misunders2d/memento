@@ -186,6 +186,39 @@ def _parked_candidate(r, episode, text, *, type='knowledge'):
     return candidate_id
 
 
+@pytest.mark.parametrize('kind', ['candidate', 'episode', 'mixed'])
+@pytest.mark.parametrize('equal_relevance', [False, True])
+def test_historical_relevance_precedes_age_and_equal_relevance_uses_source_time(
+        retrieval, kind, equal_relevance):
+    r = retrieval
+    strong = capture(r.store, 'old', 'old-match', 'The Alder record explains the requested family history.',
+                     occurred_at='2024-01-01T00:00:00Z')
+    weaker = capture(r.store, 'recent', 'recent-match', 'The deployment notes describe a recent unrelated tool.',
+                     occurred_at='2026-10-20T00:00:00Z')
+    targets = []
+    for episode, item_kind, cosine in [
+            (strong, 'episode' if kind == 'mixed' else kind, .90),
+            (weaker, 'candidate' if kind == 'mixed' else kind, .90 if equal_relevance else .89)]:
+        if item_kind == 'candidate':
+            target = _parked_candidate(r, episode, episode['text'])
+        else:
+            target = 'chunk-' + episode['id']
+            chunk(r.store, target, episode)
+        index(r, target, cosine, kind=item_kind)
+        targets.append(target)
+    Processing(r.graph).park_history(now=NOW)
+    expected = targets[1] if equal_relevance else targets[0]
+    for automatic in (False, True):
+        # Deep admits both kinds explicitly; automatic compares its two bounded
+        # historical fallback kinds without broadening ordinary fallback rules.
+        effort = 'deep' if kind == 'mixed' and not automatic else 'cheap'
+        [hit] = r.recall('unmatchedword', effort=effort, automatic=automatic, limit=1)
+        assert hit['id'] == expected
+        assert hit['score'] == pytest.approx(.90)
+        assert hit['source_occurred_at'] == datetime.fromisoformat(
+            (weaker if equal_relevance else strong)['occurred_at']).isoformat()
+
+
 def test_media_alone_does_not_suppress_fallback_and_instruction_only_parked_candidates_stay_out(retrieval):
     r = retrieval
     processing = Processing(r.graph)
