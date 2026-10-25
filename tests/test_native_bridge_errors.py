@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import urllib.parse
 
 import pytest
@@ -69,8 +70,8 @@ def service():
 
         def do_GET(self):
             case = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)['q'][0]
-            if case == 'timeout':
-                time.sleep(5.2)  # Exercise the unchanged five-second Python HTTP timeout.
+            if case == 'slow_success':
+                time.sleep(5.2)  # Explicit recall must survive the former five-second deadline.
             status = 503 if case == 'http' else 200
             self.send_response(status)
             self.end_headers()
@@ -93,7 +94,7 @@ def service():
 
 @pytest.mark.parametrize('harness', ['pi', 'omp'])
 @pytest.mark.parametrize('case,category', [
-    ('timeout', 'timeout'), ('http', 'HTTP 503'), ('malformed', 'invalid response'),
+    ('slow_success', None), ('http', 'HTTP 503'), ('malformed', 'invalid response'),
     ('oversized', 'response too large'), ('success', None)])
 def test_real_native_tool_http_boundary(native_tool, service, harness, case, category):
     run, _ = native_tool
@@ -105,6 +106,19 @@ def test_real_native_tool_http_boundary(native_tool, service, harness, case, cat
         expected = {'result': {'memories': [], 'client_revision': 'synthetic'}}
         assert result == {'result': {'content': [{'type': 'text', 'text': json.dumps(expected, separators=(',', ':'))}],
             'details': expected}}
+
+
+def test_explicit_recall_uses_longer_http_budget(monkeypatch):
+    def request(config, endpoint, *, timeout):
+        assert endpoint.startswith('/recall?')
+        assert timeout == 30
+        raise TimeoutError(PRIVATE)
+
+    monkeypatch.setattr(bridge, 'http', request)
+    with pytest.raises(TimeoutError) as failure:
+        bridge.native(SimpleNamespace(config={}), dict(harness='pi', session_id='synthetic-session',
+            action='tool', tool='recall', arguments={'query': 'synthetic'}))
+    assert bridge.upload_error(failure.value)['category'] == 'timeout'
 
 
 def test_real_native_tool_connection_failure(native_tool):

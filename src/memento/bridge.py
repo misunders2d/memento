@@ -1234,7 +1234,7 @@ def native(spool, data, *, recall=automatic):
             parameters = {**arguments}
             if 'query' in parameters:
                 parameters['q'] = parameters.pop('query')
-            return http(spool.config, '/recall?' + urllib.parse.urlencode(parameters), timeout=5)
+            return http(spool.config, '/recall?' + urllib.parse.urlencode(parameters), timeout=30)
         if tool == 'history':
             return http(spool.config, '/history/' + urllib.parse.quote(str(arguments['id']), safe=''), timeout=5)
         if tool == 'loop':

@@ -450,7 +450,7 @@ function registerTools(api: NativeAPI, T: typeof SchemaType, harness: string,
         }
         const result = await bridge(loader, { ...base, tool: verb, arguments: args,
           ...(["remember", "link", "supersede"].includes(verb) ? { entries: ctx.sessionManager.getEntries() } : {}),
-        }, 15_000, signal);
+        }, verb === "recall" ? 45_000 : 15_000, signal);
         return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
       },
     });
