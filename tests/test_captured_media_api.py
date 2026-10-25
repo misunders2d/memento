@@ -83,7 +83,7 @@ def assert_indexes(tmp_path, monkeypatch, blob_first):
             refs = [r[0] for r in db.execute('SELECT episode_id FROM captured_media_refs WHERE sha256=?', (sha,))]
             vectors = db.execute('''SELECT s.modality,s.artifact_sha256,v.embedding FROM segments s
                 JOIN vector_items i ON i.target=s.id AND i.kind='segment'
-                JOIN memory_vectors v ON v.rowid=i.seq AND v.current=1 WHERE s.node_id=?''',
+                JOIN memory_vectors v ON v.rowid=i.seq AND i.current=1 WHERE s.node_id=?''',
                 (row['node_id'],)).fetchall()
             assert db.execute('SELECT sha256 FROM media_files WHERE node_id=?', (row['node_id'],)).fetchone()[0] == sha
             assert db.execute('SELECT 1 FROM media_representations WHERE node_id=?', (row['node_id'],)).fetchone()

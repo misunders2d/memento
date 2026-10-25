@@ -21,6 +21,7 @@ from memento.jobs import Queue
 from memento.portable import export_archive, import_archive
 from memento.raw_text import FRAME_BYTES, MIME, RawTextUnavailable, decode_frame, runs
 from memento.store import ConflictError, Store
+from memento.schema import VERSION
 from test_cold import DirectoryColdFixture
 
 
@@ -523,7 +524,7 @@ def test_frame_status_cover_upgrade_is_atomic_and_preserves_physical_data(tmp_pa
     try:
         assert reopened.get(original['id']) == original
         assert [tuple(row) for row in reopened._db.execute('SELECT * FROM raw_frames ORDER BY id')] == frames
-        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == VERSION
         assert not reopened._db.execute("SELECT 1 FROM sqlite_schema WHERE name='raw_frames_source'").fetchone()
         page = reopened._db.execute(
             "SELECT rootpage FROM sqlite_schema WHERE name='raw_frames_status_cover_v1'").fetchone()[0]

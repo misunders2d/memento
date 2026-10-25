@@ -243,7 +243,7 @@ def transfer_measurement(retrieval, suggestions):
     identifiers = {item['id'] for item in suggestions}
     with retrieval.store._mutex:
         rows = retrieval.store._db.execute(f'''SELECT i.target,v.embedding FROM vector_items i
-            JOIN memory_vectors v ON v.rowid=i.seq WHERE i.kind='node' AND v.current=1
+            JOIN memory_vectors v ON v.rowid=i.seq WHERE i.kind='node' AND i.current=1
             AND i.target IN ({','.join('?' for _ in identifiers)})''', tuple(identifiers)).fetchall() if identifiers else []
         vectors = {row['target']: np.frombuffer(row['embedding'], dtype=np.float32).copy()
                    for row in rows if row['target'] in identifiers}
@@ -530,7 +530,8 @@ def learning(service, agent, report, *, directory, store, retrieval=None,
         status_elapsed_ms=(time.perf_counter() - started) * 1000)
     with store._mutex:
         report['measurement'].update(vector_rows=store._db.execute('SELECT count(*) FROM vector_items').fetchone()[0],
-            current_vector_rows=store._db.execute('SELECT count(*) FROM memory_vectors WHERE current=1').fetchone()[0])
+            current_vector_rows=store._db.execute('''SELECT count(*) FROM vector_items i
+                JOIN memory_vectors v ON v.rowid=i.seq WHERE i.current=1''').fetchone()[0])
     report.update(replay_id=replay['id'], scenarios=scenarios,
         fresh_native_behavior='Root must independently test actual conduct using these current requests and native injected context.')
     report['learning_evidence'] = dict(stage_suggestion_ids={item['stage']: [value['id'] for value in item['suggestions']]

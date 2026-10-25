@@ -85,7 +85,7 @@ def test_retired_noise_leaves_active_memory_but_keeps_history_and_sources(world)
     assert noise not in automatic(world) and fact in automatic(world)
     assert noise not in {item['id'] for item in world.retrieval.recall('scores', effort='cheap')}
     # Vector and search rows stay for history; only their recall eligibility ends.
-    assert store._db.execute('''SELECT v.current FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
+    assert store._db.execute('''SELECT i.current FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
         WHERE i.target=? AND i.kind='node' ''', (noise,)).fetchall()[0][0] == 0
     assert store._db.execute('SELECT version FROM node_fts WHERE id=?', (noise,)).fetchone()[0] == 2
     # The automatic markers close as never-obligations: no completion source time is invented.

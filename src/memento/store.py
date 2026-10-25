@@ -19,9 +19,9 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from .schema import (SUPPORTED_VERSIONS, VERSION as SCHEMA_VERSION, header_target, initialize, upgrade_episode_fts,
+from .schema import (VERSION as SCHEMA_VERSION, check_version, header_target, initialize, upgrade_episode_fts,
                      upgrade_historical_pool, upgrade_node_fts, upgrade_raw_text, upgrade_status_index,
-                     upgrade_captured_media, upgrade_repair_groups)
+                     upgrade_captured_media, upgrade_repair_groups, upgrade_vector_partitions)
 from .blobs import BlobStore
 from .artifacts import Artifacts
 from .captured_media import references as media_references, record_references
@@ -103,8 +103,11 @@ class Store:
             # Read the header before the journal-mode change so an unknown
             # future format is refused without touching the file.
             version = self._db.execute('PRAGMA user_version').fetchone()[0]
-            if version != 0 and version not in SUPPORTED_VERSIONS:
-                raise RuntimeError(f'Unsupported database schema version: {version}')
+            if version != 0:
+                try:
+                    check_version(self._db)
+                except ValueError as error:
+                    raise RuntimeError(str(error)) from None
             mode = self._db.execute('PRAGMA journal_mode=WAL').fetchone()[0]
             if mode != 'wal':
                 raise RuntimeError('Evidence storage requires SQLite WAL mode')
@@ -130,10 +133,9 @@ class Store:
                     upgrade_node_fts(self._db)
                     upgrade_historical_pool(self._db)
                     upgrade_repair_groups(self._db)
-                    # The header marks frame-capable storage; it commits with the
-                    # physical upgrades so pre-frame readers refuse this file. A
-                    # database that ever activated historical parking keeps header 3;
-                    # startup never lowers a header.
+                    upgrade_vector_partitions(self._db)
+                    # Older writers use mutable vec0 metadata. Fence them only
+                    # after the physical rebuild has been verified in this transaction.
                     target = header_target(self._db, version)
                     if version != target:
                         self._db.execute(f'PRAGMA user_version={target}')

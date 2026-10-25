@@ -160,8 +160,8 @@ class MediaIngest:
                     continue
             segments = db.execute('''SELECT s.*,v.embedding AS vector
                 FROM segments s
-                LEFT JOIN vector_items i ON i.target=s.id AND i.kind='segment' AND i.version=1
-                LEFT JOIN memory_vectors v ON v.rowid=i.seq AND v.current=1
+                LEFT JOIN vector_items i ON i.target=s.id AND i.kind='segment' AND i.version=1 AND i.current=1
+                LEFT JOIN memory_vectors v ON v.rowid=i.seq
                 WHERE s.node_id=? ORDER BY s.rowid''', (row['node_id'],)).fetchall()
             if not segments or any(segment['vector'] is None for segment in segments):
                 continue

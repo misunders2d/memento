@@ -208,7 +208,7 @@ class Processing:
         conversation with unextracted history (parked range (seq, latest_seq], live
         cursor at latest_seq), fences on pending/leased extraction inside those
         ranges and on every pending or leased consolidation batch, every active
-        undecided candidate parked, and the header raised to 3. Repeating is a
+        undecided candidate parked, and the header raised to at least 3. Repeating is a
         no-op: the boundary never extends to newer captures. Everything captured
         afterwards, including delayed offline records of old conversations, processes
         normally through the live cursor. Raw history and the ordinary cursor are untouched.
@@ -236,7 +236,8 @@ class Processing:
                         WHERE kind='consolidate' AND state IN ('pending','leased')''')
                     db.execute(f'''INSERT INTO historical_parked_candidates(candidate_id)
                         SELECT c.id FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}''')
-                    db.execute(f'PRAGMA user_version={PARKING_VERSION}')
+                    header = db.execute('PRAGMA user_version').fetchone()[0]
+                    db.execute(f'PRAGMA user_version={max(header, PARKING_VERSION)}')
                 result = historical_status(db)
                 db.execute('COMMIT')
                 return result

@@ -3,17 +3,28 @@
 import logging
 import time
 
-# Database header (PRAGMA user_version). Pre-frame readers accept only
-# LEGACY_VERSION and return empty text for frame-compressed records instead of
-# failing, so frame-aware code marks every database it opens with VERSION, which
-# those readers already refuse at startup, export, import and restore.
+# Database headers fence readers/writers that cannot preserve the physical
+# storage contract: raw frames (2), historical parking (3), vector partitions (4).
 LEGACY_VERSION = 1
-VERSION = 2
+FRAME_VERSION = 2
+VERSION = 4
 # Header 3 is written by an explicit historical-pool activation. Images that know
 # only headers 1/2 would ignore the parking policy and resume bulk extraction of
 # the parked backlog, so they must refuse the file. Nothing ever lowers a header.
 PARKING_VERSION = 3
-SUPPORTED_VERSIONS = (LEGACY_VERSION, VERSION, PARKING_VERSION)
+SUPPORTED_VERSIONS = (LEGACY_VERSION, FRAME_VERSION, PARKING_VERSION, VERSION)
+
+
+def _clean_vector_layout(db):
+    row = db.execute("SELECT sql FROM sqlite_schema WHERE name='memory_vectors'").fetchone()
+    items = db.execute("SELECT sql FROM sqlite_schema WHERE name='vector_items'").fetchone()
+    current = next((column for column in db.execute('PRAGMA table_info(vector_items)')
+                    if column[1] == 'current'), None)
+    return (row is not None and 'kind text partition key' in ' '.join(row[0].lower().split())
+            and 'current' not in {column[1] for column in db.execute('PRAGMA table_info(memory_vectors)')}
+            and current is not None and current[2].upper() == 'INTEGER' and current[3] == 1
+            and current[4] in ('1', '(1)')
+            and items is not None and 'check(currentin(0,1))' in ''.join(items[0].lower().split()))
 
 
 def check_version(db):
@@ -21,14 +32,14 @@ def check_version(db):
     version = db.execute('PRAGMA user_version').fetchone()[0]
     if version not in SUPPORTED_VERSIONS:
         raise ValueError(f'Unsupported database schema version: {version}')
+    if version >= VERSION and not _clean_vector_layout(db):
+        raise ValueError('Database schema version 4 requires immutable vector partitions and ordinary current metadata')
     return version
 
 
 def header_target(db, current):
-    """The header this database must carry: never lower, 3 once parking was activated."""
-    parked = db.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='historical_activation'").fetchone() and \
-        db.execute('SELECT 1 FROM historical_activation LIMIT 1').fetchone()
-    return max(current, PARKING_VERSION if parked else VERSION)
+    """The current physical format fence; never lower an existing header."""
+    return max(current, VERSION)
 
 
 _HISTORICAL_POOL = (
@@ -132,6 +143,30 @@ _EPISODES_NO_UPDATE = """CREATE TRIGGER episodes_no_update BEFORE UPDATE ON epis
         AND NEW.text_runs IS OLD.text_runs)
     BEGIN SELECT RAISE(ABORT, 'episodes are immutable'); END"""
 
+_MEMORY_VECTORS = """CREATE VIRTUAL TABLE memory_vectors USING vec0(
+    embedding float[768] distance_metric=cosine,kind text partition key)"""
+_VECTOR_CURRENT = 'current INTEGER NOT NULL DEFAULT 1 CHECK(current IN (0,1))'
+
+# Mutable eligibility belongs to the ordinary metadata table; vec0 stores only
+# embeddings and their immutable kind partition. Invalidation is ordinary SQL.
+_VECTOR_INVALIDATION_TRIGGERS = (
+    ('candidate_vector_terminal', """CREATE TRIGGER candidate_vector_terminal AFTER INSERT ON candidate_decisions
+        WHEN NEW.decision IN ('promote','reject')
+        BEGIN UPDATE vector_items SET current=0 WHERE kind='candidate' AND target=NEW.candidate_id; END"""),
+    ('forgotten_candidate_vector', """CREATE TRIGGER forgotten_candidate_vector AFTER INSERT ON forgotten_targets
+        WHEN NEW.kind='candidate'
+        BEGIN UPDATE vector_items SET current=0 WHERE kind='candidate' AND target=NEW.target; END"""),
+    ('forgotten_source_vectors', """CREATE TRIGGER forgotten_source_vectors AFTER INSERT ON forgotten_sources
+        BEGIN UPDATE vector_items SET current=0 WHERE seq IN (
+            SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target
+            JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode'
+                AND e.source=NEW.source AND e.event_id=NEW.event_id
+            UNION SELECT i.seq FROM vector_items i JOIN candidates c ON c.id=i.target
+            JOIN extraction_runs r ON r.id=c.run_id JOIN episodes e ON e.id=r.episode_id
+            WHERE i.kind='candidate' AND e.source=NEW.source AND e.event_id=NEW.event_id); END"""),
+)
+
+
 _SCHEMA = (
     """CREATE TABLE episodes (
            seq INTEGER PRIMARY KEY CHECK(seq > 0),
@@ -205,11 +240,10 @@ _SCHEMA = (
        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
        model_id TEXT NOT NULL, revision TEXT NOT NULL, dimensions INTEGER NOT NULL,
        text_encoding INTEGER NOT NULL DEFAULT 0 CHECK(text_encoding IN (0,1))) STRICT""",
-    """CREATE TABLE vector_items (
+    f"""CREATE TABLE vector_items (
        seq INTEGER PRIMARY KEY, target TEXT NOT NULL, kind TEXT NOT NULL,
-       version INTEGER NOT NULL, UNIQUE(target,kind,version)) STRICT""",
-    """CREATE VIRTUAL TABLE memory_vectors USING vec0(
-       embedding float[768] distance_metric=cosine,current boolean)""",
+       version INTEGER NOT NULL, {_VECTOR_CURRENT}, UNIQUE(target,kind,version)) STRICT""",
+    _MEMORY_VECTORS,
     """CREATE TABLE review_proposals (
        id TEXT PRIMARY KEY, commit_id TEXT NOT NULL,
        command TEXT NOT NULL, base_versions TEXT NOT NULL) STRICT""",
@@ -324,22 +358,7 @@ _SCHEMA = (
     'CREATE INDEX segment_blob ON segments(artifact_sha256)',
     'CREATE INDEX segment_source_blob ON segments(source_sha256)',
     'CREATE INDEX vector_kind ON vector_items(kind,seq)',
-    """CREATE TRIGGER candidate_vector_terminal AFTER INSERT ON candidate_decisions
-       WHEN NEW.decision IN ('promote','reject')
-       BEGIN UPDATE memory_vectors SET current=0 WHERE rowid IN (
-           SELECT seq FROM vector_items WHERE kind='candidate' AND target=NEW.candidate_id); END""",
-    """CREATE TRIGGER forgotten_candidate_vector AFTER INSERT ON forgotten_targets
-       WHEN NEW.kind='candidate'
-       BEGIN UPDATE memory_vectors SET current=0 WHERE rowid IN (
-           SELECT seq FROM vector_items WHERE kind='candidate' AND target=NEW.target); END""",
-    """CREATE TRIGGER forgotten_source_vectors AFTER INSERT ON forgotten_sources
-       BEGIN UPDATE memory_vectors SET current=0 WHERE rowid IN (
-           SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target
-           JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode'
-               AND e.source=NEW.source AND e.event_id=NEW.event_id
-           UNION SELECT i.seq FROM vector_items i JOIN candidates c ON c.id=i.target
-           JOIN extraction_runs r ON r.id=c.run_id JOIN episodes e ON e.id=r.episode_id
-           WHERE i.kind='candidate' AND e.source=NEW.source AND e.event_id=NEW.event_id); END""",
+    *(statement for _, statement in _VECTOR_INVALIDATION_TRIGGERS),
 )
 
 _IMMUTABLE_KEYS = {'graph_commits': 'id=NEW.id OR command_id=NEW.command_id',
@@ -387,6 +406,62 @@ def upgrade_captured_media(db):
     """Small durable discovery/admission state; historical work stays off startup."""
     for statement in _CAPTURED_MEDIA:
         db.execute(statement)
+
+
+def _upgrade_vector_triggers(db):
+    for name, statement in _VECTOR_INVALIDATION_TRIGGERS:
+        previous = db.execute("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?", (name,)).fetchone()
+        if previous is None or previous[0] != statement:
+            db.execute(f'DROP TRIGGER IF EXISTS {name}')
+            db.execute(statement)
+
+
+def upgrade_vector_partitions(db):
+    """Atomically separate mutable eligibility from the immutable vector index.
+
+    Caller owns the transaction and header-4 fence. A regular disk-backed staging
+    table preserves exact vectors and legacy flags while vec0 is recreated under
+    the same name; its shadow tables cannot safely be renamed. No model call or
+    Python vector cache is involved. Metadata without an embedding stays stored.
+    """
+    if not db.in_transaction:
+        raise RuntimeError('Vector partition upgrade requires an active transaction')
+    if _clean_vector_layout(db):
+        _upgrade_vector_triggers(db)
+        return
+    if db.execute('''SELECT 1 FROM memory_vectors v LEFT JOIN vector_items i ON i.seq=v.rowid
+        WHERE i.seq IS NULL OR i.kind IS NULL
+        OR i.kind NOT IN ('node','candidate','episode','segment') LIMIT 1''').fetchone():
+        raise RuntimeError('Cannot partition vector rows with missing or invalid kind')
+    log = logging.getLogger(__name__)
+    log.warning('Rebuilding kind-partitioned vector index')
+    started = time.perf_counter()
+    db.execute('''CREATE TABLE _memory_vector_partition_stage (
+        seq INTEGER PRIMARY KEY,embedding BLOB NOT NULL,current INTEGER NOT NULL,kind TEXT NOT NULL) STRICT''')
+    db.execute('''INSERT INTO _memory_vector_partition_stage
+        SELECT v.rowid,v.embedding,v.current,i.kind FROM memory_vectors v
+        JOIN vector_items i ON i.seq=v.rowid''')
+    if 'current' not in {column[1] for column in db.execute('PRAGMA table_info(vector_items)')}:
+        db.execute(f'ALTER TABLE vector_items ADD COLUMN {_VECTOR_CURRENT}')
+    db.execute('''UPDATE vector_items SET current=(
+        SELECT s.current FROM _memory_vector_partition_stage s WHERE s.seq=vector_items.seq)
+        WHERE seq IN (SELECT seq FROM _memory_vector_partition_stage)''')
+    db.execute('DROP TABLE memory_vectors')
+    db.execute(_MEMORY_VECTORS)
+    db.execute('''INSERT INTO memory_vectors(rowid,embedding,kind)
+        SELECT seq,embedding,kind FROM _memory_vector_partition_stage ORDER BY seq''')
+    expected = db.execute('SELECT count(*) FROM _memory_vector_partition_stage').fetchone()[0]
+    actual = db.execute('SELECT count(*) FROM memory_vectors').fetchone()[0]
+    mismatch = db.execute('''SELECT 1 FROM _memory_vector_partition_stage s
+        LEFT JOIN memory_vectors v ON v.rowid=s.seq
+        LEFT JOIN vector_items i ON i.seq=s.seq
+        WHERE v.rowid IS NULL OR v.embedding IS NOT s.embedding
+        OR i.current IS NOT s.current OR v.kind IS NOT s.kind OR i.kind IS NOT s.kind LIMIT 1''').fetchone()
+    if expected != actual or mismatch is not None or not _clean_vector_layout(db):
+        raise RuntimeError('Vector partition rebuild did not preserve every stored vector')
+    db.execute('DROP TABLE _memory_vector_partition_stage')
+    _upgrade_vector_triggers(db)
+    log.warning('Kind-partitioned vector index rebuild completed in %.3f seconds', time.perf_counter() - started)
 
 
 def upgrade_episode_fts(db):

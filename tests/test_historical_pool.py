@@ -11,7 +11,7 @@ from memento.graph import Graph
 from memento.jobs import LostLease
 from memento.portable import export_archive, import_archive
 from memento.processing import PARKED_ERROR, Processing
-from memento.schema import PARKING_VERSION, VERSION
+from memento.schema import VERSION
 from memento.status import operational_status
 from memento.store import Store
 
@@ -92,7 +92,7 @@ def test_park_freezes_current_backlog_and_new_history_keeps_processing(tmp_path)
         assert before['seq'] < before['latest_seq']
 
         state = processing.park_history(now=NOW)
-        assert state['active'] and state['parked_conversations'] == 2 and state['header'] == PARKING_VERSION
+        assert state['active'] and state['parked_conversations'] == 2 and state['header'] == VERSION
         assert state['live_pending_conversations'] == 0 and state['parked_candidates'] == 0
         parked = parking(store, 'old')
         assert parked['parked_through'] == parked['live_seq'] == before['latest_seq'] and parked['live_offset'] == 0
@@ -132,7 +132,7 @@ def test_park_freezes_current_backlog_and_new_history_keeps_processing(tmp_path)
         store.close()
     reopened = Store(tmp_path / 'data')
     try:
-        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == PARKING_VERSION
+        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == VERSION
         assert parking(reopened, 'old')['parked_through'] == before['latest_seq']
         assert Processing(Graph(reopened)).claim(**ARGS)['work'][0]['input']['windows'][0]['text'] == \
             'Captured after activation, still live.'
@@ -231,19 +231,20 @@ def test_activation_header_survives_restart_and_restore_and_header_two_readers_r
         processing = Processing(Graph(store))
         capture(store, 'old', 'o1', 'Unprocessed historical statement.')
         assert header(data / 'memory.sqlite') == VERSION
-        assert header_two_reader(data / 'memory.sqlite') == VERSION
+        with pytest.raises(RuntimeError, match=f'Unsupported database schema version: {VERSION}'):
+            header_two_reader(data / 'memory.sqlite')
         processing.park_history(now=NOW)
         rows = store._db.execute('SELECT * FROM historical_parking').fetchall()
         assert [tuple(row) for row in rows] == [(SOURCE, 'old', 1, 1, 0)]
     finally:
         store.close()
     path = data / 'memory.sqlite'
-    assert header(path) == PARKING_VERSION
-    with pytest.raises(RuntimeError, match='Unsupported database schema version: 3'):
+    assert header(path) == VERSION
+    with pytest.raises(RuntimeError, match=f'Unsupported database schema version: {VERSION}'):
         header_two_reader(path)
     reopened = Store(data)
     try:
-        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == PARKING_VERSION, 'startup never lowers the header'
+        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == VERSION, 'startup never lowers the header'
         assert Processing(Graph(reopened)).claim(**ARGS)['work'] == []
     finally:
         reopened.close()
@@ -252,7 +253,7 @@ def test_activation_header_survives_restart_and_restore_and_header_two_readers_r
     destination = tmp_path / 'restored'
     result = import_archive(archive, destination)
     assert 'user_version' not in result['rebased']
-    assert header(destination / 'memory.sqlite') == PARKING_VERSION
+    assert header(destination / 'memory.sqlite') == VERSION
     with pytest.raises(RuntimeError, match='Unsupported database schema version'):
         header_two_reader(destination / 'memory.sqlite')
     restored = Store(destination)
@@ -261,6 +262,6 @@ def test_activation_header_survives_restart_and_restore_and_header_two_readers_r
         assert restored._db.execute('SELECT count(*) FROM historical_activation').fetchone()[0] == 1
         processing = Processing(Graph(restored))
         assert processing.claim(**ARGS)['work'] == [], 'the parking policy travels with the database'
-        assert processing.history_status()['active'] and processing.history_status()['header'] == PARKING_VERSION
+        assert processing.history_status()['active'] and processing.history_status()['header'] == VERSION
     finally:
         restored.close()

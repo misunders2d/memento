@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from memento.api import create_app
 from memento.store import Store
+from memento.schema import VERSION
 
 
 @pytest.fixture
@@ -150,7 +151,7 @@ def test_legacy_raw_fts_migration_is_transactional_and_restarts_without_redeleti
             assert reopened.get(raw['id'])['text'] == 'opaqueuniquebinarytoken'
             assert reopened.search('opaqueuniquebinarytoken') == []
             assert [item['id'] for item in reopened.search('projection sentence')] == [text['id']]
-            assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 2
+            assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == VERSION
         finally:
             reopened.close()
 

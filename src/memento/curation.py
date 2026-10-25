@@ -72,13 +72,11 @@ def _copy_vector(graph, node_id, old_version, new_version):
     simply stays pending for ordinary indexing.
     """
     db = graph.store._db
-    db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN
-        (SELECT seq FROM vector_items WHERE kind='node' AND target=?)''', (node_id,))
+    db.execute("UPDATE vector_items SET current=0 WHERE kind='node' AND target=?", (node_id,))
     previous = db.execute('''SELECT i.seq FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
         WHERE i.target=? AND i.kind='node' AND i.version=?''', (node_id, old_version)).fetchone()
     if previous is not None:
-        db.execute('UPDATE vector_items SET version=? WHERE seq=?', (new_version, previous['seq']))
-        db.execute('UPDATE memory_vectors SET current=1 WHERE rowid=?', (previous['seq'],))
+        db.execute('UPDATE vector_items SET version=?,current=1 WHERE seq=?', (new_version, previous['seq']))
 
 
 def attach(graph, commit, target, evidence, *, approved=False, expected_version=None):
@@ -250,8 +248,7 @@ def _absorb_one(graph, commit, source, target, *, entity, proposal_id=None):
     _union_evidence(db, b['id'], survivor, [(b['id'], b['version']), (a['id'], a['version'])])
     _copy_vector(graph, b['id'], b['version'], survivor)
     redirect_edges(graph, commit, a['id'], b['id'])
-    db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN
-        (SELECT seq FROM vector_items WHERE kind='node' AND target=?)''', (a['id'],))
+    db.execute("UPDATE vector_items SET current=0 WHERE kind='node' AND target=?", (a['id'],))
     if a['pinned'] and not b['pinned']:
         pin(graph, commit, b['id'], True)
     from .importance import transfer_usage
@@ -462,9 +459,8 @@ def retire(graph, commit, target, evidence):
          None, node['pinned'], node['scope']))
     db.execute('''INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote
         FROM graph_evidence WHERE target=? AND version=?''', (version, target, node['version']))
-    db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN (
-        SELECT seq FROM vector_items WHERE (kind='node' AND target=?)
-        OR (kind='segment' AND target IN (SELECT id FROM segments WHERE node_id=?)))''', (target, target))
+    db.execute('''UPDATE vector_items SET current=0 WHERE (kind='node' AND target=?)
+        OR (kind='segment' AND target IN (SELECT id FROM segments WHERE node_id=?))''', (target, target))
     relations, declined = [], []
     for edge in edges:
         db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',

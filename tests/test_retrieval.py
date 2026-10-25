@@ -13,7 +13,7 @@ import pytest
 np = pytest.importorskip('numpy')
 
 from memento.graph import Graph
-from memento.retrieval import Retrieval
+from memento.retrieval import Retrieval, _nearest_vectors
 from memento.store import Store
 from memento.status import operational_status
 
@@ -80,6 +80,107 @@ def test_automatic_eligibility_precedes_vector_limit_and_explicit_entities_remai
     # Entity-only data still answers a small requested limit with the entity itself.
     assert [item['category'] for item in r.recall('Memento evidence', automatic=True, limit=1)] == ['entity_context']
     assert any(item['type'] == 'project' for item in r.recall('Memento', effort='cheap', limit=100))
+
+
+@pytest.mark.parametrize('channel', ['automatic', 'cheap', 'deep'])
+def test_sparse_recall_does_not_scan_unrelated_vector_chunks(retrieval, monkeypatch, channel):
+    r = retrieval
+    useful, _ = assertion(r, 'The synthetic user keeps the spare key in the blue cabinet.')
+    index(r, useful, .8)
+    # A large unrelated raw index must not make each small eligible pool scan
+    # every vec0 chunk. These vectors have no eligible episode projection.
+    vector = np.zeros(768, np.float32)
+    vector[0] = 1
+    db = r.store._db
+    db.execute('BEGIN')
+    db.executemany("INSERT INTO vector_items(target,kind,version) VALUES (?,'episode',1)",
+                   ((f'unrelated-{number}',) for number in range(2048)))
+    db.executemany("INSERT INTO memory_vectors(rowid,embedding,kind) VALUES (?,?,'episode')",
+                   ((row['seq'], vector.tobytes()) for row in db.execute(
+                       "SELECT seq FROM vector_items WHERE kind='episode'")))
+    db.execute('COMMIT')
+    scans = []
+    snapshot = r.store.read_snapshot
+
+    @contextmanager
+    def observed_snapshot():
+        with snapshot() as reader:
+            reader.set_trace_callback(lambda sql: scans.append(sql) if sql.startswith('--')
+                                      and 'memory_vectors_chunks' in sql else None)
+            yield reader
+
+    monkeypatch.setattr(r.store, 'read_snapshot', observed_snapshot)
+    hits = r.recall('unmatchedword', automatic=channel == 'automatic',
+                    effort='deep' if channel == 'deep' else 'cheap', limit=1, scope='professional')
+    assert [hit['id'] for hit in hits] == [useful]
+    assert scans and all('WHERE partition00 = ?' in ' '.join(sql.split()) for sql in scans), \
+        'recall did not prune unrelated vector kinds before loading their chunks'
+
+
+@pytest.mark.parametrize('pool', ['empty', 'sparse', 'dense'])
+def test_exact_vector_top_k_matches_native_knn_for_every_eligible_current_vector(retrieval, pool):
+    db = retrieval.store._db
+    total = 2050
+    vectors = np.random.default_rng(734).normal(size=(total, 768)).astype(np.float32)
+    query = np.zeros(768, np.float32)
+    query[0] = 1
+    # The nearest eligible vector is last in source order, far beyond K. Neither
+    # the SQL eligibility pool nor distance calculation may be pre-limited.
+    vectors[-1] = query * 2
+    db.execute('BEGIN')
+    db.executemany("INSERT INTO vector_items(seq,target,kind,version,current) VALUES (?,?,'node',1,?)",
+                   ((number, f'vector-{number}', int(number % 13 != 0)) for number in range(1, total + 1)))
+    db.executemany("INSERT INTO memory_vectors(rowid,embedding,kind) VALUES (?,?,'node')",
+                   ((number, vector.tobytes()) for number, vector in enumerate(vectors, 1)))
+    # Preserve the deployed pre-upgrade metric/filter implementation as the
+    # reference, independently of the new ordinary eligibility flag.
+    db.execute('''CREATE VIRTUAL TABLE legacy_vectors USING vec0(
+        embedding float[768] distance_metric=cosine,current boolean)''')
+    db.executemany('INSERT INTO legacy_vectors(rowid,embedding,current) VALUES (?,?,?)',
+                   ((number, vector.tobytes(), int(number % 13 != 0))
+                    for number, vector in enumerate(vectors, 1)))
+    db.execute('COMMIT')
+    eligible = {'empty': 'SELECT seq FROM vector_items WHERE 0',
+                'sparse': 'SELECT seq FROM vector_items WHERE seq%257=0 OR seq=2050',
+                'dense': 'SELECT seq FROM vector_items'}[pool]
+    expected = db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
+        FROM legacy_vectors v JOIN vector_items i ON i.seq=v.rowid
+        WHERE v.embedding MATCH ? AND k=7 AND v.current=1
+        AND v.rowid IN ({eligible}) ORDER BY v.distance''', (query.tobytes(),)).fetchall()
+    actual = _nearest_vectors(db, query.tobytes(), 7, 'node', eligible)
+    # Random unequal distances make order comparable; partitioning keeps the
+    # native cosine distance and every eligible row unchanged.
+    assert [tuple(row) for row in actual] == [tuple(row) for row in expected]
+    if pool != 'empty':
+        assert actual[0]['target'] == 'vector-2050' and actual[0]['cosine'] == 1
+
+
+def test_exact_vector_top_k_keeps_tied_nearest_boundary(retrieval):
+    q = np.zeros(768, np.float32)
+    q[0] = 1
+    for number in range(4):
+        retrieval._put(f'tied-{number}', 'node', 1, q)
+    db = retrieval.store._db
+    db.execute('UPDATE vector_items SET current=0 WHERE seq=4')
+    hits = _nearest_vectors(db, q.tobytes(), 2, 'node', 'SELECT seq FROM vector_items')
+    # KNN never promised an identity order among exact ties. Either exact search
+    # may choose any K current rows at that boundary, with the same metric.
+    assert len(hits) == 2
+    assert {row['target'] for row in hits} <= {'tied-0', 'tied-1', 'tied-2'}
+    assert all(row['cosine'] == 1 for row in hits)
+
+
+def test_inactive_vectors_are_filtered_before_the_nearest_limit(retrieval):
+    r = retrieval
+    for number in range(30):
+        index(r, f'inactive-{number}', .99)
+    r.store._db.execute('UPDATE vector_items SET current=0')
+    index(r, 'current-match', .8)
+    q = np.zeros(768, np.float32)
+    q[0] = 1
+    hits = _nearest_vectors(r.store._db, q.tobytes(), 1, 'node', 'SELECT seq FROM vector_items')
+    assert [row['target'] for row in hits] == ['current-match']
+    assert hits[0]['cosine'] == pytest.approx(.8)
 
 
 @pytest.mark.parametrize('text', [
@@ -179,8 +280,7 @@ def test_original_source_recency_ranks_without_hiding_old_imports(
     assert hits[1]['decay'] == pytest.approx(math.exp2(-age / 90))
     assert hits[1]['text'].startswith('Source 2026-05-23: ') is automatic
     assert hits[1]['valid_from'] is hits[1]['valid_to'] is None
-    r.store._db.execute('UPDATE memory_vectors SET current=0 WHERE rowid IN '
-                        '(SELECT seq FROM vector_items WHERE target=?)', (fresh,))
+    r.store._db.execute('UPDATE vector_items SET current=0 WHERE target=?', (fresh,))
     assert r.recall('unmatchedword', limit=1, **options)[0]['id'] == old
     assert r.graph.history(old) == before
 
@@ -1159,10 +1259,10 @@ def test_index_status_counts_real_vectors_without_repeated_per_unit_probes(retri
              for i in range(1, total + 1)))
         db.executemany('INSERT INTO episode_chunks VALUES (?,?,0,28)',
                        ((f'x{i}', f'e{i}') for i in range(1, prepared + 1)))
-        db.executemany("INSERT INTO vector_items VALUES (?,?,'episode',1)",
-                       ((i, f'x{i}') for i in range(1, vector_count + 1)))
-        db.executemany('INSERT INTO memory_vectors(rowid,embedding,current) VALUES (?,?,?)',
-                       ((i, vector, i % 13 != 0) for i in range(1, vector_count + 1)))
+        db.executemany("INSERT INTO vector_items(seq,target,kind,version,current) VALUES (?,?,'episode',1,?)",
+                       ((i, f'x{i}', i % 13 != 0) for i in range(1, vector_count + 1)))
+        db.executemany("INSERT INTO memory_vectors(rowid,embedding,kind) VALUES (?,?,'episode')",
+                       ((i, vector) for i in range(1, vector_count + 1)))
         db.executemany('INSERT INTO index_failures VALUES (?,1,1,\'ValueError\',0,?)',
                        ((f'x{i}', int(i % 11 == 0)) for i in range(7, prepared + 1, 7)))
         db.execute('COMMIT')
@@ -1449,6 +1549,44 @@ def test_terminal_candidate_vectors_cannot_crowd_out_live_candidates(retrieval):
     assert [hit['id'] for hit in r.recall('unmatchedword', effort='cheap', limit=1)] == [live]
 
 
+@pytest.mark.parametrize('recursive', [False, True])
+@pytest.mark.parametrize('decision', ['promote', 'reject'])
+def test_nested_candidate_and_source_invalidation_is_atomic_and_exact(retrieval, recursive, decision):
+    r = retrieval
+    terminal, _ = candidate(r, 'The terminal candidate has exact original evidence.')
+    forgotten, raw = candidate(r, 'The source-forgotten candidate has exact original evidence.')
+    direct, _ = candidate(r, 'The directly forgotten candidate has exact original evidence.')
+    for target in (terminal, forgotten, direct):
+        index(r, target, .9, kind='candidate')
+    r.store._db.execute('INSERT INTO episode_chunks VALUES (?,?,0,?)', ('forgotten-chunk', raw['id'], len(raw['text'])))
+    index(r, 'forgotten-chunk', .9, kind='episode')
+    index(r, 'unaffected', .9)
+    db = r.store._db
+    db.execute(f'PRAGMA recursive_triggers={int(recursive)}')
+    before = [tuple(row) for row in db.execute('SELECT rowid,embedding,kind FROM memory_vectors ORDER BY rowid')]
+    metadata = [tuple(row) for row in db.execute('SELECT seq,target,kind,version FROM vector_items ORDER BY seq')]
+
+    def invalidate():
+        db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,NULL,NULL)',
+                   ('terminal', terminal, 'fixture', decision))
+        db.execute('INSERT INTO forgotten_sources VALUES (?,?,?,?)',
+                   (raw['source'], raw['event_id'], 'fixture', 'fixture'))
+        db.execute('INSERT INTO forgotten_targets VALUES (?,?,?)', (direct, 'fixture', 'candidate'))
+
+    for commit in (False, True):
+        db.execute('BEGIN IMMEDIATE')
+        invalidate()
+        assert [(row['target'], row['current']) for row in db.execute('''SELECT i.target,i.current
+            FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq ORDER BY i.seq''')] == [
+                (terminal, 0), (forgotten, 0), (direct, 0), ('forgotten-chunk', 0), ('unaffected', 1)]
+        db.execute('COMMIT' if commit else 'ROLLBACK')
+        if not commit:
+            assert all(row[0] == 1 for row in db.execute('SELECT current FROM vector_items'))
+    assert [tuple(row) for row in db.execute('SELECT rowid,embedding,kind FROM memory_vectors ORDER BY rowid')] == before
+    assert [tuple(row) for row in db.execute('SELECT seq,target,kind,version FROM vector_items ORDER BY seq')] == metadata
+    assert r.store.get(raw['id']) == raw
+
+
 def test_human_exclusion_hides_candidate_and_raw_vectors_without_deleting_history(retrieval, monkeypatch):
     r = retrieval
     target, episode = candidate(r, 'Orion has a private launch checklist.')
@@ -1702,3 +1840,32 @@ def test_legacy_control_token_vectors_upgrade_once_without_changing_history(retr
     monkeypatch.setattr('memento.retrieval.embed_texts', unexpected_reencode)
     restarted = Retrieval(r.graph, model=r.model)
     assert restarted.recall('unmatchedword', effort='cheap')[0]['id'] == literal
+
+
+def test_literal_text_vector_repair_never_reactivates_inactive_metadata(retrieval, monkeypatch):
+    r = retrieval
+    ordinary, _ = assertion(r, 'The ordinary decision remains active.')
+    inactive, _ = assertion(r, 'The inactive source includes literal <eos> text.')
+    index(r, ordinary, .8)
+    index(r, inactive, .7)
+    db = r.store._db
+    db.execute('UPDATE vector_items SET current=0 WHERE target=?', (inactive,))
+    before = db.execute('''SELECT i.seq,v.embedding FROM vector_items i
+        JOIN memory_vectors v ON v.rowid=i.seq WHERE i.target=?''', (inactive,)).fetchone()
+    history = r.graph.history(inactive)
+    db.execute('ALTER TABLE vector_model DROP COLUMN text_encoding')
+    r.model.tokenizer.all_special_tokens = ['<eos>']
+
+    def encode(model, texts):
+        vectors = np.zeros((len(texts), 768), np.float32)
+        vectors[:, 0] = 1
+        return vectors
+
+    monkeypatch.setattr('memento.retrieval.embed_texts', encode)
+    repaired = Retrieval(r.graph, model=r.model)
+    after = db.execute('''SELECT i.seq,i.current,v.embedding FROM vector_items i
+        JOIN memory_vectors v ON v.rowid=i.seq WHERE i.target=?''', (inactive,)).fetchone()
+    assert after['seq'] == before['seq'] and after['embedding'] != before['embedding']
+    assert after['current'] == 0
+    assert r.graph.history(inactive) == history
+    assert [row['id'] for row in repaired.recall('unmatchedword', effort='cheap')] == [ordinary]

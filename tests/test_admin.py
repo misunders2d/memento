@@ -29,7 +29,7 @@ def test_owner_socket_compact_reclaims_disk_and_preserves_raw_fts_graph_vectors(
             evidence=[dict(episode_id=projected['id'], quote='Exact searchable source.')])
         vector = struct.pack('<768f', 1.0, *([0.0] * 767))
         store._db.execute("INSERT INTO vector_items(seq,target,kind,version) VALUES(101,?,'node',1)", (node['id'],))
-        store._db.execute('INSERT INTO memory_vectors(rowid,embedding,current) VALUES(101,?,1)', (vector,))
+        store._db.execute("INSERT INTO memory_vectors(rowid,embedding,kind) VALUES(101,?,'node')", (vector,))
         while store.compress_raw_step():
             pass
         store._db.execute('CREATE TABLE discarded(payload BLOB)')

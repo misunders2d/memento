@@ -643,7 +643,7 @@ class Consolidator:
         for candidate in candidates:
             queue = []
             vector = db.execute('''SELECT v.embedding FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
-                WHERE i.target=? AND i.kind='candidate' AND v.current=1''', (candidate['id'],)).fetchone()
+                WHERE i.target=? AND i.kind='candidate' AND i.current=1''', (candidate['id'],)).fetchone()
             if candidate['kind'] != 'relation':
                 exact = [item['id'] for item in self.graph._exact_identities(candidate['type'], candidate['text'])]
                 # Typed lexical lookup needs no vector: tick can consolidate before
@@ -667,9 +667,9 @@ class Consolidator:
                         ORDER BY bm25(node_fts),n.id LIMIT 8''', (match, candidate['type']))]
                 semantic = [] if vector is None else [row['target'] for row in db.execute('''SELECT i.target
                     FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-                    WHERE v.embedding MATCH ? AND k=2 AND v.current=1
+                    WHERE v.embedding MATCH ? AND k=2 AND v.kind='node'
                     AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN node_versions n
-                        ON n.id=i.target AND n.version=i.version WHERE i.kind='node' AND n.type=?
+                        ON n.id=i.target AND n.version=i.version WHERE i.kind='node' AND i.current=1 AND n.type=?
                         AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id))
                     ORDER BY v.distance''', (vector['embedding'], candidate['type']))]
                 # Reserved checks alternate lexical and same-type semantic hits so
@@ -683,8 +683,8 @@ class Consolidator:
             if vector is not None:
                 queue.extend(item['target'] for item in db.execute('''SELECT i.target FROM memory_vectors v
                     JOIN vector_items i ON i.seq=v.rowid
-                    WHERE v.embedding MATCH ? AND k=8 AND v.current=1
-                    AND v.rowid IN (SELECT seq FROM vector_items WHERE kind='node') ORDER BY v.distance''',
+                    WHERE v.embedding MATCH ? AND k=8 AND v.kind='node'
+                    AND v.rowid IN (SELECT seq FROM vector_items WHERE kind='node' AND current=1) ORDER BY v.distance''',
                     (vector['embedding'],)))
             queue.extend(item['id'] for item in self.graph.recall_keywords(candidate['text'][:512], 8))
             optional[candidate['id']] = list(dict.fromkeys(queue))

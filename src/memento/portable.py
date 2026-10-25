@@ -17,7 +17,7 @@ import sqlite_vec
 
 from .blobs import BlobStore
 from .raw_text import runs, validate_frames
-from .schema import LEGACY_VERSION, VERSION as SCHEMA_VERSION, check_version
+from .schema import VERSION as SCHEMA_VERSION, check_version, upgrade_vector_partitions
 from .drive_connect import public_binding, read_binding, check_binding, _publish
 
 _FORMAT = 'memento-portable'
@@ -335,9 +335,10 @@ def import_archive(archive_path: Path, destination: Path):
                 db.execute('DELETE FROM cold_transfers')
                 db.execute('DELETE FROM cold_failures')
                 db.execute('DELETE FROM backups')
-                # A legacy header restored by frame-aware code may already hold
-                # frames; mark it so a pre-frame image cannot serve it later.
-                if schema_version == LEGACY_VERSION:
+                # Upgrade the private staged database before publication;
+                # older writers must refuse its partitioned vector layout.
+                upgrade_vector_partitions(db)
+                if schema_version < SCHEMA_VERSION:
                     db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
             if db.execute('PRAGMA foreign_key_check').fetchone() is not None:
                 raise ValueError('Imported database foreign key check failed')
@@ -364,7 +365,7 @@ def import_archive(archive_path: Path, destination: Path):
                     self_contained=not remote_count, drive=drive,
                     rebased=(['blobs.tier=hot', 'blobs.remote_id=NULL'] if version == 1 else ['blobs.tier']) +
                             ['cold_transfers', 'cold_failures', 'backups'] +
-                            (['user_version'] if schema_version == LEGACY_VERSION else []))
+                            (['user_version'] if schema_version < SCHEMA_VERSION else []))
     finally:
         if stage.exists():
             shutil.rmtree(stage)

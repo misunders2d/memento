@@ -13,7 +13,7 @@ from memento.blobs import BlobStore
 from memento.cold_manager import ColdManager
 from memento.graph import Graph
 from memento.portable import export_archive, import_archive
-from memento.schema import LEGACY_VERSION, PARKING_VERSION, VERSION
+from memento.schema import LEGACY_VERSION, VERSION
 from memento.store import Store
 from test_cold import DirectoryColdFixture
 from test_raw_text import episode
@@ -109,8 +109,7 @@ def test_legacy_header_with_frames_is_marked_atomically_and_reads_exactly(tmp_pa
 def _future_database(path):
     with closing(sqlite3.connect(path)) as db:
         db.execute('CREATE TABLE blobs (sha256 TEXT, size INTEGER, remote_id TEXT, tier TEXT)')
-        # Header 3 is the explicit historical-parking header; the first unknown one follows it.
-        db.execute(f'PRAGMA user_version={PARKING_VERSION + 1}')
+        db.execute(f'PRAGMA user_version={VERSION + 1}')
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -119,7 +118,7 @@ def test_unknown_future_header_is_refused_before_any_file_change(tmp_path):
     data.mkdir(mode=0o700)
     path = data / 'memory.sqlite'
     digest = _future_database(path)
-    with pytest.raises(RuntimeError, match=f'Unsupported database schema version: {PARKING_VERSION + 1}'):
+    with pytest.raises(RuntimeError, match=f'Unsupported database schema version: {VERSION + 1}'):
         Store(data)
     assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
     assert not (data / 'memory.sqlite-wal').exists() and not (data / 'memory.sqlite-shm').exists()

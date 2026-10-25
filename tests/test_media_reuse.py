@@ -118,7 +118,7 @@ def test_incomplete_or_incompatible_representation_is_not_reused(media, invalida
     if invalidate == 'missing':
         db.execute('DELETE FROM memory_vectors WHERE rowid=?', (vector,))
     elif invalidate == 'inactive':
-        db.execute('UPDATE memory_vectors SET current=0 WHERE rowid=?', (vector,))
+        db.execute('UPDATE vector_items SET current=0 WHERE seq=?', (vector,))
     else:
         db.execute("UPDATE media_representations SET identity='other-decoder' WHERE node_id=?", (first['id'],))
     second = save(media, sha256, evidence, 'captured', captured=True)

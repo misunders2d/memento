@@ -11,6 +11,7 @@ import pytest
 from memento.curation import attach
 from memento.graph import Graph
 from memento.portable import _connect
+from memento.schema import VERSION
 from memento.store import Store
 from test_curation import curated  # noqa: F401  (fixture reuse)
 
@@ -23,13 +24,13 @@ LEGACY_TRIGGER = """CREATE TRIGGER node_index AFTER INSERT ON node_versions
 def _vector(store, node_id, version=1, data=VECTOR):
     seq = store._db.execute("INSERT INTO vector_items(target,kind,version) VALUES (?,'node',?)",
                             (node_id, version)).lastrowid
-    store._db.execute('INSERT INTO memory_vectors(rowid,embedding,current) VALUES (?,?,1)', (seq, data))
+    store._db.execute("INSERT INTO memory_vectors(rowid,embedding,kind) VALUES (?,?,'node')", (seq, data))
     return seq
 
 
 def _indexed(store, node_id):
     return [(row['version'], row['current'], row['embedding']) for row in store._db.execute('''
-        SELECT i.version,v.current,v.embedding FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
+        SELECT i.version,i.current,v.embedding FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
         WHERE i.kind='node' AND i.target=? ORDER BY i.version''', (node_id,))]
 
 
@@ -196,7 +197,7 @@ def test_legacy_all_version_index_upgrades_once_atomically_and_idempotently(tmp_
         names = {row[0] for row in db.execute('SELECT name FROM sqlite_schema')}
         assert 'node_index' in names and 'node_index_current_v1' not in names and 'node_fts_documents' not in names
         assert db.execute('SELECT count(*) FROM node_fts').fetchone()[0] == 6
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert db.execute('PRAGMA user_version').fetchone()[0] == VERSION
     finally:
         db.close()
     caplog.clear()
@@ -205,7 +206,7 @@ def test_legacy_all_version_index_upgrades_once_atomically_and_idempotently(tmp_
         assert len([r for r in caplog.records if r.name == 'memento.schema' and 'text index' in r.getMessage()]) == 2
         names = {row[0] for row in reopened._db.execute('SELECT name FROM sqlite_schema')}
         assert 'node_index' not in names and 'node_index_current_v1' in names
-        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert reopened._db.execute('PRAGMA user_version').fetchone()[0] == VERSION
         _consistent_documents(reopened._db)
         assert reopened._db.execute('SELECT count(*) FROM node_versions').fetchone()[0] == 6
         graph = Graph(reopened)

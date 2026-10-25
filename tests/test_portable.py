@@ -86,7 +86,7 @@ def portable(tmp_path):
     db.execute("INSERT INTO vector_model(singleton,model_id,revision,dimensions) VALUES (1,'synthetic','fixed',768)")
     seq = db.execute("INSERT INTO vector_items(target,kind,version) VALUES (?,'node',1)", (node['id'],)).lastrowid
     vector = struct.pack('<768f', 1.0, *([0.0] * 767))
-    db.execute('INSERT INTO memory_vectors(rowid,embedding,current) VALUES (?,?,1)', (seq, vector))
+    db.execute("INSERT INTO memory_vectors(rowid,embedding,kind) VALUES (?,?,'node')", (seq, vector))
     db.execute('''INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts,owner,lease_until)
                   VALUES ('queued','media/queued','media',?,'leased',0,1,'old-owner',123)''',
                (json.dumps({'sha256': sha}),))

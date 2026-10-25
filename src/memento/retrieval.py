@@ -37,6 +37,15 @@ ENTITY_ANCHOR_TERMS = 64
 MEDIA_COSINE_FLOORS = {'image': 0.67, 'audio': 0.645, 'text': TEXT_COSINE_FLOOR}
 
 
+def _nearest_vectors(db, vector, limit, kind, eligible, parameters=()):
+    """Exact eligible top-K; the physical partition avoids unrelated vector bytes."""
+    return db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
+        FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
+        WHERE v.embedding MATCH ? AND k=? AND v.kind=?
+        AND v.rowid IN (SELECT seq FROM vector_items WHERE current=1 AND seq IN ({eligible}))
+        ORDER BY v.distance''', (vector, limit, kind, *parameters)).fetchall()
+
+
 def _episode_units(episodes='episodes'):
     return f'''SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,
         x.episode_id,x.start,x.end,2 AS priority,NULL AS scope,x.rowid AS position
@@ -374,14 +383,14 @@ class Retrieval:
             if node['type'] != candidate['type']:
                 continue
             old = db.execute('''SELECT v.embedding FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-                WHERE i.target=? AND i.kind='node' AND i.version=? AND v.current=1''',
+                WHERE i.target=? AND i.kind='node' AND i.version=? AND i.current=1''',
                 (node['id'], node['version'])).fetchone()
             cosine = float(np.clip(np.dot(vector, np.frombuffer(old['embedding'], np.float32)), -1, 1)) if old else None
             matches[node['id']] = dict(target=node['id'], version=node['version'], cosine=cosine, name_match=1)
         semantic = db.execute('''SELECT i.target,i.version,1-v.distance AS cosine FROM memory_vectors v
-            JOIN vector_items i ON i.seq=v.rowid WHERE v.embedding MATCH ? AND k=5 AND v.current=1
+            JOIN vector_items i ON i.seq=v.rowid WHERE v.embedding MATCH ? AND k=5 AND v.kind='node'
             AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN node_versions n
-                ON n.id=i.target AND n.version=i.version WHERE i.kind='node' AND n.type=?
+                ON n.id=i.target AND n.version=i.version WHERE i.kind='node' AND i.current=1 AND n.type=?
                 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id))
             ORDER BY v.distance''', (vector.tobytes(), candidate['type'])).fetchall()
         for node in semantic:
@@ -409,8 +418,8 @@ class Retrieval:
             return 0
         cursor = db.execute('INSERT INTO vector_items(target,kind,version) VALUES (?,?,?)',
                             (target, kind, version))
-        db.execute('INSERT INTO memory_vectors(rowid,embedding,current) VALUES (?,?,1)',
-                   (cursor.lastrowid, vector.tobytes()))
+        db.execute('INSERT INTO memory_vectors(rowid,embedding,kind) VALUES (?,?,?)',
+                   (cursor.lastrowid, vector.tobytes(), kind))
         return 1
 
     def _candidate_record(self, target, db=None):
@@ -492,12 +501,9 @@ class Retrieval:
     def _historical_passages(self, query, vector, limit, db, *, keyword=True):
         """Bounded unverified passages from parked raw history: existing chunk vectors, existing floor, literal FTS."""
         found = {}
-        rows = db.execute(f'''SELECT i.target,1-v.distance AS cosine
-            FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-            WHERE v.embedding MATCH ? AND k=? AND v.current=1
-            AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target
-                JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode' AND {HISTORICAL_RAW_SQL})
-            ORDER BY v.distance''', (vector.tobytes(), max(8, limit * 4))).fetchall()
+        rows = _nearest_vectors(db, vector.tobytes(), max(8, limit * 4), 'episode',
+            f'''SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target
+                JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode' AND {HISTORICAL_RAW_SQL}''')
         for row in rows:
             if row['cosine'] < TEXT_COSINE_FLOOR:
                 continue
@@ -523,14 +529,11 @@ class Retrieval:
     def _automatic_fallback(self, query, vector, ranked_at, limit, db):
         """No meaningful current memory: at most one parked candidate and one unverified passage."""
         items = []
-        rows = db.execute(f'''SELECT i.target,1-v.distance AS cosine
-            FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-            WHERE v.embedding MATCH ? AND k=4 AND v.current=1
-            AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN candidates c ON c.id=i.target
+        rows = _nearest_vectors(db, vector.tobytes(), 4, 'candidate',
+            f'''SELECT i.seq FROM vector_items i JOIN candidates c ON c.id=i.target
                 JOIN historical_parked_candidates h ON h.candidate_id=c.id AND h.released_at IS NULL
                 WHERE i.kind='candidate' AND c.kind='memory' AND c.type NOT IN ({_ENTITY_SQL})
-                AND {ACTIVE_CANDIDATE_SQL})
-            ORDER BY v.distance''', (vector.tobytes(),)).fetchall()
+                AND {ACTIVE_CANDIDATE_SQL}''')
         for row in rows:
             if row['cosine'] < AUTOMATIC_COSINE_FLOOR:
                 break
@@ -897,14 +900,12 @@ class Retrieval:
                 return anchors
             rows = []
             for kind in ('node', 'candidate', 'segment'):
-                rows.extend(db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
-                    FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-                    WHERE v.embedding MATCH ? AND k=? AND v.current=1
-                    AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({_AUTOMATIC_ELIGIBLE}) a
+                rows.extend(_nearest_vectors(db, vector.tobytes(), min(120, max(24, limit * 20)), kind,
+                    f'''SELECT i.seq FROM vector_items i JOIN ({_AUTOMATIC_ELIGIBLE}) a
                         ON a.id=i.target AND a.kind=i.kind AND a.version=i.version
-                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?)))
-                    ORDER BY v.distance''',
-                    (vector.tobytes(), min(120, max(24, limit * 20)), kind, scope, scope)).fetchall())
+                        WHERE i.kind=? AND a.kind=?
+                        AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?))''',
+                    (kind, kind, scope, scope)))
             matches = {}
             context_only = {}
             for row in sorted(rows, key=lambda item: (-item['cosine'], item['target'])):
@@ -1052,14 +1053,12 @@ class Retrieval:
             rows = []
             kinds = ('node', 'segment', 'candidate', 'episode') if effort == 'deep' and scope is None else ('node', 'segment', 'candidate')
             for kind in kinds:
-                rows.extend(db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
-                    FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-                    WHERE v.embedding MATCH ? AND k=? AND v.current=1
-                    AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({_RECALL_ELIGIBLE}) a
+                rows.extend(_nearest_vectors(db, query_vector.tobytes(), min(1000, limit * 20), kind,
+                    f'''SELECT i.seq FROM vector_items i JOIN ({_RECALL_ELIGIBLE}) a
                         ON a.id=i.target AND a.kind=i.kind AND a.version=i.version
-                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?)))
-                    ORDER BY v.distance''',
-                    (query_vector.tobytes(), min(1000, limit * 20), kind, scope, scope)).fetchall())
+                        WHERE i.kind=? AND a.kind=?
+                        AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?))''',
+                    (kind, kind, scope, scope)))
             keyword_ids = set(matches)
             seen_raw = set()
             for row in rows:
@@ -1208,7 +1207,7 @@ class Retrieval:
                     WHERE f.source=e.source AND f.event_id=e.event_id)),
                 indexed_units AS MATERIALIZED (
                 SELECT i.target,i.kind,i.version FROM memory_vectors v
-                JOIN vector_items i ON i.seq=v.rowid WHERE v.current=1),
+                JOIN vector_items i ON i.seq=v.rowid WHERE i.current=1),
                 units AS (
                 SELECT a.* FROM ({eligible}) a WHERE ? IS NULL
                 OR EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id

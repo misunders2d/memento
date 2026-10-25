@@ -498,9 +498,8 @@ class Graph:
              previous['valid_from'], valid_at if kind == 'change' else previous['valid_to'],
              replacement_id, previous['pinned'], previous['scope']))
         self._evidence(old, version, evidence)
-        self.store._db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN (
-            SELECT seq FROM vector_items WHERE (kind='node' AND target=?)
-            OR (kind='segment' AND target IN (SELECT id FROM segments WHERE node_id=?)))''',
+        self.store._db.execute('''UPDATE vector_items SET current=0 WHERE (kind='node' AND target=?)
+            OR (kind='segment' AND target IN (SELECT id FROM segments WHERE node_id=?))''',
             (old, old))
         edge_id = uuid4().hex[:12]
         self.store._db.execute('INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)',

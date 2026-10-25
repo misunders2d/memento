@@ -78,8 +78,8 @@ def _exclude(graph, commit, record):
                  node['superseded_by'], node['pinned'], node['scope']))
             db.execute('''INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote
                 FROM graph_evidence WHERE target=? AND version=?''', (version, target, node['version']))
-        db.execute('''UPDATE memory_vectors SET current=0 WHERE rowid IN (SELECT seq FROM vector_items
-            WHERE (kind='node' AND target=?) OR (kind='segment' AND target IN (SELECT id FROM segments WHERE node_id=?)))''',
+        db.execute('''UPDATE vector_items SET current=0
+            WHERE (kind='node' AND target=?) OR (kind='segment' AND target IN (SELECT id FROM segments WHERE node_id=?))''',
             (target, target))
     for target in record['edges']:
         edge = db.execute('SELECT * FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1', (target,)).fetchone()

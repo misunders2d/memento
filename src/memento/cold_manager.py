@@ -362,6 +362,11 @@ class ColdManager:
         (destination / 'memory.sqlite').chmod(0o600)
         restored = sqlite3.connect(destination / 'memory.sqlite')
         try:
+            restored.enable_load_extension(True)
+            try:
+                sqlite_vec.load(restored)
+            finally:
+                restored.enable_load_extension(False)
             # Refuse an unknown header before any artifact download or startup upgrade.
             check_version(restored)
             artifacts = restored.execute("SELECT sha256,remote_id FROM blobs WHERE tier='hot'").fetchall()

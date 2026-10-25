@@ -36,14 +36,14 @@ def test_pin_requires_review_preserves_evidence_and_reuses_unchanged_vector(cura
     node = remember('memory', 'knowledge', 'Preserve this decision.')
     seq = store._db.execute('INSERT INTO vector_items(target,kind,version) VALUES (?,\'node\',1)', (node['id'],)).lastrowid
     vector = struct.pack('768f', 1, *([0] * 767))
-    store._db.execute('INSERT INTO memory_vectors(rowid,embedding,current) VALUES (?,?,1)', (seq, vector))
+    store._db.execute("INSERT INTO memory_vectors(rowid,embedding,kind) VALUES (?,?,'node')", (seq, vector))
     proposal = review(dict(op='pin', node_id=node['id'], pinned=True), 'pin-request')
     assert graph.history(node['id'])[-1]['pinned'] == 0
     approve(proposal, 'pin-approved')
     history = graph.history(node['id'])
     assert [row['pinned'] for row in history] == [0, 1]
     assert history[0]['evidence'] == history[1]['evidence']
-    indexed = store._db.execute('''SELECT i.version,v.current,v.embedding FROM vector_items i
+    indexed = store._db.execute('''SELECT i.version,i.current,v.embedding FROM vector_items i
         JOIN memory_vectors v ON v.rowid=i.seq WHERE i.target=? ORDER BY i.version''', (node['id'],)).fetchall()
     # The unchanged text's single derived vector row moves to the new version.
     assert [(row['version'], row['current']) for row in indexed] == [(2, 1)]

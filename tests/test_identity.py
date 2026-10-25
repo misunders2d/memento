@@ -581,7 +581,7 @@ def test_vector_only_same_type_match_gets_a_reserved_check(world):
     vector = struct.pack('768f', 1, *([0] * 767))
     for target, kind in ((related, 'node'), (candidate, 'candidate')):
         seq = store._db.execute('INSERT INTO vector_items(target,kind,version) VALUES (?,?,1)', (target, kind)).lastrowid
-        store._db.execute('INSERT INTO memory_vectors(rowid,embedding,current) VALUES (?,?,1)', (seq, vector))
+        store._db.execute('INSERT INTO memory_vectors(rowid,embedding,kind) VALUES (?,?,?)', (seq, vector, kind))
     context = consolidate()['input']
     assert context['candidates'][0]['identity'] == dict(exact=[], exact_total=0, similar=[related])
     assert origin['id'] in {item['episode_id'] for item in context['raw_windows']}
