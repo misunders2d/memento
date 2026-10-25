@@ -3,8 +3,10 @@
 import hashlib
 import json
 import logging
+import os
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from threading import Event, RLock, Thread
 
@@ -17,6 +19,8 @@ from .text_chunks import TextChunk, chunks
 from .importance import query_key, query_recency
 from .captured_media import active_references, visible_sql
 from .store import GOAL_CONTEXT_PREFIX, LEGACY_CONTEXT_PREFIX, legacy_native_context
+from .ann import Projection
+from .qdrant import SearchUnavailable
 
 MODEL_ID = 'google/embeddinggemma-2'
 MODEL_REVISION = '914f7f89142e33e77833254d9c9b90c3cef7303b'
@@ -192,6 +196,118 @@ class Retrieval:
             except BaseException:
                 db.execute('ROLLBACK')
                 raise
+        self._projection = (Projection(self.store, EMBED_DIM,
+            dict(model_id=MODEL_ID, revision=MODEL_REVISION, dimensions=EMBED_DIM, projection=1),
+            self._projection_payloads) if 'MEMENTO_QDRANT_BINARY' in os.environ else None)
+        self.graph._retrieval = self
+
+    @contextmanager
+    def _snapshot(self):
+        with (self._projection.snapshot() if self._projection is not None else self.store.read_snapshot()) as db:
+            yield db
+
+    def _vector_rows(self, db, vector, limit, *, kind, pool, scope=None, type=None):
+        if self._projection is not None:
+            return self._projection.search(db, vector, limit, kind=kind, pool=pool, scope=scope, type=type)
+        # Explicitly unconfigured standalone installations retain their existing
+        # SQLite engine. A configured projection never reaches this branch.
+        if pool in ('ordinary', 'automatic'):
+            eligible = _RECALL_ELIGIBLE if pool == 'ordinary' else _AUTOMATIC_ELIGIBLE
+            where = f'''v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({eligible}) a
+                ON a.id=i.target AND a.kind=i.kind AND a.version=i.version
+                WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?)))'''
+            parameters = (kind, scope, scope)
+        elif pool == 'entity':
+            where = '''v.rowid IN (SELECT i.seq FROM vector_items i JOIN node_versions n
+                ON n.id=i.target AND n.version=i.version WHERE i.kind='node' AND n.type=?
+                AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id))'''
+            parameters = (type,)
+        elif pool == 'historical':
+            where = f'''v.rowid IN (SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target
+                JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode' AND {HISTORICAL_RAW_SQL})'''
+            parameters = ()
+        elif pool == 'parked_candidate':
+            where = f'''v.rowid IN (SELECT i.seq FROM vector_items i JOIN candidates c ON c.id=i.target
+                JOIN historical_parked_candidates h ON h.candidate_id=c.id AND h.released_at IS NULL
+                WHERE i.kind='candidate' AND c.kind='memory' AND c.type NOT IN ({_ENTITY_SQL})
+                AND {ACTIVE_CANDIDATE_SQL})'''
+            parameters = ()
+        else:
+            raise ValueError('Unknown vector eligibility pool')
+        return db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
+            FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
+            WHERE v.embedding MATCH ? AND k=? AND v.current=1 AND {where}
+            ORDER BY v.distance''', (vector.tobytes(), limit, *parameters)).fetchall()
+
+    def _projection_payloads(self, db, rows):
+        """Query-independent eligibility from the very same evidence snapshot.
+
+        Every lookup uses stable indexed IDs; no source-body hydration or global
+        vector scan is needed for an incremental payload update.
+        """
+        result, entity_types = {}, {}
+        for row in rows:
+            kind, target, version = row['kind'], row['target'], row['version']
+            flags = dict(kind=kind, type='', current=bool(row['current']), ordinary=False,
+                automatic=False, historical=False, parked_candidate=False, entity=False,
+                personal=False, professional=False)
+            record = None
+            if kind == 'node':
+                record = db.execute('''SELECT n.id,n.type,substr(n.text,1,240) AS text,n.scope
+                    FROM node_versions n WHERE n.id=? AND n.version=? AND n.state='active'
+                    AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+                    AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id)
+                    AND ''' + visible_sql(), (target, version)).fetchone()
+                if record is not None:
+                    flags['ordinary'] = record['type'] != 'media'
+                    flags['entity'] = True  # _match_entity also supplies the exact type.
+            elif kind == 'candidate':
+                record = self._candidate_record(target, db=db)
+                flags['ordinary'] = record is not None
+            elif kind == 'segment':
+                record = self._automatic_record(row, db=db)
+                flags['ordinary'] = record is not None
+            elif kind == 'episode':
+                episode = db.execute(f'''SELECT e.source,e.kind,e.metadata,
+                    coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip'
+                    AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)
+                    AS ordinary,({HISTORICAL_RAW_SQL}) AS historical,
+                    CASE WHEN e.kind='user' AND e.source GLOB 'native:*:codex'
+                        AND (substr(e.text,1,?)=? OR substr(e.text,1,?)=?) THEN e.text ELSE '' END AS legacy_text
+                    FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id WHERE x.id=?''',
+                    (len(LEGACY_CONTEXT_PREFIX), LEGACY_CONTEXT_PREFIX,
+                     len(GOAL_CONTEXT_PREFIX), GOAL_CONTEXT_PREFIX, target)).fetchone()
+                if episode is not None:
+                    flags['type'] = 'raw_episode'
+                    flags['ordinary'] = bool(episode['ordinary'])
+                    flags['historical'] = bool(episode['historical']) and not legacy_native_context(
+                        episode['source'], episode['kind'], episode['legacy_text'], episode['metadata'])
+            if record is not None:
+                flags['type'] = record['type']
+                scope = json.loads(record['scope']) if isinstance(record['scope'], str) else record['scope']
+                flags.update(personal='personal' in scope, professional='professional' in scope)
+                if record['type'] not in entity_types:
+                    entity_types[record['type']] = record['type'] in ENTITY_TYPES or db.execute(
+                        "SELECT 1 FROM memory_types WHERE name=? AND category='entity'", (record['type'],)).fetchone() is not None
+                entity = entity_types[record['type']]
+                parent = record['id']
+                parent_version = record.get('version', version) if isinstance(record, dict) else version
+                if kind == 'segment':
+                    parent_version = record['version']
+                legacy = self._legacy_context_only(parent, parent_version, db=db)
+                content = kind == 'segment' or _automatic_content(record['text'])
+                if kind == 'candidate':
+                    memory = record['candidate_kind'] == 'memory' and record['type'] not in ENTITY_TYPES
+                    flags['automatic'] = (memory and not entity and record['type'] != 'experience'
+                                          and not record['historical'] and content and not legacy)
+                    flags['parked_candidate'] = memory and record['historical'] and content and not legacy
+                elif kind == 'segment':
+                    flags['automatic'] = content and not legacy
+                else:
+                    flags['automatic'] = (not entity and record['type'] != 'media' and content and not legacy
+                        and (record['type'] != 'experience' or self.graph._behavior(parent, db=db) is not None))
+            result[row['seq']] = flags
+        return result
 
     def _upgrade_text_encoding(self):
         """Re-encode legacy control-token text once; keep all raw data and vector IDs."""
@@ -217,6 +333,7 @@ class Retrieval:
                 if not np.isfinite(vector).all() or not np.isclose(np.linalg.norm(vector), 1, atol=0.001):
                     raise ValueError('Invalid literal-text migration embedding')
                 db.execute('UPDATE memory_vectors SET embedding=? WHERE rowid=?', (vector.tobytes(), row['seq']))
+                db.execute('INSERT INTO search_outbox(seq,nonce) VALUES (?,lower(hex(randomblob(16))))', (row['seq'],))
         # Retry the fixed failure class now, but only the normal worker may resolve it.
         for failure in db.execute('SELECT target,version FROM index_failures WHERE resolved=0').fetchall():
             row = db.execute(f'''WITH indexable AS ({_INDEXABLE})
@@ -328,15 +445,21 @@ class Retrieval:
                 # Bound background activations independently of foreground queries.
                 with self._inference:
                     vector = embed_texts(self.model, ['title: none | text: ' + row['text']])[0]
-                prepared.append((row, vector, None))
+                # Association hints are advisory. All search/network work must
+                # finish before entering the indexing writer transaction.
+                try:
+                    hints = self._match_entity(row, vector) if row['kind'] == 'candidate' else []
+                except SearchUnavailable:
+                    hints = []
+                prepared.append((row, vector, None, hints))
             except Exception as error:
-                prepared.append((row, None, error))
+                prepared.append((row, None, error, []))
         with self.store._mutex:
             db = self.store._db
             db.execute('BEGIN IMMEDIATE')
             try:
                 count = 0
-                for row, vector, error in prepared:
+                for row, vector, error, hints in prepared:
                     if not self._indexable(row):
                         continue
                     db.execute('SAVEPOINT index_item')
@@ -345,7 +468,7 @@ class Retrieval:
                             raise error
                         inserted = self._put(row['id'], row['kind'], row['version'], vector)
                         if row['kind'] == 'candidate':
-                            self._match_entity(row, vector)
+                            self._commit_entity_matches(row, hints)
                         db.execute('UPDATE index_failures SET resolved=1 WHERE target=? AND version=?',
                                    (row['id'], row['version']))
                         count += inserted
@@ -370,33 +493,47 @@ class Retrieval:
                 raise
 
     def _match_entity(self, candidate, vector):
-        db = self.store._db
-        if db.execute("SELECT kind FROM candidates WHERE id=?", (candidate['id'],)).fetchone()['kind'] != 'entity':
-            return
+        # Most indexed candidates are ordinary facts. Do not acquire the search
+        # lock or make network requests for those non-entity units.
+        with self.store.read_snapshot() as db:
+            current = db.execute(f"SELECT kind FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE_SQL}",
+                                 (candidate['id'],)).fetchone()
+            if current is None or current['kind'] != 'entity':
+                return []
         vector = np.asarray(vector, dtype=np.float32)
-        matches = {}
-        named = self.graph.recall_keywords(candidate['text'], 20)
-        for node in named:
-            if node['type'] != candidate['type']:
+        with self._snapshot() as db:
+            current = db.execute(f"SELECT kind FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE_SQL}",
+                                 (candidate['id'],)).fetchone()
+            if current is None or current['kind'] != 'entity':
+                return []
+            matches = {}
+            for node in self.graph.recall_keywords(candidate['text'], 20, db=db):
+                if node['type'] != candidate['type']:
+                    continue
+                old = db.execute('''SELECT v.embedding FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
+                    WHERE i.target=? AND i.kind='node' AND i.version=? AND v.current=1''',
+                    (node['id'], node['version'])).fetchone()
+                cosine = float(np.clip(np.dot(vector, np.frombuffer(old['embedding'], np.float32)), -1, 1)) if old else None
+                matches[node['id']] = dict(target=node['id'], version=node['version'], cosine=cosine, name_match=1)
+            for node in self._vector_rows(db, vector, 5, kind='node', pool='entity', type=candidate['type']):
+                if node['cosine'] >= 0.78 and node['target'] not in matches:
+                    matches[node['target']] = dict(target=node['target'], version=node['version'],
+                                                   cosine=node['cosine'], name_match=0)
+            return sorted(matches.values(), key=lambda item:
+                (-item['name_match'], -(item['cosine'] if item['cosine'] is not None else -1), item['target']))[:5]
+
+    def _commit_entity_matches(self, candidate, hints):
+        db = self.store._db
+        if db.execute(f"SELECT 1 FROM candidates c WHERE c.id=? AND c.kind='entity' AND {ACTIVE_CANDIDATE_SQL}",
+                      (candidate['id'],)).fetchone() is None:
+            return
+        for node in hints:
+            if db.execute('''SELECT 1 FROM node_versions n WHERE n.id=? AND n.version=? AND n.type=?
+                AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+                AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id)''',
+                (node['target'], node['version'], candidate['type'])).fetchone() is None:
                 continue
-            old = db.execute('''SELECT v.embedding FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-                WHERE i.target=? AND i.kind='node' AND i.version=? AND v.current=1''',
-                (node['id'], node['version'])).fetchone()
-            cosine = float(np.clip(np.dot(vector, np.frombuffer(old['embedding'], np.float32)), -1, 1)) if old else None
-            matches[node['id']] = dict(target=node['id'], version=node['version'], cosine=cosine, name_match=1)
-        semantic = db.execute('''SELECT i.target,i.version,1-v.distance AS cosine FROM memory_vectors v
-            JOIN vector_items i ON i.seq=v.rowid WHERE v.embedding MATCH ? AND k=5 AND v.current=1
-            AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN node_versions n
-                ON n.id=i.target AND n.version=i.version WHERE i.kind='node' AND n.type=?
-                AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id))
-            ORDER BY v.distance''', (vector.tobytes(), candidate['type'])).fetchall()
-        for node in semantic:
-            if node['cosine'] >= 0.78 and node['target'] not in matches:
-                matches[node['target']] = dict(node, name_match=0)
-        selected = sorted(matches.values(), key=lambda item:
-            (-item['name_match'], -(item['cosine'] if item['cosine'] is not None else -1), item['target']))[:5]
-        for node in selected:
-            db.execute('INSERT INTO candidate_entity_matches VALUES (?,?,?,?,?,?,?,?)',
+            db.execute('INSERT OR IGNORE INTO candidate_entity_matches VALUES (?,?,?,?,?,?,?,?)',
                 (candidate['id'], node['target'], node['version'], node['cosine'], node['name_match'],
                  'native-indexer/' + MODEL_ID + '@' + MODEL_REVISION,
                  'Tentative name/vector association only; no identity merge or primary assertion',
@@ -498,12 +635,7 @@ class Retrieval:
     def _historical_passages(self, query, vector, limit, db, *, keyword=True, ranked_at=None):
         """Bounded unverified passages from parked raw history: existing chunk vectors, existing floor, literal FTS."""
         found = {}
-        rows = db.execute(f'''SELECT i.target,1-v.distance AS cosine
-            FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-            WHERE v.embedding MATCH ? AND k=? AND v.current=1
-            AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target
-                JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode' AND {HISTORICAL_RAW_SQL})
-            ORDER BY v.distance''', (vector.tobytes(), max(8, limit * 4))).fetchall()
+        rows = self._vector_rows(db, vector, max(8, limit * 4), kind='episode', pool='historical')
         for row in rows:
             if row['cosine'] < TEXT_COSINE_FLOOR:
                 continue
@@ -533,14 +665,7 @@ class Retrieval:
         """No meaningful current memory: at most one parked candidate and one unverified passage."""
         items = []
         candidates = []
-        rows = db.execute(f'''SELECT i.target,1-v.distance AS cosine
-            FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-            WHERE v.embedding MATCH ? AND k=4 AND v.current=1
-            AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN candidates c ON c.id=i.target
-                JOIN historical_parked_candidates h ON h.candidate_id=c.id AND h.released_at IS NULL
-                WHERE i.kind='candidate' AND c.kind='memory' AND c.type NOT IN ({_ENTITY_SQL})
-                AND {ACTIVE_CANDIDATE_SQL})
-            ORDER BY v.distance''', (vector.tobytes(),)).fetchall()
+        rows = self._vector_rows(db, vector, 4, kind='candidate', pool='parked_candidate')
         for row in rows:
             if row['cosine'] < AUTOMATIC_COSINE_FLOOR:
                 break
@@ -898,7 +1023,7 @@ class Retrieval:
         ranked_at = datetime.now(timezone.utc)
         # One WAL snapshot serves every read of this request; the writer
         # connection and its mutex stay free for capture, health and commits.
-        with self.store.read_snapshot() as db:
+        with self._snapshot() as db:
             # Named entities spelled in the request anchor the offer; semantic
             # facts fill the remaining slots of the same bounded limit.
             anchors = self._entity_anchors(query, limit, scope, db)
@@ -907,14 +1032,8 @@ class Retrieval:
                 return anchors
             rows = []
             for kind in ('node', 'candidate', 'segment'):
-                rows.extend(db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
-                    FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-                    WHERE v.embedding MATCH ? AND k=? AND v.current=1
-                    AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({_AUTOMATIC_ELIGIBLE}) a
-                        ON a.id=i.target AND a.kind=i.kind AND a.version=i.version
-                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?)))
-                    ORDER BY v.distance''',
-                    (vector.tobytes(), min(120, max(24, limit * 20)), kind, scope, scope)).fetchall())
+                rows.extend(self._vector_rows(db, vector, min(120, max(24, limit * 20)),
+                                             kind=kind, pool='automatic', scope=scope))
             matches = {}
             context_only = {}
             for row in sorted(rows, key=lambda item: (-item['cosine'], item['target'])):
@@ -1015,14 +1134,14 @@ class Retrieval:
             raise ValueError('Invalid automatic recall context')
         if automatic:
             return self._automatic(query, limit, scope, context)
+        with self._query_inference:
+            query_vector = embed_query(self.model, query)
         # One WAL snapshot serves every read of this request; the writer
         # connection and its mutex stay free for capture, health and commits.
-        with self.store.read_snapshot() as db:
+        with self._snapshot() as db:
             keywords = self.graph.recall_keywords(query, min(100, limit * 4),
                                                  scope=scope, include_archived=effort == 'deep', db=db)
             matches = {row['id']: dict(row, score=TEXT_COSINE_FLOOR + 0.25, match='keyword') for row in keywords}
-            with self._query_inference:
-                query_vector = embed_query(self.model, query)
             ranked_at = datetime.now(timezone.utc)
             match = ' '.join('"' + term.replace('"', '""') + '"' for term in query.split())
             segment_keywords = db.execute(f'''SELECT {NODE_SUMMARY},
@@ -1062,14 +1181,8 @@ class Retrieval:
             rows = []
             kinds = ('node', 'segment', 'candidate', 'episode') if effort == 'deep' and scope is None else ('node', 'segment', 'candidate')
             for kind in kinds:
-                rows.extend(db.execute(f'''SELECT i.kind,i.target,i.version,1-v.distance AS cosine
-                    FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
-                    WHERE v.embedding MATCH ? AND k=? AND v.current=1
-                    AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN ({_RECALL_ELIGIBLE}) a
-                        ON a.id=i.target AND a.kind=i.kind AND a.version=i.version
-                        WHERE i.kind=? AND (? IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?)))
-                    ORDER BY v.distance''',
-                    (query_vector.tobytes(), min(1000, limit * 20), kind, scope, scope)).fetchall())
+                rows.extend(self._vector_rows(db, query_vector, min(1000, limit * 20),
+                                             kind=kind, pool='ordinary', scope=scope))
             keyword_ids = set(matches)
             seen_raw = set()
             for row in rows:
@@ -1177,8 +1290,19 @@ class Retrieval:
     def start(self):
         if self._worker is not None:
             raise RuntimeError('Indexer already started')
+        if self._projection is not None:
+            self._projection.start()
         def run():
+            initial_search_ready = self._projection is None
             while not self._stop.is_set():
+                # Match the qualified initial-build CPU/RAM coexistence: the
+                # foreground model stays available, but background encoding
+                # waits for the first coherent projection only.
+                if not initial_search_ready:
+                    if not self._projection.available:
+                        self._stop.wait(.1)
+                        continue
+                    initial_search_ready = True
                 try:
                     processed = self.index_pending(limit=16)
                     self.index_error = None
@@ -1194,6 +1318,8 @@ class Retrieval:
         self._stop.set()
         if self._worker is not None:
             self._worker.join()
+        if self._projection is not None:
+            self._projection.close()
 
     def status(self, source=None):
         """Exact current index-unit counts; unchunked episodes are reported separately."""
@@ -1238,8 +1364,11 @@ class Retrieval:
                 AND NOT EXISTS (SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id)
                 AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)''',
                 (source,) if source is not None else ()).fetchone()[0]
-        return dict(available=True, **dict(row), unprepared_episodes=unprepared,
-                    error=type(self.index_error).__name__ if self.index_error else None)
+        result = dict(available=True, **dict(row), unprepared_episodes=unprepared,
+                      error=type(self.index_error).__name__ if self.index_error else None)
+        if self._projection is not None:
+            result['search'] = dict(engine='qdrant', ready=self._projection.available, error=self._projection.error)
+        return result
 
     def health(self):
         if self.index_error is not None:

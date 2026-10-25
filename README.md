@@ -180,6 +180,10 @@ MEMENTO_EMBEDDINGS=1 uv run memento --data-dir ./data
 
 Run under the intended service identity with private storage, not inside the ordinary agent's identity when testing human-review isolation. This foreground development command does not install a boot service or reproduce Compose's resource limits.
 
+The container includes the pinned Linux x86_64 Qdrant executable and starts it as a private loopback child in the same CPU/RAM limits. Standalone development can select that same pinned executable explicitly with `MEMENTO_QDRANT_BINARY=/absolute/path/to/qdrant`; it accepts no remote search endpoint. Without this setting, standalone development retains the existing SQLite exact engine. A configured missing or failed child never falls back to that slower engine.
+
+SQLite retains the original vectors and all memory authority. The private `data/search/` index is disposable and is excluded from portable/Drive database snapshots. Initial construction and recovery rebuild it from existing vectors without re-embedding. After child startup, capture and health remain available while projection builds or a running child becomes unavailable: `/health` reports `search_ready: false`, and semantic recall returns an explicit 503. Startup may add derived invalidation tables/indexes under the existing SQLite headers 1/2/3; it does not change vector IDs, embedding bytes or evidence. Keep space for the derived index and SQLite WAL while the initial read snapshot is open.
+
 API contracts: `http://127.0.0.1:8765/docs`. Agent-readable installation guide: `http://127.0.0.1:8765/connect`.
 
 ## 2. Install the native server processor

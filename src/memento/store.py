@@ -28,6 +28,7 @@ from .captured_media import references as media_references, record_references
 from .raw_text import (FRAME_BYTES, KINDS as RAW_KINDS, MIME as RAW_MIME,
                        RawTextUnavailable, decode_frame, elide, hydrate, hydrate_frames)
 from .portable import _connect
+from .ann import upgrade as upgrade_search
 
 LEGACY_CONTEXT_PREFIX = '# AGENTS.md instructions'
 GOAL_CONTEXT_PREFIX = '<codex_internal_context source="goal">'
@@ -115,6 +116,7 @@ class Store:
                 self._db.execute('BEGIN IMMEDIATE')
                 try:
                     initialize(self._db)
+                    upgrade_search(self._db)
                     self._db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
                     self._db.execute('COMMIT')
                 except BaseException:
@@ -130,6 +132,7 @@ class Store:
                     upgrade_node_fts(self._db)
                     upgrade_historical_pool(self._db)
                     upgrade_repair_groups(self._db)
+                    upgrade_search(self._db)
                     # The header marks frame-capable storage; it commits with the
                     # physical upgrades so pre-frame readers refuse this file. A
                     # database that ever activated historical parking keeps header 3;

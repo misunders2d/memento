@@ -1,16 +1,19 @@
+FROM qdrant/qdrant@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2 AS qdrant
 FROM python:3.14-slim
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tesseract-ocr \
+    && apt-get install -y --no-install-recommends tesseract-ocr libunwind8 \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 COPY THIRD_PARTY_NOTICES.md ./
+COPY --from=qdrant /qdrant/qdrant /usr/local/bin/memento-qdrant
+COPY src/memento/QDRANT_LICENSE /usr/share/doc/memento-qdrant/LICENSE
 RUN pip install --no-cache-dir uv==0.13.1 \
     && uv sync --frozen --no-dev --extra media --extra embedding --extra drive \
     && mkdir -m 0700 /data && chown 10001:10001 /data
 USER 10001:10001
-ENV MEMENTO_DATA_DIR=/data HF_HOME=/data/models OMP_NUM_THREADS=1
+ENV MEMENTO_DATA_DIR=/data HF_HOME=/data/models OMP_NUM_THREADS=1 MEMENTO_QDRANT_BINARY=/usr/local/bin/memento-qdrant
 EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3)"]

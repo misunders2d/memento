@@ -1,5 +1,12 @@
 # Third-party notices
 
+The service image bundles the unmodified Qdrant 1.20.0 executable from the official
+`qdrant/qdrant@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2` image.
+Qdrant is distributed under the Apache License 2.0; its full license is retained in
+`src/memento/QDRANT_LICENSE` and `/usr/share/doc/memento-qdrant/LICENSE` in the image.
+This bundle pins the Linux x86_64 executable; ARM is not supported by this pin.
+The original project is https://github.com/qdrant/qdrant.
+
 The indexing units, search scoring and many parameters in this project are ported (re-implemented in Python) from
 [DigUp](https://github.com/ARahim3/DigUp), which is distributed under the following license:
 

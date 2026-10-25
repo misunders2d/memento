@@ -20,7 +20,6 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
-from http.client import HTTPException
 import json
 import mimetypes
 import os
@@ -35,7 +34,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from uuid import uuid4
 
 MAX_BODY = 1024 * 1024
@@ -94,7 +92,19 @@ class BridgeResponseError(ValueError):
         super().__init__(self.category)
 
 
+def _http_exception():
+    # Ready-only local claims do not need the HTTP/TLS dependency tree.
+    from http.client import HTTPException
+    return HTTPException
+
+
 def http(config, endpoint, body=None, timeout=1, *, content_type=None):
+    import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, message, headers, url):
+            return None
+
     data = body if isinstance(body, bytes) else None if body is None else encode(body)
     if data is not None and len(data) > (MAX_ATTACHMENT if content_type else MAX_BODY):
         raise ValueError('request body too large')
@@ -123,15 +133,10 @@ def upload_error(error):
             sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
         result = {'category': 'lock'}
     else:
-        result = {'category': 'network' if isinstance(error, (OSError, HTTPException)) else 'validation'}
+        result = {'category': 'network' if isinstance(error, (OSError, _http_exception())) else 'validation'}
     result['action'] = ('Check the reported failure and configured service, then retry the same upload. '
                         'Queued captures are retained.')
     return result
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, message, headers, url):
-        return None
 
 
 def codex_message(record):
@@ -696,7 +701,7 @@ def upload(config_path, config, *, background=False, paths=()):
                             continue
                         stopped = True
                         break
-                    except (OSError, ValueError, HTTPException) as exc:
+                    except (OSError, ValueError, _http_exception()) as exc:
                         failure = {**upload_error(exc), 'outbox_id': identifier}
                         if content_type:
                             failed_blobs.add(identifier)
@@ -943,7 +948,7 @@ def passive(spool, conversation, query, cwd=None, *, budget=CONTEXT_BYTES, notic
         result = recall_fetch(spool.config, dict(query=query, previous=previous[0] if previous else ''), RECALL_WAIT)
         return recall_offer(spool, conversation, query, result, budget=budget,
                             notice_in_context=notice_in_context, harness=harness)
-    except (OSError, ValueError, TypeError, HTTPException):
+    except (OSError, ValueError, TypeError, _http_exception()):
         return {**recall_cached(spool, conversation, query, budget), 'error': 'recall_unavailable'}
 
 
@@ -992,7 +997,7 @@ def recall_worker(config_path, config, conversation, owner):
             request = state['latest']
             try:
                 result = recall_fetch(config, request, max(.01, deadline - time.time()))
-            except (OSError, ValueError, TypeError, HTTPException):
+            except (OSError, ValueError, TypeError, _http_exception()):
                 result = {'error': 'recall_unavailable'}
             spool.db.execute('BEGIN IMMEDIATE')
             state = recall_state(spool, conversation)
@@ -1325,7 +1330,7 @@ def hook(spool, harness, data, *, recall=automatic):
             quotes = unresolved_quotes(command)
             if quotes:
                 flush_conversation(spool, harness, conversation, quotes)
-        except (OSError, ValueError, sqlite3.Error, HTTPException):
+        except (OSError, ValueError, sqlite3.Error, _http_exception()):
             return {'hookSpecificOutput': {'hookEventName': event, 'permissionDecision': 'deny',
                     'permissionDecisionReason': 'Memento current-conversation capture is pending; retry after upload.'}}
         if harness == 'codex':
@@ -1395,7 +1400,7 @@ def agy_hook(spool, event, data, *, recall=automatic):
             quotes = unresolved_quotes(command)
             if quotes:
                 flush_conversation(spool, 'agy', conversation, quotes)
-        except (OSError, ValueError, sqlite3.Error, HTTPException):
+        except (OSError, ValueError, sqlite3.Error, _http_exception()):
             return {'decision': 'deny', 'reason': 'Memento current-conversation capture is pending; retry after upload.'}
         if any(command.get(key) != value for key, value in expected.items()):
             return {'decision': 'deny', 'reason': 'Retry this Memento command with ' + encode(expected).decode('utf-8')}
@@ -1521,6 +1526,7 @@ def install(config_path, native_config_dir=None):
     if harness in ('pi', 'omp'):
         destination = root / 'extensions' / 'memento'
         for remote, name in (('/integrations/' + harness, 'index.ts'), ('/integrations/shared', 'native_shared.ts')):
+            import urllib.request
             request = urllib.request.Request(config['url'].rstrip('/') + remote)
             with urllib.request.urlopen(request, timeout=15) as response:
                 content = response.read(4 * MAX_BODY + 1)
@@ -1705,7 +1711,7 @@ def main(argv=None):
             # Antigravity requires a JSON object on stdout, including no output.
             print(json.dumps(result or {}, ensure_ascii=False))
         return 0
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, HTTPException) as exc:
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, _http_exception()) as exc:
         if deferred_capture and isinstance(exc, sqlite3.Error):
             # A busy writer must not consume the foreground allowance or stop
             # recovery of the already registered transcript after it releases.

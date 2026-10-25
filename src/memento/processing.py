@@ -441,6 +441,8 @@ class Processing:
                 job = self.queue.claim([kind], exclude=exclude)
                 if job is None:
                     break
+                handler = self.extractor if kind == 'extract' else self.consolidator
+                discovery = self.consolidator.prepare_discovery(job) if kind == 'consolidate' else None
                 with self.store._mutex:
                     prior = self.store._db.execute('SELECT result FROM graph_commits WHERE command_id=?',
                                                    (kind + '/' + job.id,)).fetchone()
@@ -448,13 +450,12 @@ class Processing:
                         self.queue.complete(job, json.loads(prior['result']))
                         schedule()
                         continue
-                    handler = self.extractor if kind == 'extract' else self.consolidator
                     # Bounded feedback from this job's last rejected output survives in
                     # the private context until a later rejection replaces it.
                     previous = self.store._db.execute('SELECT context FROM jobs WHERE id=?', (job.id,)).fetchone()
                     rejection = (json.loads(previous['context']).get('previous_rejection')
                                  if previous and previous['context'] else None)
-                    context = handler.prepare(job)
+                    context = (handler.prepare(job, discovery=discovery) if kind == 'consolidate' else handler.prepare(job))
                     if rejection is not None:
                         context['previous_rejection'] = rejection
                     self.store._db.execute('UPDATE jobs SET context=? WHERE id=? AND owner=?',

@@ -26,6 +26,53 @@ def pending(spool, endpoint='/episodes'):
         'SELECT body FROM outbox WHERE endpoint=? ORDER BY id', (endpoint,))]
 
 
+def test_fresh_local_ready_claim_does_not_load_http_or_tls(tmp_path):
+    import subprocess
+    import sys
+
+    result = subprocess.run([sys.executable, '-c', '''
+import sys
+from memento import bridge
+config = dict(uid=1000, client_uid='local-claim', url='http://127.0.0.1:1')
+spool = bridge.Spool(sys.argv[1], config)
+try:
+    assert bridge.native(spool, dict(harness='pi', session_id='local', action='recall-ready', turn='unowned')) == {'pending': False}
+    assert 'http.client' not in sys.modules
+    assert 'urllib.request' not in sys.modules
+    assert 'ssl' not in sys.modules
+finally:
+    spool.close()
+''', str(tmp_path / 'runner.json')], capture_output=True, text=True, timeout=3)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize('status', [302, 307])
+def test_http_redirect_never_resends_captured_evidence(status):
+    calls = []
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls.append(self.path)
+            self.send_response(status if self.path == '/episodes' else 200)
+            self.send_header('Location', '/redirected')
+            self.end_headers()
+        do_GET = do_POST
+        def log_message(self, *_args):
+            pass
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(bridge.urllib.error.HTTPError) as rejected:
+            bridge.http(dict(url=f'http://127.0.0.1:{server.server_port}'), '/episodes',
+                        {'text': 'Synthetic evidence must stay at its configured endpoint.'})
+        assert rejected.value.code == status
+        assert calls == ['/episodes']
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_exact_unicode_chunks_survive_restart(tmp_path):
     spool = spool_at(tmp_path)
     text = ('𝄞é中文\n"\\' * 120000)

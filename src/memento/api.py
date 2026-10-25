@@ -21,6 +21,7 @@ from .blobs import BlobStore
 from .artifacts import Artifacts
 from .jobs import LostLease
 from .raw_text import RawTextUnavailable
+from .qdrant import SearchUnavailable
 from .viewer import install as install_viewer
 
 
@@ -389,6 +390,10 @@ def create_app(data_dir: Path) -> FastAPI:
     async def missing_raw_source(request, error):
         return Response(json.dumps({'detail': str(error)}), status_code=503, media_type='application/json')
 
+    @app.exception_handler(SearchUnavailable)
+    async def missing_search_index(request, error):
+        return Response(json.dumps({'detail': str(error)}), status_code=503, media_type='application/json')
+
     @app.get('/health')
     def health():
         app.state.store.health()
@@ -403,7 +408,13 @@ def create_app(data_dir: Path) -> FastAPI:
             cold = app.state.cold_runtime
             raise HTTPException(503, dict(error='Cold archival incomplete',
                 archive_error=cold.last_error, archive_failure_count=cold.sweep_failure_count))
-        return {'status': 'ok', 'processing': 'host_runner'}
+        result = {'status': 'ok', 'processing': 'host_runner'}
+        projection = getattr(app.state.retrieval, '_projection', None)
+        if projection is not None:
+            # Local state only: capture/health never wait for the search lock or
+            # perform an HTTP request to the indexing child.
+            result['search_ready'] = projection.available
+        return result
 
     @app.get('/status')
     def status(source: Annotated[str | None, Query(min_length=1, max_length=256)] = None):

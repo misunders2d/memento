@@ -1,6 +1,8 @@
 """Validated consolidation plans produced by the connected harness, never an API client."""
 
+import hashlib
 import json
+import os
 import re
 import time
 from itertools import zip_longest
@@ -14,6 +16,7 @@ from .extraction import ACTIVE_CANDIDATE_SQL, AWAITING_DECISION_SQL, UNPARKED_CA
 from .graph import RELATIONS, behavior_ground_truth, identity_text
 from .store import ConflictError
 from .commands import Scope
+from .qdrant import SearchUnavailable
 
 VERSION = 'consolidate-v7'
 # Consolidation admits a candidate only with at least one evidence episode that is
@@ -238,6 +241,41 @@ def native_trace(episode):
 class Consolidator:
     def __init__(self, graph):
         self.graph, self.store = graph, graph.store
+
+    def prepare_discovery(self, job):
+        """Advisory ANN comparisons, before claim preparation takes the writer mutex."""
+        retrieval = getattr(self.graph, '_retrieval', None)
+        configured = (retrieval is not None and retrieval._projection is not None) or 'MEMENTO_QDRANT_BINARY' in os.environ
+        if not configured:
+            return None
+        result = dict(candidates={}, pending=False)
+        if retrieval is None or retrieval._projection is None:
+            result['pending'] = True
+            return result
+        import numpy as np
+        try:
+            with retrieval._snapshot() as db:
+                for identifier in job.payload['candidate_ids']:
+                    candidate = db.execute(f'SELECT c.* FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE_SQL}',
+                                           (identifier,)).fetchone()
+                    vector = db.execute('''SELECT v.embedding FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
+                        WHERE i.target=? AND i.kind='candidate' AND v.current=1''', (identifier,)).fetchone()
+                    if candidate is None or vector is None:
+                        continue
+                    query = np.frombuffer(vector['embedding'], dtype=np.float32)
+                    typed = ([] if candidate['kind'] == 'relation' else retrieval._vector_rows(
+                        db, query, 2, kind='node', pool='entity', type=candidate['type']))
+                    broad = retrieval._projection.search(db, query, 8, kind='node', pool='entity')
+                    result['candidates'][identifier] = dict(
+                        source=[candidate[key] for key in ('kind', 'type', 'text')] + [json.loads(candidate['scope'])],
+                        vector=hashlib.sha256(vector['embedding']).hexdigest(),
+                        typed=[dict(target=row['target'], version=row['version']) for row in typed],
+                        broad=[dict(target=row['target'], version=row['version']) for row in broad])
+        except SearchUnavailable:
+            # Omit only advisory discoveries. The existing lexical/identity,
+            # evidence and version gates still prepare the bounded batch.
+            result['pending'] = True
+        return result
 
     def pending(self, limit=16, *, after=0, through=9223372036854775807, unreserved=False):
         # Candidates named in a pending or leased consolidation payload belong to that
@@ -516,7 +554,7 @@ class Consolidator:
             context['ready'][target] = dict(versions={row['id']: row['version'] for row in rows},
                 loops={row['id']: snapshot(self.graph, row['id'], row['version']) for row in rows})
 
-    def _snapshot(self, ids, maintenance_ids=(), reviewed_ids=()):
+    def _snapshot(self, ids, maintenance_ids=(), reviewed_ids=(), *, discovery=None):
         from .loops import current, snapshot
         db = self.store._db
         if not ids and not maintenance_ids:
@@ -644,6 +682,17 @@ class Consolidator:
             queue = []
             vector = db.execute('''SELECT v.embedding FROM vector_items i JOIN memory_vectors v ON v.rowid=i.seq
                 WHERE i.target=? AND i.kind='candidate' AND v.current=1''', (candidate['id'],)).fetchone()
+            hint = discovery['candidates'].get(candidate['id']) if discovery is not None else None
+            if hint is not None and (hint['source'] != [candidate[key] for key in ('kind', 'type', 'text', 'scope')]
+                    or vector is None or hint['vector'] != hashlib.sha256(vector['embedding']).hexdigest()):
+                hint = None
+            def hinted(kind):
+                if hint is None:
+                    return []
+                return [row['target'] for row in hint[kind] if db.execute('''SELECT 1 FROM node_versions n
+                    WHERE n.id=? AND n.version=? AND n.state='active'
+                    AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)''',
+                    (row['target'], row['version'])).fetchone()]
             if candidate['kind'] != 'relation':
                 exact = [item['id'] for item in self.graph._exact_identities(candidate['type'], candidate['text'])]
                 # Typed lexical lookup needs no vector: tick can consolidate before
@@ -665,7 +714,7 @@ class Consolidator:
                         WHERE node_fts MATCH ? AND n.type=? AND n.state='active'
                         AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
                         ORDER BY bm25(node_fts),n.id LIMIT 8''', (match, candidate['type']))]
-                semantic = [] if vector is None else [row['target'] for row in db.execute('''SELECT i.target
+                semantic = hinted('typed') if discovery is not None else [] if vector is None else [row['target'] for row in db.execute('''SELECT i.target
                     FROM memory_vectors v JOIN vector_items i ON i.seq=v.rowid
                     WHERE v.embedding MATCH ? AND k=2 AND v.current=1
                     AND v.rowid IN (SELECT i.seq FROM vector_items i JOIN node_versions n
@@ -680,7 +729,9 @@ class Consolidator:
                 similar = [target for target in similar if target not in exact]
                 identities[candidate['id']] = exact, similar
                 queue.extend(exact + similar)
-            if vector is not None:
+            if discovery is not None:
+                queue.extend(hinted('broad'))
+            elif vector is not None:
                 queue.extend(item['target'] for item in db.execute('''SELECT i.target FROM memory_vectors v
                     JOIN vector_items i ON i.seq=v.rowid
                     WHERE v.embedding MATCH ? AND k=8 AND v.current=1
@@ -803,9 +854,14 @@ class Consolidator:
         unchecked = {key: list(dict.fromkeys(values)) for key, values in unchecked.items() if values}
         return candidates, nodes, edges, episodes, windows, resolutions, loop_snapshots, list(exposures.values()), unchecked, continuity, retirement
 
-    def prepare(self, job):
+    def prepare(self, job, *, discovery=None):
+        retrieval = getattr(self.graph, '_retrieval', None)
+        if discovery is None and ((retrieval is not None and retrieval._projection is not None)
+                                   or 'MEMENTO_QDRANT_BINARY' in os.environ):
+            # Direct callers already holding the writer never start networking.
+            discovery = dict(candidates={}, pending=True)
         candidates, nodes, edges, _, windows, resolutions, loop_snapshots, exposures, unchecked, continuity, retirement = self._snapshot(
-            job.payload['candidate_ids'], job.payload.get('maintenance_ids', ()), job.payload.get('reviewed_ids', ()))
+            job.payload['candidate_ids'], job.payload.get('maintenance_ids', ()), job.payload.get('reviewed_ids', ()), discovery=discovery)
         return dict(loop_policy_version=VERSION,
                     candidates=candidates, existing_nodes=list(nodes.values()), existing_relations=list(edges.values()),
                     raw_windows=sorted(windows.values(), key=lambda item: (item['sequence'], item['start'])),
@@ -813,7 +869,7 @@ class Consolidator:
                     behavior_exposures=exposures,
                     maintenance_ids=list(dict.fromkeys(canonical(self.graph, target)['id']
                         for target in job.payload.get('maintenance_ids', ()) if canonical(self.graph, target)['id'] in nodes)),
-                    context_truncated=bool(unchecked) or bool(continuity.get('pending')),
+                    context_truncated=bool(unchecked) or bool(continuity.get('pending')) or bool(discovery and discovery['pending']),
                     retirement_ready=list(retirement.get('ready', {})),
                     _unchecked=unchecked, _continuity=continuity, _retirement=retirement)
 
