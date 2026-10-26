@@ -369,6 +369,9 @@ mod tests {
         drop(store);
         let db = Connection::open(dir.path().join("memory.sqlite")).unwrap();
         init(&db).unwrap();
+        // Reconstruct the original legacy layout, before comparison-only status
+        // indexes existed (header1 also lacks their text_runs expression column).
+        db.execute_batch("DROP INDEX vector_blobs_status_current_v1; DROP INDEX episodes_status_indexable_v1; DROP INDEX episodes_status_raw_v1;").unwrap();
         db.execute_batch("CREATE VIRTUAL TABLE memory_vectors USING vec0(embedding float[768] distance_metric=cosine,current boolean); INSERT INTO memory_vectors(rowid,embedding,current) SELECT seq,embedding,current FROM vector_blobs; DROP TABLE vector_blobs; DROP TABLE projection_events; DROP TABLE projection_ack; DROP TABLE runtime_state; DROP TABLE media_stage_units;").unwrap();
         let mut vector = vec![0_u8; 3072];
         vector[..4].copy_from_slice(&1f32.to_le_bytes());

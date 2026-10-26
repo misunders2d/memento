@@ -14,6 +14,8 @@ mod query_rows;
 mod records;
 pub mod retrieval;
 pub mod runtime;
+#[cfg(test)]
+mod status_count_tests;
 pub mod viewer;
 #[cfg(test)]
 mod viewer_tests;

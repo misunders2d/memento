@@ -1478,7 +1478,7 @@ mod tests {
         }
     }
     #[test]
-    fn t3_strict_cosine_dominance_needs_literal_name_and_normal_floor() {
+    fn t3_mixed_query_needs_corroboration_and_pure_name_keeps_normal_floor() {
         let mut f = Fixture::new();
         let strong = f.add(
             "Nadia North",
@@ -1514,6 +1514,9 @@ mod tests {
         );
         let rows = f.recall("What did Nadia do?", 6, true, Some("personal"));
         assert_eq!(rows[0]["id"], fact);
+        assert!(rows.iter().all(|r| r["category"] != "entity_context"));
+        let rows = f.recall("Nadia", 6, true, Some("personal"));
+        assert_eq!(rows[0]["id"], fact);
         assert_eq!(rows[1]["id"], strong);
         assert!(rows.iter().all(|r| r["id"] != weak && r["id"] != zero));
         let tie = f.add(
@@ -1526,6 +1529,11 @@ mod tests {
         );
         let rows = f.recall("What did Nadia do?", 6, true, Some("personal"));
         assert!(rows.iter().all(|r| r["id"] != tie));
+        assert!(
+            f.recall("Nadia", 6, true, Some("personal"))
+                .iter()
+                .any(|r| r["id"] == tie)
+        );
     }
     #[test]
     fn t3_df_is_current_active_visible_and_scoped_not_global_or_version_counted() {
@@ -1850,5 +1858,134 @@ mod tests {
         assert!(entities.iter().all(|r| r["same_name_count"] == 2
             && r["same_name_ids"].as_array().unwrap().len() == 1
             && r["text"].as_str().unwrap().contains("not merged")));
+    }
+    #[test]
+    fn t3_actual_mark_cosine_advantage_does_not_imply_mixed_query_name_intent() {
+        let mut f = Fixture::new();
+        let mark = f.add(
+            "Mark Petrov",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.7044715,
+            "professional",
+        );
+        let finance = f.add(
+            "Finance Team",
+            "organization",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.2,
+            "professional",
+        );
+        let logistics = f.add(
+            "The logistics checklist is done for tomorrow's delivery",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.6990622,
+            "professional",
+        );
+        f.connect(&mark, &finance);
+        let rows = f.recall("Mark checklist done", 6, true, Some("professional"));
+        assert_eq!(rows[0]["id"], logistics);
+        assert!(
+            rows.iter().all(|r| r["category"] != "entity_context"
+                && r["id"] != mark
+                && r["id"] != finance)
+        );
+        // Literal pure-name intent can admit context after the retained unrelated fact.
+        let rows = f.recall("Mark", 6, true, Some("professional"));
+        assert_eq!(rows[0]["id"], logistics);
+        assert_eq!(rows[1]["id"], mark);
+        assert_eq!(rows[1]["match"], "partial_entity_name");
+        assert_eq!(rows[1]["connections"][0]["id"], finance);
+    }
+    #[test]
+    fn t3_pure_partial_name_without_fact_passes_but_every_mixed_query_token_is_checked() {
+        let mut f = Fixture::new();
+        let mark = f.add(
+            "Mark Petrov — manages logistics",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
+        for query in ["Mark", "MARK!", "Mark Mark"] {
+            let rows = f.recall(query, 6, true, Some("personal"));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], mark);
+            assert_eq!(rows[0]["match"], "partial_entity_name");
+            assert!(rows[0].get("basis_memory_id").is_none());
+        }
+        for query in [
+            "Who is Mark?".to_owned(),
+            "Mark manages logistics".into(),
+            format!("{}done", "Mark ".repeat(65)),
+        ] {
+            let rows = f.recall(&query, 6, true, Some("personal"));
+            assert!(rows.iter().all(|r| r["category"] != "entity_context"));
+        }
+    }
+    #[test]
+    fn t3_pure_reviewed_alias_uses_one_literal_name_variant_without_gloss_tokens() {
+        let mut f = Fixture::new();
+        let canonical = f.add(
+            "Marcus North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
+        f.store.write(|tx|{
+            tx.sql().execute("INSERT INTO entity_merges SELECT 'reviewed-source',id,commit_id FROM node_versions WHERE id=? AND version=1",[&canonical])?;
+            tx.sql().execute("INSERT INTO alias_fts VALUES('reviewed-source','Mark Petrov — checklist done')",[])?;Ok(())
+        }).unwrap();
+        let rows = f.recall("Mark", 6, true, Some("personal"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], canonical);
+        assert_eq!(rows[0]["match"], "partial_entity_name");
+        for query in ["Mark status", "Mark checklist done", "Marcus Mark"] {
+            assert!(
+                f.recall(query, 6, true, Some("personal"))
+                    .iter()
+                    .all(|r| r["category"] != "entity_context")
+            );
+        }
+    }
+    #[test]
+    fn t3_display_connected_or_archive_wrappers_are_never_name_corroboration() {
+        let mut f = Fixture::new();
+        f.add(
+            "Mark Petrov",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
+        let fact = f.add(
+            "The logistics checklist has an unrelated stored assertion",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.7,
+            "personal",
+        );
+        f.store.read(|tx|{
+            let mut vector=[0.;768];vector[0]=1.;
+            let assertion:String=tx.sql().query_row("SELECT text FROM node_versions WHERE id=? AND version=1",[&fact],|r|r.get(0))?;
+            for original in [json!(assertion),Value::Null] {
+                for display in ["Source 2020-01-01: Logistics (Connected: Mark Petrov)","Unverified historical source Mark: Logistics"] {
+                    let fact=json!({"id":fact,"type":"knowledge","tier":"durable","category":"memory","text":display,"_full_text":original,"cosine":0.7});
+                    let mut output=vec![fact.clone()];
+                    anchors::add_partials(tx.sql(),"Mark checklist done",&vector,Some("personal"),TEXT_FLOOR,&[fact],&mut output,6)?;
+                    assert_eq!(output.len(),1);assert!(output.iter().all(|r|r["category"]!="entity_context"));
+                }
+            }
+            Ok(())
+        }).unwrap();
     }
 }

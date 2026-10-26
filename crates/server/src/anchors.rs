@@ -386,9 +386,9 @@ fn quoted(token: &str) -> String {
 }
 struct Partial {
     item: Value,
-    matched: Vec<String>,
     rare: Vec<String>,
     cosine: f64,
+    pure_name: bool,
 }
 fn partials(
     db: &Connection,
@@ -398,7 +398,12 @@ fn partials(
     floor: f64,
 ) -> Result<Vec<Partial>> {
     use rusqlite::OptionalExtension;
-    let request = tokens(query).into_iter().take(64).collect::<HashSet<_>>();
+    let query_tokens = tokens(query);
+    let request = query_tokens
+        .iter()
+        .take(64)
+        .cloned()
+        .collect::<HashSet<_>>();
     if request.is_empty() {
         return Ok(Vec::new());
     }
@@ -414,12 +419,15 @@ fn partials(
         "{active} AND {entity} AND NOT EXISTS(SELECT 1 FROM entity_merges m WHERE m.source=n.id)"
     );
     let count = "(SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS evidence_count";
-    let mut found = BTreeMap::<String, (Value, HashSet<String>)>::new();
+    let mut found = BTreeMap::<String, (Value, HashSet<String>, bool)>::new();
     let mut collect = |row: Value, name: &str| {
         let name = tokens(name_head(name));
         if name.len() < 2 {
             return;
         }
+        // Intent guard uses the entire query, not the bounded FTS discovery prefix.
+        // One stored/reviewed name variant must account for every literal token.
+        let pure_name = query_tokens.iter().all(|token| name.contains(token));
         let overlap = name
             .into_iter()
             .filter(|t| request.contains(t))
@@ -428,8 +436,11 @@ fn partials(
             return;
         }
         let id = row["id"].as_str().unwrap().to_owned();
-        let entry = found.entry(id).or_insert_with(|| (row, HashSet::new()));
+        let entry = found
+            .entry(id)
+            .or_insert_with(|| (row, HashSet::new(), false));
         entry.1.extend(overlap);
+        entry.2 |= pure_name;
     };
     for row in rows(
         db,
@@ -479,7 +490,7 @@ fn partials(
         return Ok(Vec::new());
     }
     let mut result = Vec::new();
-    for (_, (mut item, overlap)) in found {
+    for (_, (mut item, overlap, pure_name)) in found {
         let id = item["id"].as_str().unwrap();
         let version = item["version"].as_i64().unwrap();
         if legacy_only(db, id, version)? {
@@ -525,9 +536,9 @@ fn partials(
         item.as_object_mut().unwrap().remove("name");
         result.push(Partial {
             item,
-            matched: overlap.into_iter().collect(),
             rare,
             cosine: cosine.clamp(-1., 1.) as f32 as f64,
+            pure_name,
         });
     }
     result.sort_by(|a, b| {
@@ -598,26 +609,21 @@ pub fn add_partials(
             .filter(|f| output.iter().any(|r| r["id"] == f["id"]))
             .collect::<Vec<_>>();
         let shares = |fact: &Value, terms: &[String]| {
-            let text = tokens(
-                fact["_full_text"]
-                    .as_str()
-                    .unwrap_or(fact["text"].as_str().unwrap_or("")),
-            );
+            // finish() reads this field from the same snapshot's immutable assertion.
+            // Rendered text can include Source/Connected wrappers and is not corroboration.
+            let Some(assertion) = fact["_full_text"].as_str() else {
+                return false;
+            };
+            let text = tokens(assertion);
             terms.iter().any(|t| text.contains(t))
         };
         let corroborator = retained
             .iter()
             .filter(|f| shares(f, &candidate.rare))
             .min_by_key(|f| output.iter().position(|r| r["id"] == f["id"]).unwrap());
-        let dominant = retained
-            .iter()
-            .filter(|f| !shares(f, &candidate.matched))
-            .all(|f| {
-                f["cosine"]
-                    .as_f64()
-                    .is_some_and(|c| c.is_finite() && candidate.cosine > c)
-            });
-        if corroborator.is_none() && !dominant {
+        // A higher entity cosine does not establish partial-name intent: e.g. a
+        // modal/verb homograph can narrowly beat an unrelated retained fact.
+        if corroborator.is_none() && !candidate.pure_name {
             continue;
         }
         let mut proposed = output

@@ -292,16 +292,46 @@ pub fn status(
     hot_ready: bool,
     cold_ready: bool,
 ) -> Result<Value> {
+    // Source membership intentionally accepts evidence from any version. The
+    // episode branch is qualified before chunk expansion, while segment source
+    // membership belongs to its parent node. DISTINCT keeps unit counts exact.
+    let prefix = if source.is_some() {
+        "source_targets AS MATERIALIZED (SELECT DISTINCT g.target FROM episodes e INDEXED BY episodes_status_cover_v1 CROSS JOIN graph_evidence g WHERE e.source=?1 AND g.episode_id=e.id)"
+    } else {
+        "forgotten_episode_ids AS MATERIALIZED (SELECT DISTINCT e.id FROM forgotten_sources f CROSS JOIN episodes e WHERE e.source=f.source AND e.event_id=f.event_id)"
+    };
+    let membership = |target: &str| {
+        if source.is_some() {
+            format!("{target} IN (SELECT target FROM source_targets)")
+        } else {
+            "1".to_owned()
+        }
+    };
+    let (episode_index, episode_filter) = if source.is_some() {
+        (
+            "episodes_status_cover_v1",
+            "e.source=?1 AND CAST(coalesce(json_extract(e.metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip' AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)",
+        )
+    } else {
+        (
+            "episodes_status_indexable_v1",
+            "?1 IS NULL AND CAST(coalesce(json_extract(e.metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip' AND NOT EXISTS(SELECT 1 FROM forgotten_episode_ids f WHERE f.id=e.id)",
+        )
+    };
+    // All three joined keys are unique. A no-chunk episode contributes only to
+    // unprepared_episodes; absent/current=0 embeddings remain pending or failed.
+    // No intermediate per-unit state table or repeated episode anti-join is needed.
     let sql = format!(
-        "WITH status_episodes AS MATERIALIZED (SELECT e.id FROM episodes e INDEXED BY episodes_status_cover_v1 WHERE (?1 IS NULL OR e.source=?1) AND CAST(coalesce(json_extract(e.metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip' AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)),indexable AS (SELECT n.id,'node' AS kind,n.version,n.id AS rank_target FROM node_versions n WHERE n.state='active' AND n.type<>'media' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) UNION ALL SELECT c.id,'candidate',1,c.id FROM candidates c WHERE {ACTIVE_CANDIDATE} UNION ALL SELECT x.id,'episode',1,x.id FROM episode_chunks x JOIN status_episodes e ON e.id=x.episode_id UNION ALL SELECT s.id,'segment',1,n.id FROM segments s JOIN node_versions n ON n.id=s.node_id WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}),units AS (SELECT a.* FROM indexable a WHERE ?1 IS NULL OR EXISTS(SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=a.rank_target AND e.source=?1) OR (a.kind='episode' AND EXISTS(SELECT 1 FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id WHERE x.id=a.id AND e.source=?1))),states AS (SELECT a.*,EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version AND b.current=1) AS indexed,EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND f.version=a.version AND f.resolved=0) AS failed FROM units a) SELECT count(*) AS total,coalesce(sum(indexed),0) AS indexed,coalesce(sum(NOT indexed AND NOT failed),0) AS pending,coalesce(sum(NOT indexed AND failed),0) AS failed FROM states",
-        memento_ann::eligibility::visible_sql("n.id")
+        "WITH {prefix},indexable AS (SELECT n.id,'node' AS kind,n.version,n.id AS rank_target FROM node_versions n WHERE n.state='active' AND n.type<>'media' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {nodes} UNION ALL SELECT c.id,'candidate',1,c.id FROM candidates c WHERE {ACTIVE_CANDIDATE} AND {candidates} UNION ALL SELECT x.id,'episode',1,x.id FROM episodes e INDEXED BY {episode_index} LEFT JOIN episode_chunks x ON x.episode_id=e.id WHERE {episode_filter} UNION ALL SELECT s.id,'segment',1,n.id FROM segments s JOIN node_versions n ON n.id=s.node_id WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {visible} AND {nodes}) SELECT count(a.id) AS total,coalesce(sum(b.seq IS NOT NULL),0) AS indexed,coalesce(sum(a.id IS NOT NULL AND b.seq IS NULL AND f.target IS NULL),0) AS pending,coalesce(sum(a.id IS NOT NULL AND b.seq IS NULL AND f.target IS NOT NULL),0) AS failed,coalesce(sum(a.id IS NULL),0) AS unprepared_episodes FROM indexable a LEFT JOIN vector_items i ON i.target=a.id AND i.kind=a.kind AND i.version=a.version LEFT JOIN vector_blobs b INDEXED BY vector_blobs_status_current_v1 ON b.seq=i.seq AND b.current=1 LEFT JOIN index_failures f ON f.target=a.id AND f.version=a.version AND f.resolved=0",
+        nodes = membership("n.id"),
+        candidates = membership("c.id"),
+        visible = memento_ann::eligibility::visible_sql("n.id")
     );
     let mut result = records::one(db, &sql, [source])?
         .ok_or(Error::Unavailable("Index counts are unavailable"))?;
-    let unprepared:i64=db.query_row("SELECT count(*) FROM episodes e INDEXED BY episodes_status_cover_v1 WHERE (?1 IS NULL OR e.source=?1) AND CAST(coalesce(json_extract(e.metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip' AND NOT EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)",[source],|r|r.get(0))?;
     records::merge(
         &mut result,
-        json!({"available":true,"unprepared_episodes":unprepared,"error":if error {Some("NativeIndexingError")}else{None},"search":{"engine":"qdrant-edge","ready":hot_ready,"cold_ready":cold_ready,"error":if hot_ready {None}else{Some("not_ready")}}}),
+        json!({"available":true,"error":if error {Some("NativeIndexingError")}else{None},"search":{"engine":"qdrant-edge","ready":hot_ready,"cold_ready":cold_ready,"error":if hot_ready {None}else{Some("not_ready")}}}),
     );
     Ok(result)
 }

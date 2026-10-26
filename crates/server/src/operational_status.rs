@@ -180,7 +180,12 @@ pub fn operational_status(
         |r| r.get(0),
     )?;
     let captured = json!({"episodes":episodes,"conversations":conversation_count(db,source)?});
-    let mut raw=one(db,&format!("SELECT coalesce(sum(text_runs IS NULL),0) AS inline_raw_episodes,coalesce(sum(CASE (text_runs IS NULL) WHEN 1 THEN length(CAST(text AS BLOB)) ELSE 0 END),0) AS inline_raw_bytes,coalesce(sum(NOT(text_runs IS NULL)),0) AS offloaded_raw_episodes FROM episodes INDEXED BY episodes_status_cover_v1 WHERE kind IN ('native_record','native_live_record','native_hook') AND CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS TEXT)='skip'{source_and}"),rusqlite::params_from_iter(source))?.unwrap();
+    let raw_index = if source.is_some() {
+        "episodes_status_cover_v1"
+    } else {
+        "episodes_status_raw_v1"
+    };
+    let mut raw=one(db,&format!("SELECT coalesce(sum(text_runs IS NULL),0) AS inline_raw_episodes,coalesce(sum(CASE (text_runs IS NULL) WHEN 1 THEN length(CAST(text AS BLOB)) ELSE 0 END),0) AS inline_raw_bytes,coalesce(sum(NOT(text_runs IS NULL)),0) AS offloaded_raw_episodes FROM episodes INDEXED BY {raw_index} WHERE kind IN ('native_record','native_live_record','native_hook') AND CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS TEXT)='skip'{source_and}"),rusqlite::params_from_iter(source))?.unwrap();
     let compressed=one(db,&format!("SELECT coalesce(sum(record_count),0) AS records,coalesce(sum(raw_size),0) AS original,coalesce(sum(length(data)),0) AS stored FROM raw_frames INDEXED BY raw_frames_status_cover_v1{source_where}"),rusqlite::params_from_iter(source))?.unwrap();
     raw["inline_raw_episodes"] = json!(
         raw["inline_raw_episodes"].as_i64().unwrap() - compressed["records"].as_i64().unwrap()
