@@ -179,7 +179,10 @@ fn persist(path: &Path, checkpoint: &Checkpoint) -> Result<()> {
 }
 fn shard(path: PathBuf) -> Result<Shard> {
     let checkpoint = load_checkpoint(&path)?;
-    let loaded = if checkpoint.as_ref().is_some_and(|c| c.format == PROJECTION_FORMAT) {
+    let loaded = if checkpoint
+        .as_ref()
+        .is_some_and(|c| c.format == PROJECTION_FORMAT)
+    {
         EdgeShard::load(&path.join("edge"), None).ok().map(Arc::new)
     } else {
         None
@@ -196,13 +199,26 @@ fn shard(path: PathBuf) -> Result<Shard> {
 fn known(tx: &ReadTxn<'_>, tier: Tier, fence: &EventFence) -> Result<bool> {
     Ok(tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM projection_events WHERE tier=?1 AND id=?2 AND nonce=?3 AND generation=?4) OR EXISTS(SELECT 1 FROM projection_ack WHERE tier=?1 AND id=?2 AND nonce=?3 AND generation=?4)",params![tier.as_str(),fence.id,fence.nonce,fence.generation],|r|r.get(0))?)
 }
+fn rebuild_page(after: Option<i64>) -> (&'static str, i64) {
+    match after {
+        Some(seq) => (
+            "SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND i.seq>?2 ORDER BY i.seq LIMIT ?3",
+            seq,
+        ),
+        // An inclusive bound keeps the first page seekable and includes i64::MIN.
+        // Later pages use the cursor directly, without overflowing i64::MAX.
+        None => (
+            "SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND i.seq>=?2 ORDER BY i.seq LIMIT ?3",
+            i64::MIN,
+        ),
+    }
+}
 fn rows(
     tx: &ReadTxn<'_>,
     tier: Tier,
     ids: Option<&BTreeSet<i64>>,
     after: Option<i64>,
 ) -> Result<Vec<ProjectionRow>> {
-    let mut query=tx.sql().prepare("SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND (?2 IS NULL OR i.seq>?2) ORDER BY i.seq LIMIT ?3")?;
     let mut result = Vec::new();
     if let Some(ids) = ids {
         // Point-keyed reads retain every i64 ID, including negative and zero.
@@ -216,7 +232,9 @@ fn rows(
             }
         }
     } else {
-        for row in query.query_map(params![tier.as_str(), after, BATCH], decode_row)? {
+        let (sql, lower) = rebuild_page(after);
+        let mut query = tx.sql().prepare(sql)?;
+        for row in query.query_map(params![tier.as_str(), lower, BATCH], decode_row)? {
             result.push(row??);
         }
     }
@@ -723,6 +741,9 @@ impl SearchView<'_> {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod pagination_tests;
 
 #[cfg(test)]
 mod recovery_tests {
