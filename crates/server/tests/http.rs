@@ -192,6 +192,42 @@ async fn actual_mcp_lists_six_tools_normalizes_only_optional_empties_and_wraps_h
     );
 }
 #[tokio::test]
+async fn actual_mcp_scoped_recall_validates_since_before_dispatch() {
+    let (_dir, state) = fixture();
+    for (query, since, is_error) in [
+        ("", "invalid", true),
+        ("", "2026-01-01T12:00:00", true),
+        ("", "2026-01-01T12:00:00+02:00", false),
+        ("", "", false),
+        ("synthetic semantic query", "invalid", true),
+    ] {
+        let (status, response) = rpc(
+            &state,
+            "tools/call",
+            json!({"name":"recall","arguments":{"query":query,"scope":"personal","since":since}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["result"]["isError"], is_error, "{query:?} {since:?}");
+        if is_error {
+            assert!(response["result"].get("structuredContent").is_none());
+            assert_eq!(
+                response["result"]["content"],
+                json!([{"type":"text","text":"World time must be an aware ISO timestamp"}])
+            );
+        } else {
+            assert_eq!(
+                response["result"]["structuredContent"],
+                json!({"memories":[]})
+            );
+            assert_eq!(
+                response["result"]["content"],
+                json!([{"type":"text","text":"No matching memories."}])
+            );
+        }
+    }
+}
+#[tokio::test]
 async fn host_origin_error_body_and_chunked_limits_preserve_privacy() {
     let (_dir, state) = fixture();
     for (host, origin, expected) in [

@@ -226,12 +226,16 @@ fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String
     let value = match name {
         "recall" => {
             let args: RecallArgs = parse(arguments)?;
+            let since = optional(args.since);
+            if let Some(since) = since.as_deref() {
+                memento_core::utc_time(since)?;
+            }
             let request = RecallRequest {
                 query: args.query,
                 effort: optional(args.effort).unwrap_or_else(|| "normal".into()),
                 limit: args.limit,
                 scope: optional(args.scope),
-                since: optional(args.since),
+                since,
                 source: optional(args.source),
                 automatic: false,
                 context: String::new(),
