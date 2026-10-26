@@ -46,6 +46,9 @@ impl WriteTxn<'_, '_> {
         source: &str,
         conversation_id: &str,
     ) -> Result<Vec<EventFence>> {
+        // Parking moves only raw history physically. Curated/candidate/segment kinds
+        // remain hot regardless of age; both-tier events below remove the old point.
+        self.sql().execute("UPDATE vector_blobs SET tier=CASE WHEN EXISTS(SELECT 1 FROM vector_items i JOIN episode_chunks x ON x.id=i.target JOIN episodes e ON e.id=x.episode_id JOIN historical_parking h ON h.source=e.source AND h.conversation_id=e.conversation_id WHERE i.seq=vector_blobs.seq AND i.kind='episode' AND e.seq<=h.parked_through) THEN 'cold' ELSE 'hot' END WHERE seq IN(SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode' AND e.source=?1 AND e.conversation_id=?2)",[source,conversation_id])?;
         self.touch_selected(
             &episodes("SELECT id FROM episodes WHERE source=?1 AND conversation_id=?2"),
             [source, conversation_id],

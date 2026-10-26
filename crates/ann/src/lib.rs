@@ -1,4 +1,5 @@
 //! Disposable native hot/cold vector indexes. SQLite remains the sole authority.
+pub mod discovery;
 pub mod eligibility;
 use memento_core::{Error, EventFence, F32Blob, ModelSignature, ReadTxn, Result, Store, Tier};
 use qdrant_edge::{
@@ -361,7 +362,22 @@ impl Projection {
         let cut = tx.fence(tier)?;
         if checkpoint.cursor == cut && checkpoint.pending.is_none() {
             if ack {
-                self.store.write(|writer| writer.acknowledge(tier, &cut))?;
+                let acknowledged = tx.sql().query_row(
+                    "SELECT id,nonce,generation FROM projection_ack WHERE tier=?",
+                    [tier.as_str()],
+                    |r| {
+                        Ok(EventFence {
+                            id: r.get(0)?,
+                            nonce: r.get(1)?,
+                            generation: r.get(2)?,
+                        })
+                    },
+                )?;
+                // Skip the writer on healthy read-only recall. A durable index
+                // cursor whose SQL acknowledgment lagged a crash still recovers.
+                if acknowledged != cut {
+                    self.store.write(|writer| writer.acknowledge(tier, &cut))?;
+                }
             }
             return Ok(true);
         }

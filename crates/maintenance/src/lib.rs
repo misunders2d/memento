@@ -114,3 +114,20 @@ pub fn copy_verified(source: &Path, target: &Path, sha: &str, size: u64) -> Resu
     output.sync_all()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod archive_tests;
+pub mod binding;
+pub mod cold;
+pub mod cold_runtime;
+#[cfg(test)]
+mod cold_tests;
+pub mod drive;
+pub mod drive_auth;
+#[cfg(test)]
+mod drive_tests;
+pub mod fs_safe;
+pub mod portable;
+pub mod transport;
+
+pub mod desktop_connect;

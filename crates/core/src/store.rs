@@ -43,8 +43,10 @@ fn acceptable(db: &Connection) -> Result<bool> {
 pub struct Store {
     directory: PathBuf,
     writer: Mutex<Connection>,
+    pub(crate) raw_cursor: Mutex<i64>,
     _lease: File,
     permits: raw::FramePermits,
+    blobs: Arc<crate::blobs::BlobStore>,
 }
 pub struct ReadTxn<'a> {
     sql: &'a Connection,
@@ -124,6 +126,7 @@ impl Store {
         if fresh {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(include_str!("schema.sql"))?;
+            tx.execute_batch(include_str!("media_stage.sql"))?;
             tx.execute("INSERT INTO runtime_state VALUES(1,?,0)", [nonce()])?;
             for tier in [Tier::Hot, Tier::Cold] {
                 tx.execute(
@@ -139,12 +142,37 @@ impl Store {
             [],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
         )?;
+        // Add only this disposable progress table to earlier private header5 checkouts.
+        // A healthy reopen performs no DDL and never rewrites authority/history.
+        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='media_stage_units')",[],|r|r.get::<_,bool>(0))?{
+            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("media_stage.sql"))?;tx.commit()?;
+        }
+        let stage_indexes:i64=db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('media_stage_artifact','media_stage_source')",[],|r|r.get(0))?;
+        if stage_indexes != 2 {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("media_stage_indexes.sql"))?;
+            tx.commit()?;
+        }
+        let blobs = crate::blobs::BlobStore::new(directory.join("blobs"))?;
         Ok(Arc::new(Self {
+            blobs,
             directory,
             writer: Mutex::new(db),
+            raw_cursor: Mutex::new(0),
             _lease: lease,
             permits,
         }))
+    }
+    pub(crate) fn with_writer_exclusive<T>(&self, apply: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| Error::Unavailable("Evidence writer requires recovery"))?;
+        apply()
+    }
+    pub fn blobs(&self) -> &Arc<crate::blobs::BlobStore> {
+        &self.blobs
     }
     pub fn data_dir(&self) -> &Path {
         &self.directory

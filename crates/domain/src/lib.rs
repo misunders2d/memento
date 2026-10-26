@@ -2,17 +2,25 @@
 //! Agent APIs cannot approve protected changes; owner transports call explicit
 //! review/merge/forget methods after their independent OS admission boundary.
 pub mod authority;
+pub mod consolidation;
 pub mod curation;
 pub mod demand;
 mod diff;
 pub mod dto;
+pub mod extraction;
 pub mod forgetting;
 pub mod importance;
+pub mod jobs;
 pub mod loops;
-mod unicode;
+pub mod pipeline_schema;
+pub mod processing;
+/// Frozen source-runtime word and casefold data, shared with retrieval.
+pub mod unicode;
 mod util;
 pub use authority::behavior_ground_truth;
 pub use demand::{demand_extract, source_text_ranges};
+#[cfg(test)]
+mod pipeline_tests;
 #[cfg(test)]
 mod tests;
 

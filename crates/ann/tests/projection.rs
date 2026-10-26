@@ -335,3 +335,99 @@ fn callback_validation_preserves_index_readiness_and_caller_deadline_is_used() {
             .is_ok()
     );
 }
+
+#[test]
+fn caught_up_read_does_not_acquire_held_capture_writer() {
+    let (_dir, store, index) = fixture();
+    node(
+        &store,
+        1,
+        "fact",
+        0.9,
+        "personal",
+        "person",
+        true,
+        Tier::Hot,
+    );
+    index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
+    let (entered, wait) = std::sync::mpsc::channel();
+    let (release, ready) = std::sync::mpsc::channel();
+    let other = store.clone();
+    let writer = std::thread::spawn(move || {
+        other.write(|_tx| {
+            entered.send(()).unwrap();
+            let _ = ready.recv_timeout(std::time::Duration::from_millis(500));
+            Ok(())
+        })
+    });
+    wait.recv().unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(hits(&index, Tier::Hot), ["fact"]);
+    let elapsed = started.elapsed();
+    let _ = release.send(());
+    writer.join().unwrap().unwrap();
+    assert!(
+        elapsed < std::time::Duration::from_millis(150),
+        "healthy read waited for capture writer: {elapsed:?}"
+    );
+}
+
+#[test]
+fn parking_moves_raw_point_between_shards_without_changing_bytes() {
+    let (_dir, store, index) = fixture();
+    store.write(|tx|{
+        tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at) VALUES(1,'episode','fixture','event','conversation','user','A preserved historical passage','{}','2026')",[])?;
+        tx.sql().execute("INSERT INTO episode_chunks VALUES('chunk','episode',0,30)",[])?;tx.put_vector(&VectorWrite{seq:30,target:"chunk".into(),kind:VectorKind::Episode,version:1,current:true,tier:Tier::Hot,embedding:vector(0.9)})?;Ok(())}).unwrap();
+    index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
+    index.rebuild(Tier::Cold, &AtomicBool::new(false)).unwrap();
+    let original = store
+        .read(|tx| {
+            Ok(tx.sql().query_row(
+                "SELECT hex(embedding) FROM vector_blobs WHERE seq=30",
+                [],
+                |r| r.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+    store.write(|tx|{tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) VALUES('fixture','conversation',1,1,0)",[])?;tx.touch_conversation("fixture","conversation")?;Ok(())}).unwrap();
+    index
+        .snapshot(true, true, |_, view| {
+            assert!(
+                view.search(
+                    Tier::Hot,
+                    &query(),
+                    1,
+                    "episode",
+                    Pool::Ordinary,
+                    None,
+                    None
+                )?
+                .is_empty()
+            );
+            assert_eq!(
+                view.search(
+                    Tier::Cold,
+                    &query(),
+                    1,
+                    "episode",
+                    Pool::Historical,
+                    None,
+                    None
+                )?[0]
+                    .target,
+                "chunk"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .read(|tx| Ok(tx.sql().query_row(
+                "SELECT hex(embedding) FROM vector_blobs WHERE seq=30",
+                [],
+                |r| r.get::<_, String>(0)
+            )?))
+            .unwrap(),
+        original
+    );
+}

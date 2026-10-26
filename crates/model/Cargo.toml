@@ -1,0 +1,17 @@
+[package]
+name = "memento-embedding"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-18"] }
+memmap2 = "=0.9.12"
+libloading = "=0.8.9"
+sha2 = "=0.10.9"
+thiserror = "=2.0.21"
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "pnm", "ico"] }
+rustfft = "=6.4.1"
+serde_json = "=1.0.154"
+

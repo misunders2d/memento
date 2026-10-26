@@ -1,0 +1,77 @@
+Memento: connect this native agent to the private service.
+
+The agent performs installation; do not ask the human to run commands, edit
+configuration, move credentials, or change chats. Use the private service origin
+from which you fetched this guide, not the public product website.
+
+1. Identify your native harness: pi, omp, claude, codex or agy. Keep its existing
+   account, login, model selection, unrelated hooks and MCP definitions.
+2. Download /runner into ~/.local/share/memento/runner.py (private parent,
+   executable only by this user). It needs only Python 3's stdlib. Expose it as
+   ~/.local/bin/memento with a symlink to that same runner, not a second copy;
+   the processing timer must keep using the same file after upgrades. Never
+   replace an unrelated existing command. An installed Memento package also
+   supports the agent command. Use the full executable path if not on PATH.
+3. Run: memento agent add HARNESS --url SERVICE_ORIGIN
+   Substitute pi, omp, claude, codex or agy and this private service origin.
+   This installs only that harness's capture, automatic recall and memory tools.
+   A matching default runner.json keeps its role and identity; otherwise the
+   config is ${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS/runner.json.
+   Reinstallation reuses that config. Use --config PATH for an existing custom
+   location. No timezone, model discovery, new login or extra timer is needed.
+   It never creates a server processor or demotes an existing one.
+   Without the command link, use:
+   python3 ~/.local/share/memento/runner.py agent add HARNESS --url SERVICE_ORIGIN
+4. Load the installed native integration using the harness's supported reload
+   or a fresh native session. Native trust/permission prompts remain human
+   decisions: surface just that approval if required; never grant it yourself
+   or evade an owner-session admission guard.
+5. Verify the six native tools (recall, remember, link, supersede, history, loop),
+   call recall, and verify a new native exchange was captured. Installation
+   alone is not a connected result. Report any actual permission/reload blocker
+   precisely instead of claiming success.
+
+Durable client updates are explicit, never automatic:
+Updated clients can report a different available client bundle once through an
+existing recall request. The notice never installs code or restarts a session.
+Older clients need an explicit update first before they can display notices.
+Run: memento agent update HARNESS
+Use the same --config PATH and --native-config-dir PATH if installation used
+custom locations. Update reads the exact existing private service URL; it has no
+--url option and never retargets the installation. It preserves private config,
+client identity, client/server role, outbox/cursors, native settings and timers.
+The whole runner/bridge/extension bundle is validated before any replacement.
+Each file is published atomically, with the standalone runner last. This is not
+a single whole-installation transaction: rerun update after an interruption to
+finish the cutover. A failed download leaves installed code unchanged.
+The existing standalone runner path and its command symlink stay the same.
+Update never discovers models, changes logins, activates timers or restarts an
+active session. Use supported native reload or a fresh session to load new code;
+Codex hook trust remains a human decision. With no command link, use:
+python3 ~/.local/share/memento/runner.py agent update HARNESS
+If a release changes hook or MCP definitions, rerun agent add for that harness.
+
+Google Drive is optional and service-wide, not a separate grant for each agent.
+Native setup, a healthy API, the public website and Google branding do not mean
+Drive is connected. Complete these steps when the human requests Drive:
+1. On the human's browser device run runner.py drive-connect --url SERVICE_ORIGIN.
+   An already-connected service needs no new credential lookup.
+   For explicitly requested fresh consent while connected, add --reconnect;
+   the existing grant stays active until its same-binding replacement verifies.
+   If a Google link is printed, keep the helper running, let the human approve
+   drive.file, and await verified success. Only an unavailable-authorization error sends
+   you to the provisioning steps below; never present that error as a link.
+2. On the SERVICE HOST, the service owner provisions the original Desktop
+   client, intended account and existing app-created folder with:
+   memento-drive configure --client-json PRIVATE_CLIENT_PATH --account EMAIL
+   --folder-id EXISTING_FOLDER_ID --data-dir DATA_DIR
+   Look in the human's authorized credential store first; an Infisical
+   deployment may use MEMENTO_GOOGLE_DESKTOP_CLIENT_JSON. Install its CLI if
+   missing and surface only its required human login. Reuse original binding
+   metadata; ask only for metadata not available. Do not repeat Google Console
+   setup or create a replacement client or folder.
+3. Use explicitly authorized credential-manager injection into the owner
+   helper; never display secret values, move token files, share the service
+   identity or elevate privileges. If owner approval is missing, pause.
+   After provisioning, retry step 1 on the browser device. Only verified
+   service activation and a successful helper exit mean Drive is connected.

@@ -71,6 +71,14 @@ fn number(number: &Number) -> Result<String> {
     Ok(format!("{sign}{result}"))
 }
 pub fn canonical_json(value: &Value) -> Result<String> {
+    encode(value, false)
+}
+pub fn canonical_compact_json(value: &Value) -> Result<String> {
+    encode(value, true)
+}
+fn encode(value: &Value, compact: bool) -> Result<String> {
+    let comma = if compact { "," } else { ", " };
+    let colon = if compact { ":" } else { ": " };
     Ok(match value {
         Value::Null => "null".into(),
         Value::Bool(v) => v.to_string(),
@@ -80,9 +88,9 @@ pub fn canonical_json(value: &Value) -> Result<String> {
             "[{}]",
             values
                 .iter()
-                .map(canonical_json)
+                .map(|v| encode(v, compact))
                 .collect::<Result<Vec<_>>>()?
-                .join(", ")
+                .join(comma)
         ),
         Value::Object(values) => {
             let mut pairs = values.iter().collect::<Vec<_>>();
@@ -92,12 +100,12 @@ pub fn canonical_json(value: &Value) -> Result<String> {
                 pairs
                     .into_iter()
                     .map(|(key, value)| Ok(format!(
-                        "{}: {}",
+                        "{}{colon}{}",
                         serde_json::to_string(key)?,
-                        canonical_json(value)?
+                        encode(value, compact)?
                     )))
                     .collect::<Result<Vec<_>>>()?
-                    .join(", ")
+                    .join(comma)
             )
         }
     })

@@ -1106,14 +1106,11 @@ def media_save(args):
 
 
 def owner_command(operation, arguments):
-    """Retain the installed owner console, terminal confirmation and archive engine."""
-    if __package__:
-        argv = [sys.executable, '-m', 'memento.' + ('admin' if operation == 'export' else 'restore')]
-    else:
-        command = shutil.which('memento-admin' if operation == 'export' else 'memento-restore')
-        if command is None:
-            raise RunnerError('owner export/restore requires the installed Memento package on the service host')
-        argv = [command]
+    """Delegate only to the installed native owner tools on the service host."""
+    command = shutil.which('memento-admin' if operation == 'export' else 'memento-restore')
+    if command is None:
+        raise RunnerError('owner export/restore requires the installed native owner tools on the service host')
+    argv = [command]
     if operation == 'export':
         # The owner's existing parser expects its global --data-dir before export.
         owner = argparse.ArgumentParser(prog='memento export')

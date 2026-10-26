@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/domain", "crates/ann", "crates/maintenance"]
+members = ["crates/core", "crates/domain", "crates/ann", "crates/maintenance", "crates/server", "crates/model", "crates/media", "crates/owner"]
 resolver = "3"
 
 [workspace.package]
@@ -17,6 +17,14 @@ regex = "=1.13.1"
 flate2 = "=1.1.10"
 libc = "=0.2.191"
 tempfile = "=3.27.0"
+chrono-tz = "=0.10.4"
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "original-uri"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "signal", "time"] }
+futures-util = "=0.3.34"
+base64 = "=0.22.1"
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+md-5 = "=0.10.6"
+log = { version = "=0.4.34", features = ["max_level_info"] }
 qdrant-edge = "=0.9.0"
 sqlite-vec = "=0.1.9"
 tar = { version = "=0.4.46", default-features = false }
@@ -29,3 +37,8 @@ debug = 0
 incremental = false
 [profile.release]
 debug = 0
+
+[profile.dev.package.memento-embedding]
+opt-level = 1
+[profile.test.package.memento-embedding]
+opt-level = 1

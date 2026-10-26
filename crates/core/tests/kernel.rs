@@ -441,3 +441,83 @@ fn offline_validation_checks_unreferenced_frames_with_bounded_decode() {
         })
         .unwrap();
 }
+
+#[test]
+fn derived_media_stage_upgrade_is_transactional_and_healthy_reopen_has_no_ddl() {
+    let (dir, store) = store();
+    let path = store.data_dir().to_owned();
+    let original = store
+        .read(|tx| {
+            Ok(tx
+                .sql()
+                .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))?)
+        })
+        .unwrap();
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .read(|tx| Ok(tx
+                .sql()
+                .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))?))
+            .unwrap(),
+        original
+    );
+    drop(reopened);
+    let db = Connection::open(path.join("memory.sqlite")).unwrap();
+    db.execute_batch("DROP TABLE media_stage_units").unwrap();
+    drop(db);
+    let upgraded = Store::open(&path).unwrap();
+    let version = upgraded
+        .read(|tx| {
+            assert_eq!(
+                tx.sql()
+                    .query_row("SELECT count(*) FROM media_stage_units", [], |r| r
+                        .get::<_, i64>(0))?,
+                0
+            );
+            Ok(tx
+                .sql()
+                .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))?)
+        })
+        .unwrap();
+    assert_eq!(version, original + 4);
+    drop(upgraded);
+    let again = Store::open(&path).unwrap();
+    assert_eq!(
+        again
+            .read(|tx| Ok(tx
+                .sql()
+                .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))?))
+            .unwrap(),
+        version
+    );
+    drop(again);
+    drop(dir);
+}
+
+#[test]
+fn health_uses_separate_bounded_writer_probe_and_never_recreates_missing_database() {
+    let (_dir, store) = store();
+    let (entered, wait) = mpsc::channel();
+    let (release, ready) = mpsc::channel();
+    let other = store.clone();
+    let writer = thread::spawn(move || {
+        other.write(|_| {
+            entered.send(()).unwrap();
+            let _ = ready.recv_timeout(std::time::Duration::from_secs(1));
+            Ok(())
+        })
+    });
+    wait.recv().unwrap();
+    let began = std::time::Instant::now();
+    assert!(store.health().is_err());
+    assert!(began.elapsed() < std::time::Duration::from_millis(700));
+    release.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    store.health().unwrap();
+    let database = store.data_dir().join("memory.sqlite");
+    std::fs::remove_file(&database).unwrap();
+    assert!(store.health().is_err());
+    assert!(!database.exists());
+}

@@ -1,0 +1,29 @@
+[package]
+name = "memento-media"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+memento-core = { path = "../core" }
+memento-domain = { path = "../domain" }
+memento-embedding = { path = "../model" }
+ffmpeg-next = { version = "=9.0.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+pdfium-render = { version = "=0.9.4", default-features = false, features = ["pdfium_7881", "image_025", "thread_safe"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "pnm", "ico"] }
+turbojpeg = { version = "=1.5.1", default-features = false, features = ["pkg-config"] }
+libheif-rs = { version = "=3.0.0", default-features = false, features = ["v1_17"] }
+quick-xml = "=0.42.0"
+zip = { version = "=9.1.0", default-features = false, features = ["deflate"] }
+encoding_rs = "=0.8.42"
+regex = "=1.13.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+thiserror = "=2.0.21"
+rusqlite = { version = "=0.37.0", features = ["bundled", "functions"] }
+sha2 = "=0.10.9"
+libloading = "=0.8.9"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+

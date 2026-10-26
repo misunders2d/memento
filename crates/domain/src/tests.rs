@@ -607,3 +607,27 @@ fn transaction_graph_normalizes_model_scope_before_storing_nodes_and_replacement
         })
         .unwrap();
 }
+
+#[test]
+fn one_request_recency_timestamp_preserves_exact_ties_and_original_dates() {
+    let f = Fixture::new();
+    let a = f.remember("recency-a", "first retained fact", "old");
+    let b = f.remember("recency-b", "second retained fact", "new");
+    let ranked = chrono::DateTime::parse_from_rfc3339("2027-01-16T12:00:00+00:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    f.graph
+        .store
+        .read(|tx| {
+            let record = |id: &Value| json!({"id":id,"version":1,"pinned":0});
+            let left =
+                importance::query_recency_at(tx.sql(), &record(&a["id"]), None, None, ranked)?;
+            let right =
+                importance::query_recency_at(tx.sql(), &record(&b["id"]), None, None, ranked)?;
+            assert_eq!(left, right);
+            assert_eq!(left["decay"], 0.5);
+            assert_eq!(left["source_occurred_at"], "2026-10-18T12:00:00+00:00");
+            Ok(())
+        })
+        .unwrap();
+}

@@ -1,0 +1,573 @@
+{
+  "$defs": {
+    "Action": {
+      "additionalProperties": false,
+      "properties": {
+        "behavior": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Behavior"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "candidate_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "category": {
+          "anyOf": [
+            {
+              "enum": [
+                "memory",
+                "entity"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Category"
+        },
+        "change_kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "correction",
+                "change",
+                "refinement"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Change Kind"
+        },
+        "closed_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Closed Targets",
+          "type": "array"
+        },
+        "dst": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dst"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/Source"
+          },
+          "maxItems": 8,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "open_loop": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Open Loop"
+        },
+        "operation": {
+          "enum": [
+            "remember",
+            "duplicate",
+            "link",
+            "supersede",
+            "merge",
+            "register_type",
+            "reject",
+            "defer"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "relation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Relation"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "personal",
+                  "professional"
+                ],
+                "type": "string"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Scope"
+        },
+        "sensitive": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Sensitive"
+        },
+        "src": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Src"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Target"
+        },
+        "technical_evidence": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 8,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Technical Evidence"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "maxLength": 8192,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Text"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Type"
+        },
+        "valid_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Valid At"
+        },
+        "valid_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Valid From"
+        },
+        "valid_to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Valid To"
+        },
+        "why": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "operation",
+        "type",
+        "text",
+        "scope",
+        "open_loop",
+        "target",
+        "src",
+        "dst",
+        "relation",
+        "change_kind",
+        "valid_at",
+        "valid_from",
+        "valid_to",
+        "category",
+        "sensitive",
+        "evidence",
+        "why"
+      ],
+      "title": "Action",
+      "type": "object"
+    },
+    "Behavior": {
+      "additionalProperties": false,
+      "properties": {
+        "applicability": {
+          "maxLength": 1200,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Applicability",
+          "type": "string"
+        },
+        "authority": {
+          "enum": [
+            "inferred",
+            "explicit_user"
+          ],
+          "title": "Authority",
+          "type": "string"
+        },
+        "conduct": {
+          "maxLength": 1600,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Conduct",
+          "type": "string"
+        },
+        "exceptions": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Exceptions",
+          "type": "array"
+        },
+        "rationale": {
+          "maxLength": 1600,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Rationale",
+          "type": "string"
+        }
+      },
+      "required": [
+        "applicability",
+        "conduct",
+        "rationale",
+        "exceptions",
+        "authority"
+      ],
+      "title": "Behavior",
+      "type": "object"
+    },
+    "Repair": {
+      "additionalProperties": false,
+      "properties": {
+        "absorbed": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Absorbed",
+          "type": "array"
+        },
+        "behavior": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Behavior"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "change_kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "correction",
+                "change",
+                "refinement"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Change Kind"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/Source"
+          },
+          "maxItems": 9,
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "operation": {
+          "enum": [
+            "absorb",
+            "supersede",
+            "decline_loop",
+            "close_loop",
+            "retire"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "personal",
+                  "professional"
+                ],
+                "type": "string"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scope"
+        },
+        "target": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Target",
+          "type": "string"
+        },
+        "technical_evidence": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 8,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Technical Evidence"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "maxLength": 8192,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Type"
+        },
+        "valid_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Valid At"
+        },
+        "valid_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Valid From"
+        },
+        "valid_to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Valid To"
+        },
+        "why": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation",
+        "target",
+        "evidence",
+        "why"
+      ],
+      "title": "Repair",
+      "type": "object"
+    },
+    "Source": {
+      "additionalProperties": false,
+      "properties": {
+        "episode_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Episode Id",
+          "type": "string"
+        },
+        "occurrence": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Occurrence"
+        },
+        "quote": {
+          "maxLength": 12000,
+          "minLength": 1,
+          "title": "Quote",
+          "type": "string"
+        }
+      },
+      "required": [
+        "episode_id",
+        "quote",
+        "occurrence"
+      ],
+      "title": "Source",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "actions": {
+      "items": {
+        "$ref": "#/$defs/Action"
+      },
+      "maxItems": 16,
+      "title": "Actions",
+      "type": "array"
+    },
+    "continue_with": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 8,
+      "title": "Continue With",
+      "type": "array"
+    },
+    "repairs": {
+      "items": {
+        "$ref": "#/$defs/Repair"
+      },
+      "maxItems": 8,
+      "title": "Repairs",
+      "type": "array"
+    }
+  },
+  "required": [
+    "actions"
+  ],
+  "title": "Plan",
+  "type": "object"
+}

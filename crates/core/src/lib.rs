@@ -1,5 +1,10 @@
 //! Native authority kernel. Domain/HTTP/model integration is intentionally separate.
+pub mod blobs;
 pub mod canonical;
+pub mod capture;
+pub mod compact;
+pub mod compression;
+pub use compact::compact_worker;
 pub mod error;
 pub mod invalidation;
 pub mod raw;

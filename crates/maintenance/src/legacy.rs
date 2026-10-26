@@ -5,6 +5,7 @@ use memento_core::{Error, Result, Store, raw};
 use rusqlite::{Connection, OpenFlags, ffi, params};
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     ffi::{c_char, c_int},
     fs::File,
     os::unix::fs::DirBuilderExt,
@@ -20,6 +21,10 @@ pub struct ImportReport {
     pub local_blobs: u64,
     pub remote_blobs: u64,
     pub destination_header: i64,
+    pub complete: bool,
+    pub missing_assets: u64,
+    pub missing_drive_binding: bool,
+    pub raw_rows_with_missing_artifacts: u64,
 }
 fn init(db: &Connection) -> Result<()> {
     // Exact sqlite-vec0.1.9 shipped C ABI, SQLITE_CORE -> this bundled SQLite.
@@ -98,10 +103,19 @@ fn source_guard(source: &Path) -> Result<(Connection, i64)> {
     init(&db)?;
     Ok((db, header))
 }
-fn blobs(source_dir: &Path, stage: &Path, db: &Connection) -> Result<(u64, u64)> {
+fn blobs(
+    source_dir: &Path,
+    stage: &Path,
+    db: &Connection,
+    allow_missing: bool,
+    allowed_gaps: Option<&BTreeSet<String>>,
+) -> Result<(u64, u64, BTreeSet<String>, u64, bool)> {
     let mut query = db.prepare("SELECT sha256,size,remote_id FROM blobs ORDER BY sha256")?;
     let mut local = 0;
     let mut remote = 0;
+    let mut missing = BTreeSet::new();
+    let mut missing_local = 0;
+    let mut missing_binding = false;
     for row in query.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -117,10 +131,16 @@ fn blobs(source_dir: &Path, stage: &Path, db: &Connection) -> Result<(u64, u64)>
         {
             return Err(Error::Validation("Invalid registered blob checksum"));
         }
+        if remote_id.is_some() {
+            remote += 1;
+        }
         let input = source_dir.join("blobs").join(&sha[..2]).join(&sha[2..]);
         if !input.exists() {
+            missing.insert(sha.clone());
             if remote_id.is_some() {
-                remote += 1;
+                continue;
+            } else if allow_missing || allowed_gaps.is_some_and(|gaps| gaps.contains(&sha)) {
+                missing_local += 1;
                 continue;
             } else {
                 return Err(Error::Unavailable(
@@ -143,15 +163,48 @@ fn blobs(source_dir: &Path, stage: &Path, db: &Connection) -> Result<(u64, u64)>
             plain_file(&binding)?;
             let (sha, size) = hash_file(&binding)?;
             copy_verified(&binding, &stage.join("drive-binding.json"), &sha, size)?;
+        } else if allow_missing {
+            missing_binding = true;
         } else {
             return Err(Error::Unavailable(
                 "Remote blob references require the original Drive binding",
             ));
         }
     }
-    Ok((local, remote))
+    Ok((local, remote, missing, missing_local, missing_binding))
 }
 pub fn import(source: &Path, destination: &Path) -> Result<ImportReport> {
+    import_with_policy(source, destination, false, None)
+}
+/// Private, explicitly incomplete DB/index comparison. Never an agent restore bypass.
+/// Keeps every authority row/reference; missing artifacts remain unavailable.
+#[cfg(feature = "comparison-import")]
+pub fn import_database_for_comparison(source: &Path, destination: &Path) -> Result<ImportReport> {
+    import_with_policy(source, destination, true, None)
+}
+/// Explicit owner allow-incomplete restore may preserve only its verified declared gaps.
+/// This never permits absent Drive binding or corrupt artifacts that are present.
+pub fn import_with_allowed_gaps(
+    source: &Path,
+    destination: &Path,
+    allowed_missing: &BTreeSet<String>,
+) -> Result<ImportReport> {
+    if allowed_missing.iter().any(|sha| {
+        sha.len() != 64
+            || !sha
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }) {
+        return Err(Error::Validation("Invalid declared backup gap"));
+    }
+    import_with_policy(source, destination, false, Some(allowed_missing))
+}
+fn import_with_policy(
+    source: &Path,
+    destination: &Path,
+    allow_missing: bool,
+    allowed_gaps: Option<&BTreeSet<String>>,
+) -> Result<ImportReport> {
     plain_file(source)?;
     let source = source.canonicalize()?;
     let lease_path = source.parent().unwrap().join("writer.lock");
@@ -187,7 +240,13 @@ pub fn import(source: &Path, destination: &Path) -> Result<ImportReport> {
     let stage = parent.join(format!(".memento-legacy-{}", uuid::Uuid::new_v4().simple()));
     std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
     let result = (|| {
-        let (local_blobs, remote_blobs) = blobs(source.parent().unwrap(), &stage, &source_db)?;
+        let (local_blobs, remote_blobs, missing, missing_local, missing_drive_binding) = blobs(
+            source.parent().unwrap(),
+            &stage,
+            &source_db,
+            allow_missing,
+            allowed_gaps,
+        )?;
         let store = Store::open(&stage)?;
         let (tables,authority_rows,vectors)=store.write(|tx|{
             init(tx.sql())?;
@@ -213,9 +272,9 @@ pub fn import(source: &Path, destination: &Path) -> Result<ImportReport> {
             // Rebuild its derived postings with the exact capture predicate, not SELECT *.
             tx.sql().execute_batch("INSERT INTO episodes_fts(episodes_fts) VALUES('delete-all'); INSERT INTO episodes_fts(rowid,text) SELECT seq,text FROM episodes WHERE kind NOT IN ('native_record','native_live_record','native_hook') AND coalesce(json_extract(metadata,'$.extraction_mode'),'message')<>'skip';")?;
             let mut vector_count=0;
-            {let mut query=tx.sql().prepare("SELECT v.rowid,v.embedding,v.current,i.kind,i.target FROM legacy.memory_vectors v LEFT JOIN legacy.vector_items i ON i.seq=v.rowid ORDER BY v.rowid")?;let mut rows=query.query([])?;
+            {let mut query=tx.sql().prepare("SELECT v.rowid,v.embedding,v.current,i.kind,i.target FROM legacy.memory_vectors v LEFT JOIN legacy.vector_items i ON i.seq=v.rowid")?;let mut rows=query.query([])?;
                 while let Some(row)=rows.next()?{let seq:i64=row.get(0)?;let bytes:Vec<u8>=row.get(1)?;if bytes.len()!=3072{return Err(Error::Validation("Legacy FP32 vector has the wrong byte length"))}let current:i64=row.get(2)?;let kind:Option<String>=row.get(3)?;let target:Option<String>=row.get(4)?;
-                    let historical=if kind.as_deref()==Some("episode"){tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id JOIN historical_parking h ON h.source=e.source AND h.conversation_id=e.conversation_id WHERE x.id=? AND e.seq<=h.parked_through)",[target],|r|r.get::<_,bool>(0))?}else if kind.as_deref()==Some("candidate"){tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM historical_parked_candidates WHERE candidate_id=? AND released_at IS NULL)",[target],|r|r.get(0))?}else{kind.is_none()};
+                    let historical=if kind.as_deref()==Some("episode"){tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id JOIN historical_parking h ON h.source=e.source AND h.conversation_id=e.conversation_id WHERE x.id=? AND e.seq<=h.parked_through)",[target],|r|r.get::<_,bool>(0))?}else{kind.is_none()};
                     tx.sql().execute("INSERT INTO vector_blobs VALUES(?,?,?,0,?)",params![seq,bytes,current,if historical{"cold"}else{"hot"}])?;vector_count+=1;
                 }
             }
@@ -223,11 +282,18 @@ pub fn import(source: &Path, destination: &Path) -> Result<ImportReport> {
             for (_,sql) in &triggers{tx.sql().execute_batch(sql)?;}
             Ok((table_count,row_count,vector_count))
         })?;
+        let mut raw_rows_with_missing_artifacts = 0;
         store.read(|tx|{let integrity:String=tx.sql().query_row("PRAGMA integrity_check",[],|r|r.get(0))?;if integrity!="ok"{return Err(Error::Unavailable("Imported authority integrity check failed"))}
             let refs="SELECT sha256 FROM media_files UNION SELECT artifact_sha256 FROM segments UNION SELECT source_sha256 FROM segments WHERE source_sha256 IS NOT NULL";if tx.sql().query_row(&format!("SELECT EXISTS(SELECT 1 FROM ({refs}) r WHERE NOT EXISTS(SELECT 1 FROM blobs b WHERE b.sha256=r.sha256))"),[],|r|r.get::<_,bool>(0))?{return Err(Error::Validation("Imported authority references unregistered artifacts"))}
             raw::validate_frames(tx.sql())?;
-            let mut q=tx.sql().prepare("SELECT id FROM episodes WHERE raw_frame IS NOT NULL OR text_runs IS NOT NULL")?;
-            for id in q.query_map([],|r|r.get::<_,String>(0))?{raw::read_original(tx.sql(),&stage,&id?)?;}
+            let mut q=tx.sql().prepare("SELECT id,raw_frame,text_runs FROM episodes WHERE raw_frame IS NOT NULL OR text_runs IS NOT NULL")?;
+            for row in q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?)))?{
+                let (id,frame,runs)=row?;
+                if frame.is_some()&&runs.is_some(){return Err(Error::Validation("Raw episode has conflicting storage references"))}
+                if let Some(runs)=runs{let refs:Vec<(usize,String,usize)>=serde_json::from_str(&runs)?;
+                    if refs.iter().any(|r|missing.contains(&r.1)){raw_rows_with_missing_artifacts+=1;continue;}}
+                raw::read_original(tx.sql(),&stage,&id)?;
+            }
             Ok(())})?;
         drop(store);
         drop(source_db);
@@ -256,6 +322,10 @@ pub fn import(source: &Path, destination: &Path) -> Result<ImportReport> {
             local_blobs,
             remote_blobs,
             destination_header: 5,
+            complete: missing_local == 0 && !missing_drive_binding,
+            missing_assets: missing_local,
+            missing_drive_binding,
+            raw_rows_with_missing_artifacts,
         })
     })();
     if result.is_err() && stage.exists() {
@@ -299,7 +369,7 @@ mod tests {
         drop(store);
         let db = Connection::open(dir.path().join("memory.sqlite")).unwrap();
         init(&db).unwrap();
-        db.execute_batch("CREATE VIRTUAL TABLE memory_vectors USING vec0(embedding float[768] distance_metric=cosine,current boolean); INSERT INTO memory_vectors(rowid,embedding,current) SELECT seq,embedding,current FROM vector_blobs; DROP TABLE vector_blobs; DROP TABLE projection_events; DROP TABLE projection_ack; DROP TABLE runtime_state;").unwrap();
+        db.execute_batch("CREATE VIRTUAL TABLE memory_vectors USING vec0(embedding float[768] distance_metric=cosine,current boolean); INSERT INTO memory_vectors(rowid,embedding,current) SELECT seq,embedding,current FROM vector_blobs; DROP TABLE vector_blobs; DROP TABLE projection_events; DROP TABLE projection_ack; DROP TABLE runtime_state; DROP TABLE media_stage_units;").unwrap();
         let mut vector = vec![0_u8; 3072];
         vector[..4].copy_from_slice(&1f32.to_le_bytes());
         db.execute(
@@ -393,6 +463,43 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+    #[cfg(feature = "comparison-import")]
+    #[test]
+    fn explicit_database_comparison_retains_missing_references_and_reports_incomplete() {
+        let source = fixture(3);
+        std::fs::remove_dir_all(source.path().join("blobs")).unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let destination = output.path().join("comparison");
+        let before = hash_file(&source.path().join("memory.sqlite")).unwrap();
+        let report =
+            import_database_for_comparison(&source.path().join("memory.sqlite"), &destination)
+                .unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.missing_assets, 1);
+        assert_eq!(report.vectors, 5);
+        assert_eq!(
+            hash_file(&source.path().join("memory.sqlite")).unwrap(),
+            before
+        );
+        let store = Store::open(destination).unwrap();
+        store
+            .read(|tx| {
+                assert_eq!(
+                    tx.sql()
+                        .query_row("SELECT count(*) FROM blobs", [], |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                assert_eq!(
+                    tx.sql()
+                        .query_row("SELECT count(*) FROM media_files", [], |r| r
+                            .get::<_, i64>(0))?,
+                    1
+                );
+                assert_eq!(tx.original_text("frame")?.unwrap(), "compressed raw Ω😀");
+                Ok(())
+            })
+            .unwrap();
     }
     #[test]
     fn unknown_header_and_missing_blob_fail_before_publication() {

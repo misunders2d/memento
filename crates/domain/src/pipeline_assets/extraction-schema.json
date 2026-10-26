@@ -1,0 +1,335 @@
+{
+  "$defs": {
+    "EntityDraft": {
+      "additionalProperties": false,
+      "properties": {
+        "confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "dst_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dst Key"
+        },
+        "key": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "entity",
+          "title": "Kind",
+          "type": "string"
+        },
+        "occurrence": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Occurrence"
+        },
+        "open_loop": {
+          "title": "Open Loop",
+          "type": "boolean"
+        },
+        "quote": {
+          "maxLength": 12000,
+          "minLength": 1,
+          "title": "Quote",
+          "type": "string"
+        },
+        "scope": {
+          "items": {
+            "enum": [
+              "personal",
+              "professional"
+            ],
+            "type": "string"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "title": "Scope",
+          "type": "array"
+        },
+        "src_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Src Key"
+        },
+        "text": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        },
+        "type": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "valid_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Valid From"
+        },
+        "valid_to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Valid To"
+        },
+        "why": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "type",
+        "text",
+        "open_loop",
+        "why",
+        "quote",
+        "occurrence",
+        "src_key",
+        "dst_key",
+        "valid_from",
+        "valid_to",
+        "confidence",
+        "kind",
+        "scope"
+      ],
+      "title": "EntityDraft",
+      "type": "object"
+    },
+    "SingleScopeDraft": {
+      "additionalProperties": false,
+      "properties": {
+        "confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "dst_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dst Key"
+        },
+        "key": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "memory",
+            "relation"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "occurrence": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Occurrence"
+        },
+        "open_loop": {
+          "title": "Open Loop",
+          "type": "boolean"
+        },
+        "quote": {
+          "maxLength": 12000,
+          "minLength": 1,
+          "title": "Quote",
+          "type": "string"
+        },
+        "scope": {
+          "items": {
+            "enum": [
+              "personal",
+              "professional"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "title": "Scope",
+          "type": "array"
+        },
+        "src_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Src Key"
+        },
+        "text": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        },
+        "type": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "valid_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Valid From"
+        },
+        "valid_to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Valid To"
+        },
+        "why": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "type",
+        "text",
+        "open_loop",
+        "why",
+        "quote",
+        "occurrence",
+        "src_key",
+        "dst_key",
+        "valid_from",
+        "valid_to",
+        "confidence",
+        "kind",
+        "scope"
+      ],
+      "title": "SingleScopeDraft",
+      "type": "object"
+    },
+    "WindowDrafts": {
+      "additionalProperties": false,
+      "properties": {
+        "candidates": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "entity": "#/$defs/EntityDraft",
+                "memory": "#/$defs/SingleScopeDraft",
+                "relation": "#/$defs/SingleScopeDraft"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/EntityDraft"
+              },
+              {
+                "$ref": "#/$defs/SingleScopeDraft"
+              }
+            ]
+          },
+          "maxItems": 100,
+          "title": "Candidates",
+          "type": "array"
+        },
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidates",
+        "id"
+      ],
+      "title": "WindowDrafts",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "windows": {
+      "items": {
+        "$ref": "#/$defs/WindowDrafts"
+      },
+      "maxItems": 64,
+      "title": "Windows",
+      "type": "array"
+    }
+  },
+  "required": [
+    "windows"
+  ],
+  "title": "BatchDrafts",
+  "type": "object"
+}

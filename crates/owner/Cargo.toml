@@ -1,0 +1,36 @@
+[package]
+name = "memento-owner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[features]
+default = []
+legacy-import = ["memento-maintenance/legacy-import"]
+
+[dependencies]
+memento-core = { path = "../core" }
+memento-domain = { path = "../domain" }
+memento-maintenance = { path = "../maintenance", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["preserve_order", "arbitrary_precision"] }
+libc = "=0.2.191"
+uuid = { version = "=1.29.0", features = ["v4"] }
+log = { version = "=0.4.34", features = ["max_level_info"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+rusqlite = { version = "=0.37.0", features = ["bundled", "functions", "backup", "blob"] }
+
+[[bin]]
+name = "memento-admin"
+path = "src/bin/admin.rs"
+[[bin]]
+name = "memento-restore"
+path = "src/bin/restore.rs"
+
+
+[[bin]]
+name="memento-drive"
+path="src/bin/drive.rs"

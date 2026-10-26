@@ -87,6 +87,15 @@ pub fn query_recency(
     authority: Option<&str>,
     source_override: Option<Option<&str>>,
 ) -> Result<Value> {
+    query_recency_at(db, record, authority, source_override, Utc::now())
+}
+pub fn query_recency_at(
+    db: &Connection,
+    record: &Value,
+    authority: Option<&str>,
+    source_override: Option<Option<&str>>,
+    ranked_at: chrono::DateTime<Utc>,
+) -> Result<Value> {
     let target = get_str(record, "id")?;
     let source = if let Some(value) = source_override {
         value.map(str::to_owned)
@@ -110,7 +119,7 @@ pub fn query_recency(
     let cited_at = cited.as_deref().and_then(|value| parse_time(value).ok());
     let anchor = source_at.into_iter().chain(cited_at).max();
     let age = anchor
-        .map(|at| (Utc::now() - at).num_microseconds().unwrap_or(0) as f64 / 86400.0 / 1000000.0)
+        .map(|at| (ranked_at - at).num_microseconds().unwrap_or(0) as f64 / 86400.0 / 1000000.0)
         .unwrap_or(0.0)
         .max(0.0);
     let decay = if record["pinned"].as_i64().unwrap_or(0) != 0

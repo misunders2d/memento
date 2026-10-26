@@ -35,8 +35,15 @@ fn blob(data_dir: &Path, sha: &str, length: usize) -> Result<Vec<u8>> {
     {
         return Err(unavailable());
     }
+    // This is local-only hydration. HTTP/processing callers fetch cold artifacts
+    // before opening a transaction and retain their BlobReader lease. Cached
+    // bytes are checked against the immutable expected SHA/length below.
     let path = data_dir.join("blobs").join(&sha[..2]).join(&sha[2..]);
-    let file = std::fs::File::open(path).map_err(|_| unavailable())?;
+    let file = std::fs::File::open(path)
+        .or_else(|_| {
+            std::fs::File::open(data_dir.join("cold-cache").join(&sha[..2]).join(&sha[2..]))
+        })
+        .map_err(|_| unavailable())?;
     let mut value = Vec::new();
     file.take(length.checked_add(1).ok_or_else(unavailable)? as u64)
         .read_to_end(&mut value)

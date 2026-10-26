@@ -64,7 +64,7 @@ pub fn parse_time(value: &str) -> Result<DateTime<Utc>> {
         .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%:z"))
         .map(|value| value.with_timezone(&Utc))
         .map_err(|_| Error::Validation("World time must be an aware ISO timestamp"))?;
-    if !(1..=9999).contains(&parsed.year()) {
+    if !(1..=9999).contains(&parsed.year()) || parsed.nanosecond() >= 1_000_000_000 {
         return Err(Error::Validation(
             "World time must be an aware ISO timestamp",
         ));

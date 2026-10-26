@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# Linuxamd64 only; official registry digests, Rust1.98.0 +Debiantrixie/glibc2.41.
+ARG MEMENTO_NATIVE_WHEEL_SOURCE=download-native-wheels
+FROM rust:1.98.0-slim-trixie@sha256:90fd7674d9f6c35662cbf59ec39c32175511a1b7f49e39adcbe91b7420e5e972 AS build-base
+ARG DEBIAN_SNAPSHOT=20261020T000000Z
+RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s trixie main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       build-essential clang libclang-dev cmake pkg-config python3 xz-utils ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.41' \
+    && test "$(rustc --version | cut -d' ' -f2)" = 1.98.0
+COPY packaging/assemble_native_media.py packaging/prepare_native.py /opt/memento-build/
+FROM build-base AS download-native-wheels
+RUN --mount=type=cache,id=memento-native-public-amd64,target=/var/cache/memento-native \
+    python3 /opt/memento-build/prepare_native.py --cache /var/cache/memento-native \
+       --extract-wheels-to /app/.venv/lib/python3.14/site-packages
+
+# Optional current-build cache: a separately tagged qualified baseline image.
+# Copy only native directories/notices below; no Python modules/Torch survive.
+FROM ${MEMENTO_NATIVE_WHEEL_SOURCE} AS native-wheels
+FROM build-base AS build
+COPY --from=native-wheels /app/.venv/lib/python3.14/site-packages/av.libs /opt/native-packages/av.libs
+COPY --from=native-wheels /app/.venv/lib/python3.14/site-packages/pillow.libs /opt/native-packages/pillow.libs
+COPY --from=native-wheels /app/.venv/lib/python3.14/site-packages/pillow_heif.libs /opt/native-packages/pillow_heif.libs
+COPY --from=native-wheels /app/.venv/lib/python3.14/site-packages/pypdfium2_raw/libpdfium.so /opt/native-packages/pypdfium2_raw/libpdfium.so
+COPY --from=native-wheels /app/.venv/lib/python3.14/site-packages/av-19.0.1.dist-info/licenses /opt/native-packages/av-19.0.1.dist-info/licenses
+COPY --from=native-wheels /app/.venv/lib/python3.14/site-packages/pillow-12.3.0.dist-info/licenses /opt/native-packages/pillow-12.3.0.dist-info/licenses
+COPY --from=native-wheels /app/.venv/lib/python3.14/site-packages/pillow_heif-1.8.1.dist-info/licenses /opt/native-packages/pillow_heif-1.8.1.dist-info/licenses
+COPY --from=native-wheels /app/.venv/lib/python3.14/site-packages/pypdfium2-5.14.0.dist-info/licenses /opt/native-packages/pypdfium2-5.14.0.dist-info/licenses
+# Only public codec/runtime assets, never model weights. BuildKit cache can be
+# preseeded by immutable SHA filenames; every hit is reverified before use.
+RUN --mount=type=cache,id=memento-native-public-amd64,target=/var/cache/memento-native \
+    python3 /opt/memento-build/prepare_native.py --cache /var/cache/memento-native \
+       --output /opt/memento-native --sdk /opt/memento-native-sdk --source-packages /opt/native-packages
+ENV PKG_CONFIG_PATH=/opt/memento-native-sdk/lib/pkgconfig \
+    LD_LIBRARY_PATH=/opt/memento-native/media/lib:/opt/memento-native/ort/lib \
+    RUSTFLAGS="-C link-arg=-Wl,-rpath-link,/opt/memento-native/media/lib" \
+    CARGO_BUILD_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=2 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_INCREMENTAL=0
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# Portable stdlib clients/TS/staticUI are embedded bytes, not service code.
+COPY src/memento ./src/memento
+COPY THIRD_PARTY_NOTICES.md ./
+RUN --mount=type=cache,id=memento-native-cargo-amd64,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=memento-native-target-amd64,target=/build/target \
+    cargo build --locked --release -p memento-server --bin memento \
+    && mkdir -p /out/bin \
+    && cp target/release/memento /out/bin/memento \
+    && cargo build --locked --release -p memento-owner --features legacy-import \
+    && cp target/release/memento-admin target/release/memento-restore target/release/memento-drive /out/bin/ \
+    && cargo build --locked --release -p memento-maintenance --features legacy-import --bin memento-import \
+    && cp target/release/memento-import /out/bin/
+COPY packaging/native_sanity.c /opt/memento-build/
+RUN cc -O2 -I/opt/memento-native-sdk/include /opt/memento-build/native_sanity.c -ldl -o /out/memento-native-sanity
+
+FROM debian:trixie-20261020-slim@sha256:4876fdea29cac1a33a3195f1eb1952feb1fca7dd6dd00be3e2f1879cf20d34d2 AS runtime
+ARG DEBIAN_SNAPSHOT=20261020T000000Z
+RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s trixie main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends ca-certificates libstdc++6 libgcc-s1 zlib1g \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p -m 0700 /data \
+    && chown 10001:10001 /data
+COPY --from=build /out/bin/ /usr/local/bin/
+COPY --from=build /out/memento-native-sanity /usr/local/libexec/memento-native-sanity
+COPY --from=build /opt/memento-native /opt/memento-native
+COPY --from=build /build/THIRD_PARTY_NOTICES.md /usr/share/doc/memento/THIRD_PARTY_NOTICES.md
+COPY --from=build /build/crates/ann/licenses /usr/share/doc/memento/ann
+COPY --from=build /build/crates/model/licenses /usr/share/doc/memento/model
+COPY --from=build /build/crates/media/licenses /usr/share/doc/memento/media
+COPY packaging/verify_runtime.sh /usr/local/libexec/memento-verify-runtime
+ENV MEMENTO_DATA_DIR=/data MEMENTO_EMBEDDINGS=1 OMP_NUM_THREADS=1 \
+    MEMENTO_ORT_LIBRARY=/opt/memento-native/ort/lib/libonnxruntime.so.1.31.0 \
+    MEMENTO_PDFIUM_LIBRARY=/opt/memento-native/media/lib/libpdfium.so \
+    LD_LIBRARY_PATH=/opt/memento-native/media/lib:/opt/memento-native/ort/lib
+RUN sh /usr/local/libexec/memento-verify-runtime
+USER 10001:10001
+WORKDIR /app
+EXPOSE 8765
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 CMD ["/usr/local/bin/memento", "--health-check"]
+ENTRYPOINT ["/usr/local/bin/memento"]
+CMD ["--host", "0.0.0.0"]
