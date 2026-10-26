@@ -331,6 +331,7 @@ impl Retrieval {
             records.push(row);
         }
         records.sort_by(order);
+        let mut facts = Vec::new();
         // Exact full-name/alias T1 anchors keep their existing priority and budget.
         let mut emitted_ids = named
             .iter()
@@ -484,6 +485,9 @@ impl Retrieval {
                     ));
                 }
             }
+            if records::meaningful(db, &row)? {
+                facts.push(row.clone());
+            }
             row.as_object_mut().unwrap().remove("_full_text");
             row.as_object_mut().unwrap().remove("_feedback");
             emitted_ids.insert(key(&row).to_owned());
@@ -512,6 +516,16 @@ impl Retrieval {
                 }
             }
         }
+        anchors::add_partials(
+            db,
+            &request.query,
+            vector,
+            scope,
+            TEXT_FLOOR,
+            &facts,
+            &mut output,
+            limit,
+        )?;
         Ok((output, need_archive && !archive))
     }
     fn keywords(
@@ -1315,5 +1329,526 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn t3_real_unlinked_bio_shape_keeps_bio_then_canonical_and_recorded_scoped_edges() {
+        let mut f = Fixture::new();
+        let entity = f.add(
+            "Leonid North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.7948922,
+            "personal",
+        );
+        let bio = f.add(
+            "Leonid is the family member with a long retained biography",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.77928543,
+            "personal",
+        );
+        let relative = f.add(
+            "Family Relative",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.2,
+            "personal",
+        );
+        let coworker = f.add(
+            "Professional Colleague",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.2,
+            "professional",
+        );
+        f.connect(&entity, &relative);
+        f.connect(&entity, &coworker);
+        for i in 0..6 {
+            f.add(
+                &format!("Other retained family detail number {i}"),
+                "knowledge",
+                "2020-01-01T00:00:00Z",
+                0.5,
+                0.69,
+                "personal",
+            );
+        }
+        for automatic in [true, false] {
+            let rows = f.recall("Who is Leonid?", 6, automatic, Some("personal"));
+            assert_eq!(rows[0]["id"], bio);
+            assert_eq!(rows[1]["id"], entity);
+            assert_eq!(rows[1]["match"], "partial_entity_name");
+            assert!(rows[1].get("basis_memory_id").is_none());
+            let edges = rows[1]["connections"].as_array().unwrap();
+            assert_eq!(edges.len(), 1);
+            assert_eq!(edges[0]["id"], relative);
+            assert!(edges.iter().all(|e| e["id"] != bio && e["id"] != coworker));
+            assert!(rows.len() <= 6);
+        }
+    }
+    #[test]
+    fn t3_gloss_and_full_name_terms_never_turn_unnamed_roles_into_partial_names() {
+        let mut f = Fixture::new();
+        let person = f.add(
+            "Leonid North — manages logistics",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.85,
+            "personal",
+        );
+        let fact = f.add(
+            "A manager handles logistics and all evening deliveries",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.9,
+            "personal",
+        );
+        for q in ["Who manages logistics?", "Who handles evening deliveries?"] {
+            let rows = f.recall(q, 6, true, Some("personal"));
+            assert_eq!(rows[0]["id"], fact);
+            assert!(rows.iter().all(|r| r["id"] != person));
+        }
+        let rows = f.recall("Who is Leonid?", 6, true, Some("personal"));
+        assert!(rows.iter().all(|r| r["id"] != person)); // entity lacks corroboration and loses cosine dominance
+        f.connect(&fact, &person);
+        let rows = f.recall("Who manages logistics?", 6, true, Some("personal"));
+        assert!(rows.iter().all(|r| r["category"] != "entity_context"));
+        assert!(
+            rows[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Connected: Leonid North")
+        );
+    }
+    #[test]
+    fn t3_two_alex_entries_stay_separate_and_strong_edgeless_fact_keeps_limit_one() {
+        let mut f = Fixture::new();
+        let one = f.add(
+            "Alex North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.82,
+            "personal",
+        );
+        let two = f.add(
+            "Alex South",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.81,
+            "personal",
+        );
+        let fact = f.add(
+            "Alex is mentioned in a retained family source",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.90,
+            "personal",
+        );
+        let rows = f.recall("Which Alex should reply?", 6, true, Some("personal"));
+        assert_eq!(rows[0]["id"], fact);
+        assert_eq!(rows[1]["id"], one);
+        assert_eq!(rows[2]["id"], two);
+        assert!(
+            rows[1..3]
+                .iter()
+                .all(|r| r["connections"] == json!([]) && r.get("basis_memory_id").is_none())
+        );
+        let strong = f.add(
+            "Alex has a precise oxygen procedure applicable to this request",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.1,
+            0.95,
+            "personal",
+        );
+        for automatic in [false, true] {
+            assert_eq!(
+                f.recall("Which Alex should reply?", 1, automatic, Some("personal"))[0]["id"],
+                strong
+            );
+        }
+    }
+    #[test]
+    fn t3_strict_cosine_dominance_needs_literal_name_and_normal_floor() {
+        let mut f = Fixture::new();
+        let strong = f.add(
+            "Nadia North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
+        let weak = f.add(
+            "Nadia South",
+            "person",
+            "2020-01-01T00:00:00Z",
+            1.,
+            0.684,
+            "personal",
+        );
+        let zero = f.add(
+            "Someone Else",
+            "person",
+            "2020-01-01T00:00:00Z",
+            1.,
+            0.99,
+            "personal",
+        );
+        let fact = f.add(
+            "An unrelated retained statement about ordinary work",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.75,
+            "personal",
+        );
+        let rows = f.recall("What did Nadia do?", 6, true, Some("personal"));
+        assert_eq!(rows[0]["id"], fact);
+        assert_eq!(rows[1]["id"], strong);
+        assert!(rows.iter().all(|r| r["id"] != weak && r["id"] != zero));
+        let tie = f.add(
+            "Nadia West",
+            "person",
+            "2020-01-01T00:00:00Z",
+            1.,
+            0.75,
+            "personal",
+        );
+        let rows = f.recall("What did Nadia do?", 6, true, Some("personal"));
+        assert!(rows.iter().all(|r| r["id"] != tie));
+    }
+    #[test]
+    fn t3_df_is_current_active_visible_and_scoped_not_global_or_version_counted() {
+        let mut f = Fixture::new();
+        let entity = f.add(
+            "Leonid North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
+        f.add(
+            "Leonid is present in a retained biography",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.9,
+            "personal",
+        );
+        for i in 0..17 {
+            f.add(
+                &format!("Leonid appears in professional source {i}"),
+                "knowledge",
+                "2020-01-01T00:00:00Z",
+                0.5,
+                0.7,
+                "professional",
+            );
+            let forgotten = f.add(
+                &format!("Leonid appears in excluded personal source {i}"),
+                "knowledge",
+                "2020-01-01T00:00:00Z",
+                0.5,
+                0.7,
+                "personal",
+            );
+            f.store.write(|tx|{tx.sql().execute("INSERT INTO forgotten_targets SELECT ?1,commit_id,'node' FROM node_versions WHERE id=?1",[&forgotten])?;Ok(())}).unwrap();
+        }
+        assert!(
+            f.recall("Who is Leonid?", 6, true, Some("personal"))
+                .iter()
+                .any(|r| r["id"] == entity && r["match"] == "partial_entity_name")
+        );
+        assert!(
+            f.recall("Who is Leonid?", 6, true, None)
+                .iter()
+                .all(|r| r["category"] != "entity_context")
+        );
+        for i in 0..17 {
+            f.add(
+                &format!("Leonid appears in another active personal source {i}"),
+                "knowledge",
+                "2020-01-01T00:00:00Z",
+                0.5,
+                0.7,
+                "personal",
+            );
+        }
+        assert!(
+            f.recall("Who is Leonid?", 6, true, Some("personal"))
+                .iter()
+                .all(|r| r["category"] != "entity_context")
+        );
+    }
+    #[test]
+    fn t3_reviewed_alias_uses_current_pinned_canonical_vector_not_stale_names() {
+        let mut f = Fixture::new();
+        let entity = f.add(
+            "Leonid North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
+        f.add(
+            "Leonid appears in an independently retained biography",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.9,
+            "personal",
+        );
+        f.store.write(|tx|{
+            tx.sql().execute("INSERT INTO node_versions SELECT id,2,commit_id,type,'Leo North','active',valid_from,valid_to,superseded_by,1,scope FROM node_versions WHERE id=? AND version=1",[&entity])?;
+            tx.sql().execute("INSERT INTO graph_evidence SELECT target,2,episode_id,start,end,quote FROM graph_evidence WHERE target=? AND version=1",[&entity])?;
+            tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?)",[&entity])?;
+            let mut v=[0.;768];v[0]=0.8;v[1]=0.6;
+            tx.put_vector(&VectorWrite{seq:1000,target:entity.clone(),kind:VectorKind::Node,version:2,embedding:F32Blob::from_values(&v)?,current:true,tier:Tier::Hot})?;Ok(())
+        }).unwrap();
+        assert!(
+            f.recall("Who is Leonid?", 6, true, Some("personal"))
+                .iter()
+                .all(|r| r["id"] != entity)
+        );
+        f.store.write(|tx|{
+            tx.sql().execute("INSERT INTO entity_merges SELECT 'reviewed-source',id,commit_id FROM node_versions WHERE id=? AND version=2",[&entity])?;
+            tx.sql().execute("INSERT INTO alias_fts VALUES('reviewed-source','Leonid North — old reviewed description')",[])?;Ok(())
+        }).unwrap();
+        let rows = f.recall("Who is Leonid?", 6, true, Some("personal"));
+        let anchor = rows.iter().find(|r| r["id"] == entity).unwrap();
+        assert_eq!(anchor["version"], 2);
+        assert_eq!(anchor["pinned"], 1);
+        assert_eq!(anchor["match"], "partial_entity_name");
+        f.store
+            .write(|tx| {
+                tx.sql()
+                    .execute("UPDATE vector_blobs SET current=0 WHERE seq=1000", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            f.recall("Who is Leonid?", 6, true, Some("personal"))
+                .iter()
+                .all(|r| r["id"] != entity)
+        );
+    }
+    #[test]
+    fn t3_preserves_t1_t2_shared_context_budget() {
+        let mut f = Fixture::new();
+        let t1 = f.add(
+            "Uma",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.1,
+            "personal",
+        );
+        let t2 = f.add(
+            "Nadia North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.1,
+            "personal",
+        );
+        let t3 = f.add(
+            "Leonid South",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
+        let fact = f.add(
+            "Leonid has a documented relevant family biography",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.9,
+            "personal",
+        );
+        f.connect(&fact, &t2);
+        let rows = f.recall("Uma Nadia Leonid", 6, true, Some("personal"));
+        assert_eq!(rows[0]["id"], t1);
+        assert_eq!(rows[1]["id"], fact);
+        assert_eq!(rows[2]["id"], t2);
+        assert_eq!(rows[2]["match"], "recorded_connection");
+        assert!(rows.iter().all(|r| r["id"] != t3));
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["category"] == "entity_context")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn t3_candidate_separate_identity_scope_decision_and_source_forgetting_are_fenced() {
+        let mut f = Fixture::new();
+        let fact = f.add(
+            "Alex occurs in this retained family biography",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.9,
+            "personal",
+        );
+        let seed = f.add(
+            "Alex North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
+        let episode=f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"pending-alex","conversation_id":"pending-alex","kind":"user","text":"Alex South","metadata":{}})).unwrap()).unwrap();
+        f.store.write(|tx|{
+            tx.sql().execute("INSERT INTO extraction_runs SELECT 'pending-run',commit_id,?2,'test','test','[]','{}','2026-10-25' FROM node_versions WHERE id=?1 AND version=1",params![seed,episode.id])?;
+            tx.sql().execute("INSERT INTO candidates VALUES('pending-alex','pending-run','entity','person','Alex South','Exact source',NULL,NULL,1,NULL,NULL,'[\"personal\"]')",[])?;
+            tx.sql().execute("INSERT INTO graph_evidence VALUES('pending-alex',1,?1,0,10,'Alex South')",[&episode.id])?;
+            let mut v=[0.;768];v[0]=0.81;v[1]=(1f32-v[0]*v[0]).sqrt();
+            tx.put_vector(&VectorWrite{seq:2000,target:"pending-alex".into(),kind:VectorKind::Candidate,version:1,embedding:F32Blob::from_values(&v)?,current:true,tier:Tier::Hot})?;Ok(())
+        }).unwrap();
+        let rows = f.recall("Which Alex?", 6, true, Some("personal"));
+        assert_eq!(rows[0]["id"], fact);
+        assert_eq!(rows[1]["id"], seed); // durable tie class precedes candidate even with slightly lower cosine
+        let pending = rows.iter().find(|r| r["id"] == "pending-alex").unwrap();
+        assert_eq!(pending["tier"], "candidate");
+        assert_eq!(pending["match"], "partial_entity_name");
+        assert_eq!(pending["confirmed"], false);
+        assert!(
+            f.recall("Which Alex?", 6, true, Some("professional"))
+                .iter()
+                .all(|r| r["id"] != "pending-alex")
+        );
+        f.store.write(|tx|{tx.sql().execute("INSERT INTO forgotten_sources SELECT 'synthetic','pending-alex','pending-alex',commit_id FROM node_versions WHERE id=? AND version=1",[&seed])?;Ok(())}).unwrap();
+        assert!(
+            f.recall("Which Alex?", 6, true, Some("personal"))
+                .iter()
+                .all(|r| r["id"] != "pending-alex")
+        );
+        f.store.write(|tx|{
+            tx.sql().execute("INSERT INTO extraction_runs SELECT 'reject-run',r.commit_id,g.episode_id,r.version,r.requested_model,r.reported_models,r.usage,r.recorded_at FROM extraction_runs r JOIN graph_evidence g ON g.target=?1 WHERE r.id='pending-run' LIMIT 1",[&seed])?;
+            tx.sql().execute("INSERT INTO candidates SELECT 'pending-rejected','reject-run',kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope FROM candidates WHERE id='pending-alex'",[])?;
+            let mut v=[0.;768];v[0]=0.81;v[1]=(1f32-v[0]*v[0]).sqrt();
+            tx.put_vector(&VectorWrite{seq:2001,target:"pending-rejected".into(),kind:VectorKind::Candidate,version:1,embedding:F32Blob::from_values(&v)?,current:true,tier:Tier::Hot})?;Ok(())
+        }).unwrap();
+        assert!(
+            f.recall("Which Alex?", 6, true, Some("personal"))
+                .iter()
+                .any(|r| r["id"] == "pending-rejected")
+        );
+        f.store.write(|tx|{tx.sql().execute("INSERT INTO candidate_decisions SELECT 'reject-pending','pending-rejected',commit_id,'reject',NULL,NULL FROM node_versions WHERE id=? AND version=1",[&seed])?;Ok(())}).unwrap();
+        assert!(
+            f.recall("Which Alex?", 6, true, Some("personal"))
+                .iter()
+                .all(|r| r["id"] != "pending-rejected")
+        );
+    }
+
+    #[test]
+    fn t3_legacy_only_forgotten_nonfinite_and_missing_current_vectors_do_not_anchor() {
+        let mut f = Fixture::new();
+        let fact = f.add(
+            "Leonid is described by the retained source biography",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.9,
+            "personal",
+        );
+        let episode=f.store.capture(serde_json::from_value(json!({"source":"native:fixture:codex","event_id":"legacy-only","conversation_id":"legacy-only","kind":"developer","text":"Leonid Legacy","metadata":{}})).unwrap()).unwrap();
+        // Synthetic historical graph supported only by developer instruction evidence.
+        f.store.write(|tx|{
+            tx.sql().execute("INSERT INTO node_versions SELECT 't3-legacy',1,commit_id,'person','Leonid Legacy','active',NULL,NULL,NULL,0,'[\"personal\"]' FROM node_versions WHERE id=? AND version=1",[&fact])?;
+            tx.sql().execute("INSERT INTO graph_evidence VALUES('t3-legacy',1,?,0,13,'Leonid Legacy')",[&episode.id])?;
+            let mut v=[0.;768];v[0]=0.8;v[1]=0.6;
+            tx.put_vector(&VectorWrite{seq:3000,target:"t3-legacy".into(),kind:VectorKind::Node,version:1,embedding:F32Blob::from_values(&v)?,current:true,tier:Tier::Hot})?;Ok(())
+        }).unwrap();
+        for (name, mode) in [
+            ("Leonid Forgotten", "forgotten"),
+            ("Leonid Nan", "nan"),
+            ("Leonid Missing", "missing"),
+        ] {
+            let id = f.add(name, "person", "2020-01-01T00:00:00Z", 0.5, 0.8, "personal");
+            f.store.write(|tx|{
+                match mode {
+                    "forgotten"=>{tx.sql().execute("INSERT INTO forgotten_targets SELECT id,commit_id,'node' FROM node_versions WHERE id=? AND version=1",[&id])?;},
+                    "nan"=>{let v=[f32::NAN;768];tx.sql().execute("UPDATE vector_blobs SET embedding=?1 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?2)",params![F32Blob::from_values(&v)?.as_bytes(),id])?;},
+                    _=>{tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?)",[&id])?;}
+                } Ok(())
+            }).unwrap();
+        }
+        // Reject before any ANN engine handles the deliberately corrupt fixture bytes.
+        f.store
+            .read(|tx| {
+                let mut v = [0.; 768];
+                v[0] = 1.;
+                let mut output = Vec::new();
+                anchors::add_partials(
+                    tx.sql(),
+                    "Who is Leonid?",
+                    &v,
+                    Some("personal"),
+                    TEXT_FLOOR,
+                    &[],
+                    &mut output,
+                    6,
+                )?;
+                assert!(output.is_empty());
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn t3_partial_same_spelling_reports_ambiguity_without_merging() {
+        let mut f = Fixture::new();
+        let one = f.add(
+            "Alex North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.82,
+            "personal",
+        );
+        let two = f.add(
+            "Alex North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.81,
+            "personal",
+        );
+        f.add(
+            "Alex appears in this retained biography",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.9,
+            "personal",
+        );
+        let rows = f.recall("Who is Alex?", 6, true, Some("personal"));
+        let entities = rows
+            .iter()
+            .filter(|r| r["category"] == "entity_context")
+            .collect::<Vec<_>>();
+        assert_eq!(entities.len(), 2);
+        assert!(entities.iter().any(|r| r["id"] == one));
+        assert!(entities.iter().any(|r| r["id"] == two));
+        assert!(entities.iter().all(|r| r["same_name_count"] == 2
+            && r["same_name_ids"].as_array().unwrap().len() == 1
+            && r["text"].as_str().unwrap().contains("not merged")));
     }
 }

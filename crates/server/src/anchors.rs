@@ -1,4 +1,4 @@
-//! Exact stored full-name/reviewed-alias context. No partial-token identity inference.
+//! Literal name context; partial-name relevance never establishes identity.
 use crate::records::{self, merge, one, rows};
 use memento_ann::eligibility::{ACTIVE_CANDIDATE, legacy_only, visible_sql};
 use memento_core::{Error, Result};
@@ -27,7 +27,11 @@ pub fn contains_name(name: &str, text: &str) -> bool {
 }
 pub fn connection_name_matches(db: &Connection, item: &Value, query: &str) -> Result<bool> {
     let request = tokens(query);
-    let overlaps = |name: &str| tokens(name).iter().any(|token| request.contains(token));
+    let overlaps = |name: &str| {
+        tokens(name_head(name))
+            .iter()
+            .any(|token| request.contains(token))
+    };
     if overlaps(
         item["name"]
             .as_str()
@@ -364,4 +368,327 @@ pub fn from_connection(
     scope: Option<&str>,
 ) -> Result<Option<Value>> {
     durable(db, item, scope)
+}
+
+/// Read-only discovery name head. Gloss text is neither a name token nor an alias.
+/// Stored text and identity matching remain unchanged.
+fn name_head(text: &str) -> &str {
+    text.split(['—', '–', ':', '\n', '(', ';', ','])
+        .next()
+        .unwrap_or("")
+        .split(" - ")
+        .next()
+        .unwrap_or("")
+        .trim()
+}
+fn quoted(token: &str) -> String {
+    format!("\"{}\"", token.replace('"', "\"\""))
+}
+struct Partial {
+    item: Value,
+    matched: Vec<String>,
+    rare: Vec<String>,
+    cosine: f64,
+}
+fn partials(
+    db: &Connection,
+    query: &str,
+    vector: &[f32; 768],
+    scope: Option<&str>,
+    floor: f64,
+) -> Result<Vec<Partial>> {
+    use rusqlite::OptionalExtension;
+    let request = tokens(query).into_iter().take(64).collect::<HashSet<_>>();
+    if request.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut terms = request.iter().map(|s| quoted(s)).collect::<Vec<_>>();
+    terms.sort();
+    let matched = terms.join(" OR ");
+    let active = format!(
+        "n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND {} AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2))",
+        visible_sql("n.id")
+    );
+    let entity = "(n.type IN ('person','organization','project','concept','place','tool') OR EXISTS(SELECT 1 FROM memory_types t WHERE t.name=n.type AND t.category='entity'))";
+    let eligible = format!(
+        "{active} AND {entity} AND NOT EXISTS(SELECT 1 FROM entity_merges m WHERE m.source=n.id)"
+    );
+    let count = "(SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS evidence_count";
+    let mut found = BTreeMap::<String, (Value, HashSet<String>)>::new();
+    let mut collect = |row: Value, name: &str| {
+        let name = tokens(name_head(name));
+        if name.len() < 2 {
+            return;
+        }
+        let overlap = name
+            .into_iter()
+            .filter(|t| request.contains(t))
+            .collect::<HashSet<_>>();
+        if overlap.is_empty() {
+            return;
+        }
+        let id = row["id"].as_str().unwrap().to_owned();
+        let entry = found.entry(id).or_insert_with(|| (row, HashSet::new()));
+        entry.1.extend(overlap);
+    };
+    for row in rows(
+        db,
+        &format!(
+            "SELECT {},n.text AS name,{count},NULL AS alias,'durable' AS tier FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND {eligible} ORDER BY bm25(node_fts),n.id LIMIT 64",
+            records::NODE_SUMMARY
+        ),
+        params![matched, scope],
+    )? {
+        let name = row["name"].as_str().unwrap().to_owned();
+        collect(row, &name);
+    }
+    let aliases = format!(
+        "WITH RECURSIVE canonical(source,target,depth) AS (SELECT source,target,0 FROM entity_merges UNION ALL SELECT c.source,m.superseded_by,c.depth+1 FROM canonical c JOIN node_versions m ON m.id=c.target AND m.state IN ('merged','refined') AND m.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=m.id) WHERE m.superseded_by IS NOT NULL AND c.depth<64) SELECT {},n.text AS name,{count},alias_fts.text AS alias,'durable' AS tier FROM alias_fts JOIN canonical a ON a.source=alias_fts.id JOIN node_versions n ON n.id=a.target WHERE alias_fts MATCH ?1 AND {eligible} ORDER BY bm25(alias_fts),n.id LIMIT 64",
+        records::NODE_SUMMARY
+    );
+    for row in rows(db, &aliases, params![matched, scope])? {
+        let alias = row["alias"].as_str().unwrap().to_owned();
+        collect(row, &alias);
+    }
+    for row in rows(
+        db,
+        &format!(
+            "SELECT c.id,1 AS version,c.type,c.text,c.text AS name,c.scope,'candidate' AS tier,(SELECT max(julianday(e.occurred_at)) FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND g.version=1 AND e.occurred_at IS NOT NULL) AS source_at FROM candidate_fts JOIN candidates c ON c.id=candidate_fts.id WHERE candidate_fts MATCH ?1 AND c.kind='entity' AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(c.scope) WHERE value=?2)) ORDER BY bm25(candidate_fts),c.id LIMIT 64"
+        ),
+        params![matched, scope],
+    )? {
+        let name = row["name"].as_str().unwrap().to_owned();
+        collect(row, &name);
+    }
+    if found.is_empty() {
+        return Ok(Vec::new());
+    }
+    let active_count: i64 = db.query_row(
+        &format!("SELECT count(*) FROM node_versions n WHERE {active}"),
+        params![Option::<i64>::None, scope],
+        |r| r.get(0),
+    )?;
+    let threshold = 16.max(active_count / 100);
+    let mut rarity = BTreeMap::new();
+    let query_norm = vector
+        .iter()
+        .map(|v| (*v as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if !query_norm.is_finite() || query_norm <= 0. {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for (_, (mut item, overlap)) in found {
+        let id = item["id"].as_str().unwrap();
+        let version = item["version"].as_i64().unwrap();
+        if legacy_only(db, id, version)? {
+            continue;
+        }
+        let mut rare = Vec::new();
+        for token in &overlap {
+            if !rarity.contains_key(token) {
+                let df:i64=db.query_row(&format!("SELECT count(*) FROM (SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND {active} LIMIT ?3)"),params![quoted(token),scope,threshold+1],|r|r.get(0))?;
+                rarity.insert(token.clone(), df <= threshold);
+            }
+            if rarity[token] {
+                rare.push(token.clone());
+            }
+        }
+        if rare.is_empty() {
+            continue;
+        }
+        // Keyed current-vector reads only; no whole-vector scan and no new ANN mask.
+        let kind = if item["tier"] == "durable" {
+            "node"
+        } else {
+            "candidate"
+        };
+        let bytes:Option<Vec<u8>>=db.query_row("SELECT b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind=? AND i.version=? AND b.current=1 ORDER BY i.seq LIMIT 1",params![id,kind,version],|r|r.get(0)).optional()?;
+        let Some(bytes) = bytes else { continue };
+        let values = memento_core::F32Blob::from_bytes(bytes)?.values();
+        let norm = values
+            .iter()
+            .map(|v| (*v as f64).powi(2))
+            .sum::<f64>()
+            .sqrt()
+            * query_norm;
+        let cosine = values
+            .iter()
+            .zip(vector)
+            .map(|(a, b)| *a as f64 * *b as f64)
+            .sum::<f64>()
+            / norm;
+        if !norm.is_finite() || norm <= 0. || !cosine.is_finite() || cosine < floor {
+            continue;
+        }
+        item.as_object_mut().unwrap().remove("name");
+        result.push(Partial {
+            item,
+            matched: overlap.into_iter().collect(),
+            rare,
+            cosine: cosine.clamp(-1., 1.) as f32 as f64,
+        });
+    }
+    result.sort_by(|a, b| {
+        (b.item["tier"] == "durable")
+            .cmp(&(a.item["tier"] == "durable"))
+            .then_with(|| b.cosine.total_cmp(&a.cosine))
+            .then_with(|| {
+                b.item["evidence_count"]
+                    .as_i64()
+                    .unwrap_or(0)
+                    .cmp(&a.item["evidence_count"].as_i64().unwrap_or(0))
+            })
+            .then_with(|| {
+                b.item["source_at"]
+                    .as_f64()
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .total_cmp(&a.item["source_at"].as_f64().unwrap_or(f64::NEG_INFINITY))
+            })
+            .then_with(|| a.item["id"].as_str().cmp(&b.item["id"].as_str()))
+    });
+    Ok(result)
+}
+/// Add relevance-qualified partial-name contexts after the actually retained facts/T2.
+/// No identity decision, inferred edge or basis_memory_id is made by this path.
+pub fn add_partials(
+    db: &Connection,
+    query: &str,
+    vector: &[f32; 768],
+    scope: Option<&str>,
+    floor: f64,
+    facts: &[Value],
+    output: &mut Vec<Value>,
+    limit: usize,
+) -> Result<()> {
+    let budget = 2.min(limit);
+    let contexts = |rows: &[Value]| {
+        rows.iter()
+            .filter(|r| r["category"] == "entity_context")
+            .count()
+    };
+    if budget == 0 || contexts(output) >= budget {
+        return Ok(());
+    }
+    let candidates = partials(db, query, vector, scope, floor)?;
+    let mut spelled = BTreeMap::<(String, String), Vec<String>>::new();
+    for candidate in &candidates {
+        spelled
+            .entry((
+                candidate.item["type"].as_str().unwrap().into(),
+                identity(candidate.item["text"].as_str().unwrap()),
+            ))
+            .or_default()
+            .push(candidate.item["id"].as_str().unwrap().into());
+    }
+    for candidate in candidates {
+        if contexts(output) >= budget {
+            break;
+        }
+        let id = candidate.item["id"].as_str().unwrap();
+        if output
+            .iter()
+            .any(|r| r["id"] == id && r["category"] == "entity_context")
+        {
+            continue;
+        }
+        let retained = facts
+            .iter()
+            .filter(|f| output.iter().any(|r| r["id"] == f["id"]))
+            .collect::<Vec<_>>();
+        let shares = |fact: &Value, terms: &[String]| {
+            let text = tokens(
+                fact["_full_text"]
+                    .as_str()
+                    .unwrap_or(fact["text"].as_str().unwrap_or("")),
+            );
+            terms.iter().any(|t| text.contains(t))
+        };
+        let corroborator = retained
+            .iter()
+            .filter(|f| shares(f, &candidate.rare))
+            .min_by_key(|f| output.iter().position(|r| r["id"] == f["id"]).unwrap());
+        let dominant = retained
+            .iter()
+            .filter(|f| !shares(f, &candidate.matched))
+            .all(|f| {
+                f["cosine"]
+                    .as_f64()
+                    .is_some_and(|c| c.is_finite() && candidate.cosine > c)
+            });
+        if corroborator.is_none() && !dominant {
+            continue;
+        }
+        let mut proposed = output
+            .iter()
+            .filter(|r| r["id"] != id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let first_fact = proposed
+            .iter()
+            .position(|r| retained.iter().any(|f| f["id"] == r["id"]));
+        let after = if let Some(fact) = corroborator {
+            proposed.iter().position(|r| r["id"] == fact["id"])
+        } else {
+            first_fact
+        };
+        let mut index = after.map(|i| i + 1).unwrap_or_else(|| {
+            proposed
+                .iter()
+                .take_while(|r| r["category"] == "entity_context")
+                .count()
+        });
+        if let Some(fact_index) = after {
+            let basis = proposed[fact_index]["id"].clone();
+            while index < proposed.len()
+                && (proposed[index]["basis_memory_id"] == basis
+                    || proposed[index]["match"] == "partial_entity_name")
+            {
+                index += 1;
+            }
+        }
+        if corroborator.is_none() {
+            while index < proposed.len()
+                && proposed[index]["cosine"]
+                    .as_f64()
+                    .is_some_and(|c| c >= candidate.cosine)
+            {
+                index += 1;
+            }
+        }
+        if index >= limit {
+            continue;
+        }
+        let rendered = if candidate.item["tier"] == "durable" {
+            durable(db, &candidate.item, scope)?
+        } else {
+            pending(db, &candidate.item, scope)?
+        };
+        let Some(mut anchor) = rendered else { continue };
+        let same = &spelled[&(
+            candidate.item["type"].as_str().unwrap().into(),
+            identity(candidate.item["text"].as_str().unwrap()),
+        )];
+        if same.len() > 1 {
+            anchor["same_name_count"] = json!(same.len());
+            anchor["same_name_ids"] = json!(
+                same.iter()
+                    .filter(|other| other.as_str() != id)
+                    .collect::<Vec<_>>()
+            );
+            anchor["text"] = json!(format!(
+                "One of {} separate entries spelled alike; not merged. {}",
+                same.len(),
+                anchor["text"].as_str().unwrap()
+            ));
+        }
+        anchor["match"] = json!("partial_entity_name");
+        anchor["cosine"] = json!(candidate.cosine);
+        anchor["score"] = json!(candidate.cosine);
+        proposed.insert(index, anchor);
+        proposed.truncate(limit);
+        *output = proposed;
+    }
+    Ok(())
 }
