@@ -188,7 +188,7 @@ fn commit_index(store: &Store, row: &Value, vector: &[f32; 768], hints: &[Value]
             if !still_indexable(tx.sql(),row)? {return Ok(());}
             let exists:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind=? AND i.version=?)",params![row["id"].as_str(),row["kind"].as_str(),row["version"].as_i64()],|r|r.get(0))?;
             if !exists {let existing:Option<i64>=tx.sql().query_row("SELECT seq FROM vector_items WHERE target=? AND kind=? AND version=?",params![row["id"].as_str(),row["kind"].as_str(),row["version"].as_i64()],|r|r.get(0)).optional()?;let seq=match existing{Some(seq)=>seq,None=>{tx.sql().execute("INSERT INTO vector_items(target,kind,version) VALUES(?,?,?)",params![row["id"].as_str(),row["kind"].as_str(),row["version"].as_i64()])?;tx.sql().last_insert_rowid()}};
-                let tier=if row["kind"]=="episode"&&tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id JOIN historical_parking h ON h.source=e.source AND h.conversation_id=e.conversation_id AND e.seq<=h.parked_through WHERE x.id=?)",[row["id"].as_str()],|r|r.get::<_,bool>(0))?{Tier::Cold}else{Tier::Hot};
+                let tier=if row["kind"]=="episode"{Tier::Cold}else{Tier::Hot};
                 tx.put_vector(&VectorWrite{seq,target:row["id"].as_str().unwrap().into(),kind:match row["kind"].as_str(){Some("node")=>VectorKind::Node,Some("candidate")=>VectorKind::Candidate,_=>VectorKind::Episode},version:row["version"].as_i64().unwrap(),embedding:F32Blob::from_values(vector)?,current:true,tier})?;
             }
             if row["kind"]=="candidate" {for hint in hints{let valid:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM node_versions n WHERE n.id=? AND n.version=? AND n.type=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id))",params![hint["target"].as_str(),hint["version"].as_i64(),row["type"].as_str()],|r|r.get(0))?;if valid{tx.sql().execute("INSERT OR IGNORE INTO candidate_entity_matches VALUES(?,?,?,?,?,?,?,?)",params![row["id"].as_str(),hint["target"].as_str(),hint["version"].as_i64(),hint["cosine"].as_f64(),hint["name_match"].as_i64(),format!("native-indexer/{}@{}",memento_core::MODEL_ID,memento_core::MODEL_REVISION),"Tentative name/vector association only; no identity merge or primary assertion",memento_core::now_utc()])?;}}}
@@ -215,6 +215,19 @@ mod tests {
         let source=store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"one","conversation_id":"thread","kind":"user","text":"Original exact source for revision tests","metadata":{}})).unwrap()).unwrap();
         let graph = Graph::new(store.clone());
         (dir, store, graph, source.id)
+    }
+    #[test]
+    fn raw_pool_new_unparked_index_unit_is_cold_without_reembedding_or_parking() {
+        let (_dir,store,_graph,episode)=fixture();
+        store.write(|tx|{tx.sql().execute("INSERT INTO episode_chunks VALUES('fresh-chunk',?,0,8)",[&episode])?;Ok(())}).unwrap();
+        let mut vector=[0.;768];vector[0]=1.;
+        commit_index(&store,&json!({"id":"fresh-chunk","kind":"episode","version":1,"text":"Original"}),&vector,&[]).unwrap();
+        store.read(|tx|{
+            let (tier,bytes):(String,Vec<u8>)=tx.sql().query_row("SELECT b.tier,b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target='fresh-chunk'",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            assert_eq!(tier,"cold");assert_eq!(bytes,F32Blob::from_values(&vector)?.as_bytes());
+            assert_eq!(tx.sql().query_row("SELECT count(*) FROM historical_parking",[],|r|r.get::<_,i64>(0))?,0);
+            Ok(())
+        }).unwrap();
     }
     #[test]
     fn native_index_commit_is_idempotent_and_revalidates_old_version_after_encoding() {

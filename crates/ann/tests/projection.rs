@@ -431,3 +431,61 @@ fn parking_moves_raw_point_between_shards_without_changing_bytes() {
         original
     );
 }
+
+#[test]
+fn raw_pool_upgrade_retiers_in_batches_preserves_rows_and_rebuilds_old_payload_format() {
+    let (_dir,store,index)=fixture();
+    node(&store,50000,"curated",0.8,"personal","person",true,Tier::Hot);
+    let ids=std::iter::once(i64::MIN).chain(0..255).chain(std::iter::once(i64::MAX)).collect::<Vec<_>>();
+    store.write(|tx| {
+        tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at) VALUES(1,'raw-source','fixture','raw-source','raw-source','user',?,'{}','2026')",["Retained raw source passage ".repeat(300)])?;
+        for (position,seq) in ids.iter().enumerate() {
+            let chunk=format!("raw-{position}");
+            tx.sql().execute("INSERT INTO episode_chunks VALUES(?,'raw-source',?,?)",params![chunk,position as i64,position as i64+1])?;
+            tx.put_vector(&VectorWrite{seq:*seq,target:chunk,kind:VectorKind::Episode,version:1,current:*seq!=0,tier:Tier::Hot,embedding:vector(0.9)})?;
+        }
+        Ok(())
+    }).unwrap();
+    let preserved=|| -> Vec<(i64,String,String,i64,Vec<u8>,bool)> {
+        store.read(|tx| {
+            let mut query=tx.sql().prepare("SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq ORDER BY i.seq")?;
+            Ok(query.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).unwrap()
+    };
+    let state=|| -> (i64,i64) {store.read(|tx|Ok((tx.sql().query_row("SELECT generation FROM runtime_state",[],|r|r.get(0))?,tx.sql().query_row("SELECT count(*) FROM projection_events",[],|r|r.get(0))?))).unwrap()};
+    let original=preserved();
+    index.rebuild(Tier::Hot,&AtomicBool::new(false)).unwrap();
+    index.rebuild(Tier::Cold,&AtomicBool::new(false)).unwrap();
+    for tier in ["hot","cold"] {
+        let path=store.data_dir().join("search").join(tier).join("checkpoint.json");
+        let mut checkpoint:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        checkpoint["format"]=serde_json::json!(1);
+        std::fs::write(path,serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    }
+    let before=state();
+    drop(index);
+    let index=Projection::open(store.clone(),ModelSignature::pinned()).unwrap();
+    let migrated=state();
+    assert_eq!(migrated.0,before.0+2); //257 raw rows in existing256-row transactions.
+    assert_eq!(migrated.1,before.1+2*ids.len() as i64);
+    assert_eq!(preserved(),original);
+    assert!(index.synchronize(Tier::Hot).is_err()); //Old payload format cannot serve.
+    drop(index);
+    let index=Projection::open(store.clone(),ModelSignature::pinned()).unwrap();
+    assert_eq!(state(),migrated); //No marker/counter is needed for an idempotent reopen.
+    index.rebuild(Tier::Hot,&AtomicBool::new(false)).unwrap();
+    assert!(!index.ready(Tier::Cold));
+    assert_eq!(hits(&index,Tier::Hot),["curated"]);
+    index.rebuild(Tier::Cold,&AtomicBool::new(false)).unwrap();
+    index.snapshot(true,true,|_,view| {
+        assert!(view.search(Tier::Hot,&query(),300,"episode",Pool::Ordinary,None,None)?.is_empty());
+        let raw=view.search(Tier::Cold,&query(),300,"episode",Pool::RawFallback,None,None)?;
+        assert_eq!(raw.len(),256);
+        assert!(raw.iter().any(|r|r.seq==i64::MIN));
+        assert!(raw.iter().any(|r|r.seq==i64::MAX));
+        assert!(raw.iter().all(|r|r.seq!=0));
+        assert!(view.search(Tier::Cold,&query(),300,"episode",Pool::Historical,None,None)?.is_empty());
+        Ok(())
+    }).unwrap();
+    assert_eq!(preserved(),original);
+}

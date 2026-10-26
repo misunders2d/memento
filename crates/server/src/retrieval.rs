@@ -3,9 +3,9 @@ use crate::{Recall, RecallRequest, anchors, records};
 use chrono::{DateTime, Utc};
 use memento_ann::{
     Pool, Projection, SearchHit, SearchView,
-    eligibility::{self, ACTIVE_CANDIDATE, HISTORICAL, visible_sql},
+    eligibility::{self, ACTIVE_CANDIDATE, HISTORICAL, RAW_FALLBACK, visible_sql},
 };
-use memento_core::{Error, F32Blob, ReadTxn, Result, Store, Tier};
+use memento_core::{Error, F32Blob, ReadTxn, Result, Store, Tier, raw};
 use memento_domain::{behavior, importance, unicode};
 use memento_embedding::EmbeddingModel;
 use rusqlite::{OptionalExtension, params};
@@ -251,7 +251,7 @@ impl Retrieval {
                 }
             }
         } else if need_archive && archive {
-            let mut fallback = Self::historical(
+            let mut fallback = Self::raw_fallback(
                 tx,
                 view,
                 &request.query,
@@ -616,7 +616,20 @@ impl Retrieval {
         }
         Ok(())
     }
-    fn historical(
+    fn raw_fallback_state(tx: &ReadTxn<'_>, episode_id: &str) -> Result<Option<bool>> {
+        let state = tx.sql().query_row(
+            &format!("SELECT e.source,e.kind,e.text,e.metadata,({RAW_FALLBACK}),({HISTORICAL}) FROM episodes e WHERE e.id=?"),
+            [episode_id],
+            |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, Option<String>>(2)?,r.get::<_, String>(3)?,r.get::<_, bool>(4)?,r.get::<_, bool>(5)?)),
+        ).optional()?;
+        let Some((source, kind, text, metadata, allowed, historical)) = state else {
+            return Ok(None);
+        };
+        let metadata: Value = serde_json::from_str(&metadata)?;
+        Ok((allowed && !raw::legacy_native_context(&source, &kind, text.as_deref(), Some(&metadata)))
+            .then_some(historical))
+    }
+    fn raw_fallback(
         tx: &ReadTxn<'_>,
         view: &SearchView<'_>,
         query: &str,
@@ -631,14 +644,18 @@ impl Retrieval {
             vector,
             (limit * 4).max(8),
             "episode",
-            Pool::Historical,
+            Pool::RawFallback,
             None,
             None,
         )? {
             if (hit.cosine as f64) < TEXT_FLOOR {
                 continue;
             }
-            if let Some(mut row) = hydrate(tx, &hit, true)? {
+            let episode_id: String = tx.sql().query_row(
+                "SELECT episode_id FROM episode_chunks WHERE id=?", [&hit.target], |r| r.get(0),
+            )?;
+            let Some(historical) = Self::raw_fallback_state(tx, &episode_id)? else { continue };
+            if let Some(mut row) = hydrate(tx, &hit, historical)? {
                 records::merge(
                     &mut row,
                     json!({"cosine":hit.cosine,"score":hit.cosine,"match":"semantic"}),
@@ -648,17 +665,8 @@ impl Retrieval {
         }
         if keywords {
             for row in tx.search_episodes(Some(query), (limit * 4).min(100), None, None, None)? {
-                let historical: bool = tx.sql().query_row(
-                    &format!(
-                        "SELECT EXISTS(SELECT 1 FROM episodes e WHERE e.id=? AND {HISTORICAL})"
-                    ),
-                    [key(&row)],
-                    |r| r.get(0),
-                )?;
-                if !historical {
-                    continue;
-                }
-                if let Some(mut passage) = records::matched_passage(tx, key(&row), query, true)? {
+                let Some(historical) = Self::raw_fallback_state(tx, key(&row))? else { continue };
+                if let Some(mut passage) = records::matched_passage(tx, key(&row), query, historical)? {
                     let cosine = found.get(key(&passage)).and_then(|v| v["cosine"].as_f64());
                     records::merge(
                         &mut passage,
@@ -677,8 +685,10 @@ impl Retrieval {
                     continue;
                 }
                 let date = source_label(&row);
+                let historical = row["historical"] == true;
                 row["text"] = json!(format!(
-                    "Unverified historical raw passage{date}: {}",
+                    "Unverified {}raw passage{date}: {}",
+                    if historical { "historical " } else { "" },
                     row["text"]
                         .as_str()
                         .unwrap_or("")
@@ -686,7 +696,9 @@ impl Retrieval {
                         .collect::<Vec<_>>()
                         .join(" ")
                 ));
-                row["category"] = json!("historical_raw");
+                if historical {
+                    row["category"] = json!("historical_raw");
+                }
                 row["importance"] = json!(0.5);
                 row["archived"] = json!(0);
             }
@@ -877,6 +889,7 @@ mod tests {
     use memento_core::{ModelSignature, VectorKind, VectorWrite};
     use memento_domain::Graph;
     use std::sync::atomic::AtomicBool;
+    include!("raw_pool_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,

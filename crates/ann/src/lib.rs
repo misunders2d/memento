@@ -27,6 +27,7 @@ use std::{
 };
 const BATCH: usize = 256;
 const FOREGROUND_EVENTS: usize = 512;
+const PROJECTION_FORMAT: u32 = 2;
 fn unavailable() -> Error {
     Error::Unavailable("Semantic search is not ready")
 }
@@ -107,6 +108,7 @@ pub enum Pool {
     Ordinary,
     Automatic,
     Historical,
+    RawFallback,
     ParkedCandidate,
     Entity,
 }
@@ -116,6 +118,7 @@ impl Pool {
             Self::Ordinary => "ordinary",
             Self::Automatic => "automatic",
             Self::Historical => "historical",
+            Self::RawFallback => "raw_fallback",
             Self::ParkedCandidate => "parked_candidate",
             Self::Entity => "entity",
         }
@@ -176,7 +179,7 @@ fn persist(path: &Path, checkpoint: &Checkpoint) -> Result<()> {
 }
 fn shard(path: PathBuf) -> Result<Shard> {
     let checkpoint = load_checkpoint(&path)?;
-    let loaded = if checkpoint.is_some() {
+    let loaded = if checkpoint.as_ref().is_some_and(|c| c.format == PROJECTION_FORMAT) {
         EdgeShard::load(&path.join("edge"), None).ok().map(Arc::new)
     } else {
         None
@@ -276,6 +279,7 @@ fn indices(shard: &EdgeShard) -> Result<()> {
         ("ordinary", PayloadSchemaType::Bool),
         ("automatic", PayloadSchemaType::Bool),
         ("historical", PayloadSchemaType::Bool),
+        ("raw_fallback", PayloadSchemaType::Bool),
         ("parked_candidate", PayloadSchemaType::Bool),
         ("entity", PayloadSchemaType::Bool),
         ("personal", PayloadSchemaType::Bool),
@@ -289,6 +293,27 @@ fn indices(shard: &EdgeShard) -> Result<()> {
         )))?;
     }
     Ok(())
+}
+fn reconcile_raw_tiers(store: &Store) -> Result<()> {
+    let mut next = i64::MIN;
+    loop {
+        let last = store.write(|tx| {
+            let mut query = tx.sql().prepare("SELECT i.seq FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.kind='episode' AND i.seq>=?1 AND b.tier='hot' ORDER BY i.seq LIMIT ?2")?;
+            let ids = query.query_map(params![next, BATCH], |r| r.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(query);
+            for id in &ids {
+                tx.sql().execute("UPDATE vector_blobs SET tier='cold' WHERE seq=?", [id])?;
+                tx.touch_vector(*id, Tier::Hot)?;
+                tx.touch_vector(*id, Tier::Cold)?;
+            }
+            Ok(ids.last().copied())
+        })?;
+        match last.and_then(|seq| seq.checked_add(1)) {
+            Some(after) => next = after,
+            None => return Ok(()),
+        }
+    }
 }
 impl Projection {
     pub fn open(store: Arc<Store>, signature: ModelSignature) -> Result<Arc<Self>> {
@@ -309,6 +334,9 @@ impl Projection {
             if let Some(stored)=stored{if stored!=signature{return Err(Error::Unavailable("Stored vectors use a different model signature"))}}
             else{let count:i64=tx.sql().query_row("SELECT count(*) FROM vector_blobs",[],|r|r.get(0))?;if count!=0{return Err(Error::Unavailable("Stored vectors have no model signature"))}tx.sql().execute("INSERT INTO vector_model VALUES(1,?,?,?,?)",params![signature.model_id,signature.revision,signature.dimensions,signature.text_encoding])?;}Ok(())
         })?;
+        // Idempotent bounded transactions: legacy Hot raw points move through the
+        // existing two-tier dirty log without changing source text or vector bytes.
+        reconcile_raw_tiers(&store)?;
         let hot = shard(root.join("hot"))?;
         let cold = shard(root.join("cold"))?;
         Ok(Arc::new(Self {
@@ -328,7 +356,7 @@ impl Projection {
         self.tier(tier).ready.load(Ordering::Acquire)
     }
     fn valid(&self, tx: &ReadTxn<'_>, tier: Tier, checkpoint: &Checkpoint) -> Result<bool> {
-        Ok(checkpoint.format == 1
+        Ok(checkpoint.format == PROJECTION_FORMAT
             && !checkpoint.building
             && checkpoint.db_uuid == tx.source_cut().db_uuid
             && checkpoint.signature == self.signature
@@ -471,7 +499,7 @@ impl Projection {
             let shard = Arc::new(edge(EdgeShard::new(&staging.join("edge"), config()))?);
             indices(&shard)?;
             let mut checkpoint = Checkpoint {
-                format: 1,
+                format: PROJECTION_FORMAT,
                 db_uuid: source.db_uuid,
                 signature: self.signature.clone(),
                 tier,
