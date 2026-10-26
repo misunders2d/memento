@@ -4,6 +4,7 @@ use memento_core::{CharSpan, Error, ReadTxn, Result, raw};
 use memento_domain::{behavior, loops};
 use rusqlite::{Connection, Params, params, types::ValueRef};
 use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 pub const NODE_SUMMARY: &str = "n.id,n.version,n.type,substr(n.text,1,240) AS text,n.state,n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,(SELECT c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id ORDER BY v.version LIMIT 1) AS created_at,coalesce((SELECT importance FROM node_stats WHERE node_id=n.id),0.5) AS importance,coalesce((SELECT decay FROM node_stats WHERE node_id=n.id),1) AS decay,coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0) AS archived,coalesce((SELECT access_count FROM node_stats WHERE node_id=n.id),0) AS access_count,(SELECT last_cited_at FROM node_stats WHERE node_id=n.id) AS last_cited_at";
 pub fn rows<P: Params>(db: &Connection, sql: &str, params: P) -> Result<Vec<Value>> {
     let mut statement = db.prepare(sql)?;
@@ -265,17 +266,70 @@ pub fn related(db: &Connection, id: &str, hops: usize, scope: Option<&str>) -> R
             "Related traversal is limited to one or two hops",
         ));
     }
+    // Expand only reached origins. Eligibility precedes each origin's eight-edge
+    // limit, including duplicate endpoints/self-edges just as in the old walk.
+    // Every caller supplies its pinned read transaction, so all hops share a cut.
     let sql = format!(
-        "WITH RECURSIVE current_nodes AS (SELECT n.* FROM node_versions n WHERE n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?1 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?1))),current_edges AS (SELECT e.* FROM edge_versions e WHERE e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id)),adjacency AS (SELECT src AS origin,dst AS target,rel,'out' AS direction,id FROM current_edges UNION ALL SELECT dst,src,rel,'in',id FROM current_edges),bounded AS (SELECT a.*,row_number() OVER (PARTITION BY origin ORDER BY a.id) AS fanout FROM adjacency a JOIN current_nodes n ON n.id=a.target),walk(id,depth,via,relation,direction,edge_id) AS (VALUES(?2,0,NULL,NULL,NULL,NULL) UNION ALL SELECT a.target,w.depth+1,w.id,a.rel,a.direction,a.id FROM walk w JOIN bounded a ON a.origin=w.id WHERE w.depth<?3 AND a.fanout<=8),reached AS (SELECT n.id,n.type,substr(n.text,1,160) AS one_line,n.valid_from,n.valid_to,n.scope,coalesce((SELECT importance FROM node_stats WHERE node_id=n.id),0.5) AS importance,w.depth AS hops,w.via,w.relation,w.direction,w.edge_id,row_number() OVER(PARTITION BY n.id ORDER BY w.depth,w.edge_id,w.via) AS choice FROM walk w JOIN current_nodes n ON n.id=w.id WHERE w.depth>0 AND n.id<>?2) SELECT id,type,one_line,valid_from,valid_to,scope,importance,hops,via,relation,direction,edge_id FROM reached WHERE choice=1 ORDER BY hops,importance DESC,id LIMIT 16",
+        "SELECT n.id,n.type,substr(n.text,1,160) AS one_line,n.valid_from,n.valid_to,n.scope,coalesce((SELECT importance FROM node_stats WHERE node_id=n.id),0.5) AS importance,a.rel AS relation,a.direction,a.id AS edge_id FROM (SELECT e.id,e.dst AS target,e.rel,'out' AS direction FROM edge_versions e WHERE e.src=?2 AND e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) UNION ALL SELECT e.id,e.src AS target,e.rel,'in' AS direction FROM edge_versions e WHERE e.dst=?2 AND e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id)) a JOIN node_versions n ON n.id=a.target WHERE n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?1 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?1)) ORDER BY a.id LIMIT 8",
         visible_sql("n.id")
     );
-    let mut result = rows(db, &sql, params![scope, id, hops])?;
+    let mut frontier = BTreeSet::from([id.to_owned()]);
+    let mut expanded = BTreeSet::new();
+    let mut reached = BTreeMap::<String, Value>::new();
+    for depth in 1..=hops {
+        let mut next = BTreeSet::new();
+        for origin in frontier {
+            if !expanded.insert(origin.clone()) {
+                continue;
+            }
+            for mut item in rows(db, &sql, params![scope, origin])? {
+                let target = item["id"].as_str().unwrap().to_owned();
+                next.insert(target.clone());
+                if target == id {
+                    continue;
+                }
+                item["hops"] = json!(depth);
+                item["via"] = json!(origin);
+                let replace = reached.get(&target).is_none_or(|old| {
+                    (depth, item["edge_id"].as_str().unwrap(), origin.as_str())
+                        < (
+                            old["hops"].as_u64().unwrap() as usize,
+                            old["edge_id"].as_str().unwrap(),
+                            old["via"].as_str().unwrap(),
+                        )
+                });
+                if replace {
+                    reached.insert(target, item);
+                }
+            }
+        }
+        frontier = next;
+    }
+    let mut result = reached.into_values().collect::<Vec<_>>();
+    result.sort_by(|a, b| {
+        a["hops"]
+            .as_u64()
+            .cmp(&b["hops"].as_u64())
+            .then_with(|| {
+                b["importance"]
+                    .as_f64()
+                    .unwrap()
+                    .partial_cmp(&a["importance"].as_f64().unwrap())
+                    .unwrap()
+            })
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    result.truncate(16);
     for item in &mut result {
         self::scope(item)?;
         item["loop"] = json!(loops::current(db, item["id"].as_str().unwrap())?);
     }
     Ok(result)
 }
+
+#[cfg(test)]
+#[path = "related_tests.rs"]
+mod related_tests;
 
 pub fn media_sources(db: &Connection, record: &mut Value) -> Result<bool> {
     if record["type"] != "media" {

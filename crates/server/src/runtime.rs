@@ -463,8 +463,12 @@ fn pause(stop: &AtomicBool, duration: Duration) {
 }
 fn rebuild_until_ready(projection: &Projection, tier: Tier, stop: &AtomicBool) -> Result<()> {
     while !stop.load(Ordering::Acquire) {
-        if matches!(projection.synchronize(tier), Ok(true)) {
-            return Ok(());
+        match projection.synchronize(tier) {
+            Ok(true) => return Ok(()),
+            // A valid bounded catch-up has more events, not a damaged index.
+            // Keep draining the existing shard and check stop before every step.
+            Ok(false) => continue,
+            Err(_) => {}
         }
         match projection.rebuild(tier, stop) {
             Ok(()) => return Ok(()),
@@ -473,4 +477,104 @@ fn rebuild_until_ready(projection: &Projection, tier: Tier, stop: &AtomicBool) -
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use memento_core::{F32Blob, VectorKind, VectorWrite};
+    use std::os::unix::fs::MetadataExt;
+    #[test]
+    fn healthy_large_dirty_cut_catches_up_without_replacing_the_hot_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        let projection = Projection::open(store.clone(), ModelSignature::pinned()).unwrap();
+        let mut vector = [0.; 768];
+        vector[0] = 1.;
+        store.write(|tx|{
+            tx.sql().execute("INSERT INTO graph_commits VALUES('test','test','{}','{}','owner','Synthetic startup catch-up','2026-10-26T00:00:00Z')",[])?;
+            tx.sql().execute("INSERT INTO node_versions VALUES('node',1,'test','knowledge','A stable synthetic remembered fact','active',NULL,NULL,NULL,0,'[\"personal\"]')",[])?;
+            tx.put_vector(&VectorWrite{seq:0,target:"node".into(),kind:VectorKind::Node,version:1,current:true,tier:Tier::Hot,embedding:F32Blob::from_values(&vector)?})?;Ok(())
+        }).unwrap();
+        let stop = AtomicBool::new(false);
+        projection.rebuild(Tier::Hot, &stop).unwrap();
+        let hot = store.data_dir().join("search/hot");
+        let inode = std::fs::metadata(&hot).unwrap().ino();
+        let original: Value =
+            serde_json::from_slice(&std::fs::read(hot.join("checkpoint.json")).unwrap()).unwrap();
+        let before_bytes = store
+            .read(|tx| {
+                Ok(tx.sql().query_row(
+                    "SELECT embedding FROM vector_blobs WHERE seq=0",
+                    [],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )?)
+            })
+            .unwrap();
+        store
+            .write(|tx| {
+                for _ in 0..600 {
+                    tx.touch_vector(0, Tier::Hot)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let cut = store
+            .read(|tx| {
+                assert_eq!(
+                    tx.sql().query_row(
+                        "SELECT count(*) FROM projection_events WHERE tier='hot'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    600
+                );
+                tx.fence(Tier::Hot)
+            })
+            .unwrap();
+        rebuild_until_ready(&projection, Tier::Hot, &stop).unwrap();
+        assert_eq!(std::fs::metadata(&hot).unwrap().ino(), inode);
+        let ready: Value =
+            serde_json::from_slice(&std::fs::read(hot.join("checkpoint.json")).unwrap()).unwrap();
+        assert_eq!(ready["db_uuid"], original["db_uuid"]);
+        assert_eq!(ready["signature"], original["signature"]);
+        assert_eq!(ready["cursor"]["id"], cut.id);
+        assert!(ready["pending"].is_null());
+        assert_eq!(ready["building"], false);
+        store
+            .read(|tx| {
+                assert_eq!(
+                    tx.sql().query_row(
+                        "SELECT count(*) FROM projection_events WHERE tier='hot'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                assert_eq!(
+                    tx.sql().query_row(
+                        "SELECT embedding FROM vector_blobs WHERE seq=0",
+                        [],
+                        |r| r.get::<_, Vec<u8>>(0)
+                    )?,
+                    before_bytes
+                );
+                Ok(())
+            })
+            .unwrap();
+        let hits = projection
+            .snapshot(true, false, |_, view| {
+                view.search(
+                    Tier::Hot,
+                    &vector,
+                    1,
+                    "node",
+                    memento_ann::Pool::Ordinary,
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+        assert_eq!(hits[0].target, "node");
+    }
 }
