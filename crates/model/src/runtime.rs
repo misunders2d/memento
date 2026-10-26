@@ -102,28 +102,49 @@ impl Assets {
             .graph_dir
             .clone()
             .unwrap_or_else(|| config.model_dir.join("onnx"));
-        let mut mappings = Vec::with_capacity(3);
-        for (name, graph_sha, weight_sha, bytes) in GRAPH_FILES {
-            verify_path(&graph_dir.join(format!("{name}.onnx")), graph_sha)?;
-            let mut file = File::open(
-                config
-                    .model_dir
-                    .join("onnx")
-                    .join(format!("{name}.onnx_data")),
-            )?;
-            if file.metadata()?.len() != bytes {
-                return Err(Error::InvalidAssets("weight file size mismatch".into()));
-            }
-            verify_reader(&mut file, weight_sha)?;
-            // SAFETY: caller supplies immutable pinned assets. The readonly map
-            // and its file owner are retained until every SessionSet is dropped.
-            let map = unsafe { MmapOptions::new().map(&file)? };
-            mappings.push(Mapping { map, _file: file });
-        }
+        Self::load_files(&config.model_dir, graph_dir, &GRAPH_FILES)
+    }
+    fn load_files(
+        model_dir: &Path,
+        graph_dir: PathBuf,
+        files: &[(&str, &str, &str, u64); 3],
+    ) -> Result<Self> {
+        // One auxiliary worker plus this caller bound verification to two jobs.
+        // Both results are joined before errors escape, so partial maps/files drop.
+        let mappings = std::thread::scope(|scope| -> Result<Vec<Mapping>> {
+            let first = std::thread::Builder::new().spawn_scoped(scope, || {
+                files[..2]
+                    .iter()
+                    .map(|spec| Self::mapping(model_dir, &graph_dir, *spec))
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            let last = Self::mapping(model_dir, &graph_dir, files[2]);
+            let mut mappings = first
+                .join()
+                .map_err(|_| Error::InvalidAssets("asset verification worker failed".into()))??;
+            mappings.push(last?);
+            Ok(mappings)
+        })?;
         Ok(Self {
             mappings,
             graph_dir,
         })
+    }
+    fn mapping(
+        model_dir: &Path,
+        graph_dir: &Path,
+        (name, graph_sha, weight_sha, bytes): (&str, &str, &str, u64),
+    ) -> Result<Mapping> {
+        verify_path(&graph_dir.join(format!("{name}.onnx")), graph_sha)?;
+        let mut file = File::open(model_dir.join("onnx").join(format!("{name}.onnx_data")))?;
+        if file.metadata()?.len() != bytes {
+            return Err(Error::InvalidAssets("weight file size mismatch".into()));
+        }
+        verify_reader(&mut file, weight_sha)?;
+        // SAFETY: caller supplies immutable pinned assets. The readonly map
+        // and its file owner are retained until every SessionSet is dropped.
+        let map = unsafe { MmapOptions::new().map(&file)? };
+        Ok(Mapping { map, _file: file })
     }
 }
 
@@ -405,3 +426,7 @@ impl BackgroundLane {
         lane.audio(self.core.preprocessor.audio(samples, sample_rate)?)
     }
 }
+
+#[cfg(test)]
+#[path = "asset_tests.rs"]
+mod asset_tests;
