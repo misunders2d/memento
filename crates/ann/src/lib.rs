@@ -46,7 +46,9 @@ fn config() -> EdgeConfig {
         .payload_memory(Memory::Cold)
         .id_tracker_memory(Memory::Cold)
         .hnsw_config(HnswIndexConfig {
-            m: 16,
+            // SearchView always requests exact FP32 search; neither graph is used.
+            m: 0,
+            payload_m: Some(0),
             ef_construct: 200,
             full_scan_threshold: 10000,
             max_indexing_threads: 1,
@@ -54,7 +56,7 @@ fn config() -> EdgeConfig {
             ..Default::default()
         })
         .optimizers(EdgeOptimizersConfig {
-            indexing_threshold: Some(10000),
+            indexing_threshold: Some(0),
             default_segment_number: Some(2),
             prevent_unoptimized: Some(false),
             ..Default::default()

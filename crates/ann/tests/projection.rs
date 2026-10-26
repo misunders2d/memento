@@ -120,6 +120,69 @@ fn filters_apply_before_top_k_and_unoptimized_mutations_are_immediately_visible(
         .unwrap();
     assert_eq!(hits(&index, Tier::Hot), ["fresh"]);
 }
+
+#[test]
+fn exact_filtered_updates_flush_and_reopen_without_building_hnsw() {
+    let (_dir, store, index) = fixture();
+    for (seq, id, cos, scope, kind, current) in [
+        (0, "wanted", 0.7, "personal", "person", true),
+        (1, "other-scope", 0.99, "professional", "person", true),
+        (2, "other-type", 0.99, "personal", "tool", true),
+        (3, "inactive", 0.99, "personal", "person", false),
+    ] {
+        node(&store, seq, id, cos, scope, kind, current, Tier::Hot);
+    }
+    // More than two old 10,000-KiB indexing thresholds: zero indexed vectors
+    // must reflect disabled indexing, rather than a tiny below-threshold fixture.
+    store
+        .write(|tx| {
+            let embedding = vector(0.95);
+            for seq in 4..7004 {
+                tx.put_vector(&VectorWrite {
+                    seq,
+                    target: format!("inactive-padding-{seq}"),
+                    kind: VectorKind::Node,
+                    version: 1,
+                    current: false,
+                    tier: Tier::Hot,
+                    embedding: embedding.clone(),
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
+    assert_eq!(hits(&index, Tier::Hot), ["wanted"]);
+    node(
+        &store,
+        -1,
+        "fresh",
+        0.9,
+        "personal",
+        "person",
+        true,
+        Tier::Hot,
+    );
+    // The ordinary snapshot catches up the pending upsert and durably flushes it.
+    assert_eq!(hits(&index, Tier::Hot), ["fresh"]);
+    drop(index);
+    let shard =
+        qdrant_edge::EdgeShard::load(&store.data_dir().join("search/hot/edge"), None).unwrap();
+    let info = shard.info().unwrap();
+    assert_eq!(info.points_count, 7005);
+    assert_eq!(info.indexed_vectors_count, 0);
+    for field in ["kind", "current", "ordinary", "personal", "professional"] {
+        assert!(
+            info.payload_schema
+                .keys()
+                .any(|key| key.to_string() == field)
+        );
+    }
+    drop(shard);
+    let index = Projection::open(store, ModelSignature::pinned()).unwrap();
+    assert_eq!(hits(&index, Tier::Hot), ["fresh"]);
+}
+
 #[test]
 fn eligibility_without_vector_write_changes_search_and_snapshot_keeps_newer_event() {
     let (_dir, store, index) = fixture();
