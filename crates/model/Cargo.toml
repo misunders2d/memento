@@ -14,4 +14,3 @@ tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff", "bmp", "pnm", "ico"] }
 rustfft = "=6.4.1"
 serde_json = "=1.0.154"
-
