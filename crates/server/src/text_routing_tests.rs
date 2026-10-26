@@ -323,6 +323,125 @@ fn semantic_text_rejection_precedes_raw_fallback_without_changing_literal_or_sco
 }
 
 #[test]
+fn semantic_text_empty_passages_do_not_poison_valid_scoring_or_typed_bypasses() {
+    let f = Fixture::new();
+    let mut rows = BTreeMap::new();
+    for (id, text) in [
+        ("empty", json!("")),
+        ("whitespace", json!(" \n\t")),
+        ("null", Value::Null),
+        ("nonstring", json!(7)),
+    ] {
+        rows.insert(
+            id.to_owned(),
+            json!({"id":id,"type":"knowledge","text":text,"match":"semantic","score":1.,"cosine":1.}),
+        );
+    }
+    rows.insert(
+        "missing".into(),
+        json!({"id":"missing","type":"knowledge","match":"semantic","score":1.,"cosine":1.}),
+    );
+    let valid = "  Valid semantic passage text stays unchanged.  ";
+    rows.insert(
+        "valid".into(),
+        json!({"id":"valid","type":"knowledge","text":valid,"match":"semantic","score":0.8,"cosine":0.8}),
+    );
+    for (id, extra) in [
+        ("literal", json!({"match":"keyword","text":""})),
+        ("full-and", json!({"match":"hybrid","text":" \n\t"})),
+        ("entity", json!({"category":"entity_context","text":null})),
+        (
+            "behavior",
+            json!({"behavior":{"authority":"explicit_user"},"text":7}),
+        ),
+        (
+            "image",
+            json!({"type":"media","modality":"image","text":""}),
+        ),
+        (
+            "audio",
+            json!({"type":"media","modality":"audio","text":null}),
+        ),
+    ] {
+        let mut row = json!({"id":id,"type":"knowledge","match":"semantic","score":0.8,"cosine":0.8});
+        records::merge(&mut row, extra);
+        rows.insert(id.to_owned(), row);
+    }
+    let before = rows.clone();
+    let calls = std::cell::Cell::new(0);
+    let score = |documents: &[&str], _: Instant| {
+        calls.set(calls.get() + 1);
+        if documents.iter().any(|text| text.trim().is_empty()) {
+            return Err(Error::Validation(
+                "Text passage scoring requires nonempty text",
+            ));
+        }
+        assert_eq!(documents, &[valid]);
+        Ok(vec![1.])
+    };
+    f.store
+        .read(|tx| {
+            filter_text_passages(
+                tx.sql(),
+                &mut rows,
+                10,
+                Instant::now() + std::time::Duration::from_secs(5),
+                Some(&score),
+                &HashSet::new(),
+            )
+        })
+        .expect("Empty stored passages must not turn valid recall into a scoring error");
+    assert_eq!(calls.get(), 1);
+    assert_eq!(rows.len(), 7);
+    for id in ["empty", "whitespace", "null", "nonstring", "missing"] {
+        assert!(!rows.contains_key(id));
+    }
+    for (id, row) in &rows {
+        assert_eq!(row, &before[id]);
+    }
+}
+
+#[test]
+fn semantic_text_all_empty_passages_are_rejected_without_scoring() {
+    let f = Fixture::new();
+    let mut rows = BTreeMap::from([
+        (
+            "empty".into(),
+            json!({"id":"empty","type":"knowledge","text":"","match":"semantic"}),
+        ),
+        (
+            "whitespace".into(),
+            json!({"id":"whitespace","type":"knowledge","text":" \n\t","match":"semantic"}),
+        ),
+        (
+            "missing".into(),
+            json!({"id":"missing","type":"knowledge","match":"semantic"}),
+        ),
+    ]);
+    let calls = std::cell::Cell::new(0);
+    let score = |_: &[&str], _: Instant| {
+        calls.set(calls.get() + 1);
+        Err(Error::Validation(
+            "Text passage scoring requires nonempty text",
+        ))
+    };
+    f.store
+        .read(|tx| {
+            filter_text_passages(
+                tx.sql(),
+                &mut rows,
+                10,
+                Instant::now() + std::time::Duration::from_secs(5),
+                Some(&score),
+                &HashSet::new(),
+            )
+        })
+        .unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
 fn semantic_text_batch_failure_is_atomic_and_effective_query_matches_encoder_context() {
     let f = Fixture::new();
     let mut rows = BTreeMap::new();
@@ -333,6 +452,14 @@ fn semantic_text_batch_failure_is_atomic_and_effective_query_matches_encoder_con
             json!({"id":id,"type":"knowledge","text":id,"match":"semantic","score":1.,"cosine":1.}),
         );
     }
+    rows.insert(
+        "empty".into(),
+        json!({"id":"empty","type":"knowledge","text":"","match":"semantic"}),
+    );
+    rows.insert(
+        "whitespace".into(),
+        json!({"id":"whitespace","type":"knowledge","text":" \n\t","match":"semantic"}),
+    );
     let before = rows.clone();
     let calls = std::cell::Cell::new(0);
     let score = |documents: &[&str], _: Instant| {
@@ -369,6 +496,56 @@ fn semantic_text_batch_failure_is_atomic_and_effective_query_matches_encoder_con
     );
     request.automatic = false;
     assert_eq!(effective_query(&request), request.query);
+}
+
+#[test]
+fn semantic_text_deadline_after_scoring_preserves_pending_empty_rejections() {
+    let f = Fixture::new();
+    let mut rows = BTreeMap::from([
+        (
+            "empty".into(),
+            json!({"id":"empty","type":"knowledge","text":"","match":"semantic"}),
+        ),
+        (
+            "whitespace".into(),
+            json!({"id":"whitespace","type":"knowledge","text":" \n\t","match":"semantic"}),
+        ),
+        (
+            "valid".into(),
+            json!({"id":"valid","type":"knowledge","text":"Valid passage","match":"semantic"}),
+        ),
+    ]);
+    let before = rows.clone();
+    let calls = std::cell::Cell::new(0);
+    f.store
+        .read(|tx| {
+            let deadline = Instant::now() + std::time::Duration::from_millis(100);
+            let score = |documents: &[&str], deadline: Instant| {
+                calls.set(calls.get() + 1);
+                assert_eq!(documents, &["Valid passage"]);
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now())
+                        + std::time::Duration::from_millis(1),
+                );
+                Ok(vec![-9.])
+            };
+            let result = filter_text_passages(
+                tx.sql(),
+                &mut rows,
+                10,
+                deadline,
+                Some(&score),
+                &HashSet::new(),
+            );
+            assert!(matches!(
+                result,
+                Err(Error::Unavailable("Semantic search deadline expired"))
+            ));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(rows, before);
 }
 
 #[test]

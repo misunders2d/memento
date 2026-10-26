@@ -97,10 +97,15 @@ fn filter_text_passages(
 ) -> Result<()> {
     let Some(score) = score else { return Ok(()) };
     let mut passages = Vec::new();
+    let mut rejected = Vec::new();
     for (id, row) in found.iter() {
         check(deadline)?;
         if text_passage(db, row, or_only.contains(id))? {
-            passages.push((id.clone(), row));
+            if row["text"].as_str().is_none_or(|text| text.trim().is_empty()) {
+                rejected.push(id.clone());
+            } else {
+                passages.push((id.clone(), row));
+            }
         }
     }
     passages.sort_by(|a, b| order(a.1, b.1));
@@ -112,11 +117,7 @@ fn filter_text_passages(
         .take(maximum)
         .map(|(id, _)| id.clone())
         .collect();
-    let mut rejected: Vec<String> = passages
-        .iter()
-        .skip(maximum)
-        .map(|(id, _)| id.clone())
-        .collect();
+    rejected.extend(passages.iter().skip(maximum).map(|(id, _)| id.clone()));
     drop(passages);
     for batch in ids.chunks(MAX_CANDIDATES) {
         check(deadline)?;
