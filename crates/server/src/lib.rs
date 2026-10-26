@@ -143,6 +143,7 @@ pub struct AppState {
     pub allowed_hosts: Arc<Vec<String>>,
     pub media_enabled: bool,
     pub services: Option<Arc<runtime::Services>>,
+    status_admission: Arc<tokio::sync::Semaphore>,
 }
 impl AppState {
     pub fn new(store: Arc<Store>) -> Result<Self> {
@@ -156,6 +157,7 @@ impl AppState {
             allowed_hosts: Arc::new(Vec::new()),
             media_enabled: false,
             services: None,
+            status_admission: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
     /// Hydrate cold opaque runs outside the SQL snapshot and retain leases while

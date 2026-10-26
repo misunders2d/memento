@@ -14,7 +14,11 @@ use axum::{
 };
 use memento_core::{Error, Result, Tier};
 use serde_json::{Value, json};
-use std::{io::Write, sync::atomic::Ordering};
+use std::{
+    io::Write,
+    sync::{Arc, atomic::Ordering},
+};
+use tokio::sync::Semaphore;
 fn protect(mut response: Response, cache: &'static str) -> Response {
     let headers = response.headers_mut();
     headers.insert("cache-control", HeaderValue::from_static(cache));
@@ -139,6 +143,21 @@ fn static_asset(state: AppState, headers: HeaderMap, file: &str) -> Response {
         None => protect(StatusCode::NOT_FOUND.into_response(), "no-cache"),
     }
 }
+async fn status_blocking<T: Send + 'static>(
+    admission: Arc<Semaphore>,
+    apply: impl FnOnce() -> Result<T> + Send + 'static,
+) -> std::result::Result<T, ApiError> {
+    let permit = admission
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError(Error::Unavailable("Service worker is unavailable")))?;
+    blocking(move || {
+        // A canceled HTTP waiter cannot release admission while its SQL still runs.
+        let _permit = permit;
+        apply()
+    })
+    .await
+}
 pub async fn status(
     State(state): State<AppState>,
     query: std::result::Result<
@@ -149,7 +168,7 @@ pub async fn status(
     let Query(query) = query.map_err(|_| ApiError(Error::Validation("Invalid status query")))?;
     Ok(protect(
         Json(
-            blocking(move || {
+            status_blocking(state.status_admission.clone(), move || {
                 let mut runtime = RuntimeStatus::disabled();
                 if let Some(services) = &state.services {
                     let cold = services.cold_status()?;
@@ -194,6 +213,9 @@ pub async fn status(
         "no-store",
     ))
 }
+#[cfg(test)]
+#[path = "status_admission_tests.rs"]
+mod status_admission_tests;
 macro_rules! query {
     ($name:ident,$dto:ty,$method:ident) => {
         pub async fn $name(
