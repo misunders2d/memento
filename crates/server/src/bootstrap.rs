@@ -9,11 +9,11 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 const CHUNK: u64 = 8 * 1024 * 1024;
-struct Asset<'a> {
-    path: &'a str,
-    url: &'a str,
-    bytes: u64,
-    sha: &'a str,
+pub(crate) struct Asset<'a> {
+    pub(crate) path: &'a str,
+    pub(crate) url: &'a str,
+    pub(crate) bytes: u64,
+    pub(crate) sha: &'a str,
 }
 const ASSETS: &[Asset<'static>] = &[
     Asset {
@@ -164,7 +164,7 @@ fn request(
     }
     Err(Error::Unavailable("Model asset redirect limit exceeded"))
 }
-fn verify(path: &Path, asset: &Asset<'_>) -> Result<bool> {
+pub(crate) fn verify(path: &Path, asset: &Asset<'_>) -> Result<bool> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -193,7 +193,7 @@ fn verify(path: &Path, asset: &Asset<'_>) -> Result<bool> {
     }
     Ok(true)
 }
-fn ensure(
+pub(crate) fn ensure(
     transport: &dyn Transport,
     root: &Path,
     asset: &Asset<'_>,

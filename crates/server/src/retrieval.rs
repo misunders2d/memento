@@ -1,5 +1,8 @@
 //! Relevance-first native recall. All index/payload/hydration reads share one authority cut.
-use crate::{Recall, RecallRequest, anchors, records};
+use crate::{
+    Recall, RecallRequest, anchors, records,
+    text_reranker::{MAX_CANDIDATES, TextReranker},
+};
 use chrono::{DateTime, Utc};
 use memento_ann::{
     Pool, Projection, SearchHit, SearchView,
@@ -17,6 +20,10 @@ use std::{
 };
 const TEXT_FLOOR: f64 = 0.685;
 const AUTO_FLOOR: f64 = 0.66;
+// Fixed narrow text-passage validation decision. Behavior/media/entity contexts
+// are separate routes; this is not a universal semantic relevance probability.
+const SEMANTIC_TEXT_LOGIT_FLOOR: f64 = -3.63973325;
+type TextScore<'a> = dyn Fn(&[&str], Instant) -> Result<Vec<f32>> + 'a;
 fn number(v: &Value, key: &str, default: f64) -> f64 {
     v[key].as_f64().unwrap_or(default)
 }
@@ -56,6 +63,85 @@ fn order(a: &Value, b: &Value) -> std::cmp::Ordering {
         .then_with(|| number(b, "_feedback", 0.).total_cmp(&number(a, "_feedback", 0.)))
         .then_with(|| key(a).cmp(key(b)))
 }
+fn effective_query(request: &RecallRequest) -> String {
+    if request.automatic {
+        automatic_query(&request.query, &request.context)
+    } else {
+        request.query.clone()
+    }
+}
+fn text_passage(db: &rusqlite::Connection, row: &Value, or_only: bool) -> Result<bool> {
+    if (row["match"] != "semantic" && !or_only)
+        || row["type"] == "media"
+        || row["category"] == "entity_context"
+        || row["category"] == "behavioral_suggestion"
+        || row.get("behavior").is_some_and(|v| !v.is_null())
+    {
+        return Ok(false);
+    }
+    if row["type"] == "experience"
+        && row["tier"] != "candidate"
+        && behavior(db, key(row))?.is_some()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+fn filter_text_passages(
+    db: &rusqlite::Connection,
+    found: &mut BTreeMap<String, Value>,
+    limit: usize,
+    deadline: Instant,
+    score: Option<&TextScore<'_>>,
+    or_only: &HashSet<String>,
+) -> Result<()> {
+    let Some(score) = score else { return Ok(()) };
+    let mut passages = Vec::new();
+    for (id, row) in found.iter() {
+        check(deadline)?;
+        if text_passage(db, row, or_only.contains(id))? {
+            passages.push((id.clone(), row));
+        }
+    }
+    passages.sort_by(|a, b| order(a.1, b.1));
+    // Standard bounded second-stage shortlist. Unscored semantic-only tail is
+    // not admitted; literal, behavior, entity context and media stay untouched.
+    let maximum = limit.max(MAX_CANDIDATES).min(100);
+    let ids: Vec<String> = passages
+        .iter()
+        .take(maximum)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut rejected: Vec<String> = passages
+        .iter()
+        .skip(maximum)
+        .map(|(id, _)| id.clone())
+        .collect();
+    drop(passages);
+    for batch in ids.chunks(MAX_CANDIDATES) {
+        check(deadline)?;
+        let documents: Vec<&str> = batch
+            .iter()
+            .map(|id| found[id]["text"].as_str().unwrap_or(""))
+            .collect();
+        let logits = score(&documents, deadline)?;
+        if logits.len() != batch.len() || logits.iter().any(|v| !v.is_finite()) {
+            return Err(Error::Unavailable(
+                "Text passage scoring returned invalid logits",
+            ));
+        }
+        for (id, logit) in batch.iter().zip(logits) {
+            if f64::from(logit) < SEMANTIC_TEXT_LOGIT_FLOOR {
+                rejected.push(id.clone());
+            }
+        }
+    }
+    check(deadline)?;
+    for id in rejected {
+        found.remove(&id);
+    }
+    Ok(())
+}
 fn ranked(db: &rusqlite::Connection, record: &mut Value, at: DateTime<Utc>) -> Result<()> {
     let authority = record["authority"].as_str().map(str::to_owned);
     let overridden = record
@@ -76,22 +162,25 @@ pub struct Retrieval {
     pub store: Arc<Store>,
     pub projection: Arc<Projection>,
     pub model: EmbeddingModel,
+    pub text_reranker: Arc<TextReranker>,
 }
 impl Retrieval {
-    pub fn new(store: Arc<Store>, projection: Arc<Projection>, model: EmbeddingModel) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        projection: Arc<Projection>,
+        model: EmbeddingModel,
+        text_reranker: Arc<TextReranker>,
+    ) -> Self {
         Self {
             store,
             projection,
             model,
+            text_reranker,
         }
     }
-    /// Model calls happen before taking the search lock or SQLite snapshot.
+    /// EmbeddingGemma query encoding precedes the search lock/SQLite snapshot.
     fn encode(&self, request: &RecallRequest) -> Result<[f32; 768]> {
-        let text = if request.automatic {
-            automatic_query(&request.query, &request.context)
-        } else {
-            request.query.clone()
-        };
+        let text = effective_query(request);
         self.model
             .encode_query(&text)
             .map_err(|_| Error::Unavailable("Native query encoding failed"))
@@ -102,11 +191,14 @@ impl Retrieval {
         vector: &[f32; 768],
         deadline: Instant,
     ) -> Result<Vec<Value>> {
+        let query = effective_query(request);
+        let score =
+            |documents: &[&str], until: Instant| self.text_reranker.score(&query, documents, until);
         let deep = request.effort == "deep" && !request.automatic && request.scope.is_none();
         let (mut results, need_archive) =
             self.projection
                 .snapshot_until(true, deep, deadline, |tx, view| {
-                    Self::current(tx, view, request, vector, deep, deadline)
+                    Self::current_scored(tx, view, request, vector, deep, deadline, Some(&score))
                 })?;
         if need_archive && !deep {
             // A new cut, acquired cold->hot, prevents mixing a future index with an old snapshot.
@@ -114,12 +206,13 @@ impl Retrieval {
             let value = self
                 .projection
                 .snapshot_until(true, true, deadline, |tx, view| {
-                    Self::current(tx, view, request, vector, true, deadline)
+                    Self::current_scored(tx, view, request, vector, true, deadline, Some(&score))
                 })?;
             results = value.0;
         }
         Ok(results)
     }
+    #[cfg(test)]
     fn current(
         tx: &ReadTxn<'_>,
         view: &SearchView<'_>,
@@ -127,6 +220,17 @@ impl Retrieval {
         vector: &[f32; 768],
         archive: bool,
         deadline: Instant,
+    ) -> Result<(Vec<Value>, bool)> {
+        Self::current_scored(tx, view, request, vector, archive, deadline, None)
+    }
+    fn current_scored(
+        tx: &ReadTxn<'_>,
+        view: &SearchView<'_>,
+        request: &RecallRequest,
+        vector: &[f32; 768],
+        archive: bool,
+        deadline: Instant,
+        score: Option<&TextScore<'_>>,
     ) -> Result<(Vec<Value>, bool)> {
         let db = tx.sql();
         let scope = request.scope.as_deref();
@@ -165,6 +269,30 @@ impl Retrieval {
                 &mut keyword_targets,
             )?;
         }
+        // Public hybrid scores combine literal and OR discovery provenance.
+        // Preserve that wire shape, but only actual all-term FTS admission is
+        // exempt from passage scoring. Automatic lookup records provenance only.
+        let mut and_targets = keyword_targets.clone();
+        if request.automatic {
+            for (kind, target, version) in keyword_ids(
+                tx,
+                &literal(&request.query, false),
+                (limit * 4).min(100),
+                scope,
+            )? {
+                let hit = SearchHit {
+                    seq: 0,
+                    target,
+                    kind,
+                    version,
+                    cosine: 0.,
+                };
+                if let Some(row) = hydrate(tx, &hit, false)? {
+                    and_targets.insert(key(&row).to_owned());
+                }
+            }
+        }
+        let mut or_only = HashSet::new();
         let mut discoveries = Vec::new();
         Self::discover(
             tx,
@@ -179,6 +307,9 @@ impl Retrieval {
             if let Some(record) = hydrate(tx, hit, false)? {
                 if hit.cosine as f64 >= floor(&record, request.automatic) {
                     keyword_targets.insert(key(&record).to_owned());
+                    if !and_targets.contains(key(&record)) {
+                        or_only.insert(key(&record).to_owned());
+                    }
                 }
             }
         }
@@ -214,6 +345,7 @@ impl Retrieval {
                 matches.insert(id, record);
             }
         }
+        filter_text_passages(db, &mut matches, limit, deadline, score, &or_only)?;
         let meaningful = matches.values().try_fold(false, |yes, v| {
             Ok::<_, Error>(yes || records::meaningful(db, v)?)
         })?;
@@ -222,6 +354,7 @@ impl Retrieval {
             && (request.effort != "deep" || request.automatic)
             && matches.len() + named.len() < limit;
         if request.effort == "deep" && !request.automatic && scope.is_none() {
+            let mut raw_matches = BTreeMap::new();
             for tier in [Tier::Hot, Tier::Cold] {
                 for hit in view.search(tier, vector, n, "episode", Pool::Ordinary, None, None)? {
                     if hit.cosine as f64 >= TEXT_FLOOR {
@@ -230,7 +363,7 @@ impl Retrieval {
                                 &mut row,
                                 json!({"cosine":hit.cosine,"score":hit.cosine,"match":"semantic"}),
                             );
-                            matches.entry(key(&row).to_owned()).or_insert(row);
+                            raw_matches.entry(key(&row).to_owned()).or_insert(row);
                         }
                     }
                 }
@@ -241,17 +374,28 @@ impl Retrieval {
                 if let Some(mut row) =
                     records::matched_passage(tx, key(&episode), &request.query, false)?
                 {
-                    let old = matches.get(key(&row));
+                    let old = raw_matches.get(key(&row));
                     let cosine = old.and_then(|v| v["cosine"].as_f64());
                     records::merge(
                         &mut row,
                         json!({"score":cosine.unwrap_or(TEXT_FLOOR)+0.25,"cosine":cosine,"match":if cosine.is_some(){"hybrid"}else{"keyword"}}),
                     );
-                    matches.insert(key(&row).into(), row);
+                    raw_matches.insert(key(&row).into(), row);
                 }
             }
+            filter_text_passages(
+                db,
+                &mut raw_matches,
+                limit,
+                deadline,
+                score,
+                &HashSet::new(),
+            )?;
+            for (id, row) in raw_matches {
+                matches.entry(id).or_insert(row);
+            }
         } else if need_archive && archive {
-            let mut fallback = Self::raw_fallback(
+            let mut fallback = Self::raw_fallback_scored(
                 tx,
                 view,
                 &request.query,
@@ -259,6 +403,8 @@ impl Retrieval {
                 if request.automatic { 1 } else { limit },
                 !request.automatic,
                 at,
+                deadline,
+                score,
             )?;
             if request.automatic {
                 let mut parked = Vec::new();
@@ -291,6 +437,13 @@ impl Retrieval {
                         parked.push(row);
                     }
                 }
+                parked.sort_by(order);
+                let mut eligible: BTreeMap<String, Value> = parked
+                    .into_iter()
+                    .map(|row| (key(&row).to_owned(), row))
+                    .collect();
+                filter_text_passages(db, &mut eligible, limit, deadline, score, &HashSet::new())?;
+                let mut parked: Vec<Value> = eligible.into_values().collect();
                 parked.sort_by(order);
                 if let Some(row) = parked.into_iter().next() {
                     fallback.push(row);
@@ -626,9 +779,11 @@ impl Retrieval {
             return Ok(None);
         };
         let metadata: Value = serde_json::from_str(&metadata)?;
-        Ok((allowed && !raw::legacy_native_context(&source, &kind, text.as_deref(), Some(&metadata)))
-            .then_some(historical))
+        Ok((allowed
+            && !raw::legacy_native_context(&source, &kind, text.as_deref(), Some(&metadata)))
+        .then_some(historical))
     }
+    #[cfg(test)]
     fn raw_fallback(
         tx: &ReadTxn<'_>,
         view: &SearchView<'_>,
@@ -637,6 +792,29 @@ impl Retrieval {
         limit: usize,
         keywords: bool,
         at: DateTime<Utc>,
+    ) -> Result<Vec<Value>> {
+        Self::raw_fallback_scored(
+            tx,
+            view,
+            query,
+            vector,
+            limit,
+            keywords,
+            at,
+            Instant::now() + std::time::Duration::from_secs(5),
+            None,
+        )
+    }
+    fn raw_fallback_scored(
+        tx: &ReadTxn<'_>,
+        view: &SearchView<'_>,
+        query: &str,
+        vector: &[f32; 768],
+        limit: usize,
+        keywords: bool,
+        at: DateTime<Utc>,
+        deadline: Instant,
+        score: Option<&TextScore<'_>>,
     ) -> Result<Vec<Value>> {
         let mut found = BTreeMap::new();
         for hit in view.search(
@@ -652,9 +830,13 @@ impl Retrieval {
                 continue;
             }
             let episode_id: String = tx.sql().query_row(
-                "SELECT episode_id FROM episode_chunks WHERE id=?", [&hit.target], |r| r.get(0),
+                "SELECT episode_id FROM episode_chunks WHERE id=?",
+                [&hit.target],
+                |r| r.get(0),
             )?;
-            let Some(historical) = Self::raw_fallback_state(tx, &episode_id)? else { continue };
+            let Some(historical) = Self::raw_fallback_state(tx, &episode_id)? else {
+                continue;
+            };
             if let Some(mut row) = hydrate(tx, &hit, historical)? {
                 records::merge(
                     &mut row,
@@ -665,8 +847,12 @@ impl Retrieval {
         }
         if keywords {
             for row in tx.search_episodes(Some(query), (limit * 4).min(100), None, None, None)? {
-                let Some(historical) = Self::raw_fallback_state(tx, key(&row))? else { continue };
-                if let Some(mut passage) = records::matched_passage(tx, key(&row), query, historical)? {
+                let Some(historical) = Self::raw_fallback_state(tx, key(&row))? else {
+                    continue;
+                };
+                if let Some(mut passage) =
+                    records::matched_passage(tx, key(&row), query, historical)?
+                {
                     let cosine = found.get(key(&passage)).and_then(|v| v["cosine"].as_f64());
                     records::merge(
                         &mut passage,
@@ -676,6 +862,14 @@ impl Retrieval {
                 }
             }
         }
+        filter_text_passages(
+            tx.sql(),
+            &mut found,
+            limit,
+            deadline,
+            score,
+            &HashSet::new(),
+        )?;
         let mut result = Vec::new();
         for (_, mut row) in found {
             ranked(tx.sql(), &mut row, at)?;
@@ -890,6 +1084,7 @@ mod tests {
     use memento_domain::Graph;
     use std::sync::atomic::AtomicBool;
     include!("raw_pool_tests.rs");
+    include!("text_routing_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,

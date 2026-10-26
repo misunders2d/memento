@@ -1,16 +1,16 @@
 use crate::{
-    validation, AudioInput, Error, ImageInput, Preprocessor, Result, TextChunk, TextInput,
-    DIMENSIONS, MODEL_REVISION,
+    AudioInput, DIMENSIONS, Error, ImageInput, MODEL_REVISION, Preprocessor, Result, TextChunk,
+    TextInput, validation,
 };
 use memmap2::{Mmap, MmapOptions};
 use ort::{
-    session::{builder::GraphOptimizationLevel, Session},
+    session::{Session, builder::GraphOptimizationLevel},
     value::Tensor,
 };
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
-    ffi::{c_char, CStr},
+    ffi::{CStr, c_char},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -154,7 +154,9 @@ struct ApiBase {
     get_version_string: unsafe extern "C" fn() -> *const c_char,
 }
 
-fn initialize_runtime(path: &Path) -> Result<()> {
+/// Share the unchanged, checksum-pinned ONNX runtime with auxiliary local models.
+/// This initializes no EmbeddingGemma sessions and changes no encoder settings.
+pub fn initialize_runtime(path: &Path) -> Result<()> {
     let canonical = path.canonicalize()?;
     let mut active = ACTIVE_RUNTIME.lock().map_err(|_| Error::PoisonedLane)?;
     if let Some(current) = active.as_ref() {

@@ -32,6 +32,7 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub model: Option<ModelConfig>,
     pub bootstrap_assets: bool,
+    pub text_reranker_dir: Option<PathBuf>,
     pub pdfium: Option<PathBuf>,
     pub allowed_hosts: Vec<String>,
     pub compact_executable: PathBuf,
@@ -285,9 +286,32 @@ impl Application {
                                 &background_services.stop,
                             )?;
                         }
+                        let runtime_library = model_config.runtime_library.clone();
                         let model = EmbeddingModel::load(model_config).map_err(|_| {
                             Error::Unavailable("Pinned multimodal model failed to load")
                         })?;
+                        if background_services.stop.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        let text_reranker_root =
+                            config.text_reranker_dir.clone().unwrap_or_else(|| {
+                                config
+                                    .data_dir
+                                    .join("models")
+                                    .join("text-reranker")
+                                    .join(crate::text_reranker::MODEL_REVISION)
+                            });
+                        if config.text_reranker_dir.is_none() {
+                            crate::text_reranker::prepare(
+                                &NativeTransport::new(),
+                                &text_reranker_root,
+                                &background_services.stop,
+                            )?;
+                        }
+                        let text_reranker = Arc::new(crate::text_reranker::TextReranker::load(
+                            &text_reranker_root,
+                            &runtime_library,
+                        )?);
                         if background_services.stop.load(Ordering::Acquire) {
                             return Ok(());
                         }
@@ -307,6 +331,7 @@ impl Application {
                             store.clone(),
                             projection.clone(),
                             model.clone(),
+                            text_reranker,
                         ));
                         *deferred
                             .0

@@ -16,6 +16,7 @@ pub mod retrieval;
 pub mod runtime;
 #[cfg(test)]
 mod status_count_tests;
+pub mod text_reranker;
 pub mod viewer;
 #[cfg(test)]
 mod viewer_tests;

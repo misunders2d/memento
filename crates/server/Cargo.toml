@@ -25,6 +25,8 @@ futures-util.workspace=true
 base64.workspace=true
 sha2.workspace=true
 rusqlite.workspace=true
+ort={version="=2.0.0-rc.13",default-features=false,features=["std","load-dynamic","api-18"]}
+tokenizers={version="=0.23.2",default-features=false,features=["fancy-regex"]}
 [dev-dependencies]
 tempfile.workspace=true
 tower = { version = "=0.5.3", features = ["util"] }

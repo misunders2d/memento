@@ -121,6 +121,7 @@ fn run() -> Result<()> {
         data_dir: data,
         model,
         bootstrap_assets: std::env::var_os("MEMENTO_MODEL_DIR").is_none(),
+        text_reranker_dir: std::env::var_os("MEMENTO_TEXT_RERANKER_DIR").map(PathBuf::from),
         pdfium,
         allowed_hosts: std::env::var("MEMENTO_ALLOWED_HOSTS")
             .unwrap_or_default()

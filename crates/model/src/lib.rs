@@ -7,12 +7,14 @@ mod runtime;
 mod text;
 pub mod validation;
 
-pub use audio::{AudioInput, AUDIO_MAX_SAMPLES, AUDIO_SAMPLE_RATE};
+pub use audio::{AUDIO_MAX_SAMPLES, AUDIO_SAMPLE_RATE, AudioInput};
 pub use error::{Error, Result};
 pub use image::ImageInput;
-pub use runtime::{BackgroundLane, EmbeddingModel, ForegroundLane, ModelConfig};
+pub use runtime::{
+    BackgroundLane, EmbeddingModel, ForegroundLane, ModelConfig, initialize_runtime,
+};
 use std::path::Path;
-pub use text::{document_prompt, TextChunk, TextInput, MAX_SEQUENCE_LENGTH, QUERY_PREFIX};
+pub use text::{MAX_SEQUENCE_LENGTH, QUERY_PREFIX, TextChunk, TextInput, document_prompt};
 
 pub const DIMENSIONS: usize = 768;
 pub const MODEL_ID: &str = "google/embeddinggemma-2";
