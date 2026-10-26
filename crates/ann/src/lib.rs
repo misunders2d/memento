@@ -665,6 +665,7 @@ impl SearchView<'_> {
             .filter(filter)
             .params(SearchParams {
                 hnsw_ef: Some(2048),
+                exact: true,
                 ..Default::default()
             })
             .with_payload(true.into())
