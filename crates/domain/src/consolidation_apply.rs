@@ -55,6 +55,9 @@ fn span(episodes: &Map<String, Value>, source: &Value) -> Result<(usize, usize)>
         source["occurrence"].as_u64().map(|value| value as usize),
     )
 }
+fn visible_link_endpoint(db: &Connection, target: &str) -> Result<bool> {
+    Ok(one(db, &format!("SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}", super::context_builder::VISIBLE), [target])?.is_some())
+}
 fn technical_grounding(
     action: &Value,
     candidate: &Value,
@@ -363,6 +366,30 @@ fn validate(
         if (repair["operation"] == "absorb") != !absorbed.is_empty() {
             return Err(reject("consolidation_reference_not_supplied", vec![]));
         }
+        if repair["operation"] == "link" {
+            let dst = repair["dst"].as_str().ok_or_else(|| reject("consolidation_relation_endpoints_required", vec![]))?;
+            if !nodes.contains_key(dst) {
+                return Err(reject("consolidation_reference_not_supplied", vec![]));
+            }
+            if !repair["relation"].as_str().is_some_and(|rel| RELATIONS.contains(&rel)) {
+                return Err(reject("consolidation_relation_invalid", vec![]));
+            }
+            // The existing uniqueness bound is per repair target, not per
+            // referenced subject: several independent claims can name one entity.
+            if dst != target {
+                affected.push(dst.to_owned());
+            }
+            for endpoint in &affected {
+                if !visible_link_endpoint(db, endpoint)? {
+                    return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan").into());
+                }
+                if node(db, endpoint)?["version"] != nodes[endpoint]["version"] {
+                    return Err(Error::Conflict("Consolidation graph context changed; derive a fresh plan").into());
+                }
+            }
+        } else if !repair["dst"].is_null() || !repair["relation"].is_null() {
+            return Err(reject("consolidation_schema_invalid", vec![]));
+        }
         repair["absorbed"] = json!(absorbed);
         if repair["operation"] == "absorb" {
             if let Some(code) = curation::absorb_check(db, &target, &absorbed)? {
@@ -623,7 +650,7 @@ pub(super) fn apply(
         why,
     );
     Ok(consolidator.graph.store.command(&ctx,&request,|tx,commit|{
-        job.check_in(tx.sql())?;check_continuity(tx.sql(),context_value)?;for repair in &prepared.repairs{if repair["operation"]=="retire"{check_retirement(tx.sql(),context_value,get_str(repair,"target")?)?;}}
+        job.check_in(tx.sql())?;check_continuity(tx.sql(),context_value)?;for repair in &prepared.repairs{if repair["operation"]=="retire"{check_retirement(tx.sql(),context_value,get_str(repair,"target")?)?;}if repair["operation"]=="link"{for key in ["target","dst"]{if !visible_link_endpoint(tx.sql(),get_str(repair,key)?)?{return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan"));}}}}
         if !ineligible(tx.sql(),&ids)?.is_empty(){return Err(Error::Conflict("Consolidation eligibility changed; derive a fresh plan"));}for(target,frozen)in &prepared.nodes{if node(tx.sql(),target)?["version"]!=frozen["version"]{return Err(Error::Conflict("Consolidation graph context changed; derive a fresh plan"));}}for(target,frozen)in &prepared.edges{if one(tx.sql(),"SELECT version FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1",[target])?.is_none_or(|current|current["version"]!=frozen["version"]){return Err(Error::Conflict("Consolidation relation context changed; derive a fresh plan"));}}
         let loop_snapshots=context_value["loop_snapshots"].as_object().unwrap();if !prepared.repairs.is_empty()||prepared.actions.iter().any(|action|!action["closed_targets"].as_array().unwrap().is_empty()){for(target,frozen)in loop_snapshots{let version=prepared.nodes.get(target).or_else(||prepared.edges.get(target)).and_then(|value|value["version"].as_i64()).unwrap_or(1);if loops::snapshot(tx.sql(),target,version)?!=*frozen{return Err(Error::Conflict("Consolidation loop state changed; derive a fresh plan"));}}}
         let mut closures=vec![];let mut closure_sources:HashMap<String,Vec<Option<String>>>=HashMap::new();for action in &prepared.actions{let candidate_id=get_str(action,"candidate_id")?;let original=prepared.selected[candidate_id]["evidence"].as_array().unwrap().iter().map(|reference|reference["episode_id"].as_str().unwrap()).collect::<BTreeSet<_>>();let sources=action["evidence"].as_array().unwrap().iter().filter(|source|original.contains(source["episode_id"].as_str().unwrap())).map(|source|prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str().map(str::to_owned)).collect::<Vec<_>>();for target in action["closed_targets"].as_array().unwrap(){let target=target.as_str().unwrap();let(at,status)=loops::closure_time(&loop_snapshots[target],&sources)?;closures.push(json!({"candidate_id":candidate_id,"target":target,"source_occurred_at":at,"status":status}));}closure_sources.insert(candidate_id.into(),sources);}
@@ -636,6 +663,7 @@ pub(super) fn apply(
             result["decision"]=json!(state);results.insert(candidate_id.into(),result);
         }
         let mut repair_results=Map::new();for repair in &prepared.repairs{let original=get_str(repair,"target")?;let target=follow_refinements(tx.sql(),original,&destinations)?;let evidence=&repair["evidence"];let result=match get_str(repair,"operation")?{
+            "link"=>{let dst=follow_refinements(tx.sql(),get_str(repair,"dst")?,&destinations)?;if !visible_link_endpoint(tx.sql(),&target)?||!visible_link_endpoint(tx.sql(),&dst)?{return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan"));}link(tx,commit,&target,get_str(repair,"relation")?,&dst,evidence)?},
             "absorb"=>{let mut absorbed=vec![];for source in strings(&repair["absorbed"])?{absorbed.push(follow_refinements(tx.sql(),&source,&destinations)?);}let result=curation::absorb(tx,commit,&target,&absorbed,Some(evidence),false,None)?;if result["status"]=="absorbed"{for source in absorbed{if node(tx.sql(),&source)?["state"]=="merged"{destinations.insert(source,json!(target));}}}result},
             "supersede"=>{let result=TxGraph::supersede(tx,commit,&json!({"op":"supersede","old":target,"new":{"type":repair["type"],"text":repair["text"],"scope":repair.get("scope").filter(|scope|!scope.is_null()).unwrap_or(&prepared.nodes[original]["scope"])},"kind":repair["change_kind"],"valid_at":repair["valid_at"],"evidence":evidence}),false)?;if let Some(new)=result["superseded_by"].as_str(){destinations.insert(target.clone(),json!(new));}result},
             "decline_loop"=>loops::decline_automatic(tx,commit,&target,&loop_snapshots[original])?,
@@ -705,6 +733,17 @@ fn follow_refinements(
         target = next.into();
     }
     Ok(target)
+}
+fn link(tx: &WriteTxn, commit: &str, a: &str, rel: &str, b: &str, evidence: &Value) -> Result<Value> {
+    if !RELATIONS.contains(&rel) {
+        return Err(Error::Validation("consolidation_relation_invalid"));
+    }
+    let existing = one(tx.sql(), "SELECT e.id FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1", params![a, rel, b])?;
+    if let Some(existing) = existing {
+        curation::attach(tx, commit, get_str(&existing, "id")?, evidence, false, None)
+    } else {
+        TxGraph::link(tx, commit, &json!({"op":"link","a":a,"rel":rel,"b":b,"evidence":evidence}), false)
+    }
 }
 fn apply_action(
     tx: &WriteTxn,
@@ -862,27 +901,7 @@ fn apply_action(
                     &json!({"op":"merge","a":a,"b":b,"evidence":evidence}),
                 )?
             } else {
-                let rel = action["relation"]
-                    .as_str()
-                    .ok_or(Error::Validation("consolidation_relation_invalid"))?;
-                if !RELATIONS.contains(&rel) {
-                    return Err(Error::Validation("consolidation_relation_invalid"));
-                }
-                let existing = one(
-                    tx.sql(),
-                    "SELECT e.id FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1",
-                    params![a, rel, b],
-                )?;
-                if let Some(existing) = existing {
-                    curation::attach(tx, commit, get_str(&existing, "id")?, evidence, false, None)?
-                } else {
-                    TxGraph::link(
-                        tx,
-                        commit,
-                        &json!({"op":"link","a":a,"rel":rel,"b":b,"evidence":evidence}),
-                        false,
-                    )?
-                }
+                link(tx, commit, &a, action["relation"].as_str().ok_or(Error::Validation("consolidation_relation_invalid"))?, &b, evidence)?
             }
         }
         "register_type" => {

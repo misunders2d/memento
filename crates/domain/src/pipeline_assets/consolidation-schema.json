@@ -360,6 +360,18 @@
           "default": null,
           "title": "Change Kind"
         },
+        "dst": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dst"
+        },
         "evidence": {
           "items": {
             "$ref": "#/$defs/Source"
@@ -375,10 +387,23 @@
             "supersede",
             "decline_loop",
             "close_loop",
-            "retire"
+            "retire",
+            "link"
           ],
           "title": "Operation",
           "type": "string"
+        },
+        "relation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Relation"
         },
         "scope": {
           "anyOf": [

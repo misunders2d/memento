@@ -540,6 +540,44 @@ def test_empty_night_can_consolidate_candidates_extracted_later_that_night(extra
                for candidate in task['input']['candidates'])
 
 
+@pytest.mark.parametrize('relation_endpoint', [False, True])
+def test_memory_subject_link_promotes_same_batch_but_relation_endpoints_fail(extraction, relation_endpoint):
+    store, graph, processing, episode, payload, work, output = extraction
+    candidates = [draft('claim', 'memory', 'knowledge', 'Сергей связан с Mellanni', TEXT),
+                  draft('subject', 'entity', 'organization', 'Mellanni', 'Mellanni, Memory'),
+                  draft('subject-link', 'relation', 'mentions', 'Утверждение о Mellanni', TEXT,
+                        'claim', 'subject-link' if relation_endpoint else 'subject')]
+    output['windows'][0]['candidates'] = candidates
+    if relation_endpoint:
+        with pytest.raises(ValueError, match='candidate_relation_endpoint_missing'):
+            processing.complete(id=work['id'], owner=work['owner'], agent='fixture', output=output)
+        assert store._db.execute('SELECT count(*) FROM candidates').fetchone()[0] == 0
+        return
+    processing.complete(id=work['id'], owner=work['owner'], agent='fixture', output=output)
+    task, = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True)['work']
+    actions = []
+    for candidate in task['input']['candidates']:
+        relation = candidate['kind'] == 'relation'
+        actions.append(dict(candidate_id=candidate['id'], operation='link' if relation else 'remember',
+            type=None if relation else candidate['type'], text=None if relation else candidate['text'],
+            scope=None if relation else candidate['scope'], open_loop=False, target=None,
+            src=candidate['src'] if relation else None, dst=candidate['dst'] if relation else None,
+            relation='mentions' if relation else None, change_kind=None, valid_at=None,
+            valid_from=None, valid_to=None, category=None, sensitive=None,
+            evidence=[dict(episode_id=episode['id'], quote=TEXT, occurrence=None)],
+            why='Preserve explicit claim and its source-backed subject'))
+    actions.sort(key=lambda item: item['operation'] != 'link')
+    result = processing.complete(id=task['id'], owner=task['owner'], agent='fixture', output=dict(actions=actions))
+    pending = task['input']['candidates']
+    claim = next(c for c in pending if c['kind'] == 'memory')
+    entity = next(c for c in pending if c['kind'] == 'entity')
+    relation = next(c for c in pending if c['kind'] == 'relation')
+    edge = graph.history(result['results'][relation['id']]['id'])[-1]
+    assert edge['src'] == result['results'][claim['id']]['id']
+    assert edge['dst'] == result['results'][entity['id']]['id']
+    assert edge['rel'] == 'mentions' and edge['evidence'][0]['episode_id'] == episode['id']
+
+
 @pytest.mark.parametrize('kind,metadata', [
     ('tool', {}),
     ('turn', {'extraction_mode': 'tool_output'}),

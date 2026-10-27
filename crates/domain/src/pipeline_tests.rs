@@ -1,4 +1,6 @@
 //! Frozen synthetic semantic controls; no model invocation or acceptance claim.
+#[path = "claim_link_tests.rs"]
+mod claim_link_tests;
 use super::*;
 use crate::{
     pipeline_schema,

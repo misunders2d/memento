@@ -63,6 +63,80 @@ def automatic(graph, target):
         dict(op='consolidate'), lambda commit: mark(graph, commit, target, True) or {})
 
 
+@pytest.mark.parametrize('defect', [None, 'unknown', 'evidence', 'scope', 'forgotten', 'version', 'missing-dst'])
+def test_existing_claim_subject_link_uses_supplied_nodes_and_authority_fences(world, defect):
+    store, graph, processing, node = world
+    premise = 'Orion expedition preserves signed archives.'
+    fact, a = node(premise, quote=premise, scope=('personal',))
+    subject, b = node('Orion expedition', 'project', quote=premise, scope=('personal',))
+    seed(processing, [fact, subject])
+    task, = claim(processing)
+    assert task['input']['candidates'] == []
+    proposed = repair('link', fact, [a, b], dst=subject, relation='mentions')
+    if defect == 'unknown':
+        proposed['dst'] = 'not-supplied'
+    elif defect == 'evidence':
+        proposed['evidence'][0] = dict(a, quote='Not in the original source')
+    elif defect == 'scope':
+        proposed['scope'] = ['professional']
+    elif defect == 'forgotten':
+        from memento.forgetting import preview, apply as forget
+        selected = preview(graph, subject)
+        graph._command('forget-subject', 'owner', 'Explicit forgetting control',
+            dict(op='forget', target=subject, token=selected['token']),
+            lambda commit: forget(graph, commit, subject, selected['token']))
+    elif defect == 'version':
+        graph.supersede(command_id='refine-after-prepare', actor='owner', why='Concurrent refinement control',
+            old=subject, new=dict(type='project', text='Orion expedition', scope=['personal']),
+            kind='refinement', evidence=[b])
+    elif defect == 'missing-dst':
+        del proposed['dst']
+    commits = store._db.execute('SELECT count(*) FROM graph_commits').fetchone()[0]
+    if defect:
+        with pytest.raises((ValueError, ConflictError)):
+            complete(processing, task, [proposed])
+        assert store._db.execute('SELECT count(*) FROM graph_commits').fetchone()[0] == commits
+        assert store._db.execute("SELECT count(*) FROM edge_versions WHERE rel='mentions'").fetchone()[0] == 0
+    else:
+        result = complete(processing, task, [proposed])
+        edge = graph.history(result['repair_results'][fact]['id'])[-1]
+        assert (edge['src'], edge['rel'], edge['dst']) == (fact, 'mentions', subject)
+        assert {ref['episode_id'] for ref in edge['evidence']} == {a['episode_id'], b['episode_id']}
+        assert graph.history(fact)[-1]['scope'] == ['personal']
+        assert graph.history(subject)[-1]['text'] == 'Orion expedition'
+
+
+@pytest.mark.parametrize('duplicate', [False, True])
+@pytest.mark.parametrize('pinned', [False, True])
+def test_existing_link_duplicate_evidence_and_pins_keep_normal_review_policy(world, duplicate, pinned):
+    store, graph, processing, node = world
+    premise = 'Orion expedition preserves signed archives.'
+    fact, a = node(premise, quote=premise)
+    subject, b = node('Orion expedition', 'project', quote=premise)
+    edge_id = None
+    if duplicate:
+        edge_id = graph.link(command_id='prior-link', actor='owner', why='Original subject relation',
+            a=fact, rel='mentions', b=subject,
+            evidence=[dict(a, quote='Orion expedition')])['id']
+    if pinned:
+        from memento.curation import pin
+        graph._command('manual-pin', 'owner', 'Manual source-protection control',
+            dict(op='pin', node_id=subject, pinned=True), lambda commit: pin(graph, commit, subject, True))
+    seed(processing, [fact, subject])
+    task, = claim(processing)
+    result = complete(processing, task, [repair('link', fact, [a, b], dst=subject, relation='mentions')])
+    linked = result['repair_results'][fact]
+    if pinned:
+        assert linked['status'] == 'pending_review'
+        assert store._db.execute("SELECT count(*) FROM edge_versions WHERE rel='mentions'").fetchone()[0] == int(duplicate)
+    elif duplicate:
+        assert linked['id'] == edge_id
+        assert len(graph.history(edge_id)) == 2
+        assert len(graph.history(edge_id)[-1]['evidence']) == 3
+    else:
+        assert graph.history(linked['id'])[-1]['rel'] == 'mentions'
+
+
 def test_old_only_entities_and_claims_coalesce_with_original_evidence(world):
     store, graph, processing, node = world
     tool, a = node('Herdr', 'tool', quote='Herdr is my terminal multiplexer.')

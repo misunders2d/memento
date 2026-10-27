@@ -127,6 +127,10 @@ different descriptions, roles, interfaces or glosses: a tool's name, its CLI and
 Keep an entity's established correct canonical name in its text; add interface facets and descriptive details as supported atomic claims, relations or aliases instead of expanding that name.
 Same spelling, lexical overlap or similarity is discovery, never proof of the same referent. Keep genuinely different referents separate.
 Use optional repairs for already-existing supplied nodes, including when candidates is empty. Each repair has a specific why.
+Use repair link to connect an existing atomic claim to its explicitly evidenced subject: target is the source node, dst the destination,
+relation the existing directional label (usually mentions). Both endpoints must be supplied existing nodes; cite exact original premises
+from both. Linking adds no new assertion text, scope or behavior. All other repair fields stay null/empty. At most one repair per target;
+independent claims may link to the same entity. A verbatim quote proves provenance, not that a relationship is semantically justified.
 absorb, supersede and decline_loop cite verbatim original premises from every affected node. absorb names target as survivor and absorbed as the same-referent entities or
 equivalent atomic claims to coalesce. Claims with different scopes, world-validity intervals or incompatible behavior are not duplicates;
 independent facts and different historical states remain separate. Preserve meaningful relations, original evidence/history and user choices.
@@ -204,8 +208,10 @@ class Plan(BaseModel):
 
 class Repair(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    operation: Literal['absorb', 'supersede', 'decline_loop', 'close_loop', 'retire']
+    operation: Literal['absorb', 'supersede', 'decline_loop', 'close_loop', 'retire', 'link']
     target: str = Field(min_length=1, max_length=64)
+    dst: str | None = None
+    relation: str | None = None
     absorbed: list[str] = Field(default_factory=list, max_length=8)
     type: str | None = None
     text: str | None = Field(default=None, min_length=1, max_length=8192)
@@ -938,6 +944,23 @@ class Consolidator:
         if any(snapshot(self.graph, edge, current[edge]) != previous for edge, previous in frozen['loops'].items()):
             raise ConflictError('Consolidation retirement loop changed; derive a fresh plan')
 
+    def _link_endpoint_visible(self, target):
+        from .captured_media import visible_sql
+        return self.store._db.execute(f'''SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active'
+            AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+            AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id)
+            AND {visible_sql()}''', (target,)).fetchone() is not None
+
+    def _link(self, commit, a, relation, b, evidence):
+        from .curation import attach
+        if relation not in RELATIONS or relation == 'supersedes':
+            raise ValueError('consolidation_relation_invalid')
+        existing = self.store._db.execute('''SELECT e.id FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=?
+            AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1''',
+            (a, relation, b)).fetchone()
+        return attach(self.graph, commit, existing['id'], evidence) if existing else self.graph._apply_link(
+            commit, dict(op='link', a=a, rel=relation, b=b, evidence=evidence))
+
     def apply(self, job, context, output, *, agent, model=None, usage=None):
         if context.get('loop_policy_version') != VERSION:
             raise ConflictError('Consolidation loop policy changed; derive a fresh plan')
@@ -1046,6 +1069,23 @@ class Consolidator:
             repaired.update(affected)
             if (repair.operation == 'absorb') != bool(repair.absorbed):
                 raise ValueError('consolidation_reference_not_supplied')
+            if repair.operation == 'link':
+                if repair.dst is None:
+                    raise ValueError('consolidation_relation_endpoints_required')
+                if repair.dst not in nodes:
+                    raise ValueError('consolidation_reference_not_supplied')
+                if repair.relation not in RELATIONS or repair.relation == 'supersedes':
+                    raise ValueError('consolidation_relation_invalid')
+                # Uniqueness is per repair target; independent claims may share a subject.
+                if repair.dst != repair.target:
+                    affected.append(repair.dst)
+                for endpoint in affected:
+                    if not self._link_endpoint_visible(endpoint):
+                        raise ConflictError('Consolidation link endpoint changed; derive a fresh plan')
+                    if self.graph._node(endpoint)['version'] != nodes[endpoint]['version']:
+                        raise ConflictError('Consolidation graph context changed; derive a fresh plan')
+            elif repair.dst is not None or repair.relation is not None:
+                raise ValueError('consolidation_schema_invalid')
             if repair.operation == 'absorb':
                 from .curation import absorb_check
                 code = absorb_check(self.graph, repair.target, repair.absorbed)
@@ -1111,6 +1151,9 @@ class Consolidator:
             for repair in plan.repairs:
                 if repair.operation == 'retire':
                     self._check_retirement(context, repair.target)
+                if repair.operation == 'link' and any(not self._link_endpoint_visible(endpoint)
+                        for endpoint in (repair.target, repair.dst)):
+                    raise ConflictError('Consolidation link endpoint changed; derive a fresh plan')
             if self._ineligible(selected):
                 raise ConflictError('Consolidation eligibility changed; derive a fresh plan')
             for target, snapshot in nodes.items():
@@ -1176,7 +1219,14 @@ class Consolidator:
                 while target in destinations and self.graph._node(target)['state'] == 'refined':
                     target = destinations[target]
                 evidence = [source.model_dump() for source in repair.evidence]
-                if repair.operation == 'absorb':
+                if repair.operation == 'link':
+                    dst = repair.dst
+                    while dst in destinations and self.graph._node(dst)['state'] == 'refined':
+                        dst = destinations[dst]
+                    if not all(self._link_endpoint_visible(endpoint) for endpoint in (target, dst)):
+                        raise ConflictError('Consolidation link endpoint changed; derive a fresh plan')
+                    result = self._link(commit, target, repair.relation, dst, evidence)
+                elif repair.operation == 'absorb':
                     absorbed = []
                     for source in repair.absorbed:
                         while source in destinations and self.graph._node(source)['state'] == 'refined':
@@ -1416,13 +1466,7 @@ class Consolidator:
             a, b = resolve(action.src, follow=True), resolve(action.dst, follow=True)
             if a is None or b is None:
                 return dict(status='dependency_pending_review'), 'defer'
-            if action.relation not in RELATIONS or action.relation == 'supersedes':
-                raise ValueError('consolidation_relation_invalid')
-            existing = self.store._db.execute('''SELECT e.id FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=?
-                AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1''',
-                (a, action.relation, b)).fetchone()
-            result = attach(self.graph, commit, existing['id'], evidence) if existing else self.graph._apply_link(
-                commit, dict(op='link', a=a, rel=action.relation, b=b, evidence=evidence))
+            result = self._link(commit, a, action.relation, b, evidence)
         elif op == 'merge':
             if action.src is None or action.dst is None:
                 raise ValueError('consolidation_merge_endpoints_required')

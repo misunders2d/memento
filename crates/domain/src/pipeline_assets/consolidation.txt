@@ -91,6 +91,10 @@ different descriptions, roles, interfaces or glosses: a tool's name, its CLI and
 Keep an entity's established correct canonical name in its text; add interface facets and descriptive details as supported atomic claims, relations or aliases instead of expanding that name.
 Same spelling, lexical overlap or similarity is discovery, never proof of the same referent. Keep genuinely different referents separate.
 Use optional repairs for already-existing supplied nodes, including when candidates is empty. Each repair has a specific why.
+Use repair link to connect an existing atomic claim to its explicitly evidenced subject: target is the source node, dst the destination,
+relation the existing directional label (usually mentions). Both endpoints must be supplied existing nodes; cite exact original premises
+from both. Linking adds no new assertion text, scope or behavior. All other repair fields stay null/empty. At most one repair per target;
+independent claims may link to the same entity. A verbatim quote proves provenance, not that a relationship is semantically justified.
 absorb, supersede and decline_loop cite verbatim original premises from every affected node. absorb names target as survivor and absorbed as the same-referent entities or
 equivalent atomic claims to coalesce. Claims with different scopes, world-validity intervals or incompatible behavior are not duplicates;
 independent facts and different historical states remain separate. Preserve meaningful relations, original evidence/history and user choices.

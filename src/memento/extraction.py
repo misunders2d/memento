@@ -147,7 +147,9 @@ if repeated. Preserve Unicode and whitespace exactly. Distinguish an entity from
 Use knowledge for stable factual information about the user or world, decision for choices, and experience for incidents or lessons.
 For knowledge and decision memories, retain the explicitly supplied subject/product and limiting version or conditions in the text; do not replace them with vague references or invent missing context.
 Entity types: person, organization, project, concept, place, tool. Relationship types: belongs_to, follows_up_on, works_in, decided_by, mentions,
-part_of, caused_by, owned_by, related_to. Relationship src_key/dst_key reference entity keys in this same response; preserve direction.
+part_of, caused_by, owned_by, related_to. Relationship src_key/dst_key reference memory or entity keys in this same response, never relationship keys; preserve direction.
+When original evidence explicitly names the subject of an atomic claim, retain the claim and entity separately and emit a claim-to-entity
+mentions relationship with its own exact supporting quote. Shared words alone do not establish a subject or justify a link.
 For nonrelationships src_key/dst_key must be null. For relationships use type as the relationship label. Give each candidate a unique key.
 Unknown world valid_from/valid_to are null: NEVER substitute capture or conversation timestamps. Non-null times must be explicitly supported
 aware ISO timestamps. Confidence is epistemic confidence, not importance. why briefly explains why this deserves durable memory.
@@ -322,7 +324,8 @@ class Extractor:
                 src = dst = None
                 if draft.kind == 'relation':
                     if (draft.src_key not in keys or draft.dst_key not in keys
-                            or keys[draft.src_key]['kind'] != 'entity' or keys[draft.dst_key]['kind'] != 'entity'):
+                            or keys[draft.src_key]['kind'] not in ('entity', 'memory')
+                            or keys[draft.dst_key]['kind'] not in ('entity', 'memory')):
                         raise ValueError('candidate_relation_endpoint_missing')
                     src, dst = keys[draft.src_key]['id'], keys[draft.dst_key]['id']
                     item['id'] = 'c_' + hashlib.sha256((item['id'] + '|' + src + '|' + dst).encode()).hexdigest()[:32]
