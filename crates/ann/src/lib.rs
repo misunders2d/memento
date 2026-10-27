@@ -193,6 +193,23 @@ fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T
         }
     }
 }
+fn lock_ready_until(shard: &Shard, deadline: Instant) -> Result<MutexGuard<'_, State>> {
+    loop {
+        match shard.state.try_lock() {
+            // A free loaded cache may validate/catch up on its first foreground
+            // read before background readiness is set; preserve that contract.
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(unavailable()),
+            Err(_) => {
+                // Rebuild owns State while publishing no usable Cold view. Do
+                // not wait its entire build/request deadline before reporting it.
+                if !shard.ready.load(Ordering::Acquire) { return Err(unavailable()); }
+                check(Some(deadline))?;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
 fn load_checkpoint(path: &Path) -> Result<Option<Checkpoint>> {
     match std::fs::read(path.join("checkpoint.json")) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
@@ -700,7 +717,7 @@ impl Projection {
     ) -> Result<T> {
         check(Some(deadline))?;
         // Preserve cold->hot order; waiting for a Cold build never holds Hot.
-        let mut cold_guard = if cold { Some(lock_until(&self.cold.state, deadline)?) } else { None };
+        let mut cold_guard = if cold { Some(lock_ready_until(&self.cold, deadline)?) } else { None };
         let mut hot_guard = lock_until(&self.hot.state, deadline)?;
         self.store.read(|tx| {
             if let Some(state) = cold_guard.as_mut() {
@@ -741,7 +758,7 @@ impl Projection {
         check(Some(deadline))?;
         // Fixed cold->hot ordering. A cold build never monopolizes the hot lock.
         let mut cold_guard = if cold {
-            Some(lock_until(&self.cold.state, deadline)?)
+            Some(lock_ready_until(&self.cold, deadline)?)
         } else {
             None
         };
@@ -1091,6 +1108,53 @@ mod recovery_tests {
         let hits=view.search(Tier::Hot,&query,1,"node",Pool::Ordinary,Some("personal"),None).unwrap();
         assert_eq!(hits[0].target,"durable");
         assert!((hits[0].cosine-0.7).abs()<1e-6);
+    }
+    #[test]
+    fn cold_rebuild_unavailable_returns_without_waiting_or_blocking_hot() {
+        use std::sync::mpsc;
+        let (_dir, store, index) = fixture();
+        add(&store,"curated",1,0.9);
+        for tier in [Tier::Hot,Tier::Cold] {
+            index.rebuild(tier,&AtomicBool::new(false)).unwrap();
+        }
+        // Pause the exact Cold rebuild ownership boundary; no Hot lock is held.
+        let maintenance=index.cold.maintenance.lock().unwrap();
+        let cold=index.cold.state.lock().unwrap();
+        let (started_tx,started_rx)=mpsc::channel();
+        let (result_tx,result_rx)=mpsc::channel();
+        let callbacks=Arc::new(AtomicBool::new(false));
+        let workers:Vec<_>=[false,true].into_iter().map(|owned| {
+            let index=index.clone();let started=started_tx.clone();
+            let result=result_tx.clone();let callbacks=callbacks.clone();
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let deadline=Instant::now()+Duration::from_secs(10);
+                let value=if owned {
+                    index.snapshot_hot_until(true,deadline,|_,_| {
+                        callbacks.store(true,Ordering::Release);Ok(())
+                    },|_,(),_|Ok(()))
+                } else {
+                    index.snapshot_until(true,true,deadline,|_,_| {
+                        callbacks.store(true,Ordering::Release);Ok(())
+                    })
+                };
+                result.send(matches!(value,Err(Error::Unavailable("Semantic search is not ready")))).unwrap();
+            })
+        }).collect();
+        for _ in 0..2 {started_rx.recv_timeout(Duration::from_secs(5)).unwrap();}
+        // Covers readiness becoming false while the lock is contended, as well
+        // as a request arriving after rebuild has already announced unavailability.
+        index.cold.ready.store(false,Ordering::Release);
+        let first=result_rx.recv_timeout(Duration::from_secs(1));
+        let second=result_rx.recv_timeout(Duration::from_secs(1));
+        let hot=top(&index);
+        drop(cold);drop(maintenance);
+        index.cold.ready.store(true,Ordering::Release);
+        for worker in workers {worker.join().unwrap();}
+        assert_eq!(first.unwrap(),true,"Cold request waited for rebuild State");
+        assert_eq!(second.unwrap(),true,"Cold request waited for rebuild State");
+        assert!(!callbacks.load(Ordering::Acquire),"unavailable Cold invoked snapshot callbacks");
+        assert_eq!(hot.unwrap(),"curated","Cold rebuild blocked available Hot results");
     }
 }
 
