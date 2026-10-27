@@ -1,6 +1,6 @@
-//! Vendor lifecycle proof only; production config/maintenance is deliberately unchanged.
+//! Legacy control versus the production Cold-storage lifecycle; no capacity claim.
 use super::*;
-use qdrant_edge::{BoolIndexParams, KeywordIndexParams, PayloadConfig, PayloadSchemaParams, SegmentState};
+use qdrant_edge::{PayloadConfig, SegmentState};
 
 const POINTS: u64 = 4096;
 const FIELDS: [(&str, PayloadSchemaType); 11] = [
@@ -12,20 +12,29 @@ const FIELDS: [(&str, PayloadSchemaType); 11] = [
     ("professional", PayloadSchemaType::Bool),
 ];
 
+fn legacy_config() -> EdgeConfig {
+    EdgeConfigBuilder::new()
+        .vector(DEFAULT_VECTOR_NAME, EdgeVectorParamsBuilder::new(768, Distance::Cosine)
+            .memory(Memory::Cold).datatype(VectorStorageDatatype::Float32).build())
+        .payload_memory(Memory::Cold).id_tracker_memory(Memory::Cold)
+        .hnsw_config(HnswIndexConfig {
+            m:0,payload_m:Some(0),ef_construct:200,full_scan_threshold:10000,
+            max_indexing_threads:1,memory:Some(Memory::Cold),..Default::default()
+        })
+        .optimizers(EdgeOptimizersConfig {
+            indexing_threshold:Some(0),default_segment_number:Some(2),
+            prevent_unoptimized:Some(false),..Default::default()
+        })
+        .max_search_threads(1).wal_enabled(true)
+        .wal_options(WalOptions {segment_capacity:1024*1024,..Default::default()}).build()
+}
+
 fn field_indices(shard: &EdgeShard, cold: bool) {
-    if !cold { indices(shard).unwrap(); return; }
+    if cold { indices(shard).unwrap(); return; }
+    // Freeze legacy FieldType schemas; production now requests explicit Cold.
     for (name, kind) in FIELDS {
-        let params = match kind {
-            PayloadSchemaType::Keyword => PayloadSchemaParams::Keyword(KeywordIndexParams {
-                memory: Some(Memory::Cold), ..Default::default()
-            }),
-            PayloadSchemaType::Bool => PayloadSchemaParams::Bool(BoolIndexParams {
-                memory: Some(Memory::Cold), ..Default::default()
-            }),
-            _ => unreachable!(),
-        };
         shard.update(UpdateOperation::FieldIndexOperation(FieldIndexOperations::CreateIndex(CreateIndex {
-            field_name: name.parse().unwrap(), field_schema: Some(PayloadFieldSchema::FieldParams(params)),
+            field_name:name.parse().unwrap(),field_schema:Some(PayloadFieldSchema::FieldType(kind)),
         }))).unwrap();
     }
 }
@@ -134,10 +143,11 @@ fn storage_evidence(path: &Path, shard: &EdgeShard, candidate: bool) -> usize {
 fn exact_m0_vendor_cold_conversion_preserves_filtered_updates_and_reopen() {
     let dir=tempfile::tempdir().unwrap();
     let control_path=dir.path().join("control"); let candidate_path=dir.path().join("candidate");
-    let control=EdgeShard::new(&control_path,config()).unwrap();
-    let mut candidate_config=config();
-    let optimizers=candidate_config.optimizers.as_mut().unwrap();
-    optimizers.indexing_threshold=None; // Actual pinned vendor default: 10,000 KiB.
+    let control=EdgeShard::new(&control_path,legacy_config()).unwrap();
+    let candidate_config=config();
+    let optimizers=candidate_config.optimizers.as_ref().unwrap();
+    assert_eq!(optimizers.indexing_threshold,Some(10_000));
+    assert_eq!(optimizers.max_segment_size,Some(256_000));
     assert_eq!(optimizers.get_indexing_threshold_kb(),10_000);
     assert_eq!(optimizers.get_max_segment_size_kb(1),256_000);
     let candidate=EdgeShard::new(&candidate_path,candidate_config).unwrap();

@@ -3,9 +3,9 @@ pub mod discovery;
 pub mod eligibility;
 use memento_core::{Error, EventFence, F32Blob, ModelSignature, ReadTxn, Result, Store, Tier};
 use qdrant_edge::{
-    CreateIndex, DEFAULT_VECTOR_NAME, Distance, EdgeConfig, EdgeConfigBuilder,
+    BoolIndexParams, CreateIndex, DEFAULT_VECTOR_NAME, Distance, EdgeConfig, EdgeConfigBuilder,
     EdgeOptimizersConfig, EdgeShard, EdgeVectorParamsBuilder, FieldIndexOperations, Filter,
-    HnswIndexConfig, Memory, NamedQuery, Payload, PayloadFieldSchema, PayloadSchemaType, PointId,
+    HnswIndexConfig, KeywordIndexParams, Memory, NamedQuery, Payload, PayloadFieldSchema, PayloadSchemaParams, PayloadSchemaType, PointId,
     PointInsertOperations, PointOperations, PointStructPersisted, QueryEnum, QueryRequestBuilder,
     ResourceBudget, ScoringQuery, SearchParams, UpdateOperation, VectorInternal,
     VectorStorageDatatype, VectorStructPersisted, WalOptions,
@@ -27,7 +27,8 @@ use std::{
 };
 const BATCH: usize = 256;
 const FOREGROUND_EVENTS: usize = 512;
-const PROJECTION_FORMAT: u32 = 2;
+// Disposable profile fence: older caches retain uncapped appendable/Pinned indexes.
+const PROJECTION_FORMAT: u32 = 3;
 fn unavailable() -> Error {
     Error::Unavailable("Semantic search is not ready")
 }
@@ -56,7 +57,10 @@ fn config() -> EdgeConfig {
             ..Default::default()
         })
         .optimizers(EdgeOptimizersConfig {
-            indexing_threshold: Some(0),
+            // Vendor units are KiB of vectors, not point counts. Positive indexing
+            // converts Cold storage to nonappendable mmap even with both graphs off.
+            indexing_threshold: Some(10_000),
+            max_segment_size: Some(256_000),
             default_segment_number: Some(2),
             prevent_unoptimized: Some(false),
             ..Default::default()
@@ -95,6 +99,9 @@ struct State {
     checkpoint: Option<Checkpoint>,
 }
 struct Shard {
+    // Background-only ownership of the absolute Edge path through optimization
+    // and rebuild publication. Foreground reads never acquire this permit.
+    maintenance: Mutex<()>,
     state: Mutex<State>,
     ready: AtomicBool,
     path: PathBuf,
@@ -218,6 +225,7 @@ fn shard(path: PathBuf) -> Result<Shard> {
         None
     };
     Ok(Shard {
+        maintenance: Mutex::new(()),
         state: Mutex::new(State {
             shard: loaded,
             checkpoint,
@@ -333,14 +341,29 @@ fn indices(shard: &EdgeShard) -> Result<()> {
         ("personal", PayloadSchemaType::Bool),
         ("professional", PayloadSchemaType::Bool),
     ] {
+        let schema = match kind {
+            PayloadSchemaType::Keyword => PayloadSchemaParams::Keyword(KeywordIndexParams {
+                memory: Some(Memory::Cold), ..Default::default()
+            }),
+            // The pinned vendor accepts Cold but implements Bool as heap/Pinned
+            // RoaringFlags<MmapFile>. The lifecycle test retains this limitation.
+            PayloadSchemaType::Bool => PayloadSchemaParams::Bool(BoolIndexParams {
+                memory: Some(Memory::Cold), ..Default::default()
+            }),
+            _ => unreachable!(),
+        };
         edge(shard.update(UpdateOperation::FieldIndexOperation(
             FieldIndexOperations::CreateIndex(CreateIndex {
                 field_name: name.parse().unwrap(),
-                field_schema: Some(PayloadFieldSchema::FieldType(kind)),
+                field_schema: Some(PayloadFieldSchema::FieldParams(schema)),
             }),
         )))?;
     }
     Ok(())
+}
+fn optimize(shard: &EdgeShard) -> Result<()> {
+    edge(shard.optimize_with_budget(ResourceBudget::new(1, 1)))?;
+    edge(shard.flush())
 }
 fn reconcile_raw_tiers(store: &Store) -> Result<()> {
     let mut next = i64::MIN;
@@ -457,6 +480,9 @@ impl Projection {
             }
             return Ok(true);
         }
+        // Background pages yield to optimization every 256 points. Foreground
+        // retains its existing bounded 512-event admission and never optimizes.
+        let limit = if foreground { FOREGROUND_EVENTS } else { BATCH };
         let mut query=tx.sql().prepare("SELECT id,nonce,generation,vector_seq FROM projection_events WHERE tier=? AND id>? AND id<=? ORDER BY id LIMIT ?")?;
         let events = query
             .query_map(
@@ -464,7 +490,7 @@ impl Projection {
                     tier.as_str(),
                     checkpoint.cursor.id,
                     cut.id,
-                    FOREGROUND_EVENTS + 1
+                    limit + 1
                 ],
                 |r| {
                     Ok((
@@ -484,7 +510,7 @@ impl Projection {
         if foreground && events.len() > FOREGROUND_EVENTS {
             return Err(unavailable());
         }
-        let events = &events[..events.len().min(FOREGROUND_EVENTS)];
+        let events = &events[..events.len().min(limit)];
         let through = events.last().unwrap().0.clone();
         checkpoint.pending = Some(through.clone());
         persist(path, &checkpoint)?;
@@ -518,11 +544,29 @@ impl Projection {
     }
     /// One short background step. Large backlogs are never reported healthy-empty.
     pub fn synchronize(&self, tier: Tier) -> Result<bool> {
+        self.synchronize_with(tier, optimize)
+    }
+    fn synchronize_with(
+        &self,
+        tier: Tier,
+        maintenance: impl FnOnce(&EdgeShard) -> Result<()>,
+    ) -> Result<bool> {
         let shard = self.tier(tier);
-        let mut state = shard.state.lock().map_err(|_| unavailable())?;
-        let result = self
-            .store
-            .read(|tx| self.sync(tx, tier, &mut state, &shard.path, None, false, true));
+        let _maintenance = shard.maintenance.lock().map_err(|_| unavailable())?;
+        let (result, native) = {
+            let mut state = shard.state.lock().map_err(|_| unavailable())?;
+            let result = self.store.read(|tx| {
+                self.sync(tx, tier, &mut state, &shard.path, None, false, true)
+            });
+            (result, state.shard.clone())
+        };
+        // Same-tier foreground reads/updates may use the native Arc during vendor
+        // optimization. No SQL snapshot or State guard survives this boundary.
+        // The maintenance permit prevents rebuild from reusing its absolute path.
+        let result = result.and_then(|ready| {
+            maintenance(native.as_deref().ok_or_else(unavailable)?)?;
+            Ok(ready)
+        });
         shard
             .ready
             .store(matches!(result, Ok(true)), Ordering::Release);
@@ -532,6 +576,7 @@ impl Projection {
     /// No source writer or long WAL snapshot is held during Edge optimization.
     pub fn rebuild(&self, tier: Tier, stop: &AtomicBool) -> Result<()> {
         let target = self.tier(tier);
+        let _maintenance = target.maintenance.lock().map_err(|_| unavailable())?;
         let mut state = target.state.lock().map_err(|_| unavailable())?;
         target.ready.store(false, Ordering::Release);
         let staging = target.path.with_file_name(format!(
@@ -568,14 +613,17 @@ impl Projection {
                 })?;
                 match next {
                     None => break,
-                    Some(seq) => after = Some(seq),
+                    Some(seq) => {
+                        after = Some(seq);
+                        if stop.load(Ordering::Acquire) { return Err(unavailable()); }
+                        optimize(&shard)?;
+                    }
                 }
             }
             if stop.load(Ordering::Acquire) {
                 return Err(unavailable());
             }
-            edge(shard.optimize_with_budget(ResourceBudget::new(1, 1)))?;
-            edge(shard.flush())?;
+            optimize(&shard)?;
             checkpoint.building = false;
             persist(&staging, &checkpoint)?;
             let mut staging_state = State {
@@ -586,9 +634,12 @@ impl Projection {
                 if stop.load(Ordering::Acquire) {
                     return Err(unavailable());
                 }
-                if self.store.read(|tx| {
+                let synced = self.store.read(|tx| {
                     self.sync(tx, tier, &mut staging_state, &staging, None, false, false)
-                })? {
+                })?;
+                if stop.load(Ordering::Acquire) { return Err(unavailable()); }
+                optimize(staging_state.shard.as_deref().ok_or_else(unavailable)?)?;
+                if synced {
                     break;
                 }
             }
@@ -917,6 +968,78 @@ mod recovery_tests {
                 .read(|tx| Ok(tx.dirty(Tier::Hot, i64::MAX)?.is_empty()))
                 .unwrap()
         );
+    }
+    #[test]
+    fn legacy_profile_checkpoint_rebuild_preserves_authority_and_fp32() {
+        let (_dir, store, index) = fixture();
+        add(&store, "old", 1, 0.7);
+        index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
+        let before = store.read(|tx| Ok((tx.source_cut().clone(), tx.sql().query_row(
+            "SELECT embedding,current,generation FROM vector_blobs WHERE seq=1", [],
+            |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)),
+        )?))).unwrap();
+        let mut legacy = load_checkpoint(&index.hot.path).unwrap().unwrap();
+        legacy.format = 2;
+        persist(&index.hot.path, &legacy).unwrap();
+        drop(index);
+        let index = Projection::open(store.clone(), ModelSignature::pinned()).unwrap();
+        assert!(index.hot.state.lock().unwrap().shard.is_none());
+        assert!(!index.ready(Tier::Hot));
+        assert!(top(&index).is_err(), "legacy cache was falsely ready");
+        index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
+        assert_eq!(top(&index).unwrap(), "old");
+        assert_eq!(load_checkpoint(&index.hot.path).unwrap().unwrap().format, 3);
+        let after = store.read(|tx| Ok((tx.source_cut().clone(), tx.sql().query_row(
+            "SELECT embedding,current,generation FROM vector_blobs WHERE seq=1", [],
+            |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)),
+        )?))).unwrap();
+        assert_eq!(after, before, "derived profile upgrade changed authority");
+    }
+    #[test]
+    fn background_optimization_releases_foreground_and_serializes_rebuild_path() {
+        use std::sync::mpsc;
+        let (_dir, store, index) = fixture();
+        add(&store, "old", 1, 0.7);
+        index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
+        let native = index.hot.state.lock().unwrap().shard.clone().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let background = {
+            let index = index.clone();
+            std::thread::spawn(move || index.synchronize_with(Tier::Hot, |shard| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                optimize(shard)
+            }))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(index.hot.maintenance.try_lock().is_err());
+        assert!(index.hot.state.try_lock().is_ok(), "State held during native maintenance");
+        assert!(index.cold.maintenance.try_lock().is_ok(), "maintenance crossed tiers");
+        // A fresh authoritative mutation and foreground fence/query must proceed
+        // while maintenance is paused; no SQL read transaction/State guard remains.
+        add(&store, "new", 2, 0.9);
+        assert_eq!(top(&index).unwrap(), "new");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let rebuilding = {
+            let index = index.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = index.rebuild(Tier::Hot, &AtomicBool::new(false));
+                finished_tx.send(()).unwrap();
+                result
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)), "rebuild reused path during old-Arc maintenance");
+        assert!(Arc::ptr_eq(index.hot.state.lock().unwrap().shard.as_ref().unwrap(), &native));
+        release_tx.send(()).unwrap();
+        assert!(background.join().unwrap().unwrap());
+        rebuilding.join().unwrap().unwrap();
+        assert!(!Arc::ptr_eq(index.hot.state.lock().unwrap().shard.as_ref().unwrap(), &native));
+        assert_eq!(top(&index).unwrap(), "new");
     }
 }
 

@@ -132,8 +132,8 @@ fn exact_filtered_updates_flush_and_reopen_without_building_hnsw() {
     ] {
         node(&store, seq, id, cos, scope, kind, current, Tier::Hot);
     }
-    // More than two old 10,000-KiB indexing thresholds: zero indexed vectors
-    // must reflect disabled indexing, rather than a tiny below-threshold fixture.
+    // Cross two 10,000-KiB thresholds so real Cold conversion is exercised.
+    // HNSW-labelled storage may report indexed vectors with both graphs off.
     store
         .write(|tx| {
             let embedding = vector(0.95);
@@ -170,7 +170,36 @@ fn exact_filtered_updates_flush_and_reopen_without_building_hnsw() {
         qdrant_edge::EdgeShard::load(&store.data_dir().join("search/hot/edge"), None).unwrap();
     let info = shard.info().unwrap();
     assert_eq!(info.points_count, 7005);
-    assert_eq!(info.indexed_vectors_count, 0);
+    let mut live_segments = 0;
+    let mut cold_segments = 0;
+    for entry in std::fs::read_dir(store.data_dir().join("search/hot/edge/segments")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if !path.is_dir() || name.starts_with('.') || name.ends_with(".deleted")
+            || !path.join("version.info").is_file() { continue; }
+        live_segments += 1;
+        let state:qdrant_edge::SegmentState = serde_json::from_slice(
+            &std::fs::read(path.join("segment.json")).unwrap()).unwrap();
+        let vector = &state.config.vector_data[qdrant_edge::DEFAULT_VECTOR_NAME];
+        let actual = serde_json::to_value(vector).unwrap();
+        assert_eq!(actual["datatype"], "float32");
+        assert!(vector.quantization_config.is_none());
+        if !state.config.is_appendable() {
+            cold_segments += 1;
+            assert_eq!(actual["storage_type"], "Mmap");
+            assert_eq!(actual["index"]["type"], "hnsw");
+            assert_eq!(actual["index"]["options"]["m"], 0);
+            assert_eq!(actual["index"]["options"]["payload_m"], 0);
+            let graph:serde_json::Value = serde_json::from_slice(
+                &std::fs::read(path.join("vector_index/hnsw_config.json")).unwrap()).unwrap();
+            for key in ["m", "m0", "payload_m", "payload_m0"] {
+                assert_eq!(graph[key], 0, "built graph parameter {key}");
+            }
+        }
+    }
+    assert_eq!(live_segments, info.segments_count);
+    assert!(cold_segments > 0, "fixture did not prove actual nonappendable Cold storage");
+    eprintln!("native indexed-vector storage count: {}", info.indexed_vectors_count);
     for field in ["kind", "current", "ordinary", "personal", "professional"] {
         assert!(
             info.payload_schema
