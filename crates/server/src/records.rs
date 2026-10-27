@@ -219,6 +219,9 @@ pub fn matched_passage(
     query: &str,
     historical: bool,
 ) -> Result<Option<Value>> {
+    // Whole-episode FTS is discovery only: the focused excerpt can contain just
+    // one query term. Semantic recall validates this passage with its scorer;
+    // literal raw-evidence endpoints keep their existing source-text behavior.
     let Some(source) = tx.original_text(id)? else {
         return Ok(None);
     };

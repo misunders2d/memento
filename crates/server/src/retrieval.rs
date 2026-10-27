@@ -55,9 +55,23 @@ fn literal(query: &str, or: bool) -> String {
         .collect::<Vec<_>>()
         .join(if or { " OR " } else { " " })
 }
+fn relevance(v: &Value) -> f64 {
+    v["cosine"].as_f64().unwrap_or_else(|| {
+        // The unboosted fallback is a prior, not measured cosine. The lexical
+        // discovery bonus is not global semantic relevance; the unchanged
+        // public score therefore need not be monotonic in returned order.
+        number(v, "score", 0.)
+            - if matches!(v["match"].as_str(), Some("keyword" | "hybrid")) {
+                0.25
+            } else {
+                0.
+            }
+    })
+}
 fn order(a: &Value, b: &Value) -> std::cmp::Ordering {
-    number(b, "score", 0.)
-        .total_cmp(&number(a, "score", 0.))
+    relevance(b)
+        .total_cmp(&relevance(a))
+        .then_with(|| number(b, "score", 0.).total_cmp(&number(a, "score", 0.)))
         .then_with(|| number(b, "decay", 1.).total_cmp(&number(a, "decay", 1.)))
         .then_with(|| number(b, "importance", 0.5).total_cmp(&number(a, "importance", 0.5)))
         .then_with(|| number(b, "_feedback", 0.).total_cmp(&number(a, "_feedback", 0.)))
@@ -71,7 +85,10 @@ fn effective_query(request: &RecallRequest) -> String {
     }
 }
 fn text_passage(db: &rusqlite::Connection, row: &Value, or_only: bool) -> Result<bool> {
-    if (row["match"] != "semantic" && !or_only)
+    let raw = row["tier"] == "raw" || row["type"] == "raw_episode";
+    // Episode-level lexical discovery does not validate its selected passage.
+    // This scorer is used by semantic recall, not literal raw-evidence APIs.
+    if (row["match"] != "semantic" && !or_only && !raw)
         || row["type"] == "media"
         || row["category"] == "entity_context"
         || row["category"] == "behavioral_suggestion"
@@ -109,15 +126,24 @@ fn filter_text_passages(
         }
     }
     passages.sort_by(|a, b| order(a.1, b.1));
-    // Standard bounded second-stage shortlist. Unscored semantic-only tail is
-    // not admitted; literal, behavior, entity context and media stay untouched.
+    // Keep the existing semantic shortlist. Newly validated raw lexical rows
+    // retain all already-discovered FTS coverage, in batches of at most ten.
+    // This can add bounded scoring work; the existing deadline still applies.
     let maximum = limit.max(MAX_CANDIDATES).min(100);
-    let ids: Vec<String> = passages
-        .iter()
-        .take(maximum)
-        .map(|(id, _)| id.clone())
-        .collect();
-    rejected.extend(passages.iter().skip(maximum).map(|(id, _)| id.clone()));
+    let mut ids = Vec::new();
+    let mut semantic = 0;
+    for (id, row) in &passages {
+        let raw_lexical = (row["tier"] == "raw" || row["type"] == "raw_episode")
+            && matches!(row["match"].as_str(), Some("keyword" | "hybrid"));
+        if raw_lexical || semantic < maximum {
+            ids.push(id.clone());
+            if !raw_lexical {
+                semantic += 1;
+            }
+        } else {
+            rejected.push(id.clone());
+        }
+    }
     drop(passages);
     for batch in ids.chunks(MAX_CANDIDATES) {
         check(deadline)?;
@@ -1171,6 +1197,62 @@ mod tests {
                 )
                 .unwrap()
                 .0
+        }
+    }
+    #[test]
+    fn relevance_first_keeps_public_scores_and_uses_age_only_after_measured_relevance() {
+        let mut f = Fixture::new();
+        let strong = f.add(
+            "Longstanding precise contextual assertion",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.1,
+            0.9,
+            "personal",
+        );
+        let lexical = f.add(
+            "Quartz routine describes a broader association",
+            "knowledge",
+            "2026-10-26T00:00:00Z",
+            1.,
+            0.72,
+            "personal",
+        );
+        for automatic in [false, true] {
+            let rows = f.recall("quartz", 2, automatic, Some("personal"));
+            assert_eq!(rows[0]["id"], strong);
+            assert_eq!(rows[1]["id"], lexical);
+            assert_eq!(rows[1]["match"], "hybrid");
+            assert!((number(&rows[0], "score", 0.) - 0.9).abs() < 1e-6);
+            assert!((number(&rows[1], "score", 0.) - 0.97).abs() < 1e-6);
+            assert!((number(&rows[1], "cosine", 0.) - 0.72).abs() < 1e-6);
+            assert!(number(&rows[0], "decay", 1.) < number(&rows[1], "decay", 1.));
+        }
+    }
+    #[test]
+    fn relevance_first_preserves_exact_anchor_priority_over_stronger_semantic_rows() {
+        let mut f = Fixture::new();
+        let person = f.add(
+            "Alex Frame",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.1,
+            0.2,
+            "personal",
+        );
+        f.add(
+            "A different strongly related semantic assertion",
+            "knowledge",
+            "2026-10-26T00:00:00Z",
+            1.,
+            0.99,
+            "personal",
+        );
+        for automatic in [false, true] {
+            let rows = f.recall("Tell me about Alex Frame", 1, automatic, Some("personal"));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], person);
+            assert_eq!(rows[0]["category"], "entity_context");
         }
     }
     #[test]

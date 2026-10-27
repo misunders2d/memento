@@ -163,6 +163,16 @@ impl Store {
             tx.execute_batch(include_str!("status_indexes.sql"))?;
             tx.commit()?;
         }
+        let relation_indexes: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('search_candidate_relation_src_v1','search_candidate_relation_dst_v1')",
+            [],
+            |r| r.get(0),
+        )?;
+        if relation_indexes != 2 {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("candidate_relation_indexes.sql"))?;
+            tx.commit()?;
+        }
         let blobs = crate::blobs::BlobStore::new(directory.join("blobs"))?;
         Ok(Arc::new(Self {
             blobs,

@@ -302,9 +302,42 @@ fn semantic_text_rejection_precedes_raw_fallback_without_changing_literal_or_sco
             })
             .unwrap()
             .0;
-        assert!(rows.iter().any(|r| r["episode_id"] == raw.episode
-            && ["keyword", "hybrid"].contains(&r["match"].as_str().unwrap_or(""))));
+        // Whole-episode lexical discovery cannot bypass passage validation on
+        // semantic recall, including the deep raw union.
+        assert!(rows.is_empty());
     }
+    // Exercise the real literal/raw-evidence route independently. No semantic
+    // model is configured: the source filter must retain original raw access.
+    let state = crate::AppState::new(f.store.clone()).unwrap();
+    let mut literal = RecallRequest {
+        query: "brine".into(),
+        source: Some("synthetic".into()),
+        ..Default::default()
+    };
+    let original = state
+        .recall_memories(
+            &literal,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(original.len(), 1);
+    assert_eq!(original[0]["id"], raw.episode);
+    assert_eq!(original[0]["text"], "Supported brine density source evidence");
+    assert_eq!(original[0]["source"], "synthetic");
+    assert_eq!(original[0]["conversation_id"], "text-filter-raw");
+    assert_eq!(original[0]["type"], "raw_episode");
+    assert_eq!(original[0]["tier"], "raw");
+    assert_eq!(original[0]["match"], "keyword");
+    assert_eq!(original[0]["score"], 0.0);
+    assert_eq!(original[0]["confirmed"], false);
+    literal.scope = Some("personal".into());
+    assert!(state
+        .recall_memories(
+            &literal,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap()
+        .is_empty());
     let request = RecallRequest {
         query: "unseen paraphrase".into(),
         effort: "deep".into(),

@@ -255,7 +255,7 @@ fn pending(db: &Connection, item: &Value, scope: Option<&str>) -> Result<Option<
     for row in rows(
         db,
         &format!(
-            "SELECT c.id,c.type AS relation,c.src,c.dst FROM candidates c WHERE c.kind='relation' AND (c.src=?1 OR c.dst=?1) AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(c.scope) WHERE value=?2)) ORDER BY c.id LIMIT 32"
+            "SELECT c.id,c.type AS relation,c.src,c.dst FROM candidates c WHERE c.kind='relation' AND c.id IN (SELECT id FROM candidates WHERE kind='relation' AND src=?1 UNION SELECT id FROM candidates WHERE kind='relation' AND dst=?1) AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(c.scope) WHERE value=?2)) ORDER BY c.id LIMIT 32"
         ),
         params![id, scope],
     )? {
