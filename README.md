@@ -61,7 +61,7 @@ flowchart TB
     E --> C["Unconfirmed Candidates (Span-verified, legacy instructions filtered)"]
     C --> N["Nightly Consolidation Lane (configured local window, default 02:00-07:00, compact existing-evidence spans)"]
     N --> V{"Whole-Batch Validation Gate (Exact spans + technical_evidence trace)"}
-    V -->|"Valid: atomic commit"| M["Durable Versioned Graph (Current-node FTS5 + reused vec0 vectors)"]
+    V -->|"Valid: atomic commit"| M["Durable Versioned Graph (Current-node FTS5 + reused FP32 vectors)"]
     V -.->|"Rejected: rollback + bounded previous_rejection"| N
     C --> R["Hybrid Recall (Auto injection + 6 MCP tools)"]
     M --> R
@@ -77,7 +77,7 @@ flowchart TB
 | **Self-correcting validation feedback** | Every batch is validated atomically. If a batch fails a quote, span, coverage or grounding check, nothing commits; the job records a bounded private `previous_rejection` (fixed code + up to 3 offending quote references) so the next retry can fix the exact error instead of repeating it blind. |
 | **Dual-path behavioral & technical learning** | User-stated rules (`authority="explicit_user"`) require direct user ground-truth quotes. Inferred technical lessons (`authority="inferred"`) require captured native `attempt → result` sequences in one conversation (`technical_evidence`), even when the lesson was first articulated in a later reporting tool call, and retain evidenced pitfalls to avoid when refining earlier approaches. |
 | **Legacy instruction filtering** | Historical candidates whose only evidence is a legacy developer/instruction envelope stay preserved and searchable in history, but are excluded from consolidation model calls (`excluded_legacy_candidates`). |
-| **Zero-bloat FTS & vector reuse** | `node_fts` indexes only the latest version of each node identity via a `VACUUM`-safe integer key mapping (`node_fts_documents`), and corroborating or pinning unchanged text (`attach` / `pin`) reuses the existing `vec0` embedding in place. |
+| **Zero-bloat FTS & vector reuse** | `node_fts` indexes only the latest version of each node identity via a `VACUUM`-safe integer key mapping (`node_fts_documents`), and corroborating or pinning unchanged text (`attach` / `pin`) reuses the existing FP32 vector in place; the native Qdrant Edge indexes are derived from SQLite authority. |
 | **Non-blocking health checks** | `/health` probes SQLite writer availability on a dedicated short-lived connection (`0.25s` bound) and reads indexing failures from a `WAL` snapshot, never queuing behind read-only context preparation. |
 
 Extraction starts after native compaction or conversation inactivity. Candidates remain visibly unconfirmed and can be recalled before promotion; deeper consolidation runs in the configured night window. Learning takes processing time.
@@ -687,11 +687,21 @@ This is a **point-in-time move, not synchronization**. Before the final export, 
 
 ## Development and project records
 
+The production service and owner tools are Rust. `Dockerfile.native` provides their pinned compiler, ONNX Runtime and media build environment. Inside that environment, run:
+
+```sh
+cargo test --locked --workspace
+```
+
+Native implementation areas: `crates/server` (HTTP/MCP, retrieval and asset startup), `crates/core`/`crates/domain` (SQLite authority, evidence and processing), `crates/ann` (disposable Hot/Cold search indexes), `crates/model`/`crates/media` (existing model and media operations), and `crates/owner`/`crates/maintenance` (administration, import, recovery and optional storage). The portable clients remain `src/memento/runner.py`, `bridge.py` and `native_*.ts`; Python stdlib on agent hosts remains supported.
+
+For the explicitly selected Python comparison/development service:
+
 ```sh
 uv run --extra media --extra embedding --extra drive pytest -q
 ```
 
-Key implementation areas: `api.py`/`mcp_server.py` (interfaces), `runner.py`/`bridge.py`/`native_*.ts` (native integration), `processing.py`/`extraction.py`/`consolidation.py` (processing), `store.py`/`graph.py`/`retrieval.py` (evidence and retrieval), and `drive_*.py`/`cold_*.py` (optional storage).
+Its implementation remains `api.py`/`mcp_server.py` (interfaces), `runner.py`/`bridge.py`/`native_*.ts` (native integration), `processing.py`/`extraction.py`/`consolidation.py` (processing), `store.py`/`graph.py`/`retrieval.py` (evidence and retrieval), and `drive_*.py`/`cold_*.py` (optional storage).
 
 Linear is the source of truth for design and status: [Personal Clone](https://linear.app/mellanni/project/personal-clone-d5c1389b6508) · [Memory 2](https://linear.app/mellanni/document/memory-2-4d1f54cbf034) · [origin MEL-657](https://linear.app/mellanni/issue/MEL-657). Repository operator details are in [AGENTS.md](AGENTS.md); third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
