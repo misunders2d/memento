@@ -121,7 +121,7 @@ The expandable sections retain the full installation, agent and operator instruc
 4. Start new native sessions and verify capture → candidate → fresh-session recall.
 5. If wanted, connect Google Drive through explicit human consent and verify activation.
 
-> **Already installed?** Reuse the existing data directory or volume, Compose overrides, private configs and native logins. Re-running setup preserves the generated client identity. Do not initialize a fresh database over an existing deployment, copy identities between devices, or use `docker compose down -v` as an upgrade command.
+> **Already installed?** Native schema-header-5 installations reuse their existing data directory or volume, Compose overrides, private configs and native logins. Python schema-header-1/2/3 installations must follow the offline import below before starting the native service; pointing it at the old database is refused. Re-running client setup preserves the generated identity. Do not initialize a fresh database over an existing deployment, copy identities between devices, or use `docker compose down -v` as an upgrade command.
 >
 > **Installing agent?** Execute the permitted setup and verification yourself. Surface only genuine human steps: native login/trust, service-owner permissions and Google consent. Never request secret values in chat or treat a healthy API as proof of native capture or Drive authorization.
 
@@ -129,12 +129,14 @@ The expandable sections retain the full installation, agent and operator instruc
 
 ### Requirements
 
-- Linux with Docker Engine and Compose, or Python **3.12+** and [uv](https://docs.astral.sh/uv/).
+- Linux **x86_64** with Docker Engine and Compose for the native service. Python **3.12+** is needed on hosts running the portable native-agent runner/processor. The Python service remains available separately for comparison/development below.
 - Dedicated persistent **local Linux storage**. Do not use NFS, SMB or FUSE for the live database.
 - Space and network access for the pinned full `google/embeddinggemma-2` model; any required model access/license acceptance is a human prerequisite.
 - A separate ordinary-user native agent account. One service process per data directory.
 
 ### Recommended: Docker Compose
+
+Compose builds `Dockerfile.native`: the Rust service and native owner/import tools, with pinned ONNX Runtime and media libraries. The baseline Python `Dockerfile` and `pyproject.toml` remain available for comparison/development; Compose does not select them.
 
 Clone the repository, then enter it:
 
@@ -171,18 +173,40 @@ Overrides: `MEMENTO_UID`, `MEMENTO_GID`, `MEMENTO_AGENT_UID`, `MEMENTO_DATA_DIR`
 
 **Human-review isolation matters:** the agent must not share the service UID, have sudo, or control the Docker daemon. Docker-daemon access can defeat this boundary. Container hardening is not a substitute for separating those privileges.
 
-### Non-container development
+### Upgrade a Python instance to the native service
+
+These are explicit service-owner operations, not automatic startup migration. Stop the old service and its processing timer before taking the final checkpointed offline copy. Preserve that original directory, private client configs and identities; remote clients can retain new captures in their existing outboxes while the service is stopped. Never run the old and new instances as simultaneous writers.
+
+The offline source copy must include `memory.sqlite`, all registered local payloads under `blobs/`, and its original `drive-binding.json` when remote references exist. A database with a nonempty WAL is refused: make a consistent, checkpointed copy with the old service's supported backup tooling, rather than copying a live database or deleting its sidecars. The importer reads this source only, verifies authority rows and FP32 IDs/bytes, and publishes schema header 5 into a **new, nonexistent child directory**. Missing required local payloads, missing remote binding or unknown headers abort import.
+
+For example, with a complete stopped copy at `/private/legacy-checkpoint`, prepare a separate empty parent owned by the selected service UID/GID (defaults shown), then build without starting the service:
+
+```sh
+sudo install -d -o 10001 -g 10001 -m 0700 /private/native-import
+docker compose build memory
+docker compose run --rm --no-deps \
+  --entrypoint /usr/local/bin/memento-import \
+  -v /private/legacy-checkpoint:/legacy:ro \
+  -v /private/native-import:/data \
+  memory /legacy/memory.sqlite /data/instance
+```
+
+Use the configured UID/GID if overridden. The `/data` override above is the new import parent, not the old live data mount. Require the import receipt to report `complete: true`; preserve that receipt and the original source. Only after successful verification, point `MEMENTO_DATA_DIR` (or the existing Compose mount override) at `/private/native-import/instance`, retain all other overrides, and verify that the effective `/data` mount selects this imported destination before `docker compose up --build -d`. Reconnect the original Drive binding through the normal owner-consent workflow if needed; import does not copy OAuth tokens. The native service obtains its pinned model assets in the destination's own model cache. Do not change database headers by hand or point a Python service at the imported header-5 database. Rollback retains the untouched old instance; do not accept writes on both timelines.
+
+SQLite retains the original vectors and all memory authority. The native service loads Qdrant Edge in process; its private `data/search/` index is disposable and excluded from portable/Drive database snapshots. Initial construction and recovery rebuild it from existing vectors without re-embedding. Capture and health remain available while search prepares; `/health` reports `search_ready: false`, and semantic recall returns an explicit 503 until ready. Keep space for the derived index and SQLite WAL while the initial read snapshot is open.
+
+### Python comparison/development only
+
+The baseline Python entrypoints remain explicit development/comparison tools. Use a separate Python-format data directory, never the native service's header-5 storage:
 
 ```sh
 uv sync --extra media --extra embedding --extra drive
-MEMENTO_EMBEDDINGS=1 uv run memento --data-dir ./data
+MEMENTO_EMBEDDINGS=1 uv run memento --data-dir ./python-development-data
 ```
 
-Run under the intended service identity with private storage, not inside the ordinary agent's identity when testing human-review isolation. This foreground development command does not install a boot service or reproduce Compose's resource limits.
+Run under the intended service identity with private storage, not inside the ordinary agent's identity when testing human-review isolation. This foreground command does not install the native service, a boot service or Compose's resource limits. To build the Python comparison image explicitly, use `docker build -f Dockerfile -t memento-python-development .`.
 
-The container includes the pinned Linux x86_64 Qdrant executable and starts it as a private loopback child in the same CPU/RAM limits. Standalone development can select that same pinned executable explicitly with `MEMENTO_QDRANT_BINARY=/absolute/path/to/qdrant`; it accepts no remote search endpoint. Without this setting, standalone development retains the existing SQLite exact engine. A configured missing or failed child never falls back to that slower engine.
-
-SQLite retains the original vectors and all memory authority. The private `data/search/` index is disposable and is excluded from portable/Drive database snapshots. Initial construction and recovery rebuild it from existing vectors without re-embedding. After child startup, capture and health remain available while projection builds or a running child becomes unavailable: `/health` reports `search_ready: false`, and semantic recall returns an explicit 503. Startup may add derived invalidation tables/indexes under the existing SQLite headers 1/2/3; it does not change vector IDs, embedding bytes or evidence. Keep space for the derived index and SQLite WAL while the initial read snapshot is open.
+The Python image includes its pinned Linux x86_64 Qdrant executable and starts it as a private loopback child in the same CPU/RAM limits. Python development can select that executable with `MEMENTO_QDRANT_BINARY=/absolute/path/to/qdrant`; it accepts no remote search endpoint. Without this setting, Python development retains its SQLite exact engine. A configured missing or failed child never falls back to that engine.
 
 API contracts: `http://127.0.0.1:8765/docs`. Agent-readable installation guide: `http://127.0.0.1:8765/connect`.
 
@@ -498,10 +522,10 @@ These are separate from native setup, a healthy API, the public website and Goog
 - The exact intended account and original app-created folder for reconnection.
 - Human consent to **only `drive.file`**. For an External app, **In production** avoids Testing's seven-day refresh-token limitation. Re-consent after publishing if the old grant was issued in Testing.
 
-On the **service host**, the service owner provisions the original binding, under the service identity:
+On the **service host**, the service owner provisions the original binding, under the service identity. Non-container operator examples below require the native owner binaries and their matching runtime libraries installed under `/usr/local`; a Python package installation does not install these native tools. For the default Compose installation, use the container command that follows:
 
 ```sh
-uv run --extra drive memento-drive configure \
+/usr/local/bin/memento-drive configure \
   --client-json /private/original-desktop-client.json \
   --account YOU@example.com --folder-id EXISTING_FOLDER_ID \
   --data-dir /private/memento-data
@@ -510,7 +534,7 @@ uv run --extra drive memento-drive configure \
 For Compose, run that same provisioning helper inside the existing container, where its default identity owns `/data`:
 
 ```sh
-docker compose exec -T memory /app/.venv/bin/memento-drive configure \
+docker compose exec -T memory /usr/local/bin/memento-drive configure \
   --client-json /tmp/original-desktop-client.json \
   --account YOU@example.com --folder-id EXISTING_FOLDER_ID --data-dir /data
 ```
@@ -526,7 +550,7 @@ Installing agents should reuse the human's authorized credential store before re
 The normal one-link workflow deliberately requires an existing folder binding. For a genuinely new installation with no app-created folder, the human/operator uses the standalone connector:
 
 ```sh
-uv run --extra drive memento-drive connect \
+/usr/local/bin/memento-drive connect \
   --client-json /private/desktop-client.json --account YOU@example.com \
   --output /private/drive-oauth.json
 ```
@@ -547,8 +571,8 @@ A definitive revoked/expired grant leaves the service available for reconnection
 Human decisions use the **owner-only admin socket**, not an agent-accessible admin HTTP API. Run as service owner/root; review decisions and forget require human terminal confirmation:
 
 ```sh
-docker compose exec memory /app/.venv/bin/memento-admin --data-dir /data list
-docker compose exec memory /app/.venv/bin/memento-admin --data-dir /data backup
+docker compose exec memory /usr/local/bin/memento-admin --data-dir /data list
+docker compose exec memory /usr/local/bin/memento-admin --data-dir /data backup
 ```
 
 `approve PROPOSAL_ID --why REASON`, `reject PROPOSAL_ID --why REASON` and `forget ID --why REASON` are operator actions. Forget removes active memory and suppresses re-extraction; **it does not erase raw history, artifacts or existing backups**. Restoring an old backup can restore forgotten content.
@@ -562,12 +586,12 @@ There is **no automatic database backup**. The backup command requests and verif
 To reclaim database space after background compression, the service owner runs:
 
 ```sh
-docker compose exec memory /app/.venv/bin/memento-admin --data-dir /data compact
+docker compose exec memory /usr/local/bin/memento-admin --data-dir /data compact
 ```
 
 This compacts the existing database and checkpoints its WAL. It creates no export archive and performs no Drive transfers. Allow free disk space of roughly twice the database size for SQLite's temporary work; scratch files use the persistent data volume. Service writes and memory operations using the writer lock wait during compaction, so clients can temporarily time out and retain captures in their outboxes. Let the operation finish. The JSON result reports database/WAL sizes before and after, free pages and whether the checkpoint completed. A busy checkpoint is reported as incomplete rather than claiming that all disk space was reclaimed. Ctrl+C disconnects the client; it does not cancel work already running in the service.
 
-Every database this version opens, imports or restores carries schema header 2 (`PRAGMA user_version`). Older pre-compression images refuse that header at startup, export, import and Drive restore with `Unsupported database schema version` instead of serving empty text for compressed records. Earlier frame-aware images also refuse header 2, so after upgrading, roll back only to a version that supports both database header 2 and compressed raw history. Older version-1 databases and archives remain readable by this version and receive the header on first open or restore; unknown future headers are refused before any change.
+Native live databases use schema header **5** (`PRAGMA user_version`). Python headers 1/2/3 require the explicit offline import above; the native daemon does not upgrade them in place. Legacy archives are converted through the native restore/import path. Unknown headers are refused before mutation. Python readers cannot open header 5: preserve the untouched old instance for rollback, and never lower a header to bypass that fence.
 
 When Drive is connected, saved media of any size and other payloads of at least **10 MiB** are eligible for prompt upload. Pinning or memory importance does not prevent their verified remote storage. Other unprotected artifacts remain eligible after 90 days. The existing overrides are `MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS` and `MEMENTO_COLD_MIN_BYTES`.
 
@@ -580,8 +604,8 @@ Local copies are removed only after remote verification. Pending media work and 
 On a separate recovery host, the intended service owner uses a human-provided private connection:
 
 ```sh
-uv run --extra drive memento-restore --connection /private/drive-oauth.json
-uv run --extra drive memento-restore --connection /private/drive-oauth.json \
+/usr/local/bin/memento-restore --connection /private/drive-oauth.json
+/usr/local/bin/memento-restore --connection /private/drive-oauth.json \
   --backup-id BACKUP_ID --destination /private/empty-recovery
 ```
 
@@ -595,7 +619,7 @@ The service owner can export a **single private database archive**. It includes 
 
 The archive records the original Drive account, folder and public client ID, without tokens or client secrets. Restore reports that connection identity; reconnect the original binding to read referenced files. Export and database restoration need no active Drive connection. An archive with remote references is not an offline copy of those files. `memento status` reports local-only payload bytes separately from verified remote bytes.
 
-The supported frontdoor is `memento export --data-dir DIR --output NEW_ARCHIVE`, run on the service host as its owner, and `memento restore --archive FILE --destination EMPTY` on the destination. These delegate to the existing owner administration and restore commands; the downloaded client runner does not contain another archive engine. Export retains its interactive human confirmation.
+The portable client runner supports `memento export --data-dir DIR --output NEW_ARCHIVE` on the service host as its owner, and `memento restore --archive FILE --destination EMPTY` on the destination, when the native owner tools are installed on that host. These delegate to `memento-admin` and `memento-restore`; the downloaded runner contains no archive engine. The daemon binary named `memento` inside the native container is the service entrypoint: use the explicit owner-tool commands below there. Export retains its interactive human confirmation.
 
 Import only archives you exported and kept private. Checksums detect corruption; they do not authenticate an archive against a malicious author.
 
@@ -603,7 +627,7 @@ Keep output and staging on persistent storage, **not the container's `/tmp` tmpf
 
 ```sh
 docker compose exec memory mkdir -p -m 0700 /data/exports
-docker compose exec memory /app/.venv/bin/memento-admin --data-dir /data \
+docker compose exec memory /usr/local/bin/memento-admin --data-dir /data \
   export --output /data/exports/memento.tar
 docker compose cp memory:/data/exports/memento.tar /private/memento.tar
 ```
@@ -615,7 +639,7 @@ Ctrl+C exits the waiting command but does not cancel the server export; it finis
 For a non-container destination, run as its intended service owner:
 
 ```sh
-uv run memento-restore --archive /private/memento.tar \
+/usr/local/bin/memento-restore --archive /private/memento.tar \
   --destination /private/empty-memento
 ```
 
@@ -624,8 +648,9 @@ Import verifies checksums, SQLite integrity and the exact required local-file se
 **Fresh Compose host: import before the first `up`.** Prepare empty `./data` with the normal service ownership above. Make the archive mount readable by UID/GID `10001:10001`, mode `0600`, without moving OAuth tokens. Import into a child directory so publication stays atomic on the data volume:
 
 ```sh
+docker compose build memory
 docker compose run --rm --no-deps \
-  --entrypoint /app/.venv/bin/memento-restore \
+  --entrypoint /usr/local/bin/memento-restore \
   -v /private/memento.tar:/import/memento.tar:ro \
   memory --archive /import/memento.tar --destination /data/instance
 ```

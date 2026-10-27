@@ -1,6 +1,8 @@
 services:
   memory:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.native
     restart: unless-stopped
     user: "${MEMENTO_UID:-10001}:${MEMENTO_GID:-10001}"
     env_file:
