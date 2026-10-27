@@ -24,6 +24,14 @@ const AUTO_FLOOR: f64 = 0.66;
 // are separate routes; this is not a universal semantic relevance probability.
 const SEMANTIC_TEXT_LOGIT_FLOOR: f64 = -3.63973325;
 type TextScore<'a> = dyn Fn(&[&str], Instant) -> Result<Vec<f32>> + 'a;
+// Owned per-request results only, never an index handle or persistent cache.
+struct HotPreview {
+    at: DateTime<Utc>,
+    curated: Vec<SearchHit>,
+    deep_raw: Vec<SearchHit>,
+    parked: Option<Result<Vec<SearchHit>>>,
+}
+
 fn number(v: &Value, key: &str, default: f64) -> f64 {
     v[key].as_f64().unwrap_or(default)
 }
@@ -224,17 +232,21 @@ impl Retrieval {
         let deep = request.effort == "deep" && !request.automatic && request.scope.is_none();
         let (mut results, need_archive) =
             self.projection
-                .snapshot_until(true, deep, deadline, |tx, view| {
-                    Self::current_scored(tx, view, request, vector, deep, deadline, Some(&score))
-                })?;
+                .snapshot_hot_until(deep, deadline,
+                    |_, view| Self::hot_preview(view, request, vector, deep),
+                    |tx, hot, cold| Self::current_owned_scored(tx, hot,
+                        |n, pool| cold.search(vector, n, "episode", pool, None, None),
+                        request, vector, deep, deadline, Some(&score)))?;
         if need_archive && !deep {
             // A new cut, acquired cold->hot, prevents mixing a future index with an old snapshot.
             // Hot answers never wait for archive construction unless the existing raw fallback is required.
             let value = self
                 .projection
-                .snapshot_until(true, true, deadline, |tx, view| {
-                    Self::current_scored(tx, view, request, vector, true, deadline, Some(&score))
-                })?;
+                .snapshot_hot_until(true, deadline,
+                    |_, view| Self::hot_preview(view, request, vector, true),
+                    |tx, hot, cold| Self::current_owned_scored(tx, hot,
+                        |n, pool| cold.search(vector, n, "episode", pool, None, None),
+                        request, vector, true, deadline, Some(&score)))?;
             results = value.0;
         }
         Ok(results)
@@ -250,6 +262,26 @@ impl Retrieval {
     ) -> Result<(Vec<Value>, bool)> {
         Self::current_scored(tx, view, request, vector, archive, deadline, None)
     }
+    fn hot_preview(view: &SearchView<'_>, request: &RecallRequest, vector: &[f32; 768], archive: bool) -> Result<HotPreview> {
+        let at = Utc::now();
+        let limit = if request.automatic { request.limit.min(6) } else { request.limit };
+        let n = if request.automatic { (limit * 20).clamp(24, 120) } else { (limit * 20).min(1000) };
+        let pool = if request.automatic { Pool::Automatic } else { Pool::Ordinary };
+        let mut curated = Vec::new();
+        for kind in ["node", "candidate", "segment"] {
+            curated.extend(view.search(Tier::Hot, vector, n, kind, pool, request.scope.as_deref(), None)?);
+        }
+        let deep_raw = if request.effort == "deep" && !request.automatic && request.scope.is_none() {
+            view.search(Tier::Hot, vector, n, "episode", Pool::Ordinary, None, None)?
+        } else { Vec::new() };
+        // A bounded preview may be unused if the archive cut has enough curated
+        // results. Preserve its error until this optional pool is actually used.
+        let parked = if archive && request.automatic && request.scope.is_none() && limit > 0 {
+            Some(view.search(Tier::Hot, vector, 4, "candidate", Pool::ParkedCandidate, None, None))
+        } else { None };
+        Ok(HotPreview { at, curated, deep_raw, parked })
+    }
+    #[cfg(test)]
     fn current_scored(
         tx: &ReadTxn<'_>,
         view: &SearchView<'_>,
@@ -259,9 +291,24 @@ impl Retrieval {
         deadline: Instant,
         score: Option<&TextScore<'_>>,
     ) -> Result<(Vec<Value>, bool)> {
+        let hot = Self::hot_preview(view, request, vector, archive)?;
+        Self::current_owned_scored(tx, hot,
+            |n, pool| view.search(Tier::Cold, vector, n, "episode", pool, None, None),
+            request, vector, archive, deadline, score)
+    }
+    fn current_owned_scored(
+        tx: &ReadTxn<'_>,
+        hot: HotPreview,
+        cold_search: impl FnOnce(usize, Pool) -> Result<Vec<SearchHit>>,
+        request: &RecallRequest,
+        vector: &[f32; 768],
+        archive: bool,
+        deadline: Instant,
+        score: Option<&TextScore<'_>>,
+    ) -> Result<(Vec<Value>, bool)> {
         let db = tx.sql();
         let scope = request.scope.as_deref();
-        let at = Utc::now();
+        let HotPreview { at, curated, deep_raw, parked: parked_preview } = hot;
         let limit = if request.automatic {
             request.limit.min(6)
         } else {
@@ -275,15 +322,7 @@ impl Retrieval {
         } else {
             (limit * 20).min(1000)
         };
-        let pool = if request.automatic {
-            Pool::Automatic
-        } else {
-            Pool::Ordinary
-        };
-        let mut hits = Vec::new();
-        for kind in ["node", "candidate", "segment"] {
-            hits.extend(view.search(Tier::Hot, vector, n, kind, pool, scope, None)?);
-        }
+        let mut hits = curated;
         if !request.automatic {
             // Existing all-term literal admission stays unchanged. Semantic-only OR discovery
             // below requires native cosine admission; a shared name token is not an identity anchor.
@@ -382,16 +421,13 @@ impl Retrieval {
             && matches.len() + named.len() < limit;
         if request.effort == "deep" && !request.automatic && scope.is_none() {
             let mut raw_matches = BTreeMap::new();
-            for tier in [Tier::Hot, Tier::Cold] {
-                for hit in view.search(tier, vector, n, "episode", Pool::Ordinary, None, None)? {
-                    if hit.cosine as f64 >= TEXT_FLOOR {
-                        if let Some(mut row) = hydrate(tx, &hit, false)? {
-                            records::merge(
-                                &mut row,
-                                json!({"cosine":hit.cosine,"score":hit.cosine,"match":"semantic"}),
-                            );
-                            raw_matches.entry(key(&row).to_owned()).or_insert(row);
-                        }
+            let mut raw_hits = deep_raw;
+            raw_hits.extend(cold_search(n, Pool::Ordinary)?);
+            for hit in raw_hits {
+                if hit.cosine as f64 >= TEXT_FLOOR {
+                    if let Some(mut row) = hydrate(tx, &hit, false)? {
+                        records::merge(&mut row, json!({"cosine":hit.cosine,"score":hit.cosine,"match":"semantic"}));
+                        raw_matches.entry(key(&row).to_owned()).or_insert(row);
                     }
                 }
             }
@@ -422,28 +458,15 @@ impl Retrieval {
                 matches.entry(id).or_insert(row);
             }
         } else if need_archive && archive {
+            let fallback_limit = if request.automatic { 1 } else { limit };
+            let fallback_hits = cold_search((fallback_limit * 4).max(8), Pool::RawFallback)?;
             let mut fallback = Self::raw_fallback_scored(
-                tx,
-                view,
-                &request.query,
-                vector,
-                if request.automatic { 1 } else { limit },
-                !request.automatic,
-                at,
-                deadline,
-                score,
+                tx, fallback_hits, &request.query, fallback_limit,
+                !request.automatic, at, deadline, score,
             )?;
             if request.automatic {
                 let mut parked = Vec::new();
-                for hit in view.search(
-                    Tier::Hot,
-                    vector,
-                    4,
-                    "candidate",
-                    Pool::ParkedCandidate,
-                    None,
-                    None,
-                )? {
+                for hit in parked_preview.ok_or(Error::Unavailable("Parked candidate preview is unavailable"))?? {
                     if (hit.cosine as f64) < AUTO_FLOOR {
                         continue;
                     }
@@ -479,6 +502,8 @@ impl Retrieval {
             for row in fallback {
                 matches.entry(key(&row).into()).or_insert(row);
             }
+        } else {
+            drop(cold_search);
         }
         let mut records = Vec::new();
         for (_, mut row) in matches {
@@ -822,9 +847,8 @@ impl Retrieval {
     ) -> Result<Vec<Value>> {
         Self::raw_fallback_scored(
             tx,
-            view,
+            view.search(Tier::Cold, vector, (limit * 4).max(8), "episode", Pool::RawFallback, None, None)?,
             query,
-            vector,
             limit,
             keywords,
             at,
@@ -834,9 +858,8 @@ impl Retrieval {
     }
     fn raw_fallback_scored(
         tx: &ReadTxn<'_>,
-        view: &SearchView<'_>,
+        hits: Vec<SearchHit>,
         query: &str,
-        vector: &[f32; 768],
         limit: usize,
         keywords: bool,
         at: DateTime<Utc>,
@@ -844,15 +867,7 @@ impl Retrieval {
         score: Option<&TextScore<'_>>,
     ) -> Result<Vec<Value>> {
         let mut found = BTreeMap::new();
-        for hit in view.search(
-            Tier::Cold,
-            vector,
-            (limit * 4).max(8),
-            "episode",
-            Pool::RawFallback,
-            None,
-            None,
-        )? {
+        for hit in hits {
             if (hit.cosine as f64) < TEXT_FLOOR {
                 continue;
             }
@@ -1112,6 +1127,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     include!("raw_pool_tests.rs");
     include!("text_routing_tests.rs");
+    include!("retrieval_snapshot_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,

@@ -139,6 +139,34 @@ pub struct SearchView<'a> {
     cold: Option<&'a EdgeShard>,
     deadline: Instant,
 }
+/// Single-use Cold query from the same pinned authority cut as owned Hot hits.
+/// The guard is released before the owned result reaches hydration/scoring.
+pub struct ColdQuery<'a> {
+    guard: Option<MutexGuard<'a, State>>,
+    deadline: Instant,
+}
+impl ColdQuery<'_> {
+    pub fn search(
+        self,
+        vector: &[f32; 768],
+        limit: usize,
+        kind: &str,
+        pool: Pool,
+        scope: Option<&str>,
+        memory_type: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
+        let result = {
+            let view = SearchView {
+                hot: None,
+                cold: self.guard.as_ref().and_then(|state| state.shard.as_deref()),
+                deadline: self.deadline,
+            };
+            view.search(Tier::Cold, vector, limit, kind, pool, scope, memory_type)
+        };
+        drop(self);
+        result
+    }
+}
 fn check(deadline: Option<Instant>) -> Result<()> {
     if deadline.is_some_and(|v| Instant::now() >= v) {
         Err(unavailable())
@@ -595,6 +623,44 @@ impl Projection {
         }
         result
     }
+    fn sync_snapshot(&self, tx: &ReadTxn<'_>, tier: Tier, state: &mut State, deadline: Instant) -> Result<()> {
+        let shard = self.tier(tier);
+        let synced = self.sync(tx, tier, state, &shard.path, Some(deadline), true, true);
+        shard.ready.store(matches!(synced, Ok(true)), Ordering::Release);
+        if !synced? { return Err(unavailable()); }
+        Ok(())
+    }
+    /// Own every required Hot hit before releasing Hot. The same SQLite read
+    /// transaction remains pinned through the optional single Cold query and finish.
+    pub fn snapshot_hot_until<H, T>(
+        &self,
+        cold: bool,
+        deadline: Instant,
+        collect_hot: impl FnOnce(&ReadTxn<'_>, &SearchView<'_>) -> Result<H>,
+        finish: impl FnOnce(&ReadTxn<'_>, H, ColdQuery<'_>) -> Result<T>,
+    ) -> Result<T> {
+        check(Some(deadline))?;
+        // Preserve cold->hot order; waiting for a Cold build never holds Hot.
+        let mut cold_guard = if cold { Some(lock_until(&self.cold.state, deadline)?) } else { None };
+        let mut hot_guard = lock_until(&self.hot.state, deadline)?;
+        self.store.read(|tx| {
+            if let Some(state) = cold_guard.as_mut() {
+                self.sync_snapshot(tx, Tier::Cold, state, deadline)?;
+            }
+            self.sync_snapshot(tx, Tier::Hot, &mut hot_guard, deadline)?;
+            let owned_hot = {
+                let hot_view = SearchView {
+                    hot: hot_guard.shard.as_deref(), cold: None, deadline,
+                };
+                collect_hot(tx, &hot_view)?
+            };
+            // The borrowed view is gone; no Hot handle escapes in the owned hits.
+            drop(hot_guard);
+            let value = finish(tx, owned_hot, ColdQuery { guard: cold_guard, deadline })?;
+            check(Some(deadline))?;
+            Ok(value)
+        })
+    }
     /// Encode query BEFORE calling this method. Hydration uses this same pinned cut.
     pub fn snapshot<T>(
         &self,
@@ -627,38 +693,10 @@ impl Projection {
         };
         self.store.read(|tx| {
             if let Some(state) = cold_guard.as_mut() {
-                let synced = self.sync(
-                    tx,
-                    Tier::Cold,
-                    state,
-                    &self.cold.path,
-                    Some(deadline),
-                    true,
-                    true,
-                );
-                self.cold
-                    .ready
-                    .store(matches!(synced, Ok(true)), Ordering::Release);
-                if !synced? {
-                    return Err(unavailable());
-                }
+                self.sync_snapshot(tx, Tier::Cold, state, deadline)?;
             }
             if let Some(state) = hot_guard.as_mut() {
-                let synced = self.sync(
-                    tx,
-                    Tier::Hot,
-                    state,
-                    &self.hot.path,
-                    Some(deadline),
-                    true,
-                    true,
-                );
-                self.hot
-                    .ready
-                    .store(matches!(synced, Ok(true)), Ordering::Release);
-                if !synced? {
-                    return Err(unavailable());
-                }
+                self.sync_snapshot(tx, Tier::Hot, state, deadline)?;
             }
             let view = SearchView {
                 hot: hot_guard.as_ref().and_then(|s| s.shard.as_deref()),
@@ -881,3 +919,6 @@ mod recovery_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod owned_snapshot_tests;
