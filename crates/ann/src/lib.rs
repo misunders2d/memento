@@ -922,3 +922,6 @@ mod recovery_tests {
 
 #[cfg(test)]
 mod owned_snapshot_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;
