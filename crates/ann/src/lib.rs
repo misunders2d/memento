@@ -362,8 +362,18 @@ fn indices(shard: &EdgeShard) -> Result<()> {
     Ok(())
 }
 fn optimize(shard: &EdgeShard) -> Result<()> {
-    edge(shard.optimize_with_budget(ResourceBudget::new(1, 1)))?;
-    edge(shard.flush())
+    if edge(shard.optimize_with_budget(ResourceBudget::new(1, 1)))? {
+        edge(shard.flush())?;
+    }
+    Ok(())
+}
+fn finish_build(shard: &EdgeShard, path: &Path, checkpoint: &mut Checkpoint) -> Result<()> {
+    optimize(shard)?;
+    // An unpublished below-threshold batch need not have changed any optimizer.
+    // Its vectors must still be flushed BEFORE the durable building=false fence.
+    edge(shard.flush())?;
+    checkpoint.building = false;
+    persist(path, checkpoint)
 }
 fn reconcile_raw_tiers(store: &Store) -> Result<()> {
     let mut next = i64::MIN;
@@ -623,9 +633,7 @@ impl Projection {
             if stop.load(Ordering::Acquire) {
                 return Err(unavailable());
             }
-            optimize(&shard)?;
-            checkpoint.building = false;
-            persist(&staging, &checkpoint)?;
+            finish_build(&shard, &staging, &mut checkpoint)?;
             let mut staging_state = State {
                 shard: Some(shard),
                 checkpoint: Some(checkpoint),
@@ -1040,6 +1048,49 @@ mod recovery_tests {
         rebuilding.join().unwrap().unwrap();
         assert!(!Arc::ptr_eq(index.hot.state.lock().unwrap().shard.as_ref().unwrap(), &native));
         assert_eq!(top(&index).unwrap(), "new");
+    }
+    #[test]
+    fn below_threshold_bulk_build_flushes_before_ready_checkpoint_without_wal_replay() {
+        fn disk_version(path: &Path) -> u64 {
+            let versions:Vec<_> = std::fs::read_dir(path.join("edge/segments")).unwrap()
+                .map(|entry|entry.unwrap().path())
+                .filter(|path|path.join("version.info").is_file())
+                .map(|path|serde_json::from_slice::<qdrant_edge::SegmentState>(
+                    &std::fs::read(path.join("segment.json")).unwrap()).unwrap().version.unwrap())
+                .collect();
+            assert_eq!(versions.len(),1,"tiny fixture must remain appendable");
+            versions[0]
+        }
+        let (_dir, store, index) = fixture();
+        add(&store,"durable",1,0.7);
+        let path=index.hot.path.with_file_name("unpublished-flush-proof");
+        std::fs::create_dir(&path).unwrap();
+        let native=EdgeShard::new(&path.join("edge"),config()).unwrap();
+        indices(&native).unwrap();
+        native.flush().unwrap();
+        let before=disk_version(&path);
+        let mut checkpoint=store.read(|tx| {
+            let checkpoint=Checkpoint {format:PROJECTION_FORMAT,db_uuid:tx.source_cut().db_uuid.clone(),
+                signature:ModelSignature::pinned(),tier:Tier::Hot,cursor:tx.fence(Tier::Hot)?,
+                pending:None,building:true};
+            persist(&path,&checkpoint)?;
+            upsert(&native,tx,&rows(tx,Tier::Hot,None,None)?)?;
+            Ok(checkpoint)
+        }).unwrap();
+        optimize(&native).unwrap();
+        assert_eq!(disk_version(&path),before,"unchanged optimizer unexpectedly force-flushed");
+        assert!(load_checkpoint(&path).unwrap().unwrap().building);
+        finish_build(&native,&path,&mut checkpoint).unwrap();
+        // Check actual persisted segment state BEFORE load can replay/flush WAL.
+        assert!(disk_version(&path)>before,"ready checkpoint preceded bulk data flush");
+        assert!(!load_checkpoint(&path).unwrap().unwrap().building);
+        drop(native);
+        let native=EdgeShard::load(&path.join("edge"),None).unwrap();
+        let mut query=[0.;768];query[0]=1.;
+        let view=SearchView {hot:Some(&native),cold:None,deadline:Instant::now()+Duration::from_secs(2)};
+        let hits=view.search(Tier::Hot,&query,1,"node",Pool::Ordinary,Some("personal"),None).unwrap();
+        assert_eq!(hits[0].target,"durable");
+        assert!((hits[0].cosine-0.7).abs()<1e-6);
     }
 }
 
