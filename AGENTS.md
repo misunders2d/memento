@@ -12,6 +12,8 @@ The owner-controlled **Memento: immutable top-level requirement** in the [Person
 
 **Completion housekeeping:** after material implementation or deployment changes, reconcile the Linear project overview, latest status update and affected issues with the verified result; add a dated implementation note to the design record when its architecture or operating assumptions change. Check the GitHub README and project `AGENTS.md` for affected setup, migration, recovery and development instructions. Preserve the owner-controlled baseline and historical decisions; distinguish shipped code, verified deployment, acceptance evidence and open limitations. Commit/push authorized source-document changes and verify the remote result before reporting handover complete. If an update is blocked or outside the authorized scope, report the exact gap and next action instead of leaving stale documentation unmentioned.
 
+**Reuse before building:** before designing or replacing pipeline/worker machinery, inspect maintained existing solutions through primary documentation and code. Record reusable components and gaps against the owner-controlled baseline in Linear; justify custom machinery only where existing solutions do not fit. Measure complete processing work, including existing-memory maintenance, retries and historical catch-up. Intermediate queue counts alone do not establish daily capacity or overnight completion.
+
 ## Local development
 
 Installation, Drive/native-agent polish and production acceptance run locally. Use isolated local clients and private TLS to exercise remote-client behavior. Do not deploy, test, profile or diagnose Memento on Contabo without new explicit user authorization; these operational instructions do not grant it.
