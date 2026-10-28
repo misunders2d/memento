@@ -169,7 +169,9 @@ Default deployment properties:
 | Hardening | Read-only root, `/tmp` tmpfs, all capabilities dropped, no new privileges |
 | Restart policy | `unless-stopped` |
 
-Overrides: `MEMENTO_UID`, `MEMENTO_GID`, `MEMENTO_AGENT_UID`, `MEMENTO_DATA_DIR`, `MEMENTO_PORT`; optional `.env` or `MEMENTO_ENV_FILE`. Preserve existing values and mount configuration during upgrades. Enable Docker startup on the host according to its normal administration policy.
+Overrides: `MEMENTO_UID`, `MEMENTO_GID`, `MEMENTO_AGENT_UID`, `MEMENTO_DATA_DIR`, `MEMENTO_PORT`, `MEMENTO_CPUS`, `MEMENTO_MEMORY`, `MEMENTO_MEMORY_SWAP`; optional `.env` or `MEMENTO_ENV_FILE`. Preserve existing values and mount configuration during upgrades. Enable Docker startup on the host according to its normal administration policy.
+
+Resource defaults remain 2 CPUs and 5 GiB RAM. `MEMENTO_CPUS` sets the CPU allowance; use the host's logical CPU count to allow all its CPUs. `MEMENTO_MEMORY` sets the RAM ceiling. `MEMENTO_MEMORY_SWAP` is the combined RAM-plus-swap ceiling (default 10 GiB, allowing 5 GiB swap); keep it at least as large as the RAM ceiling, or equal to it to disable container swap. Choose limits that leave room for the host and other applications. These Compose settings apply when creating/recreating the container; changing `.env` alone does not update a running container.
 
 **Human-review isolation matters:** the agent must not share the service UID, have sudo, or control the Docker daemon. Docker-daemon access can defeat this boundary. Container hardening is not a substitute for separating those privileges.
 

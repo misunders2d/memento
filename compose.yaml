@@ -15,8 +15,9 @@ services:
       - "127.0.0.1:${MEMENTO_PORT:-8765}:8765"
     volumes:
       - "${MEMENTO_DATA_DIR:-./data}:/data"
-    cpus: 2.0
-    mem_limit: 5g
+    cpus: "${MEMENTO_CPUS:-2.0}"
+    mem_limit: "${MEMENTO_MEMORY:-5g}"
+    memswap_limit: "${MEMENTO_MEMORY_SWAP:-10g}"
     pids_limit: 256
     read_only: true
     tmpfs:

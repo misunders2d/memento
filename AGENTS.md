@@ -18,6 +18,8 @@ Installation, Drive/native-agent polish and production acceptance run locally. U
 
 ### Service (local Linux storage only)
 
+Compose resource ceilings are configurable through `MEMENTO_CPUS`, `MEMENTO_MEMORY` and `MEMENTO_MEMORY_SWAP` in the deployment's `.env` (defaults: 2 CPUs, 5 GiB RAM, 10 GiB combined RAM plus swap). Use the host's logical CPU count for all-CPU access. Preserve the existing swap allowance when raising RAM, and verify the running container's effective limits separately from Compose configuration. Keep machine-specific settings private; do not raise every installation's defaults for a local headroom request.
+
 The default production service is Rust: Compose selects `Dockerfile.native`, which builds the daemon and native owner/import tools with pinned ONNX Runtime and media libraries. Run one service process per data directory. Python >=3.12 remains required for the portable stdlib runner/processor, not the native daemon. Use the pinned native build environment for Rust checks (`cargo test --locked --workspace`); API contracts remain `http://127.0.0.1:8765/docs`. The Python `Dockerfile`/`pyproject.toml` remain an explicit comparison/development path: `uv sync --extra media --extra embedding --extra drive`, `MEMENTO_EMBEDDINGS=1 uv run memento --data-dir ./python-development-data`, and `uv run pytest -q`. Never point that Python service at a native database.
 
 Fresh Compose installation (human/operator steps, not agent commands):
