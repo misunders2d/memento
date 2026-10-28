@@ -7,12 +7,11 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from .store import ConflictError, Store, legacy_native_context
+from .relations import valid_relation
 
 NODE_TYPES = frozenset(('experience', 'knowledge', 'decision', 'media', 'person',
                         'organization', 'project', 'concept', 'place', 'tool'))
 ENTITY_TYPES = frozenset(('person', 'organization', 'project', 'concept', 'place', 'tool'))
-RELATIONS = frozenset(('belongs_to', 'follows_up_on', 'works_in', 'decided_by',
-                      'supersedes', 'mentions', 'part_of', 'caused_by', 'owned_by', 'related_to'))
 # Over review_proposals p: a create-person review made only because built-in
 # person memories were once always human-gated. No current gate requires it.
 LEGACY_PERSON_REVIEW_SQL = '''(json_extract(p.command,'$.op')='remember'
@@ -343,8 +342,8 @@ class Graph:
     def link(self, *, command_id, actor, why, a, rel, b, evidence, source=None, conversation_id=None):
         if rel == 'supersedes':
             raise ValueError('Use atomic supersede; direct supersession links are not allowed')
-        if rel not in RELATIONS:
-            raise ValueError('Unknown directional relation')
+        if not valid_relation(rel):
+            raise ValueError('Invalid directional relation')
         request = dict(op='link', a=a, rel=rel, b=b, evidence=evidence, source=source, conversation_id=conversation_id)
         return self._command(command_id, actor, why, request,
                              lambda commit: self._apply_link(commit, request))

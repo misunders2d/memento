@@ -83,8 +83,8 @@ impl Graph {
         )?;
         required(&command.a, 64, "Invalid relation endpoint")?;
         required(&command.b, 64, "Invalid relation endpoint")?;
-        if !RELATIONS.contains(&command.rel.as_str()) {
-            return Err(Error::Validation("Unknown directional relation"));
+        if !valid_relation(&command.rel) {
+            return Err(Error::Validation("Invalid directional relation"));
         }
         let request = json!({"op":"link","a":command.a,"rel":command.rel,"b":command.b,
             "evidence":command.evidence,"source":command.source,"conversation_id":command.conversation_id});

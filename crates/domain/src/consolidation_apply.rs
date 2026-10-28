@@ -371,7 +371,7 @@ fn validate(
             if !nodes.contains_key(dst) {
                 return Err(reject("consolidation_reference_not_supplied", vec![]));
             }
-            if !repair["relation"].as_str().is_some_and(|rel| RELATIONS.contains(&rel)) {
+            if !repair["relation"].as_str().is_some_and(valid_relation) {
                 return Err(reject("consolidation_relation_invalid", vec![]));
             }
             // The existing uniqueness bound is per repair target, not per
@@ -456,6 +456,13 @@ fn validate(
         .iter()
         .any(|field| !repair[*field].is_null())
         {
+            return Err(reject("consolidation_schema_invalid", vec![]));
+        }
+        if repair["operation"]=="assign_loop" {
+            if !repair["responsibility"].as_str().is_some_and(loops::valid_responsibility) {
+                return Err(reject("consolidation_schema_invalid", vec![]));
+            }
+        } else if !repair["responsibility"].is_null() {
             return Err(reject("consolidation_schema_invalid", vec![]));
         }
         validate_behavior(repair, &nodes[&target], &episodes, &traces)?;
@@ -654,10 +661,11 @@ pub(super) fn apply(
         if !ineligible(tx.sql(),&ids)?.is_empty(){return Err(Error::Conflict("Consolidation eligibility changed; derive a fresh plan"));}for(target,frozen)in &prepared.nodes{if node(tx.sql(),target)?["version"]!=frozen["version"]{return Err(Error::Conflict("Consolidation graph context changed; derive a fresh plan"));}}for(target,frozen)in &prepared.edges{if one(tx.sql(),"SELECT version FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1",[target])?.is_none_or(|current|current["version"]!=frozen["version"]){return Err(Error::Conflict("Consolidation relation context changed; derive a fresh plan"));}}
         let loop_snapshots=context_value["loop_snapshots"].as_object().unwrap();if !prepared.repairs.is_empty()||prepared.actions.iter().any(|action|!action["closed_targets"].as_array().unwrap().is_empty()){for(target,frozen)in loop_snapshots{let version=prepared.nodes.get(target).or_else(||prepared.edges.get(target)).and_then(|value|value["version"].as_i64()).unwrap_or(1);if loops::snapshot(tx.sql(),target,version)?!=*frozen{return Err(Error::Conflict("Consolidation loop state changed; derive a fresh plan"));}}}
         let mut closures=vec![];let mut closure_sources:HashMap<String,Vec<Option<String>>>=HashMap::new();for action in &prepared.actions{let candidate_id=get_str(action,"candidate_id")?;let original=prepared.selected[candidate_id]["evidence"].as_array().unwrap().iter().map(|reference|reference["episode_id"].as_str().unwrap()).collect::<BTreeSet<_>>();let sources=action["evidence"].as_array().unwrap().iter().filter(|source|original.contains(source["episode_id"].as_str().unwrap())).map(|source|prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str().map(str::to_owned)).collect::<Vec<_>>();for target in action["closed_targets"].as_array().unwrap(){let target=target.as_str().unwrap();let(at,status)=loops::closure_time(&loop_snapshots[target],&sources)?;closures.push(json!({"candidate_id":candidate_id,"target":target,"source_occurred_at":at,"status":status}));}closure_sources.insert(candidate_id.into(),sources);}
-        let mut results=Map::new();let mut destinations:Map<String,Value>=Map::new();let mut resolutions=prepared.resolutions.clone();let mut actions=prepared.actions.clone();actions.sort_by_key(|action|(action["operation"]=="link",!matches!(action["operation"].as_str(),Some("remember"|"reject"|"defer"))));
+        let mut results=Map::new();let mut loop_responsibilities=Map::new();let mut destinations:Map<String,Value>=Map::new();let mut resolutions=prepared.resolutions.clone();let mut actions=prepared.actions.clone();actions.sort_by_key(|action|(action["operation"]=="link",!matches!(action["operation"].as_str(),Some("remember"|"reject"|"defer"))));
         for action in &actions{let candidate_id=get_str(action,"candidate_id")?;let candidate=&prepared.selected[candidate_id];if one(tx.sql(),&format!("SELECT 1 FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"),[candidate_id])?.is_none(){continue;}let decision=one(tx.sql(),"SELECT id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1",[candidate_id])?;if decision.map(|decision|decision["id"].clone()).unwrap_or(Value::Null)!=candidate["decision_id"]{return Err(Error::Conflict("Candidate decision changed while consolidation was running"));}
             let(mut result,state)=apply_action(tx,commit,action,candidate,&resolutions,&prepared.nodes,&destinations)?;let target=result["superseded_by"].as_str().or_else(||result["merged_into"].as_str()).or_else(||result["id"].as_str()).map(str::to_owned);
             if state=="promote"{if let Some(target)=&target{let marker=loops::current(tx.sql(),candidate_id)?;if !(action["open_loop"]==false&&loops::decline_extracted(tx,commit,candidate_id)?){loops::transfer(tx,commit,candidate_id,target)?;}importance::transfer_usage(tx,candidate_id,target)?;loops::mark(tx,commit,target,action["open_loop"].as_bool(),Some(candidate_id),marker.as_ref())?;}}else if state=="review"{loops::mark(tx,commit,candidate_id,action["open_loop"].as_bool(),None,None)?;}
+            let role_target=if state=="promote"{target.as_deref()}else if state=="review"{Some(candidate_id)}else{None};if let (Some(role_target),Some(value))=(role_target,action["responsibility"].as_str()){if loops::current(tx.sql(),role_target)?.is_some(){let role=loops::assign(tx,commit,role_target,value,&action["evidence"],false)?;if let Some(map)=role["loop_responsibilities"].as_object(){loop_responsibilities.extend(map.clone());}}}
             tx.sql().execute("INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",params![id(),candidate_id,commit,state,target,if state=="defer"{Some(timestamp()+3600.0)}else{None}])?;if ["promote","reject"].contains(&state){tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='candidate' AND target=?)",[candidate_id])?;}tx.touch_target(candidate_id)?;
             if state=="promote"{if let Some(target)=&target{resolutions.insert(candidate_id.into(),json!(target));if action["operation"]=="supersede"{if let Some(previous)=action["target"].as_str(){let previous=resolutions.get(previous).and_then(Value::as_str).unwrap_or(previous);destinations.insert(previous.into(),json!(target));}}}}
             result["decision"]=json!(state);results.insert(candidate_id.into(),result);
@@ -667,6 +675,7 @@ pub(super) fn apply(
             "absorb"=>{let mut absorbed=vec![];for source in strings(&repair["absorbed"])?{absorbed.push(follow_refinements(tx.sql(),&source,&destinations)?);}let result=curation::absorb(tx,commit,&target,&absorbed,Some(evidence),false,None)?;if result["status"]=="absorbed"{for source in absorbed{if node(tx.sql(),&source)?["state"]=="merged"{destinations.insert(source,json!(target));}}}result},
             "supersede"=>{let result=TxGraph::supersede(tx,commit,&json!({"op":"supersede","old":target,"new":{"type":repair["type"],"text":repair["text"],"scope":repair.get("scope").filter(|scope|!scope.is_null()).unwrap_or(&prepared.nodes[original]["scope"])},"kind":repair["change_kind"],"valid_at":repair["valid_at"],"evidence":evidence}),false)?;if let Some(new)=result["superseded_by"].as_str(){destinations.insert(target.clone(),json!(new));}result},
             "decline_loop"=>loops::decline_automatic(tx,commit,&target,&loop_snapshots[original])?,
+            "assign_loop"=>{let result=loops::assign(tx,commit,&target,get_str(repair,"responsibility")?,evidence,false)?;if let Some(map)=result["loop_responsibilities"].as_object(){loop_responsibilities.extend(map.clone());}result},
             "retire"=>curation::retire(tx,commit,&target,evidence)?,
             "close_loop"=>{let sources=evidence.as_array().unwrap().iter().map(|source|prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str().map(str::to_owned)).collect::<Vec<_>>();let(at,mut status)=loops::closure_time(&loop_snapshots[original],&sources)?;if prepared.nodes[original]["pinned"].as_i64().unwrap_or(0)!=0{status=Some("protected_loop_choice");}if status.is_none(){let previous=loops::current(tx.sql(),&target)?.ok_or(Error::Conflict("Consolidation loop state changed; derive a fresh plan"))?;loops::append(tx,commit,&target,"closed",previous["due_at"].as_str(),None)?;status=Some("closed");}closures.push(json!({"target":target,"status":status,"source_occurred_at":at}));json!({"id":target,"status":status,"source_occurred_at":at})},
             _=>return Err(Error::Validation("consolidation_schema_invalid")),
@@ -677,7 +686,7 @@ pub(super) fn apply(
         if !job.payload["night"].is_null(){tx.sql().execute("UPDATE consolidation_nights SET cursor=max(cursor,?) WHERE id=?",params![job.payload["next_cursor"].as_i64(),job.payload["night"].as_str()])?;}
         let mut context=context_value.clone();let redirected=apply_continuity(tx,commit,&mut context)?;let mut progressed=!redirected.is_empty();for(target,n)in &prepared.nodes{progressed|=node(tx.sql(),target)?["version"]!=n["version"];}if !progressed{for(target,frozen)in loop_snapshots{let current=one(tx.sql(),"SELECT id FROM loop_events WHERE target=? ORDER BY rowid DESC LIMIT 1",[target])?.map(|row|row["id"].clone()).unwrap_or(Value::Null);if current!=frozen["event_id"]{progressed=true;break;}}}
         continue_work(tx,commit,job,&context,&prepared.continue_with,&prepared.nodes,&destinations,progressed)?;
-        Ok(json!({"candidate_count":results.len(),"results":results,"reported_model":model,"usage":usage,"loop_closures":closures,"repair_results":repair_results,"redirected_relations":redirected}))
+        Ok(json!({"candidate_count":results.len(),"results":results,"reported_model":model,"usage":usage,"loop_closures":closures,"repair_results":repair_results,"redirected_relations":redirected,"loop_responsibilities":loop_responsibilities}))
     })?)
 }
 
@@ -735,7 +744,7 @@ fn follow_refinements(
     Ok(target)
 }
 fn link(tx: &WriteTxn, commit: &str, a: &str, rel: &str, b: &str, evidence: &Value) -> Result<Value> {
-    if !RELATIONS.contains(&rel) {
+    if !valid_relation(rel) {
         return Err(Error::Validation("consolidation_relation_invalid"));
     }
     let existing = one(tx.sql(), "SELECT e.id FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1", params![a, rel, b])?;

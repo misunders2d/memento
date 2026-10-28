@@ -57,7 +57,10 @@ impl F {
         self.graph.link(parse(json!({"command_id":"link","actor":"synthetic","why":"Related","a":self.a,"b":self.b,"rel":"related_to","evidence":[{"episode_id":self.episode,"quote":"Atlas launch"}]}))).unwrap()["id"].as_str().unwrap().into()
     }
     fn candidate(&self, id: &str, episode: &str) {
-        self.store.command(&CommandContext{command_id:format!("candidate-{id}"),actor:"fixture".into(),why:"Synthetic extraction".into()},&json!({"fixture":id}),|tx,commit|{let run=format!("run-{id}");tx.sql().execute("INSERT INTO extraction_runs VALUES(?,?,?,'extract-v2','fixture','[]','{}',?)",params![run,commit,episode,NOW])?;tx.sql().execute("INSERT INTO candidates VALUES(?,?,'memory','knowledge','Renew Zephyr passport','Synthetic exact source',NULL,NULL,0.9,NULL,NULL,'[\"personal\"]')",params![id,run])?;tx.sql().execute("INSERT INTO graph_evidence VALUES(?,1,?,0,5,'Exact')",params![id,episode])?;Ok(json!({"id":id}))}).unwrap();
+        self.candidate_scope(id,episode,"personal");
+    }
+    fn candidate_scope(&self, id: &str, episode: &str, scope: &str) {
+        self.store.command(&CommandContext{command_id:format!("candidate-{id}"),actor:"fixture".into(),why:"Synthetic extraction".into()},&json!({"fixture":id}),|tx,commit|{let run=format!("run-{id}");tx.sql().execute("INSERT INTO extraction_runs VALUES(?,?,?,'extract-v2','fixture','[]','{}',?)",params![run,commit,episode,NOW])?;tx.sql().execute("INSERT INTO candidates VALUES(?,?,'memory','knowledge','Renew Zephyr passport','Synthetic exact source',NULL,NULL,0.9,NULL,NULL,?)",params![id,run,json!([scope]).to_string()])?;tx.sql().execute("INSERT INTO graph_evidence VALUES(?,1,?,0,5,'Exact')",params![id,episode])?;Ok(json!({"id":id}))}).unwrap();
     }
 }
 #[test]
@@ -115,6 +118,34 @@ fn graph_scope_views_loop_counts_xss_and_forgotten_boundaries() {
             Ok(())
         })
         .unwrap();
+}
+#[test]
+fn complete_loop_view_includes_candidates_beyond_default_cap_with_scope_and_forgetting() {
+    let f = F::new();
+    for index in 0..103 {
+        let id = format!("loop-candidate-{index}");
+        f.candidate_scope(&id, &f.episode, if index==101 {"professional"} else {"personal"});
+        f.graph.loop_command(parse(json!({"action":"open","id":id,"command_id":format!("open-{index}")}))).unwrap();
+    }
+    f.store.write(|tx| {
+        tx.sql().execute("INSERT INTO forgotten_targets VALUES('loop-candidate-102','fixture','candidate')", [])?;
+        Ok(())
+    }).unwrap();
+    f.store.read(|tx| {
+        let bounded = graph(tx.sql(), &parse(json!({"view":"loops"})), NOW)?;
+        assert_eq!(bounded["loops"]["candidates"]["total"], 102);
+        assert_eq!(bounded["loops"]["candidates"]["items"].as_array().unwrap().len(), 100);
+        let complete = graph(tx.sql(), &parse(json!({"view":"loops","all":true})), NOW)?;
+        assert_eq!(complete["too_large"], false);
+        assert_eq!(complete["loops"]["open"], 102);
+        assert_eq!(complete["loops"]["candidates"]["items"].as_array().unwrap().len(), 102);
+        let personal = graph(tx.sql(), &parse(json!({"view":"loops","all":true,"scope":"personal"})), NOW)?;
+        assert_eq!(personal["loops"]["candidates"]["total"], 101);
+        assert_eq!(personal["loops"]["candidates"]["items"].as_array().unwrap().len(), 101);
+        assert!(personal["loops"]["candidates"]["items"].as_array().unwrap().iter().all(|item|item["id"]!="loop-candidate-101" && item["id"]!="loop-candidate-102"));
+        assert_eq!(graph(tx.sql(), &parse(json!({"all":true})), NOW)?["loops"]["candidates"]["items"].as_array().unwrap().len(), 100);
+        Ok(())
+    }).unwrap();
 }
 #[test]
 fn literal_search_paging_conversation_unicode_and_unavailable_text() {

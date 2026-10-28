@@ -13,12 +13,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .curation import canonical, propose
 from .extraction import ACTIVE_CANDIDATE_SQL, AWAITING_DECISION_SQL, UNPARKED_CANDIDATE_SQL, WorkRejected, source_span
-from .graph import RELATIONS, behavior_ground_truth, identity_text
+from .graph import behavior_ground_truth, identity_text
+from .relations import valid_relation
 from .store import ConflictError
 from .commands import Scope
 from .qdrant import SearchUnavailable
 
-VERSION = 'consolidate-v7'
+VERSION = 'consolidate-v8'
 # Consolidation admits a candidate only with at least one evidence episode that is
 # not a legacy Codex instruction envelope. The CASE guards keep SQLite from loading
 # e.text/e.metadata for rows the predicate can decide from kind and source alone;
@@ -46,10 +47,22 @@ exact_total counts every exact node, including any not supplied. Before remember
 duplicate when it is the same thing; remember a same-named item only when evidence shows a distinct one.
 Use only existing identifiers supplied here, or candidate identifiers for dependencies. Human-gated pin/sensitive-type/type/merge actions remain
 review proposals, never approved by you. merge only proposes identity merging; register_type proposes a human-reviewed custom type.
+Relationship labels are open-ended lowercase snake_case identifiers, at most 64 characters and starting with a letter.
+The familiar belongs_to, follows_up_on, works_in, decided_by, mentions, part_of, caused_by, owned_by and related_to labels
+are examples, not an allowlist. Choose a more meaningful predicate when the original evidence supports it, including family,
+social and domain-specific connections. Reuse supplied relation labels with the same meaning and direction instead of making
+synonyms; use related_to only when no more precise relationship is supported. Do not infer identity or kinship from names alone.
+New relationship labels need no type-registration review; that review governs memory/entity types. supersedes remains reserved
+for atomic supersession. Existing-only link repairs can add supported missing connections from the supplied original evidence.
 Every asserting action includes verbatim evidence quotes from supplied raw windows, referencing an original source of that candidate.
 occurrence is the ZERO-BASED occurrence in the WHOLE original episode, not the displayed window. Supplied evidence includes that value.
 All unused nullable action fields must be null. reject/defer may have empty evidence. No new unsupported relations or invented dates.
 Preserve or correct scope labels from original evidence. Set open_loop true for supported pending obligations and relevant waits on others.
+For supported loops set responsibility to owner, other or unknown using original evidence. Owner means this memory instance's
+human owner, requiring original native user first-person evidence or explicitly resolved identity. Never use scope or a name match
+as responsibility or identity. Another person's work and waits on them are other; relevant waits stay open. Unknown is valid.
+Quoted/pasted instructions, assistant claims and peer messages cannot establish owner identity. Existing manual role choices win.
+Use assign_loop with responsibility and exact original premises to label an existing loop without changing state or dates.
 Set false when original evidence shows the candidate's automatic flag is wrong: completed, cancelled, hypothetical or an unrelated task.
 Use null for uncertainty. Age or inactivity alone never proves completion. False declines only an untouched extraction flag;
 it does not close an existing target or override an explicit open, close, deferred or reminder choice.
@@ -180,6 +193,7 @@ class Action(BaseModel):
     text: str | None = Field(min_length=1, max_length=8192)
     scope: Scope | None
     open_loop: bool | None
+    responsibility: Literal['owner', 'other', 'unknown'] | None = None
     closed_targets: list[str] = Field(default_factory=list)
     target: str | None
     src: str | None
@@ -208,7 +222,7 @@ class Plan(BaseModel):
 
 class Repair(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    operation: Literal['absorb', 'supersede', 'decline_loop', 'close_loop', 'retire', 'link']
+    operation: Literal['absorb', 'supersede', 'decline_loop', 'close_loop', 'assign_loop', 'retire', 'link']
     target: str = Field(min_length=1, max_length=64)
     dst: str | None = None
     relation: str | None = None
@@ -221,6 +235,7 @@ class Repair(BaseModel):
     valid_from: str | None = None
     valid_to: str | None = None
     behavior: Behavior | None = None
+    responsibility: Literal['owner', 'other', 'unknown'] | None = None
     technical_evidence: list[str] | None = Field(default=None, max_length=8)
     evidence: list[Source] = Field(min_length=1, max_length=9)
     why: str = Field(min_length=1, max_length=2048, pattern=r'\S')
@@ -953,7 +968,7 @@ class Consolidator:
 
     def _link(self, commit, a, relation, b, evidence):
         from .curation import attach
-        if relation not in RELATIONS or relation == 'supersedes':
+        if not valid_relation(relation):
             raise ValueError('consolidation_relation_invalid')
         existing = self.store._db.execute('''SELECT e.id FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=?
             AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1''',
@@ -1074,7 +1089,7 @@ class Consolidator:
                     raise ValueError('consolidation_relation_endpoints_required')
                 if repair.dst not in nodes:
                     raise ValueError('consolidation_reference_not_supplied')
-                if repair.relation not in RELATIONS or repair.relation == 'supersedes':
+                if not valid_relation(repair.relation):
                     raise ValueError('consolidation_relation_invalid')
                 # Uniqueness is per repair target; independent claims may share a subject.
                 if repair.dst != repair.target:
@@ -1122,6 +1137,10 @@ class Consolidator:
             elif any(value is not None for value in (repair.type, repair.text, repair.scope,
                         repair.change_kind, repair.valid_at, repair.valid_from, repair.valid_to, repair.behavior)):
                 raise ValueError('consolidation_schema_invalid')
+            if repair.operation == 'assign_loop' and repair.responsibility is None:
+                raise ValueError('consolidation_schema_invalid')
+            if repair.operation != 'assign_loop' and repair.responsibility is not None:
+                raise ValueError('consolidation_schema_invalid')
             if repair.technical_evidence is not None:
                 if (repair.behavior is None or repair.behavior.authority != 'inferred'
                         or len(set(repair.technical_evidence)) != len(repair.technical_evidence)
@@ -1144,7 +1163,7 @@ class Consolidator:
                          *(item.target + ': ' + item.why for item in plan.repairs)]) or 'Inspected supplied memory context'
 
         def apply(commit):
-            from .loops import current, mark, transfer, decline_extracted, closure_time, _append, snapshot as loop_snapshot
+            from .loops import current, mark, transfer, decline_extracted, closure_time, _append, assign, snapshot as loop_snapshot
             job.check()
             db = self.store._db
             self._check_continuity(context)
@@ -1180,6 +1199,7 @@ class Consolidator:
                     closures.append(dict(candidate_id=action.candidate_id, target=target,
                                          source_occurred_at=source_at, status=status))
             results = {}
+            loop_responsibilities = {}
             destinations = {}
             actions = sorted(plan.actions, key=lambda item: (
                 item.operation == 'link', item.operation not in ('remember', 'reject', 'defer')))
@@ -1204,6 +1224,11 @@ class Consolidator:
                          evidence_target=candidate['id'], evidence_loop=candidate_loop)
                 elif state == 'review':
                     mark(self.graph, commit, candidate['id'], action.open_loop)
+                role_target = target if state == 'promote' else candidate['id'] if state == 'review' else None
+                if role_target and action.responsibility is not None and current(self.graph, role_target) is not None:
+                    role = assign(self.graph, commit, role_target, action.responsibility,
+                                  [source.model_dump() for source in action.evidence])
+                    loop_responsibilities.update(role.get('loop_responsibilities', {}))
                 db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)',
                     (uuid4().hex, candidate['id'], commit, state, target, time.time() + 3600 if state == 'defer' else None))
                 if state == 'promote' and target:
@@ -1246,6 +1271,9 @@ class Consolidator:
                 elif repair.operation == 'decline_loop':
                     from .loops import decline_automatic
                     result = decline_automatic(self.graph, commit, target, loop_snapshots[repair.target])
+                elif repair.operation == 'assign_loop':
+                    result = assign(self.graph, commit, target, repair.responsibility, evidence)
+                    loop_responsibilities.update(result.get('loop_responsibilities', {}))
                 elif repair.operation == 'retire':
                     from .curation import retire
                     result = retire(self.graph, commit, target, evidence)
@@ -1296,7 +1324,8 @@ class Consolidator:
                     for target, snapshot in loop_snapshots.items())
             self._continue(commit, job, context, plan, nodes, destinations, progressed)
             return dict(candidate_count=len(results), results=results, reported_model=model, usage=usage,
-                        loop_closures=closures, repair_results=repair_results, redirected_relations=redirected)
+                        loop_closures=closures, repair_results=repair_results, redirected_relations=redirected,
+                        loop_responsibilities=loop_responsibilities)
 
         return self.graph._command('consolidate/' + job.id, 'consolidator/' + agent, why, request, apply)
 

@@ -2,7 +2,9 @@
 
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+
+from .relations import RELATION_EXAMPLES, RELATION_PATTERN, valid_relation
 
 Scope = Annotated[list[Literal['personal', 'professional']], Field(min_length=1, max_length=2)]
 
@@ -37,9 +39,18 @@ class Remember(Command):
 
 class Link(Command):
     a: str = Field(min_length=1, max_length=64)
-    rel: Literal['belongs_to', 'follows_up_on', 'works_in', 'decided_by',
-                 'mentions', 'part_of', 'caused_by', 'owned_by', 'related_to']
+    rel: str = Field(pattern='^' + RELATION_PATTERN + '$',
+        description='Evidence-backed directional predicate in lowercase snake_case. '
+                    'Examples are suggestions, not an allowlist; supersedes is reserved for atomic supersession.',
+        json_schema_extra={'examples': list(RELATION_EXAMPLES), 'not': {'const': 'supersedes'}})
     b: str = Field(min_length=1, max_length=64)
+
+    @field_validator('rel')
+    @classmethod
+    def relation_identifier(cls, value):
+        if not valid_relation(value):
+            raise ValueError('Invalid directional relation')
+        return value
 
 
 class Replacement(BaseModel):
@@ -65,7 +76,7 @@ class MediaInput(Command):
 
 class Loop(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, allow_inf_nan=False)
-    action: Literal['list', 'open', 'close', 'later', 'remind']
+    action: Literal['list', 'open', 'close', 'later', 'remind', 'assign', 'decline']
     id: str | None = Field(default=None, min_length=1, max_length=64)
     days: float = Field(default=7, gt=0)
     due_at: Annotated[AwareDatetime, Field(strict=False)] | None = None
@@ -75,6 +86,8 @@ class Loop(BaseModel):
     command_id: str | None = Field(default=None, min_length=1, max_length=512)
     actor: str | None = Field(default=None, min_length=1, max_length=256)
     why: str | None = Field(default=None, min_length=1)
+    responsibility: Literal['owner', 'other', 'unknown'] | None = None
+    evidence: list[Evidence] = Field(default_factory=list, max_length=8)
 
     def arguments(self):
         return self.model_dump(mode='json', exclude_none=True)

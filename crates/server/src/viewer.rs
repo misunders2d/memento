@@ -1,6 +1,7 @@
 //! Existing read-only viewer DTOs. Caller owns snapshot/HTTP Host/security headers.
 use crate::query_rows::{self, ACTIVE_CANDIDATE, one, rows};
 use memento_core::{Error, Result};
+use memento_domain::loops;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,6 +38,7 @@ pub struct GraphQuery {
     #[serde(default)]
     pub all: bool,
     pub id: Option<String>,
+    pub responsibility: Option<String>,
 }
 impl Default for GraphQuery {
     fn default() -> Self {
@@ -45,6 +47,7 @@ impl Default for GraphQuery {
             scope: None,
             all: false,
             id: None,
+            responsibility: None,
         }
     }
 }
@@ -115,7 +118,7 @@ fn within(item: &Value, scope: Option<&str>) -> bool {
     })
 }
 fn loop_value(row: &Value, now: &str) -> Value {
-    json!({"due_at":row["due_at"],"deferred":row["deferred_until"].as_str().is_some_and(|v|!v.is_empty()&&v>now),"overdue":row["due_at"].as_str().is_some_and(|v|!v.is_empty()&&v<now)})
+    json!({"due_at":row["due_at"],"deferred":row["deferred_until"].as_str().is_some_and(|v|!v.is_empty()&&v>now),"overdue":row["due_at"].as_str().is_some_and(|v|!v.is_empty()&&v<now),"responsibility":row["responsibility"].as_str().unwrap_or("unknown")})
 }
 fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String, Value>> {
     let owners = rows(
@@ -205,6 +208,9 @@ fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String,
 }
 pub fn graph(db: &Connection, q: &GraphQuery, now: &str) -> Result<Value> {
     scope(q.scope.as_deref())?;
+    if q.responsibility.as_deref().is_some_and(|value|!loops::valid_responsibility(value)) {
+        return Err(Error::Validation("Invalid loop responsibility"));
+    }
     if !["memories", "behaviors", "loops", "around"].contains(&q.view.as_str()) {
         return Err(Error::Validation("Invalid graph view"));
     }
@@ -252,19 +258,20 @@ pub fn graph(db: &Connection, q: &GraphQuery, now: &str) -> Result<Value> {
             node["behavior"] = behavior["authority"].clone();
         }
     }
-    for row in rows(
-        db,
-        &format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),
-        [],
-    )? {
-        let target = row["target"].as_str().unwrap();
-        if let Some(node) = nodes.get_mut(target) {
+    let markers = rows(db,&format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),[])?;
+    let roles = loops::responsibilities(db,&markers.iter().map(|row|row["target"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?;
+    for mut row in markers {
+        let target = row["target"].as_str().unwrap().to_owned();
+        let role=roles.get(&target).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown");
+        if q.responsibility.as_deref().is_some_and(|wanted|wanted!=role) { continue; }
+        row["responsibility"]=json!(role);
+        if let Some(node) = nodes.get_mut(&target) {
             node["loop"] = loop_value(&row, now);
         } else if let Some(edge) = edges.iter_mut().find(|e| e["id"] == target) {
             edge["loop"] = loop_value(&row, now);
         }
     }
-    let candidates=rows(db,&format!("SELECT c.id,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?.into_iter().map(|row|Ok(json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"loop":loop_value(&row,now)}))).collect::<Result<Vec<_>>>()?.into_iter().filter(|r|within(r,q.scope.as_deref())).collect::<Vec<_>>();
+    let candidates=loops::visible_loop_targets(db,rows(db,&format!("SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?)?.into_iter().map(|mut row|{row["responsibility"]=json!(roles.get(row["id"].as_str().unwrap()).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown"));Ok(json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"loop":loop_value(&row,now)}))}).collect::<Result<Vec<_>>>()?.into_iter().filter(|r|within(r,q.scope.as_deref())&&q.responsibility.as_deref().is_none_or(|wanted|r["loop"]["responsibility"]==wanted)).collect::<Vec<_>>();
     let mut looped = nodes
         .values()
         .filter(|n| within(n, q.scope.as_deref()) && !n["loop"].is_null())
@@ -281,7 +288,16 @@ pub fn graph(db: &Connection, q: &GraphQuery, now: &str) -> Result<Value> {
             .map(|e| e["loop"].clone()),
     );
     looped.extend(candidates.iter().map(|c| c["loop"].clone()));
-    let loops = json!({"open":looped.iter().filter(|l|l["deferred"]!=true).count(),"deferred":looped.iter().filter(|l|l["deferred"]==true).count(),"candidates":{"total":candidates.len(),"items":candidates.iter().take(100).cloned().collect::<Vec<_>>()}});
+    let full_candidate_loops = q.all && q.view == "loops";
+    let candidate_overflow = full_candidate_loops && candidates.len() > MAX_NODES;
+    let candidate_limit = if candidate_overflow {
+        0
+    } else if full_candidate_loops {
+        MAX_NODES
+    } else {
+        100
+    };
+    let loops = json!({"open":looped.iter().filter(|l|l["deferred"]!=true).count(),"deferred":looped.iter().filter(|l|l["deferred"]==true).count(),"candidates":{"total":candidates.len(),"items":candidates.iter().take(candidate_limit).cloned().collect::<Vec<_>>()}});
     nodes.retain(|_, n| within(n, q.scope.as_deref()));
     order.retain(|id| nodes.contains_key(id));
     let mut focus = HashSet::new();
@@ -319,7 +335,7 @@ pub fn graph(db: &Connection, q: &GraphQuery, now: &str) -> Result<Value> {
         }
         _ => (),
     }
-    let chosen = if q.all {
+    let chosen = if q.all && !(q.view == "loops" && q.responsibility.is_some()) {
         nodes.keys().cloned().collect::<HashSet<_>>()
     } else if q.view == "memories" {
         let mut ranked = order.clone();
@@ -351,8 +367,9 @@ pub fn graph(db: &Connection, q: &GraphQuery, now: &str) -> Result<Value> {
         }
         chosen
     };
-    let mut result = json!({"view":q.view,"total_nodes":nodes.len(),"total_edges":edges.iter().filter(|e|nodes.contains_key(e["src"].as_str().unwrap())&&nodes.contains_key(e["dst"].as_str().unwrap())).count(),"loops":loops,"too_large":chosen.len()>MAX_NODES,"nodes":[],"edges":[]});
-    if chosen.len() > MAX_NODES {
+    let too_large = chosen.len() > MAX_NODES || candidate_overflow;
+    let mut result = json!({"view":q.view,"total_nodes":nodes.len(),"total_edges":edges.iter().filter(|e|nodes.contains_key(e["src"].as_str().unwrap())&&nodes.contains_key(e["dst"].as_str().unwrap())).count(),"loops":loops,"too_large":too_large,"nodes":[],"edges":[]});
+    if too_large {
         return Ok(result);
     }
     let sorted = chosen.iter().cloned().collect::<BTreeSet<_>>();
@@ -384,13 +401,14 @@ pub fn node(db: &Connection, id: &str, now: &str) -> Result<Value> {
         [id],
     )?
     .ok_or(Error::NotFound("Memory not found"))?;
-    let event = one(
+    let mut event = one(
         db,
         &format!(
             "SELECT l.due_at,l.deferred_until FROM loop_events l WHERE l.target=? AND {OPEN_LOOP}"
         ),
         [id],
     )?;
+    if let Some(event)=event.as_mut(){event["responsibility"]=json!(loops::responsibility(db,id)?);}
     let links = rows(
         db,
         &format!(

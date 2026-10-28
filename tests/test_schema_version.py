@@ -38,6 +38,29 @@ def header(path):
         return db.execute('PRAGMA user_version').fetchone()[0]
 
 
+def test_loop_lineage_indexes_upgrade_without_changing_evidence_or_header(tmp_path):
+    data = tmp_path / 'data'
+    store, original = compressed_store(data)
+    store.close()
+    path = data / 'memory.sqlite'
+    before = physical_rows(path)
+    with closing(sqlite3.connect(path)) as db:
+        db.execute('DROP INDEX node_versions_superseded_by')
+        db.execute('DROP INDEX candidate_decisions_promoted_target')
+        db.commit()
+        schema_before = db.execute('PRAGMA schema_version').fetchone()[0]
+    store = Store(data)
+    assert store.get(original['id']) == original
+    assert store._db.execute('PRAGMA user_version').fetchone()[0] == VERSION
+    schema_after = store._db.execute('PRAGMA schema_version').fetchone()[0]
+    assert schema_after == schema_before + 2
+    store.close()
+    reopened = Store(data)
+    assert reopened._db.execute('PRAGMA schema_version').fetchone()[0] == schema_after
+    reopened.close()
+    assert physical_rows(path) == before
+
+
 def set_header(path, version):
     with closing(sqlite3.connect(path)) as db:
         db.execute(f'PRAGMA user_version={version}')

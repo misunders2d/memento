@@ -908,7 +908,7 @@ fn stored_legacy_instruction_candidate_stays_searchable_but_never_enters_model_w
         .consolidator
         .apply(
             &job,
-            &json!({"loop_policy_version":"consolidate-v7","candidates":[{"id":"c_legacy"}]}),
+            &json!({"loop_policy_version":consolidation::VERSION,"candidates":[{"id":"c_legacy"}]}),
             &json!({"malformed":true}),
             "fixture",
             None,

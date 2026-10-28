@@ -374,6 +374,7 @@ def initialize(db):
     upgrade_captured_media(db)
     upgrade_historical_pool(db)
     upgrade_repair_groups(db)
+    upgrade_loop_responsibility_indexes(db)
     for table, predicate in _IMMUTABLE_KEYS.items():
         for operation in ("UPDATE", "DELETE"):
             db.execute(f"""CREATE TRIGGER {table}_no_{operation} BEFORE {operation} ON {table}
@@ -468,3 +469,18 @@ def upgrade_status_index(db):
     started = time.perf_counter()
     db.execute(_EPISODES_STATUS_INDEX)
     log.warning('Episode status index build completed in %.3f seconds', time.perf_counter() - started)
+
+
+def upgrade_loop_responsibility_indexes(db):
+    """Reverse lineage lookups are derived indexes, not authority migrations."""
+    statements = (
+        'CREATE INDEX IF NOT EXISTS node_versions_superseded_by '
+        'ON node_versions(superseded_by,id) WHERE superseded_by IS NOT NULL',
+        'CREATE INDEX IF NOT EXISTS candidate_decisions_promoted_target '
+        "ON candidate_decisions(target_id,candidate_id) WHERE decision='promote'",
+    )
+    present = db.execute("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN "
+        "('node_versions_superseded_by','candidate_decisions_promoted_target')").fetchone()[0]
+    if present != 2:
+        for statement in statements:
+            db.execute(statement)

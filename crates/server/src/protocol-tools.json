@@ -474,7 +474,8 @@
               "type": "string"
             },
             "rel": {
-              "enum": [
+              "description": "Evidence-backed directional predicate in lowercase snake_case. Examples are suggestions, not an allowlist; supersedes is reserved for atomic supersession.",
+              "examples": [
                 "belongs_to",
                 "follows_up_on",
                 "works_in",
@@ -485,6 +486,10 @@
                 "owned_by",
                 "related_to"
               ],
+              "not": {
+                "const": "supersedes"
+              },
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
               "type": "string"
             },
             "b": {
@@ -739,7 +744,7 @@
   {
     "name": "loop",
     "title": "Loop",
-    "description": "List or adjust a memory's loop marker; only remind sets an explicit reminder time.",
+    "description": "List/filter loops or adjust markers. assign labels responsibility; decline retracts an automatic false marker. Evidence-bearing close checks original chronology; only remind sets a reminder.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -749,7 +754,9 @@
             "open",
             "close",
             "later",
-            "remind"
+            "remind",
+            "assign",
+            "decline"
           ],
           "type": "string"
         },
@@ -852,6 +859,72 @@
         "limit": {
           "default": 20,
           "type": "integer"
+        },
+        "responsibility": {
+          "anyOf": [
+            {
+              "enum": [
+                "owner",
+                "other",
+                "unknown",
+                ""
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "evidence": {
+          "anyOf": [
+            {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "episode_id": {
+                    "anyOf": [
+                      {
+                        "maxLength": 64,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null
+                  },
+                  "quote": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "occurrence": {
+                    "anyOf": [
+                      {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null
+                  }
+                },
+                "required": [
+                  "quote"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [

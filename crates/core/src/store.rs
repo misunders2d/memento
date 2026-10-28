@@ -173,6 +173,16 @@ impl Store {
             tx.execute_batch(include_str!("candidate_relation_indexes.sql"))?;
             tx.commit()?;
         }
+        let loop_indexes: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('node_versions_superseded_by','candidate_decisions_promoted_target')",
+            [],
+            |r| r.get(0),
+        )?;
+        if loop_indexes != 2 {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("loop_responsibility_indexes.sql"))?;
+            tx.commit()?;
+        }
         let blobs = crate::blobs::BlobStore::new(directory.join("blobs"))?;
         Ok(Arc::new(Self {
             blobs,

@@ -13,10 +13,22 @@ exact_total counts every exact node, including any not supplied. Before remember
 duplicate when it is the same thing; remember a same-named item only when evidence shows a distinct one.
 Use only existing identifiers supplied here, or candidate identifiers for dependencies. Human-gated pin/sensitive-type/type/merge actions remain
 review proposals, never approved by you. merge only proposes identity merging; register_type proposes a human-reviewed custom type.
+Relationship labels are open-ended lowercase snake_case identifiers, at most 64 characters and starting with a letter.
+The familiar belongs_to, follows_up_on, works_in, decided_by, mentions, part_of, caused_by, owned_by and related_to labels
+are examples, not an allowlist. Choose a more meaningful predicate when the original evidence supports it, including family,
+social and domain-specific connections. Reuse supplied relation labels with the same meaning and direction instead of making
+synonyms; use related_to only when no more precise relationship is supported. Do not infer identity or kinship from names alone.
+New relationship labels need no type-registration review; that review governs memory/entity types. supersedes remains reserved
+for atomic supersession. Existing-only link repairs can add supported missing connections from the supplied original evidence.
 Every asserting action includes verbatim evidence quotes from supplied raw windows, referencing an original source of that candidate.
 occurrence is the ZERO-BASED occurrence in the WHOLE original episode, not the displayed window. Supplied evidence includes that value.
 All unused nullable action fields must be null. reject/defer may have empty evidence. No new unsupported relations or invented dates.
 Preserve or correct scope labels from original evidence. Set open_loop true for supported pending obligations and relevant waits on others.
+For supported loops set responsibility to owner, other or unknown using original evidence. Owner means this memory instance's
+human owner, requiring original native user first-person evidence or explicitly resolved identity. Never use scope or a name match
+as responsibility or identity. Another person's work and waits on them are other; relevant waits stay open. Unknown is valid.
+Quoted/pasted instructions, assistant claims and peer messages cannot establish owner identity. Existing manual role choices win.
+Use assign_loop with responsibility and exact original premises to label an existing loop without changing state or dates.
 Set false when original evidence shows the candidate's automatic flag is wrong: completed, cancelled, hypothetical or an unrelated task.
 Use null for uncertainty. Age or inactivity alone never proves completion. False declines only an untouched extraction flag;
 it does not close an existing target or override an explicit open, close, deferred or reminder choice.

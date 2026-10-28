@@ -5,7 +5,7 @@ from pydantic import AwareDatetime, BeforeValidator
 from fastmcp import FastMCP
 from fastmcp.tools.base import ToolResult
 
-from .commands import Link, Loop, MediaInput, Remember, Supersede
+from .commands import Evidence, Link, Loop, MediaInput, Remember, Supersede
 
 
 def _empty_as_none(value):
@@ -24,6 +24,7 @@ def _omit_empty_fields(value):
 _OptionalDate = Annotated[AwareDatetime | Literal[''] | None, BeforeValidator(_empty_as_none)]
 _OptionalString = Annotated[str | None, BeforeValidator(_empty_as_none)]
 _OptionalScope = Annotated[Literal['personal', 'professional', ''] | None, BeforeValidator(_empty_as_none)]
+_OptionalResponsibility = Annotated[Literal['owner', 'other', 'unknown', ''] | None, BeforeValidator(_empty_as_none)]
 
 
 def recall_memories(state, query='', effort='normal', limit=10, *, scope=None,
@@ -111,16 +112,18 @@ def create_mcp(state):
         return versions
 
     @mcp.tool
-    def loop(action: Literal['list', 'open', 'close', 'later', 'remind'],
+    def loop(action: Literal['list', 'open', 'close', 'later', 'remind', 'assign', 'decline'],
              id: _OptionalString = None, days: float = 7,
              due_at: _OptionalDate = None, due_before: _OptionalDate = None,
              scope: _OptionalScope = None,
              command_id: _OptionalString = None, actor: _OptionalString = None,
-             why: _OptionalString = None, limit: int = 20) -> dict:
-        """List or adjust a memory's loop marker; only remind sets an explicit reminder time."""
+             why: _OptionalString = None, limit: int = 20,
+             responsibility: _OptionalResponsibility = None,
+             evidence: list[Evidence] | None = None) -> dict:
+        """List/filter loops or adjust markers. assign labels responsibility; decline retracts an automatic false marker. Evidence-bearing close checks original chronology; only remind sets a reminder."""
         command = Loop(action=action, id=id, days=days, due_at=due_at,
                        due_before=due_before, scope=scope, command_id=command_id,
-                       actor=actor, why=why, limit=limit)
+                       actor=actor, why=why, limit=limit, responsibility=responsibility, evidence=evidence or [])
         arguments = command.arguments()
         if action == 'list':
             arguments.pop('id', None)

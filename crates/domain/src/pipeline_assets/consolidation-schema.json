@@ -113,6 +113,23 @@
           ],
           "title": "Relation"
         },
+        "responsibility": {
+          "anyOf": [
+            {
+              "enum": [
+                "owner",
+                "other",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Responsibility"
+        },
         "scope": {
           "anyOf": [
             {
@@ -387,6 +404,7 @@
             "supersede",
             "decline_loop",
             "close_loop",
+            "assign_loop",
             "retire",
             "link"
           ],
@@ -404,6 +422,23 @@
           ],
           "default": null,
           "title": "Relation"
+        },
+        "responsibility": {
+          "anyOf": [
+            {
+              "enum": [
+                "owner",
+                "other",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Responsibility"
         },
         "scope": {
           "anyOf": [

@@ -128,6 +128,53 @@ fn existing_only_link_preserves_scope_and_original_evidence() {
 }
 
 #[test]
+fn open_predicate_extracts_and_promotes_without_type_registration() {
+    let f = Fixture::new();
+    let (work, mut output, episode) = extraction(&f);
+    output["windows"][0]["candidates"][2]["type"] = json!("describes");
+    f.complete(&work, output).unwrap();
+    let work = f.consolidate_work();
+    let candidates = work["input"]["candidates"].as_array().unwrap();
+    let claim = candidates.iter().find(|c| c["kind"] == "memory").unwrap();
+    let subject = candidates.iter().find(|c| c["kind"] == "entity").unwrap();
+    let relation = candidates.iter().find(|c| c["kind"] == "relation").unwrap();
+    let mut link = action(relation, "link");
+    for field in ["type", "text", "scope"] { link[field] = Value::Null; }
+    link["src"] = claim["id"].clone();
+    link["dst"] = subject["id"].clone();
+    link["relation"] = json!("describes");
+    let result = f.complete(&work, json!({"actions":[link,action(claim,"remember"),action(subject,"remember")]})).unwrap();
+    let edge = f.graph.history(result["results"][relation["id"].as_str().unwrap()]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(edge[0]["rel"], "describes");
+    assert_eq!(edge[0]["src"], result["results"][claim["id"].as_str().unwrap()]["id"]);
+    assert_eq!(edge[0]["dst"], result["results"][subject["id"].as_str().unwrap()]["id"]);
+    assert_eq!(edge[0]["evidence"][0]["episode_id"], episode);
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM review_proposals"), 0);
+}
+
+#[test]
+fn open_predicate_existing_repair_and_explicit_link_keep_authority_fences() {
+    let f = Fixture::new();
+    let (episode, claim, entity) = existing_pair(&f, false);
+    let work = maintained_work(&f, &claim, &entity);
+    let mut proposed = repair(&episode, &claim, &entity);
+    proposed["relation"] = json!("describes");
+    let result = f.complete(&work, json!({"actions":[],"repairs":[proposed]})).unwrap();
+    let id = result["repair_results"][&claim]["id"].as_str().unwrap();
+    assert_eq!(f.graph.history(id).unwrap()[0]["rel"], "describes");
+    let commits = f.stored::<i64>("SELECT count(*) FROM graph_commits");
+    for (index, rel) in ["", "has sister", "Parent_of", "parent-of", "supersedes", &"a".repeat(65)].iter().enumerate() {
+        let request = json!({"command_id":format!("invalid-open-{index}"),"actor":"owner","why":"Invalid predicate must not mutate graph","a":claim,"rel":rel,"b":entity,"evidence":[{"episode_id":episode,"quote":CLAIM}]});
+        assert!(f.graph.link(serde_json::from_value(request).unwrap()).is_err());
+        assert_eq!(f.stored::<i64>("SELECT count(*) FROM graph_commits"), commits);
+    }
+    pin(&f, &entity);
+    let linked = f.graph.link(serde_json::from_value(json!({"command_id":"protected-new-predicate","actor":"owner","why":"New predicate cannot bypass existing protection","a":claim,"rel":"is_about","b":entity,"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap()).unwrap();
+    assert_eq!(linked["status"], "pending_review");
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM edge_versions WHERE rel='is_about'"), 0);
+}
+
+#[test]
 fn existing_link_rejects_unsupplied_evidence_scope_forgetting_and_stale_versions_atomically() {
     for defect in ["unknown", "relation-endpoint", "empty-evidence", "invented-quote", "scope", "forgotten", "stale-version", "missing-dst", "supersedes"] {
         let f = Fixture::new();

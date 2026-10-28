@@ -58,6 +58,146 @@ fn capture(text: &str) -> Value {
     json!({"source":"native:synthetic:pi","event_id":"one","conversation_id":"thread","kind":"user","text":text,"occurred_at":"2026-01-01T12:00:00+02:00","metadata":{}})
 }
 #[tokio::test]
+async fn open_directional_predicates_work_over_http_mcp_and_advertised_schemas() {
+    let (_dir, state) = fixture();
+    let (_, episode) = request(
+        &state,
+        "POST",
+        "/episodes",
+        Some(capture("Rhea is the parent of Sol.")),
+    )
+    .await;
+    let mut nodes = Vec::new();
+    for name in ["Rhea", "Sol"] {
+        let (status, node) = request(&state, "POST", "/remember", Some(json!({
+            "command_id":format!("person-{name}"),"actor":"fixture","why":"Explicit synthetic person",
+            "type":"person","text":name,"scope":["personal"],
+            "evidence":[{"episode_id":episode["id"],"quote":"Rhea is the parent of Sol."}]
+        }))).await;
+        assert_eq!(status, StatusCode::OK);
+        nodes.push(node["id"].clone());
+    }
+    let command = json!({"command_id":"family-link","actor":"fixture","why":"Explicit synthetic direction",
+        "a":nodes[0],"rel":"parent_of","b":nodes[1],
+        "evidence":[{"episode_id":episode["id"],"quote":"Rhea is the parent of Sol."}]});
+    let (status, linked) = request(&state, "POST", "/link", Some(command.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    let retried = rpc(
+        &state,
+        "tools/call",
+        json!({"name":"link","arguments":{"command":command}}),
+    )
+    .await
+    .1;
+    assert_eq!(retried["result"]["isError"], false);
+    assert_eq!(retried["result"]["structuredContent"], linked);
+    let (_, history) = request(
+        &state,
+        "GET",
+        &format!("/history/{}", linked["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(history["versions"][0]["src"], nodes[0]);
+    assert_eq!(history["versions"][0]["dst"], nodes[1]);
+    assert_eq!(history["versions"][0]["rel"], "parent_of");
+    assert_eq!(
+        history["versions"][0]["evidence"][0]["episode_id"],
+        episode["id"]
+    );
+    let advertised = rpc(&state, "tools/list", json!({})).await.1;
+    let link = advertised["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "link")
+        .unwrap();
+    let predicate = &link["inputSchema"]["properties"]["command"]["properties"]["rel"];
+    assert_eq!(predicate["type"], "string");
+    assert!(predicate.get("enum").is_none());
+    assert_eq!(predicate["not"]["const"], "supersedes");
+    let mut invalid = command;
+    invalid["command_id"] = json!("reserved");
+    invalid["rel"] = json!("supersedes");
+    let rejected = rpc(
+        &state,
+        "tools/call",
+        json!({"name":"link","arguments":{"command":invalid}}),
+    )
+    .await
+    .1;
+    assert_eq!(rejected["result"]["isError"], true);
+}
+#[tokio::test]
+async fn loop_owner_assignment_and_filter_work_through_http_and_mcp() {
+    let (_dir, state) = fixture();
+    let quote = "I still need to send the Orion checklist.";
+    let (_, episode) = request(&state, "POST", "/episodes", Some(capture(quote))).await;
+    let (_, memory) = request(
+        &state,
+        "POST",
+        "/remember",
+        Some(json!({
+            "command_id":"owner-task","actor":"fixture","why":"Explicit synthetic obligation",
+            "type":"knowledge","text":quote,"scope":["professional"],
+            "evidence":[{"episode_id":episode["id"],"quote":quote}]
+        })),
+    )
+    .await;
+    let (status, opened) = request(&state, "POST", "/loop", Some(json!({
+        "action":"open","id":memory["id"],"command_id":"open-owner-task","actor":"fixture","why":"Explicit synthetic obligation"
+    }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let assignment = json!({"action":"assign","id":memory["id"],"responsibility":"owner",
+        "command_id":"assign-owner-task","actor":"fixture","why":"Original first-person native user quote",
+        "evidence":[{"episode_id":episode["id"],"quote":quote}]});
+    let assigned = rpc(
+        &state,
+        "tools/call",
+        json!({"name":"loop","arguments":assignment}),
+    )
+    .await
+    .1;
+    assert_eq!(assigned["result"]["isError"], false);
+    let value = &assigned["result"]["structuredContent"];
+    assert_eq!(value["responsibility"], "owner");
+    for field in ["state", "due_at", "deferred_until"] {
+        assert_eq!(value[field], opened[field]);
+    }
+    let listed = rpc(
+        &state,
+        "tools/call",
+        json!({"name":"loop","arguments":{
+            "action":"list","responsibility":"owner","evidence":null
+        }}),
+    )
+    .await
+    .1;
+    assert_eq!(listed["result"]["isError"], false);
+    assert_eq!(listed["result"]["structuredContent"]["total"], 1);
+    assert_eq!(
+        listed["result"]["structuredContent"]["loops"][0]["id"],
+        memory["id"]
+    );
+    let (_, history) = request(
+        &state,
+        "GET",
+        &format!("/history/{}", memory["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    let event = history["versions"][0]["loop_events"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(event["assignment"]["responsibility"], "owner");
+    assert_eq!(
+        event["assignment"]["evidence"][0]["episode_id"],
+        episode["id"]
+    );
+}
+#[tokio::test]
 async fn actual_http_capture_graph_raw_recall_and_history_share_one_authority() {
     let (_dir, state) = fixture();
     let (status, created) = request(
@@ -208,7 +348,10 @@ async fn actual_mcp_scoped_recall_validates_since_before_dispatch() {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(response["result"]["isError"], is_error, "{query:?} {since:?}");
+        assert_eq!(
+            response["result"]["isError"], is_error,
+            "{query:?} {since:?}"
+        );
         if is_error {
             assert!(response["result"].get("structuredContent").is_none());
             assert_eq!(

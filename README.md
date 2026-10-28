@@ -461,10 +461,10 @@ The six MCP tools are:
 | --- | --- |
 | `recall` | Semantic memory search, or recent/literal raw evidence |
 | `remember` | Explicit evidence-backed save |
-| `link` | Connect memories |
+| `link` | Connect memories with an evidence-backed directional predicate |
 | `supersede` | Correct, refine or record a world-time change |
 | `history` | Inspect versions, differences, reasons and evidence |
-| `loop` | List/open/close/defer open loops or set an explicit reminder time |
+| `loop` | List, assign responsibility, open, close, decline false markers, defer or set an explicit reminder time |
 
 `recall(query, effort="normal", scope=...)` performs semantic retrieval; effort can be `cheap`, `normal` or `deep`. Omit the query for recent raw activity; use aware ISO `since` or `source` for literal raw evidence filtering. Raw history has no inferred personal/professional scope.
 
@@ -472,7 +472,13 @@ Memory age affects ranking, not deletion or availability in normal searches. Rec
 
 Explicit saves require **nonempty verbatim quotes**, with zero-based `occurrence` for repeats; native hooks resolve current-conversation provenance. Mutations require a stable `command_id`, `actor` and `why`. Reuse a command ID only for an identical retry. Save/replacement scopes are `["personal"]`, `["professional"]` or both. World-time changes require an aware `valid_at`. Native/MCP empty optional strings are treated as omitted; required text and invalid nonempty dates still fail validation. HTTP commands remain strict.
 
+Relation names are open-ended lowercase snake_case identifiers, starting with a letter and at most 64 characters. Existing names such as `part_of`, `mentions` and `related_to` are examples. Agents should choose the most specific source-supported meaning and preserve its direction; `parent_of` and `has_sister` need actual kinship evidence. No relation registration is needed. `supersedes` remains reserved for atomic correction/refinement/world-change operations.
+
 Open loops are markers on ordinary memories. Extraction can suggest a pending obligation or a relevant wait on someone else; these remain visibly unconfirmed until consolidation. Nightly consolidation can combine repeated evidence for the same obligation, decline an incorrect automatic flag, and close an existing obligation when exact, dated evidence establishes its completion or cancellation. Different obligations stay separate. Age and inactivity alone never close a loop, and uncertain or older completion evidence leaves it open. A newer human loop choice makes a stale consolidation plan re-evaluate before applying; genuinely newer evidence can reopen a completed obligation.
+
+Loop responsibility is `owner`, `other` or `unknown`, displayed as **For owner**, **Other person** or **Unspecified** in the viewer. The owner is the human owning this memory instance; personal/professional scope does not establish responsibility. Existing loops start unspecified until supporting evidence establishes a role. `loop(action="assign", responsibility=..., evidence=...)` records an exact-source attribution without changing the obligation's state, dates or deferral; `loop(action="list", responsibility="owner")` and the viewer filter select owner obligations. Original native user evidence must ground owner attribution; quoted messages and assistant reports cannot establish owner identity. Manual attributions survive automatic processing and identity transfers.
+
+For a historical audit, `loop(action="close", evidence=...)` closes only when original source times establish completion newer than the pending evidence and manual choice; `loop(action="decline", evidence=...)` retracts only an untouched automatic marker whose original premises prove it was never an obligation. These grounded repairs cover memories, relations and pending candidates, preserve protected choices, and retain their exact references in history. Omitting evidence from `close` keeps the ordinary explicit manual-close behavior. An evidence-bearing repair that is protected or chronologically uncertain reports that status and leaves the loop open.
 
 To save one explicitly, tell your agent, for example: “Remember this as an open loop: I still need to send Mira the release checklist.” The agent saves the quoted statement with `remember`, then uses `loop` to open its memory ID. Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence.
 

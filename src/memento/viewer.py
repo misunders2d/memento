@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from .extraction import ACTIVE_CANDIDATE_SQL
 from .graph import commit_behaviors
+from .loops import responsibilities, responsibility as loop_responsibility, visible_loop_targets
 from .raw_text import RawTextUnavailable
 
 UI = Path(__file__).with_name('ui')
@@ -50,8 +51,9 @@ def _json(request, value):
 
 
 def _loop(row, now):
+    row = dict(row)
     return dict(due_at=row['due_at'], deferred=bool(row['deferred_until'] and row['deferred_until'] > now),
-                overdue=bool(row['due_at'] and row['due_at'] < now))
+                overdue=bool(row['due_at'] and row['due_at'] < now), responsibility=row.get('responsibility', 'unknown'))
 
 
 def _behaviors(db, ids=None):
@@ -69,7 +71,7 @@ def _behaviors(db, ids=None):
     return behaviors
 
 
-def _graph(db, scope, now):
+def _graph(db, scope, now, *, full_candidate_loops=False, responsibility=None):
     nodes = {}
     for row in db.execute(f'''SELECT n.id,n.type,substr(n.text,1,240) AS text,n.scope,n.pinned,c.recorded_at,
             coalesce(s.importance,0.5)*coalesce(s.decay,1) AS weight FROM node_versions n
@@ -85,22 +87,29 @@ def _graph(db, scope, now):
     for node, behavior in _behaviors(db).items():
         if node in nodes:
             nodes[node]['behavior'] = behavior['authority']
-    for row in db.execute(f'SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}'):
+    markers = db.execute(f'SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}').fetchall()
+    roles = responsibilities(db, [row['target'] for row in markers])
+    for raw in markers:
+        row = dict(raw, responsibility=roles.get(raw['target'], {}).get('responsibility', 'unknown'))
+        if responsibility is not None and row['responsibility'] != responsibility:
+            continue
         holder = nodes.get(row['target']) or edges.get(row['target'])
         if holder is not None:
             holder['loop'] = _loop(row, now)
     candidates = [dict(id=row['id'], label=_label(row['text']), scope=json.loads(row['scope']),
-                       loop=_loop(row, now)) for row in db.execute(f'''SELECT c.id,substr(c.text,1,240) AS text,
+                       loop=_loop(dict(row, responsibility=roles.get(row['id'], {}).get('responsibility', 'unknown')), now)) for row in visible_loop_targets(db, db.execute(f'''SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,
         c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target
-        WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE_SQL} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC''')]
+        WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE_SQL} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC''').fetchall())]
     within = lambda item: scope is None or scope in item['scope']
     edge_within = lambda edge: within(nodes[edge['src']]) or within(nodes[edge['dst']])
-    candidates = [item for item in candidates if within(item)]
+    candidates = [item for item in candidates if within(item)
+                  and (responsibility is None or item['loop']['responsibility'] == responsibility)]
     looped = [item['loop'] for item in nodes.values() if item['loop'] and within(item)]
     looped += [edge['loop'] for edge in edges.values() if edge['loop'] and edge_within(edge)]
     looped += [item['loop'] for item in candidates]
+    candidate_limit = (0 if len(candidates) > MAX_NODES else MAX_NODES) if full_candidate_loops else 100
     loops = dict(open=sum(not loop['deferred'] for loop in looped), deferred=sum(loop['deferred'] for loop in looped),
-                 candidates=dict(total=len(candidates), items=candidates[:100]))
+                 candidates=dict(total=len(candidates), items=candidates[:candidate_limit]))
     return {key: value for key, value in nodes.items() if within(value)}, edges, loops
 
 
@@ -141,10 +150,12 @@ def install(app, allowed_hosts):
 
     @router.get('/api/graph')
     def graph(request: Request, view: Literal['memories', 'behaviors', 'loops', 'around'] = 'memories',
-              scope: Scope = None, all: bool = False, id: str | None = None):
+              scope: Scope = None, all: bool = False, id: str | None = None,
+              responsibility: Literal['owner', 'other', 'unknown'] | None = None):
         now = datetime.now(timezone.utc).isoformat()
         with app.state.store.read_snapshot() as db:
-            nodes, edges, loops = _graph(db, scope, now)
+            nodes, edges, loops = _graph(db, scope, now, full_candidate_loops=all and view == 'loops',
+                                         responsibility=responsibility)
         focus = set()
         if view == 'behaviors':
             focus = {key for key, value in nodes.items() if value['behavior']}
@@ -157,7 +168,7 @@ def install(app, allowed_hosts):
             if id not in nodes:
                 raise HTTPException(404, 'Memory not found in this scope')
             focus = {id}
-        if all:
+        if all and not (view == 'loops' and responsibility is not None):
             chosen = set(nodes)
         elif view == 'memories':
             ranked = sorted(nodes.values(), key=lambda item: (-item['weight'], item['id']))
@@ -167,7 +178,7 @@ def install(app, allowed_hosts):
             chosen = _neighbors(nodes, edges, focus)
         result = dict(view=view, total_nodes=len(nodes), total_edges=sum(
             edge['src'] in nodes and edge['dst'] in nodes for edge in edges.values()), loops=loops)
-        if len(chosen) > MAX_NODES:
+        if len(chosen) > MAX_NODES or (all and view == 'loops' and loops['candidates']['total'] > MAX_NODES):
             return _json(request, dict(result, too_large=True, nodes=[], edges=[]))
         return _json(request, dict(result, too_large=False,
             nodes=[dict(nodes[key], focus=key in focus) for key in sorted(chosen)],
@@ -182,6 +193,8 @@ def install(app, allowed_hosts):
                 raise HTTPException(404, 'Memory not found')
             loop = db.execute(f'SELECT l.due_at,l.deferred_until FROM loop_events l WHERE l.target=? AND {OPEN_LOOP}',
                               (node_id,)).fetchone()
+            if loop:
+                loop = dict(loop, responsibility=loop_responsibility(db, node_id))
             links = [dict(row) for row in db.execute(f'''SELECT e.rel,e.src,e.dst,n.id,n.type,
                 substr(n.text,1,240) AS text FROM edge_versions e JOIN node_versions n
                 ON n.id=CASE WHEN e.src=:id THEN e.dst ELSE e.src END

@@ -109,6 +109,10 @@ pub struct Loop {
     pub actor: Option<String>,
     #[serde(default)]
     pub why: Option<String>,
+    #[serde(default)]
+    pub responsibility: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

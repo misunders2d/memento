@@ -327,9 +327,13 @@ fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String
                 serde_json::to_string(&versions)?,
             ));
         }
-        "loop" => state
-            .graph
-            .loop_command(parse::<dto::Loop>(omit_empty(arguments))?)?,
+        "loop" => {
+            let mut command=omit_empty(arguments);
+            if let Some(fields)=command.as_object_mut(){
+                if fields.get("evidence").is_some_and(Value::is_null){fields.remove("evidence");}
+            }
+            state.graph.loop_command(parse::<dto::Loop>(command)?)?
+        },
         _ => return Err(Error::Validation("Unknown memory tool")),
     };
     let text = serde_json::to_string(&value)?;

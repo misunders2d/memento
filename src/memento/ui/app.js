@@ -6,7 +6,7 @@ const TYPE_COLORS = ['#9b59d0', '#2f6fde', '#d64545', '#7a8c99', '#2e9e6a', '#0f
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const $ = id => document.getElementById(id);
 
-const state = {view: 'memories', scope: '', all: false, data: null, graph: null, renderer: null,
+const state = {view: 'memories', scope: '', responsibility: '', all: false, data: null, graph: null, renderer: null,
   selected: null, matches: new Set(), focus: new Set(), moved: new Set(), dragging: null, dragged: false,
   conv: 0, cand: 0, candQuery: ''};
 const worker = new Worker('static/layout-worker.js');
@@ -38,7 +38,8 @@ async function api(path, params) {
 const typeColor = type => TYPE_COLORS[TYPES.indexOf(type)] || css('--muted');
 const when = value => value ? new Date(value).toLocaleString() : '';
 const loopColor = loop => loop.deferred ? css('--deferred') : loop.overdue ? css('--overdue') : loop.due_at ? css('--due') : css('--open');
-const loopText = loop => loop.deferred ? 'deferred' : loop.overdue ? `overdue since ${when(loop.due_at)}` : loop.due_at ? `due ${when(loop.due_at)}` : 'open, no date';
+const roleText = role => ({owner: 'For owner', other: 'Other person', unknown: 'Unspecified'}[role] || 'Unspecified');
+const loopText = loop => `${roleText(loop.responsibility)} · ${loop.deferred ? 'deferred' : loop.overdue ? `overdue since ${when(loop.due_at)}` : loop.due_at ? `due ${when(loop.due_at)}` : 'open, no date'}`;
 const harness = source => source.split(':').pop();
 
 function nodeColor(node) {
@@ -206,7 +207,8 @@ async function loadGraph() {
   status('Loading…');
   select(null);
   try {
-    const data = await api('api/graph', {view: state.view, scope: state.scope, all: state.all});
+    const data = await api('api/graph', {view: state.view, scope: state.scope, all: state.all,
+      responsibility: state.view === 'loops' ? state.responsibility : ''});
     state.data = data;
     if (data.too_large) {
       if (state.renderer) state.renderer.kill();
@@ -396,6 +398,7 @@ function setView(view) {
   const unprocessed = view === 'unprocessed';
   $('graph-view').hidden = unprocessed;
   $('unprocessed-view').hidden = !unprocessed;
+  $('responsibility').hidden = view !== 'loops';
   closePanel();
   if (unprocessed) {
     Promise.all([loadConversations(), loadCandidates()]).catch(error => openPanel([el('p', {}, `Could not load: ${error.message}`)]));
@@ -408,6 +411,7 @@ document.querySelectorAll('#tabs button').forEach(button => button.addEventListe
 $('search').addEventListener('submit', search);
 $('q').addEventListener('input', event => { if (!event.target.value && (state.matches.size || state.searchResults)) search(event); });
 $('scope').addEventListener('change', event => { state.scope = event.target.value; state.view === 'unprocessed' || loadGraph(); });
+$('responsibility').addEventListener('change', event => { state.responsibility = event.target.value; loadGraph(); });
 $('all').addEventListener('change', event => { state.all = event.target.checked; state.view === 'unprocessed' || loadGraph(); });
 $('panel-close').addEventListener('click', () => select(null));
 $('conv-prev').addEventListener('click', () => { state.conv = Math.max(0, state.conv - 50); loadConversations(); });

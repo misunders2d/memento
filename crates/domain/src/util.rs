@@ -24,17 +24,6 @@ pub const TYPES: &[&str] = &[
     "place",
     "tool",
 ];
-pub const RELATIONS: &[&str] = &[
-    "belongs_to",
-    "follows_up_on",
-    "works_in",
-    "decided_by",
-    "mentions",
-    "part_of",
-    "caused_by",
-    "owned_by",
-    "related_to",
-];
 pub const ACTIVE_CANDIDATE: &str = "NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=c.id) AND NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND d.decision IN ('promote','reject')) AND NOT EXISTS (SELECT 1 FROM extraction_runs r JOIN episodes e ON e.id=r.episode_id JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE r.id=c.run_id)";
 
 pub fn id() -> String {
@@ -94,6 +83,10 @@ pub fn valid_type(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+/// Predicate names are open-ended; only syntax and atomic supersession are reserved.
+pub fn valid_relation(value: &str) -> bool {
+    value != "supersedes" && valid_type(value)
 }
 pub fn identity(value: &str) -> String {
     value

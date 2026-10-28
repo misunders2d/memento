@@ -126,6 +126,33 @@ def test_details_search_and_unprocessed_lists(seeded):
     assert client.get('/ui/api/candidates', params=dict(q='Zephyr')).json()['total'] == 1
 
 
+def test_complete_loop_view_includes_full_candidate_cohort(seeded, monkeypatch):
+    client, _, _, _ = seeded
+    db = client.app.state.store._db
+    candidate = db.execute('SELECT * FROM candidates LIMIT 1').fetchone()
+    commit = db.execute('SELECT commit_id FROM extraction_runs WHERE id=?', (candidate['run_id'],)).fetchone()[0]
+    for index in range(103):
+        id = f'loop-candidate-{index}'
+        scope = '["professional"]' if index == 101 else '["personal"]'
+        db.execute('''INSERT INTO candidates SELECT ?,run_id,kind,type,text,why,src,dst,confidence,
+            valid_from,valid_to,? FROM candidates WHERE id=?''', (id, scope, candidate['id']))
+        db.execute('INSERT INTO loop_events VALUES (?,?,?,\'open\',NULL,NULL)', (f'loop-{index}', id, commit))
+    db.execute("INSERT INTO forgotten_targets VALUES('loop-candidate-102',?,'candidate')", (commit,))
+    bounded = graph_view(client, view='loops')['loops']['candidates']
+    assert bounded['total'] == 103 and len(bounded['items']) == 100
+    complete = graph_view(client, view='loops', all='true')
+    assert not complete['too_large']
+    assert len(complete['loops']['candidates']['items']) == complete['loops']['candidates']['total'] == 103
+    personal = graph_view(client, view='loops', all='true', scope='personal')['loops']['candidates']
+    assert len(personal['items']) == personal['total'] == 102
+    assert not {'loop-candidate-101', 'loop-candidate-102'} & {item['id'] for item in personal['items']}
+    assert len(graph_view(client, all='true')['loops']['candidates']['items']) == 100
+    monkeypatch.setattr('memento.viewer.MAX_NODES', 10)
+    overflow = graph_view(client, view='loops', all='true')
+    assert overflow['too_large'] and overflow['nodes'] == [] and overflow['edges'] == []
+    assert overflow['loops']['candidates'] == dict(total=103, items=[])
+
+
 def test_viewing_writes_nothing(seeded):
     client, ids, _, data_dir = seeded
 

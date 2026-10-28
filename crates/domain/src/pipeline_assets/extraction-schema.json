@@ -52,6 +52,23 @@
           "title": "Quote",
           "type": "string"
         },
+        "responsibility": {
+          "anyOf": [
+            {
+              "enum": [
+                "owner",
+                "other",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Responsibility"
+        },
         "scope": {
           "items": {
             "enum": [
@@ -190,6 +207,23 @@
           "minLength": 1,
           "title": "Quote",
           "type": "string"
+        },
+        "responsibility": {
+          "anyOf": [
+            {
+              "enum": [
+                "owner",
+                "other",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Responsibility"
         },
         "scope": {
           "items": {

@@ -5,21 +5,234 @@ use chrono::{Datelike, Duration, Utc};
 use memento_core::{Error, Result, WriteTxn};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+
+pub fn valid_responsibility(value: &str) -> bool {
+    matches!(value, "owner" | "other" | "unknown")
+}
+
+/// Only indexed loop events and their immutable commits are inspected. Incoming
+/// identity/promotion branches preserve role choices through refinement/transfer.
+pub fn responsibilities(db: &Connection, targets: &[String]) -> Result<HashMap<String, Value>> {
+    let selected = rows(db, "WITH RECURSIVE ancestry(root,id) AS (
+        SELECT value,value FROM json_each(?1) UNION
+        SELECT a.root,n.id FROM ancestry a JOIN node_versions n ON n.superseded_by=a.id
+          WHERE EXISTS(SELECT 1 FROM loop_events l WHERE l.target=n.id) UNION
+        SELECT a.root,d.candidate_id FROM ancestry a JOIN candidate_decisions d ON d.target_id=a.id
+          AND d.decision='promote' WHERE EXISTS(SELECT 1 FROM loop_events l WHERE l.target=d.candidate_id))
+        SELECT a.root,l.target,c.recorded_at,r.value AS attribution FROM ancestry a
+        CROSS JOIN loop_events l INDEXED BY loop_target ON l.target=a.id JOIN graph_commits c ON c.id=l.commit_id
+        JOIN json_each(c.result,'$.loop_responsibilities') r ON r.key=l.target
+        WHERE NOT EXISTS(SELECT 1 FROM json_each(r.value,'$.evidence') ref
+          JOIN episodes e ON e.id=json_extract(ref.value,'$.episode_id')
+          JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id)
+        ORDER BY json_extract(r.value,'$.manual') DESC,c.recorded_at DESC,l.rowid DESC",
+        [encode_json(&json!(targets))?])?;
+    let mut result = HashMap::new();
+    for row in selected {
+        let value = decode_json(get_str(&row, "attribution")?)?;
+        if value["responsibility"]
+            .as_str()
+            .is_some_and(valid_responsibility)
+        {
+            result
+                .entry(get_str(&row, "root")?.to_owned())
+                .or_insert(value);
+        }
+    }
+    Ok(result)
+}
+
+pub fn responsibility(db: &Connection, target: &str) -> Result<String> {
+    Ok(responsibilities(db, &[target.into()])?
+        .get(target)
+        .and_then(|value| value["responsibility"].as_str())
+        .unwrap_or("unknown")
+        .into())
+}
+
+/// Validate source quotes without rewriting assertion evidence. Native user
+/// provenance is necessary for owner attribution, never semantic ownership proof.
+pub fn grounded_sources(
+    tx: &WriteTxn,
+    target: &str,
+    sources: &Value,
+    original: bool,
+    allow_instruction: bool,
+) -> Result<Value> {
+    let evidence = sources
+        .as_array()
+        .filter(|sources| !sources.is_empty())
+        .ok_or(Error::Validation(
+            "Loop responsibility requires exact source evidence",
+        ))?;
+    let mut grounded_owner = false;
+    let mut references = vec![];
+    let mut source_times = vec![];
+    for source in evidence {
+        let quote = get_str(source, "quote")?;
+        if quote.is_empty() {
+            return Err(Error::Validation(
+                "Evidence quote must be a nonempty string",
+            ));
+        }
+        let episode_id = get_str(source, "episode_id")?;
+        let mut episode = one(tx.sql(), "SELECT * FROM episodes WHERE id=?", [episode_id])?
+            .ok_or(Error::Validation("Unknown source episode"))?;
+        if original
+            && one(
+                tx.sql(),
+                "SELECT 1 FROM graph_evidence WHERE target=? AND episode_id=? LIMIT 1",
+                params![target, episode_id],
+            )?
+            .is_none()
+        {
+            return Err(Error::Validation(
+                "Loop responsibility requires an original target source",
+            ));
+        }
+        if one(
+            tx.sql(),
+            "SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=?",
+            params![episode["source"].as_str(), episode["event_id"].as_str()],
+        )?
+        .is_some()
+        {
+            return Err(Error::Conflict(
+                "This evidence was excluded from active memory by a human decision",
+            ));
+        }
+        let metadata = decode_json(get_str(&episode, "metadata")?)?;
+        let text = tx
+            .original_text(episode_id)?
+            .ok_or(Error::Validation("Unknown source episode"))?;
+        let instruction = episode["kind"] == "developer"
+            || memento_core::raw::legacy_native_context(
+                get_str(&episode, "source")?,
+                get_str(&episode, "kind")?,
+                Some(&text),
+                Some(&metadata),
+            );
+        if !episode["text_runs"].is_null()
+            || matches!(
+                episode["kind"].as_str(),
+                Some("native_record" | "native_hook" | "native_live_record")
+            )
+            || (instruction && !allow_instruction)
+            || ((metadata["evidence_eligible"] == false || metadata["extraction_mode"] == "skip")
+                && !(instruction && allow_instruction))
+        {
+            return Err(Error::Validation(
+                "Loop responsibility requires eligible original evidence",
+            ));
+        }
+        let (start, end) = match (source["start"].as_u64(), source["end"].as_u64()) {
+            (Some(start), Some(end)) if substring(&text, start as usize, end as usize) == quote => {
+                (start as usize, end as usize)
+            }
+            _ => crate::extraction::source_span(
+                &text,
+                quote,
+                source["occurrence"].as_u64().map(|n| n as usize),
+            )?,
+        };
+        if original && one(tx.sql(),"SELECT 1 FROM graph_evidence WHERE target=? AND episode_id=? AND start<=? AND end>=? LIMIT 1",params![target,episode_id,start as i64,end as i64])?.is_none(){return Err(Error::Validation("Loop responsibility requires an original target source"));}
+        episode["text"] = json!(text);
+        grounded_owner |= episode["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("native:"))
+            && crate::behavior_ground_truth(&episode, Some(start), Some(end));
+        references.push(json!({"episode_id":episode_id,"start":start,"end":end}));
+        source_times.push(episode["occurred_at"].clone());
+    }
+    Ok(json!({"evidence":references,"source_times":source_times,"owner_grounded":grounded_owner}))
+}
+
+/// Role-only operation preserves lifecycle/dates and all explicit role choices.
+pub fn assign(
+    tx: &WriteTxn,
+    commit: &str,
+    target_id: &str,
+    value: &str,
+    sources: &Value,
+    manual: bool,
+) -> Result<Value> {
+    if !valid_responsibility(value) {
+        return Err(Error::Validation("Invalid loop responsibility"));
+    }
+    let active = target(tx.sql(), target_id)?.ok_or(Error::Validation(
+        "Responsibility requires an active visible target",
+    ))?;
+    if one(
+        tx.sql(),
+        "SELECT 1 FROM forgotten_targets WHERE target=?",
+        [target_id],
+    )?
+    .is_some()
+    {
+        return Err(Error::Validation(
+            "Responsibility requires an active visible target",
+        ));
+    }
+    let previous = current(tx.sql(), target_id)?.ok_or(Error::Validation(
+        "Responsibility requires an existing loop",
+    ))?;
+    let grounded = grounded_sources(tx, target_id, sources, !manual, false)?;
+    if value == "owner" && grounded["owner_grounded"] != true {
+        return Err(Error::Validation(
+            "Owner responsibility requires original native user evidence",
+        ));
+    }
+    let attribution = responsibilities(tx.sql(), &[target_id.into()])?;
+    if !manual
+        && (attribution
+            .get(target_id)
+            .is_some_and(|entry| entry["manual"] == true)
+            || protected(tx.sql(), &active)?)
+    {
+        return Ok(json!({"id":target_id,"status":"protected_loop_responsibility"}));
+    }
+    let mut result = append(
+        tx,
+        commit,
+        target_id,
+        get_str(&previous, "state")?,
+        previous["due_at"].as_str(),
+        previous["deferred_until"].as_str(),
+    )?;
+    result["responsibility"] = json!(value);
+    result["loop_responsibilities"] =
+        json!({target_id:{"responsibility":value,"manual":manual,"evidence":grounded["evidence"]}});
+    Ok(result)
+}
 
 pub fn current(db: &Connection, target: &str) -> Result<Option<Value>> {
-    one(
+    let mut value = one(
         db,
         "SELECT target AS id,state,due_at,deferred_until FROM loop_events WHERE target=? ORDER BY rowid DESC LIMIT 1",
         [target],
-    )
+    )?;
+    if let Some(value) = value.as_mut() {
+        value["responsibility"] = json!(responsibility(db, target)?);
+    }
+    Ok(value)
 }
 pub fn events(db: &Connection, target: &str) -> Result<Vec<Value>> {
-    rows(
+    let mut values = rows(
         db,
-        "SELECT l.state,l.due_at,l.deferred_until,l.commit_id,c.actor,c.why,c.recorded_at FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? ORDER BY l.rowid",
+        "SELECT l.state,l.due_at,l.deferred_until,l.commit_id,c.actor,c.why,c.recorded_at,r.value AS assignment,json_extract(c.result,'$.evidence') AS evidence FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id LEFT JOIN json_each(c.result,'$.loop_responsibilities') r ON r.key=l.target WHERE l.target=? ORDER BY l.rowid",
         [target],
-    )
+    )?;
+    for value in &mut values {
+        for field in ["assignment", "evidence"] {
+            if let Some(raw) = value[field].as_str() {
+                value[field] = decode_json(raw)?;
+            }
+        }
+    }
+    Ok(values)
 }
+
 pub fn append(
     tx: &WriteTxn,
     commit: &str,
@@ -94,7 +307,7 @@ pub fn snapshot(db: &Connection, target: &str, version: i64) -> Result<Value> {
     for branch in lineage(db, target)? {
         if let Some(row) = one(
             db,
-            "SELECT c.recorded_at FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? AND json_extract(c.request,'$.command.op')='loop' ORDER BY l.rowid DESC LIMIT 1",
+            "SELECT c.recorded_at FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? AND json_extract(c.request,'$.command.op')='loop' AND coalesce(json_extract(c.request,'$.command.action'),'') NOT IN ('assign','decline') AND NOT (json_extract(c.request,'$.command.action')='close' AND coalesce(json_array_length(json_extract(c.request,'$.command.evidence')),0)>0) ORDER BY l.rowid DESC LIMIT 1",
             [&branch],
         )? {
             manual_dates.push(get_str(&row, "recorded_at")?.to_owned());
@@ -173,7 +386,19 @@ fn closed_at(db: &Connection, target: &str) -> Result<Option<String>> {
                 .transpose()?
                 .unwrap_or(json!({}));
             if request["command"]["op"] == "loop" && request["command"]["action"] == "close" {
-                if let Some(at) = row["recorded_at"].as_str() {
+                let grounded = request["command"]["evidence"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty());
+                let result = row["result"]
+                    .as_str()
+                    .map(decode_json)
+                    .transpose()?
+                    .unwrap_or(json!({}));
+                if let Some(at) = if grounded {
+                    result["source_occurred_at"].as_str()
+                } else {
+                    row["recorded_at"].as_str()
+                } {
                     boundaries.push(at.to_owned());
                 }
                 break;
@@ -285,7 +510,9 @@ pub fn decline_automatic(
     target: &str,
     expected: &Value,
 ) -> Result<Value> {
-    let n = node(tx.sql(), target)?;
+    let n = self::target(tx.sql(), target)?.ok_or(Error::Validation(
+        "Loop markers require an active memory or unconfirmed candidate",
+    ))?;
     let live = snapshot(tx.sql(), target, get_i64(&n, "version")?)?;
     if live != *expected {
         return Err(Error::Conflict(
@@ -293,8 +520,8 @@ pub fn decline_automatic(
         ));
     }
     let marker = current(tx.sql(), target)?;
-    if n["state"] != "active"
-        || n["pinned"].as_i64().unwrap_or(0) != 0
+    if (n["state"] != "active" && n["tier"] != "candidate")
+        || protected(tx.sql(), &n)?
         || !live["manual_choice_at"].is_null()
         || marker.as_ref().is_none_or(|value| {
             value["state"] != "open"
@@ -308,6 +535,111 @@ pub fn decline_automatic(
     Ok(json!({"id":target,"status":"declined_not_obligation"}))
 }
 
+pub fn protected(db: &Connection, target: &Value) -> Result<bool> {
+    if target["pinned"].as_i64().unwrap_or(0) != 0 {
+        return Ok(true);
+    }
+    for endpoint in ["src", "dst"] {
+        if let Some(id) = target[endpoint].as_str() {
+            if self::endpoint(db, id)?.is_none_or(|node| node["pinned"].as_i64().unwrap_or(0) != 0)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub fn endpoint(db: &Connection, target: &str) -> Result<Option<Value>> {
+    let mut current = target.to_owned();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        if !seen.insert(current.clone())
+            || one(
+                db,
+                "SELECT 1 FROM forgotten_targets WHERE target=?",
+                [&current],
+            )?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        if let Some(row) = one(
+            db,
+            "SELECT * FROM node_versions WHERE id=? ORDER BY version DESC LIMIT 1",
+            [&current],
+        )? {
+            if row["state"] == "active" {
+                return Ok(Some(row));
+            }
+            if matches!(row["state"].as_str(), Some("merged" | "refined")) {
+                if let Some(next) = row["superseded_by"].as_str() {
+                    current = next.into();
+                    continue;
+                }
+            }
+            return Ok(None);
+        }
+        if let Some(row) = one(
+            db,
+            &format!("SELECT c.id FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"),
+            [&current],
+        )? {
+            return Ok(Some(row));
+        }
+        if let Some(row) = one(
+            db,
+            "SELECT decision,target_id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1",
+            [&current],
+        )? {
+            if row["decision"] == "promote" {
+                if let Some(next) = row["target_id"].as_str() {
+                    current = next.into();
+                    continue;
+                }
+            }
+        }
+        return Ok(None);
+    }
+    Ok(None)
+}
+
+/// Filter lightweight loop rows; shared endpoints resolve once per response.
+/// No original source text, assertion payload or evidence hydration is needed.
+pub fn visible_loop_targets(db: &Connection, values: Vec<Value>) -> Result<Vec<Value>> {
+    let mut checked = HashMap::<String, bool>::new();
+    let mut result = vec![];
+    for row in values {
+        let relation = row["candidate_kind"] == "relation"
+            || !row["loop_src"].is_null()
+            || !row["loop_dst"].is_null();
+        let mut visible = true;
+        if relation {
+            for key in ["loop_src", "loop_dst"] {
+                let Some(id) = row[key].as_str() else {
+                    visible = false;
+                    break;
+                };
+                let allowed = if let Some(value) = checked.get(id) {
+                    *value
+                } else {
+                    let value = endpoint(db, id)?.is_some();
+                    checked.insert(id.into(), value);
+                    value
+                };
+                if !allowed {
+                    visible = false;
+                    break;
+                }
+            }
+        }
+        if visible {
+            result.push(row);
+        }
+    }
+    Ok(result)
+}
+
 pub fn target(db: &Connection, id: &str) -> Result<Option<Value>> {
     let Some(mut n) = one(
         db,
@@ -318,11 +650,21 @@ pub fn target(db: &Connection, id: &str) -> Result<Option<Value>> {
         let candidate = one(
             db,
             &format!(
-                "SELECT c.id,c.type,substr(c.text,1,240) AS text,c.scope,c.valid_from,c.valid_to FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"
+                "SELECT c.id,c.type,c.kind,c.src,c.dst,substr(c.text,1,240) AS text,c.scope,c.valid_from,c.valid_to FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"
             ),
             [id],
         )?;
         let mut value = if let Some(mut value) = candidate {
+            if value["kind"] == "relation" {
+                for key in ["src", "dst"] {
+                    let Some(id) = value[key].as_str() else {
+                        return Ok(None);
+                    };
+                    if endpoint(db, id)?.is_none() {
+                        return Ok(None);
+                    }
+                }
+            }
             value["scope"] = decode_json(get_str(&value, "scope")?)?;
             value["version"] = json!(1);
             value["tier"] = json!("candidate");
@@ -341,6 +683,11 @@ pub fn target(db: &Connection, id: &str) -> Result<Option<Value>> {
             let b = node(db, get_str(&edge, "dst")?)?;
             if a["state"] != "active" || b["state"] != "active" {
                 return Ok(None);
+            }
+            for key in ["src", "dst"] {
+                if endpoint(db, get_str(&edge, key)?)?.is_none() {
+                    return Ok(None);
+                }
             }
             let mut labels = decode_json(get_str(&a, "scope")?)?
                 .as_array()
@@ -393,7 +740,11 @@ pub fn target(db: &Connection, id: &str) -> Result<Option<Value>> {
 }
 
 pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
-    if !["list", "open", "close", "later", "remind"].contains(&command.action.as_str()) {
+    if ![
+        "list", "open", "close", "later", "remind", "assign", "decline",
+    ]
+    .contains(&command.action.as_str())
+    {
         return Err(Error::Validation("Unknown loop action"));
     }
     if !matches!(
@@ -424,14 +775,39 @@ pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
     if command.due_before.is_some() && command.action != "list" {
         return Err(Error::Validation("due_before is only supported by list"));
     }
+    if command
+        .responsibility
+        .as_deref()
+        .is_some_and(|value| !valid_responsibility(value))
+    {
+        return Err(Error::Validation("Invalid loop responsibility"));
+    }
+    if command.responsibility.is_some() && !matches!(command.action.as_str(), "list" | "assign") {
+        return Err(Error::Validation(
+            "responsibility is only supported by assign or list",
+        ));
+    }
+    if !command.evidence.is_empty()
+        && !matches!(command.action.as_str(), "assign" | "close" | "decline")
+    {
+        return Err(Error::Validation(
+            "Loop evidence is only supported by assign, close or decline",
+        ));
+    }
+    if command.evidence.len() > 8 {
+        return Err(Error::Validation("Loop evidence limit is eight"));
+    }
     let cutoff = time(command.due_before.as_deref())?;
     if command.action == "list" {
         return graph.store.read(|tx|{
             let db=tx.sql();let now=now();
-            let sql=format!("WITH eligible AS (SELECT l.target AS id,l.state,l.due_at,l.deferred_until FROM loop_events l WHERE l.rowid=(SELECT max(x.rowid) FROM loop_events x WHERE x.target=l.target) AND l.state='open' AND (l.deferred_until IS NULL OR l.deferred_until<=?1) AND (?2 IS NULL OR l.due_at<?2) AND EXISTS (SELECT 1 FROM node_versions n WHERE n.id=l.target AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?3)) UNION ALL SELECT 1 FROM candidates c WHERE c.id=l.target AND {ACTIVE_CANDIDATE} AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?3)) UNION ALL SELECT 1 FROM edge_versions e JOIN node_versions a ON a.id=e.src JOIN node_versions b ON b.id=e.dst WHERE e.id=l.target AND e.state='active' AND a.state='active' AND b.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) AND a.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=a.id) AND b.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=b.id) AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?3) OR EXISTS (SELECT 1 FROM json_each(b.scope) WHERE value=?3)))) SELECT eligible.*,count(*) OVER () AS total,(SELECT max(julianday(e.occurred_at)) FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=eligible.id) AS newest_evidence FROM eligible ORDER BY due_at IS NULL,due_at,newest_evidence DESC,id LIMIT ?4");
-            let selected=rows(db,&sql,params![now,cutoff,command.scope,command.limit as i64])?;
-            let total=selected.first().map(|row|row["total"].clone()).unwrap_or(json!(0));let mut values=vec![];
-            for row in selected {if let Some(mut value)=target(db,get_str(&row,"id")?)? {for key in ["id","state","due_at","deferred_until"] {value[key]=row[key].clone();}values.push(value);}}
+            let sql=format!("WITH eligible AS (SELECT l.target AS id,l.state,l.due_at,l.deferred_until FROM loop_events l WHERE l.rowid=(SELECT max(x.rowid) FROM loop_events x WHERE x.target=l.target) AND l.state='open' AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=l.target) AND (l.deferred_until IS NULL OR l.deferred_until<=?1) AND (?2 IS NULL OR l.due_at<?2) AND EXISTS (SELECT 1 FROM node_versions n WHERE n.id=l.target AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?3)) UNION ALL SELECT 1 FROM candidates c WHERE c.id=l.target AND {ACTIVE_CANDIDATE} AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?3)) UNION ALL SELECT 1 FROM edge_versions e JOIN node_versions a ON a.id=e.src JOIN node_versions b ON b.id=e.dst WHERE e.id=l.target AND e.state='active' AND a.state='active' AND b.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) AND a.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=a.id) AND b.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=b.id) AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?3) OR EXISTS (SELECT 1 FROM json_each(b.scope) WHERE value=?3)))) SELECT eligible.*,c.kind AS candidate_kind,coalesce(c.src,e.src) AS loop_src,coalesce(c.dst,e.dst) AS loop_dst,(SELECT max(julianday(e.occurred_at)) FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=eligible.id) AS newest_evidence FROM eligible LEFT JOIN candidates c ON c.id=eligible.id LEFT JOIN edge_versions e ON e.id=eligible.id AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) ORDER BY due_at IS NULL,due_at,newest_evidence DESC,eligible.id");
+            let selected=visible_loop_targets(db,rows(db,&sql,params![now,cutoff,command.scope])?)?;
+            let ids=selected.iter().map(|row|row["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+            let roles=responsibilities(db,&ids)?;
+            let matches=selected.iter().filter(|row|command.responsibility.as_deref().is_none_or(|wanted|roles.get(row["id"].as_str().unwrap()).and_then(|role|role["responsibility"].as_str()).unwrap_or("unknown")==wanted)).collect::<Vec<_>>();
+            let total=json!(matches.len());let mut values=vec![];
+            for row in matches.into_iter().take(command.limit) {if let Some(mut value)=target(db,get_str(row,"id")?)? {for key in ["id","state","due_at","deferred_until"] {value[key]=row[key].clone();}value["responsibility"]=json!(roles.get(row["id"].as_str().unwrap()).and_then(|role|role["responsibility"].as_str()).unwrap_or("unknown"));values.push(value);}}
             Ok(json!({"loops":values,"total":total}))
         });
     }
@@ -450,6 +826,17 @@ pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
     if command.action == "remind" {
         request["due_at"] = json!(due);
     }
+    if command.action == "assign" {
+        let value = command
+            .responsibility
+            .as_deref()
+            .ok_or(Error::Validation("assign requires responsibility"))?;
+        request["responsibility"] = json!(value);
+        request["evidence"] = serde_json::to_value(&command.evidence)?;
+    }
+    if !command.evidence.is_empty() || command.action == "decline" {
+        request["evidence"] = serde_json::to_value(&command.evidence)?;
+    }
     let context = context(
         command.command_id.clone().unwrap_or_else(id),
         command.actor.clone().unwrap_or("harness/loop".into()),
@@ -459,12 +846,29 @@ pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
             .unwrap_or("Loop state adjustment".into()),
     );
     graph.store.command(&context, &request, |tx, commit| {
-        if target(tx.sql(), target_id)?.is_none() {
+        let active=target(tx.sql(), target_id)?;
+        if active.is_none() || one(tx.sql(),"SELECT 1 FROM forgotten_targets WHERE target=?",[target_id])?.is_some() {
             return Err(Error::Validation(
                 "Loop markers require an active memory or unconfirmed candidate",
             ));
         }
         let marker = current(tx.sql(), target_id)?;
+        if command.action=="assign" {
+            return assign(tx,commit,target_id,command.responsibility.as_deref().unwrap(),&request["evidence"],true);
+        }
+        if command.action=="decline" || (command.action=="close" && !command.evidence.is_empty()) {
+            let grounded=grounded_sources(tx,target_id,&request["evidence"],command.action=="decline",command.action=="decline")?;
+            let frozen=snapshot(tx.sql(),target_id,active.as_ref().unwrap()["version"].as_i64().unwrap())?;
+            let mut result=if command.action=="decline" {decline_automatic(tx,commit,target_id,&frozen)?} else {
+                let times=grounded["source_times"].as_array().unwrap().iter().map(|at|at.as_str().map(str::to_owned)).collect::<Vec<_>>();
+                let(at,mut status)=closure_time(&frozen,&times)?;
+                if protected(tx.sql(),active.as_ref().unwrap())? {status=Some("protected_loop_choice");}
+                let mut result=json!({"id":target_id,"status":status.unwrap_or("closed"),"source_occurred_at":at});
+                if status.is_none(){let previous=marker.as_ref().unwrap();let value=append(tx,commit,target_id,"closed",previous["due_at"].as_str(),None)?;for(key,value)in value.as_object().unwrap(){result[key]=value.clone();}}
+                result
+            };
+            result["evidence"]=grounded["evidence"].clone();return Ok(result);
+        }
         let deadline = marker.as_ref().and_then(|value| value["due_at"].as_str());
         if command.action == "close" {
             return append(tx, commit, target_id, "closed", deadline, None);
@@ -502,4 +906,299 @@ pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
             None,
         )
     })
+}
+
+#[cfg(test)]
+mod responsibility_tests {
+    use super::*;
+    use memento_core::{CommandContext, Store};
+    use serde::de::DeserializeOwned;
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+    fn parse<T: DeserializeOwned>(value: Value) -> T {
+        serde_json::from_value(value).unwrap()
+    }
+    struct F {
+        _dir: tempfile::TempDir,
+        store: Arc<Store>,
+        graph: Graph,
+        episode: String,
+        owner: String,
+        other: String,
+    }
+    impl F {
+        fn new() -> Self {
+            let dir = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            let episode=store.capture(parse(json!({"source":"native:fixture:pi","event_id":"one","conversation_id":"thread","kind":"user","text":"I need to renew my passport. Lena owes me signed approval.","occurred_at":"2026-01-01T00:00:00Z"}))).unwrap().id;
+            let graph = Graph::new(store.clone());
+            let mut ids = vec![];
+            for (key, quote, scope) in [
+                ("owner", "I need to renew my passport.", "professional"),
+                ("other", "Lena owes me signed approval.", "personal"),
+            ] {
+                let result=graph.remember(parse(json!({"command_id":key,"actor":"fixture","why":"Original obligation evidence","type":"knowledge","text":quote,"scope":[scope],"evidence":[{"episode_id":episode,"quote":quote}]}))).unwrap();
+                let id = result["id"].as_str().unwrap().to_owned();
+                graph
+                    .loop_command(parse(
+                        json!({"action":"open","id":id,"command_id":format!("open-{key}")}),
+                    ))
+                    .unwrap();
+                ids.push(id);
+            }
+            Self {
+                _dir: dir,
+                store,
+                graph,
+                episode,
+                owner: ids[0].clone(),
+                other: ids[1].clone(),
+            }
+        }
+        fn tag(&self, target: &str, role: &str, episode: &str, quote: &str, key: &str) -> Value {
+            self.graph.loop_command(parse(json!({"action":"assign","id":target,"responsibility":role,"command_id":key,"actor":"owner","why":"Explicit grounded role","evidence":[{"episode_id":episode,"quote":quote}]}))).unwrap()
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_owner_and_other_wait_are_independent_of_scope() {
+        let f = F::new();
+        let unknown = f
+            .graph
+            .loop_command(parse(json!({"action":"list","responsibility":"unknown"})))
+            .unwrap();
+        assert_eq!(unknown["total"], 2);
+        f.tag(
+            &f.owner,
+            "owner",
+            &f.episode,
+            "I need to renew my passport.",
+            "tag-owner",
+        );
+        f.tag(
+            &f.other,
+            "other",
+            &f.episode,
+            "Lena owes me signed approval.",
+            "tag-other",
+        );
+        let own = f
+            .graph
+            .loop_command(parse(
+                json!({"action":"list","responsibility":"owner","limit":1}),
+            ))
+            .unwrap();
+        assert_eq!(own["total"], 1);
+        assert_eq!(own["loops"][0]["id"], f.owner);
+        assert_eq!(own["loops"][0]["scope"], json!(["professional"]));
+        let waiting = f
+            .graph
+            .loop_command(parse(json!({"action":"list","responsibility":"other"})))
+            .unwrap();
+        assert_eq!(waiting["total"], 1);
+        assert_eq!(waiting["loops"][0]["state"], "open");
+        assert_eq!(waiting["loops"][0]["id"], f.other);
+    }
+
+    #[test]
+    fn fresh_manual_clarification_preserves_dates_choice_and_identity_continuity() {
+        let f = F::new();
+        f.graph.loop_command(parse(json!({"action":"remind","id":f.owner,"command_id":"due","due_at":"2027-01-01T00:00:00Z"}))).unwrap();
+        f.graph
+            .loop_command(parse(
+                json!({"action":"later","id":f.owner,"command_id":"later","days":7}),
+            ))
+            .unwrap();
+        let before = f
+            .store
+            .read(|tx| current(tx.sql(), &f.owner))
+            .unwrap()
+            .unwrap();
+        let choice =
+            f.store.read(|tx| snapshot(tx.sql(), &f.owner, 1)).unwrap()["manual_choice_at"].clone();
+        let clarification=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"clarification","conversation_id":"thread","kind":"user","text":"That passport obligation is mine."}))).unwrap().id;
+        f.tag(
+            &f.owner,
+            "owner",
+            &clarification,
+            "That passport obligation is mine.",
+            "clarify",
+        );
+        let after = f
+            .store
+            .read(|tx| current(tx.sql(), &f.owner))
+            .unwrap()
+            .unwrap();
+        for key in ["state", "due_at", "deferred_until"] {
+            assert_eq!(before[key], after[key]);
+        }
+        assert_eq!(
+            f.store.read(|tx| snapshot(tx.sql(), &f.owner, 1)).unwrap()["manual_choice_at"],
+            choice
+        );
+        let refined=f.graph.supersede(parse(json!({"command_id":"refine","actor":"owner","why":"Clearer same obligation","old":f.owner,"kind":"refinement","new":{"type":"knowledge","text":"Passport renewal remains outstanding.","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"I need to renew my passport."}]}))).unwrap()["superseded_by"].as_str().unwrap().to_owned();
+        let result = f
+            .store
+            .command(
+                &CommandContext {
+                    command_id: "auto-relabel".into(),
+                    actor: "consolidator/fixture".into(),
+                    why: "Synthetic conflicting role".into(),
+                },
+                &json!({"op":"consolidate"}),
+                |tx, commit| {
+                    assign(
+                        tx,
+                        commit,
+                        &refined,
+                        "other",
+                        &json!([{"episode_id":f.episode,"quote":"I need to renew my passport."}]),
+                        false,
+                    )
+                },
+            )
+            .unwrap();
+        assert_eq!(result["status"], "protected_loop_responsibility");
+        f.graph
+            .loop_command(parse(
+                json!({"action":"close","id":refined,"command_id":"close"}),
+            ))
+            .unwrap();
+        let closed = f
+            .store
+            .read(|tx| current(tx.sql(), &refined))
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed["state"], "closed");
+        assert_eq!(closed["responsibility"], "owner");
+    }
+
+    #[test]
+    fn owner_requires_native_user_evidence_and_forgotten_roles_are_hidden() {
+        let f = F::new();
+        let assistant=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"assistant","conversation_id":"thread","kind":"assistant","text":"The passport is the owner task."}))).unwrap().id;
+        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.owner,"responsibility":"owner","evidence":[{"episode_id":assistant,"quote":"The passport is the owner task."}]})));
+        assert!(result.is_err());
+        f.tag(
+            &f.owner,
+            "owner",
+            &f.episode,
+            "I need to renew my passport.",
+            "assigned",
+        );
+        f.store
+            .write(|tx| {
+                tx.sql().execute(
+                    "INSERT INTO forgotten_sources VALUES('native:fixture:pi','one',?,'fixture')",
+                    [&f.owner],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            f.store
+                .read(|tx| responsibility(tx.sql(), &f.owner))
+                .unwrap(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn grounded_recovery_supports_every_loop_target_and_source_time_reopening() {
+        for kind in ["node", "candidate", "edge"] {
+            let f = F::new();
+            let pending=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"pending","conversation_id":"thread","kind":"user","text":"I still owe the signed report.","occurred_at":"2026-01-01T00:00:00Z"}))).unwrap().id;
+            let node=f.graph.remember(parse(json!({"command_id":"report","actor":"fixture","why":"Original pending evidence","type":"knowledge","text":"I still owe the signed report.","scope":["professional"],"evidence":[{"episode_id":pending,"quote":"I still owe the signed report."}]}))).unwrap()["id"].as_str().unwrap().to_owned();
+            let target = if kind == "edge" {
+                f.graph.link(parse(json!({"command_id":"report-edge","actor":"fixture","why":"Report connection","a":node,"rel":"related_to","b":f.other,"evidence":[{"episode_id":pending,"quote":"I still owe the signed report."}]}))).unwrap()["id"].as_str().unwrap().to_owned()
+            } else if kind == "candidate" {
+                f.store.command(&CommandContext{command_id:"candidate".into(),actor:"extractor/fixture".into(),why:"Synthetic pending candidate".into()},&json!({"op":"extract"}),|tx,commit|{
+                    tx.sql().execute("INSERT INTO extraction_runs VALUES('report-run',?,?,'fixture','fixture','[]','{}','2026-01-01T00:00:00Z')",params![commit,pending])?;
+                    tx.sql().execute("INSERT INTO candidates VALUES('report-candidate','report-run','memory','knowledge','I still owe the signed report.','Fixture',NULL,NULL,0.9,NULL,NULL,'[\"professional\"]')",[])?;
+                    tx.sql().execute("INSERT INTO graph_evidence VALUES('report-candidate',1,?,0,30,'I still owe the signed report.')",[&pending])?;
+                    Ok(json!({}))
+                }).unwrap();
+                "report-candidate".to_owned()
+            } else {
+                node
+            };
+            f.store
+                .command(
+                    &CommandContext {
+                        command_id: "automatic".into(),
+                        actor: "extractor/fixture".into(),
+                        why: "Synthetic automatic marker".into(),
+                    },
+                    &json!({"op":"extract"}),
+                    |tx, commit| {
+                        mark(tx, commit, &target, Some(true), None, None)?;
+                        Ok(json!({}))
+                    },
+                )
+                .unwrap();
+            f.tag(
+                &target,
+                "owner",
+                &pending,
+                "I still owe the signed report.",
+                "role-only",
+            );
+            assert!(
+                f.store.read(|tx| snapshot(tx.sql(), &target, 1)).unwrap()["manual_choice_at"]
+                    .is_null()
+            );
+            let completion=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"complete","conversation_id":"thread","kind":"user","text":"I sent the signed report.","occurred_at":"2026-01-02T00:00:00Z"}))).unwrap().id;
+            let closed=f.graph.loop_command(parse(json!({"action":"close","id":target,"command_id":"grounded-close","evidence":[{"episode_id":completion,"quote":"I sent the signed report."}]}))).unwrap();
+            assert_eq!(closed["status"], "closed");
+            let renewed=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"renewed","conversation_id":"thread","kind":"user","text":"The signed report is pending again.","occurred_at":"2026-01-03T00:00:00Z"}))).unwrap().id;
+            let fresh=f.graph.remember(parse(json!({"command_id":"renewed-report","actor":"fixture","why":"Later original evidence","type":"knowledge","text":"The signed report is pending again.","scope":["professional"],"evidence":[{"episode_id":renewed,"quote":"The signed report is pending again."}]}))).unwrap()["id"].as_str().unwrap().to_owned();
+            f.store
+                .command(
+                    &CommandContext {
+                        command_id: "reopen".into(),
+                        actor: "consolidator/fixture".into(),
+                        why: "Later source reopening".into(),
+                    },
+                    &json!({"op":"consolidate"}),
+                    |tx, commit| {
+                        mark(tx, commit, &target, Some(true), Some(&fresh), None)?;
+                        Ok(json!({}))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                f.store
+                    .read(|tx| current(tx.sql(), &target))
+                    .unwrap()
+                    .unwrap()["state"],
+                "open"
+            );
+            assert!(
+                f.store.read(|tx| snapshot(tx.sql(), &target, 1)).unwrap()["manual_choice_at"]
+                    .is_null()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_quote_occurrence_zero_cannot_assign_close_or_decline() {
+        let f = F::new();
+        for action in ["assign", "close", "decline"] {
+            let mut command = json!({"action":action,"id":f.owner,"command_id":format!("empty-{action}"),"evidence":[{"episode_id":f.episode,"quote":"","occurrence":0}]});
+            if action == "assign" {
+                command["responsibility"] = json!("unknown");
+            }
+            assert!(f.graph.loop_command(parse(command)).is_err());
+        }
+        assert_eq!(
+            f.store
+                .read(|tx| current(tx.sql(), &f.owner))
+                .unwrap()
+                .unwrap()["state"],
+            "open"
+        );
+    }
 }

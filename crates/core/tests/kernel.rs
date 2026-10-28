@@ -521,3 +521,59 @@ fn health_uses_separate_bounded_writer_probe_and_never_recreates_missing_databas
     assert!(store.health().is_err());
     assert!(!database.exists());
 }
+
+#[test]
+fn loop_lineage_index_upgrade_preserves_header_evidence_and_healthy_schema() {
+    let (_dir, store) = store();
+    store
+        .command(&context("loop-index-fixture"), &json!({}), |tx, commit| {
+            seed(tx, commit)?;
+            Ok(json!({"id":"node"}))
+        })
+        .unwrap();
+    let path = store.data_dir().to_owned();
+    drop(store);
+    let db = Connection::open(path.join("memory.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP INDEX node_versions_superseded_by; DROP INDEX candidate_decisions_promoted_target;",
+    )
+    .unwrap();
+    let before: i64 = db
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    drop(db);
+    let reopened = Store::open(&path).unwrap();
+    let after = reopened
+        .read(|tx| {
+            assert_eq!(
+                tx.original_text("episode")?.as_deref(),
+                Some("Ω😀 synthetic source")
+            );
+            assert_eq!(
+                tx.sql()
+                    .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
+                FORMAT_VERSION
+            );
+            assert_eq!(
+                tx.sql()
+                    .query_row("SELECT count(*) FROM graph_commits", [], |r| r
+                        .get::<_, i64>(0))?,
+                1
+            );
+            Ok(tx
+                .sql()
+                .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))?)
+        })
+        .unwrap();
+    assert_eq!(after, before + 2);
+    drop(reopened);
+    let again = Store::open(&path).unwrap();
+    assert_eq!(
+        again
+            .read(|tx| Ok(tx
+                .sql()
+                .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))?))
+            .unwrap(),
+        after
+    );
+}
