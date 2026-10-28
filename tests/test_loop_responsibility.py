@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memento.graph import Graph
-from memento.loops import assign, current, responsibility, snapshot
+from memento.loops import assign, assign_automatic, current, responsibility, snapshot
 from memento.processing import Processing
 from memento.store import Store
 from memento.viewer import _graph
@@ -35,9 +35,14 @@ def tag(graph, id, role, evidence, key):
         command_id=key, actor='owner', why='Explicit source-grounded responsibility')
 
 
-@pytest.mark.parametrize('role,text', [('owner', 'I need to renew my passport.'),
-                                      ('other', 'Lena owes me signed approval.')])
-def test_automatic_role_commits_with_new_assertion(tmp_path, role, text):
+@pytest.mark.parametrize('role,text,kind,metadata,expected,stage', [
+    ('owner', 'I need to renew my passport.', 'user', {}, 'owner', 'extract'),
+    ('other', 'Lena owes me signed approval.', 'user', {}, 'other', 'extract'),
+    *[(role, 'tool_call inspect the pending launch report', 'assistant',
+       {'extraction_mode': 'message', 'evidence_eligible': False}, 'unknown', stage)
+      for role in ('owner', 'other', 'unknown') for stage in ('extract', 'consolidate')],
+])
+def test_automatic_role_commits_with_new_assertion(tmp_path, role, text, kind, metadata, expected, stage):
     from test_extraction import draft
     store = Store(tmp_path)
     try:
@@ -45,11 +50,11 @@ def test_automatic_role_commits_with_new_assertion(tmp_path, role, text):
         processing = Processing(graph)
         source = 'native:role-pipeline:pi'
         episode, _ = store.capture(dict(source=source, event_id='role', conversation_id='thread',
-            kind='user', text=text, occurred_at='2026-01-01T00:00:00+00:00', metadata={}))
+            kind=kind, text=text, occurred_at='2026-01-01T00:00:00+00:00', metadata=metadata))
         work, = processing.claim(agent='fixture', timezone_name='UTC',
             compaction=dict(source=source, conversation_id='thread'), kinds=['extract'])['work']
         candidate = draft('task', 'memory', 'knowledge', text, text)
-        candidate.update(open_loop=True, responsibility=role)
+        candidate.update(open_loop=True, responsibility=role if stage == 'extract' else None)
         processing.complete(id=work['id'], owner=work['owner'], agent='fixture', output=dict(
             windows=[dict(id=work['input']['windows'][0]['id'], candidates=[candidate])]))
         work, = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True,
@@ -63,7 +68,7 @@ def test_automatic_role_commits_with_new_assertion(tmp_path, role, text):
         result = processing.complete(id=work['id'], owner=work['owner'], agent='fixture',
                                      output=dict(actions=[fields]))
         target = result['results'][candidate['id']]['id']
-        assert graph.loop(action='list', responsibility=role)['loops'][0]['id'] == target
+        assert graph.loop(action='list', responsibility=expected)['loops'][0]['id'] == target
         assert graph.history(target)[-1]['evidence'][0]['episode_id'] == episode['id']
     finally:
         store.close()
@@ -82,6 +87,26 @@ def test_legacy_unknown_owner_and_other_wait_are_independent_of_scope(world):
     nodes, _, loops = _graph(store._db, None, '2026-10-28T00:00:00+00:00', responsibility='owner')
     assert nodes[owner]['loop']['responsibility'] == 'owner'
     assert nodes[other]['loop'] is None and loops['open'] == 1
+
+
+def test_automatic_role_uses_eligible_subset_without_altering_fact_evidence(world):
+    store, graph, _, evidence = world
+    trace, _ = store.capture(dict(source='native:fixture:pi', event_id='trace',
+        conversation_id='thread', kind='assistant', text='tool_call inspect the passport queue',
+        occurred_at=None, metadata={'evidence_eligible': False, 'extraction_mode': 'message'}))
+    sources = [dict(episode_id=trace['id'], quote=trace['text']), evidence[0]]
+    target = graph.remember(command_id='mixed-save', actor='owner', why='Mixed fact support',
+        type='knowledge', text='Passport renewal is pending.', scope=['professional'], evidence=sources)['id']
+    graph.loop(action='open', id=target, command_id='mixed-open')
+    before = graph.history(target)[-1]['evidence']
+    result = graph._command('mixed-role', 'consolidator/fixture', 'Ground only eligible role evidence',
+        dict(op='consolidate'), lambda commit: assign_automatic(graph, commit, target, 'owner', sources))
+    assert current(graph, target)['responsibility'] == 'owner'
+    assert [ref['episode_id'] for ref in result['loop_responsibilities'][target]['evidence']] == [
+        evidence[0]['episode_id']]
+    assert graph.history(target)[-1]['evidence'] == before
+    with pytest.raises(ValueError, match='eligible original evidence'):
+        tag(graph, target, 'unknown', [sources[0]], 'mixed-forbidden-manual')
 
 
 def test_fresh_manual_clarification_preserves_dates_and_lifecycle_choice(world):

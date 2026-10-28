@@ -148,6 +148,45 @@ pub fn grounded_sources(
     Ok(json!({"evidence":references,"source_times":source_times,"owner_grounded":grounded_owner}))
 }
 
+/// Optional automatic attribution never blocks otherwise valid memory work.
+/// Fact evidence may include technical traces that cannot authorize an assignee.
+pub fn assign_automatic(
+    tx: &WriteTxn,
+    commit: &str,
+    target_id: &str,
+    value: &str,
+    sources: &Value,
+) -> Result<Value> {
+    if !valid_responsibility(value) {
+        return Err(Error::Validation("Invalid loop responsibility"));
+    }
+    let sources = sources
+        .as_array()
+        .filter(|sources| !sources.is_empty())
+        .ok_or(Error::Validation(
+            "Loop responsibility requires exact source evidence",
+        ))?;
+    let mut eligible = vec![];
+    for source in sources {
+        match grounded_sources(tx, target_id, &json!([source]), true, false) {
+            Ok(grounded) => {
+                if value != "owner" || grounded["owner_grounded"] == true {
+                    eligible.push(source.clone());
+                }
+            }
+            Err(Error::Validation(
+                "Loop responsibility requires eligible original evidence"
+                | "Loop responsibility requires an original target source",
+            )) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if eligible.is_empty() {
+        return Ok(json!({"id":target_id,"status":"unattributed_loop_responsibility"}));
+    }
+    assign(tx, commit, target_id, value, &json!(eligible), false)
+}
+
 /// Role-only operation preserves lifecycle/dates and all explicit role choices.
 pub fn assign(
     tx: &WriteTxn,

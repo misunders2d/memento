@@ -1163,7 +1163,7 @@ class Consolidator:
                          *(item.target + ': ' + item.why for item in plan.repairs)]) or 'Inspected supplied memory context'
 
         def apply(commit):
-            from .loops import current, mark, transfer, decline_extracted, closure_time, _append, assign, snapshot as loop_snapshot
+            from .loops import current, mark, transfer, decline_extracted, closure_time, _append, assign_automatic, snapshot as loop_snapshot
             job.check()
             db = self.store._db
             self._check_continuity(context)
@@ -1226,7 +1226,7 @@ class Consolidator:
                     mark(self.graph, commit, candidate['id'], action.open_loop)
                 role_target = target if state == 'promote' else candidate['id'] if state == 'review' else None
                 if role_target and action.responsibility is not None and current(self.graph, role_target) is not None:
-                    role = assign(self.graph, commit, role_target, action.responsibility,
+                    role = assign_automatic(self.graph, commit, role_target, action.responsibility,
                                   [source.model_dump() for source in action.evidence])
                     loop_responsibilities.update(role.get('loop_responsibilities', {}))
                 db.execute('INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)',
@@ -1272,7 +1272,7 @@ class Consolidator:
                     from .loops import decline_automatic
                     result = decline_automatic(self.graph, commit, target, loop_snapshots[repair.target])
                 elif repair.operation == 'assign_loop':
-                    result = assign(self.graph, commit, target, repair.responsibility, evidence)
+                    result = assign_automatic(self.graph, commit, target, repair.responsibility, evidence)
                     loop_responsibilities.update(result.get('loop_responsibilities', {}))
                 elif repair.operation == 'retire':
                     from .curation import retire

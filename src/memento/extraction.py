@@ -347,7 +347,7 @@ class Extractor:
 
         def apply(commit):
             from .forgetting import source_blocked
-            from .loops import mark, assign
+            from .loops import mark, assign_automatic
             job.check()
             db = self.store._db
             count = 0
@@ -374,7 +374,7 @@ class Extractor:
                             (item['id'], 1, episode['id'], item['start'], item['end'], item['quote']))
                         mark(self.graph, commit, item['id'], item['open_loop'])
                         if item['open_loop'] and item['responsibility'] is not None:
-                            role = assign(self.graph, commit, item['id'], item['responsibility'], [dict(
+                            role = assign_automatic(self.graph, commit, item['id'], item['responsibility'], [dict(
                                 episode_id=episode['id'], quote=item['quote'], start=item['start'], end=item['end'])])
                             loop_responsibilities.update(role.get('loop_responsibilities', {}))
                         count += 1

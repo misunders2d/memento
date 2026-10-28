@@ -68,6 +68,12 @@ WORK_REJECTION_CODES = frozenset({
     'Invalid reviewed type definition', 'Merge requires distinct active entities of the same type',
     'Relations require active endpoints', 'Supersession requires an active node',
     'Change must follow the previous valid_from',
+    'Loop responsibility requires exact source evidence',
+    'Loop responsibility requires eligible original evidence',
+    'Loop responsibility requires an original target source',
+    'Owner responsibility requires original native user evidence',
+    'Invalid loop responsibility', 'Responsibility requires an active visible target',
+    'Responsibility requires an existing loop', 'Missing assertion commit',
 })
 SYSTEM = (
     'Process the supplied Memento task. Return exactly one JSON object matching its schema, '

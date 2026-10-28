@@ -173,6 +173,109 @@ fn automatic_loop_responsibility_commits_with_new_assertion() {
 }
 
 #[test]
+fn automatic_role_uncertainty_does_not_reject_valid_processing() {
+    for stage in ["extract", "consolidate"] {
+        for role in ["owner", "other", "unknown"] {
+            let f = Fixture::new();
+            let source = "native:role-pipeline:codex";
+            let text = "tool_call inspect the pending launch report";
+            let episode = f.capture(
+                "attempt",
+                "thread",
+                text,
+                "assistant",
+                source,
+                json!({"extraction_mode":"message","evidence_eligible":false}),
+                "2026-10-18T12:00:00Z",
+            );
+            let extract =
+                f.claim(source, "thread", Some(vec!["extract".into()]))["work"][0].clone();
+            let mut candidate = draft(text, "knowledge", true);
+            if stage == "extract" {
+                candidate["responsibility"] = json!(role);
+            }
+            f.complete(&extract, json!({"windows":[{"id":extract["input"]["windows"][0]["id"],"candidates":[candidate]}]})).unwrap();
+            let work =
+                f.claim(source, "thread", Some(vec!["consolidate".into()]))["work"][0].clone();
+            let candidate = &work["input"]["candidates"][0];
+            let mut remember = action(candidate, "remember");
+            remember["open_loop"] = json!(true);
+            remember["responsibility"] = json!(role);
+            let result = f.complete(&work, json!({"actions":[remember]})).unwrap();
+            let target = result["results"][candidate["id"].as_str().unwrap()]["id"]
+                .as_str()
+                .unwrap();
+            let history = f.graph.history(target).unwrap();
+            assert_eq!(history[0]["loop"]["state"], "open");
+            assert_eq!(history[0]["loop"]["responsibility"], "unknown");
+            assert_eq!(history[0]["evidence"][0]["episode_id"], episode);
+            assert_eq!(
+                f.stored::<i64>(
+                    "SELECT count(*) FROM candidate_decisions WHERE decision='promote'"
+                ),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn automatic_role_uses_eligible_subset_of_mixed_fact_evidence() {
+    let f = Fixture::new();
+    let source = "native:role-pipeline:pi";
+    let human = "I need to renew my passport.";
+    let trace = "tool_call inspect the passport queue";
+    let human_id = f.capture(
+        "human",
+        "thread",
+        human,
+        "user",
+        source,
+        json!({}),
+        "2026-10-18T12:00:00Z",
+    );
+    let trace_id = f.capture(
+        "trace",
+        "thread",
+        trace,
+        "assistant",
+        source,
+        json!({"evidence_eligible":false,"extraction_mode":"message"}),
+        "2026-10-18T12:00:01Z",
+    );
+    let evidence =
+        json!([{"episode_id":trace_id,"quote":trace},{"episode_id":human_id,"quote":human}]);
+    let request = json!({"op":"remember","type":"knowledge","text":"Passport renewal is pending.","scope":["professional"],"evidence":evidence});
+    let result = f
+        .graph
+        .store
+        .command(
+            &context(
+                "mixed-role".into(),
+                "consolidator/fixture".into(),
+                "Ground only eligible role evidence".into(),
+            ),
+            &request,
+            |tx, commit| {
+                let mut result = TxGraph::remember(tx, commit, &request, false)?;
+                let target = result["id"].as_str().unwrap();
+                loops::append(tx, commit, target, "open", None, None)?;
+                let role = loops::assign_automatic(tx, commit, target, "owner", &evidence)?;
+                result["loop_responsibilities"] = role["loop_responsibilities"].clone();
+                Ok(result)
+            },
+        )
+        .unwrap();
+    let target = result["id"].as_str().unwrap();
+    let assignment = &result["loop_responsibilities"][target]["evidence"];
+    assert_eq!(assignment.as_array().unwrap().len(), 1);
+    assert_eq!(assignment[0]["episode_id"], human_id);
+    let history = f.graph.history(target).unwrap();
+    assert_eq!(history[0]["loop"]["responsibility"], "owner");
+    assert_eq!(history[0]["evidence"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn actual_scheduled_extract_consolidate_history_and_immutable_schema_contract() {
     let f = Fixture::new();
     let episode = f.seed();

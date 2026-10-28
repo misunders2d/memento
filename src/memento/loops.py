@@ -81,6 +81,28 @@ def grounded_sources(graph, target, sources, *, original=False, allow_instructio
     return references, source_times, grounded_owner
 
 
+def assign_automatic(graph, commit, target, value, sources):
+    """Keep optional roles unassigned when fact evidence cannot authorize them."""
+    if value not in RESPONSIBILITIES:
+        raise ValueError('Invalid loop responsibility')
+    if not sources:
+        raise ValueError('Loop responsibility requires exact source evidence')
+    eligible = []
+    for source in sources:
+        try:
+            _, _, grounded_owner = grounded_sources(graph, target, [source], original=True)
+        except ValueError as error:
+            if str(error) not in ('Loop responsibility requires eligible original evidence',
+                                  'Loop responsibility requires an original target source'):
+                raise
+        else:
+            if value != 'owner' or grounded_owner:
+                eligible.append(source)
+    if not eligible:
+        return dict(id=target, status='unattributed_loop_responsibility')
+    return assign(graph, commit, target, value, eligible)
+
+
 def assign(graph, commit, target, value, sources, *, manual=False):
     """Ground role metadata without changing lifecycle, deadlines or deferrals."""
     if value not in RESPONSIBILITIES:
