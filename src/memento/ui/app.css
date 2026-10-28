@@ -77,4 +77,5 @@ blockquote { margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--line
 @media (max-width: 760px) {
   #unprocessed-view { grid-template-columns: 1fr; }
   #legend { display: none; }
+  #sidelist { top: 76px; max-height: calc(100% - 92px); }
 }

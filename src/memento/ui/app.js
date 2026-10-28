@@ -396,6 +396,11 @@ function setView(view) {
   state.view = view;
   for (const button of document.querySelectorAll('#tabs button')) button.setAttribute('aria-pressed', String(button.dataset.view === view));
   const unprocessed = view === 'unprocessed';
+  if (unprocessed) {
+    worker.postMessage({stop: true}); layoutRun++;
+    if (state.renderer) state.renderer.kill();
+    state.renderer = state.graph = null;
+  }
   $('graph-view').hidden = unprocessed;
   $('unprocessed-view').hidden = !unprocessed;
   $('responsibility').hidden = view !== 'loops';
