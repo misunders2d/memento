@@ -10,6 +10,8 @@ The owner-controlled **Memento: immutable top-level requirement** in the [Person
 - Design record: [Memory 2](https://linear.app/mellanni/document/memory-2-4d1f54cbf034)
 - Origin issue: [MEL-657](https://linear.app/mellanni/issue/MEL-657)
 
+**Completion housekeeping:** after material implementation or deployment changes, reconcile the Linear project overview, latest status update and affected issues with the verified result; add a dated implementation note to the design record when its architecture or operating assumptions change. Check the GitHub README and project `AGENTS.md` for affected setup, migration, recovery and development instructions. Preserve the owner-controlled baseline and historical decisions; distinguish shipped code, verified deployment, acceptance evidence and open limitations. Commit/push authorized source-document changes and verify the remote result before reporting handover complete. If an update is blocked or outside the authorized scope, report the exact gap and next action instead of leaving stale documentation unmentioned.
+
 ## Local development
 
 Installation, Drive/native-agent polish and production acceptance run locally. Use isolated local clients and private TLS to exercise remote-client behavior. Do not deploy, test, profile or diagnose Memento on Contabo without new explicit user authorization; these operational instructions do not grant it.
