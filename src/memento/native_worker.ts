@@ -82,7 +82,7 @@ export default function worker(pi: any) {
         const next = input.command.next;
         input.command = { complete: completion(input.command.complete) };
         // One safe session boundary after eight durable commits. No next lease.
-        if (next && completed < 7) {
+        if (next && completed < 7 && !emptyKinds.has(next.kinds?.[0])) {
           const saved = current; current = [];
           try { input.command.next = claim(next); } finally { current = saved; }
         }

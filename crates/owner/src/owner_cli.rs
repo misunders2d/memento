@@ -49,7 +49,7 @@ impl Console for Stdio {
     }
 }
 pub type Requester<'a> = dyn Fn(&Path, &Value) -> Result<Value> + 'a;
-pub const HELP: &str = "Human-only Memento review and portable export console\nUsage: memento-admin --data-dir PATH {list|inventory|backup|compact|history|export|approve|reject|merge|forget}\n  history {park|status}\n  export --output PATH\n  approve|reject PROPOSAL --why TEXT [--command-id ID]\n  merge CLUSTER [--into ID] [--exclude ID] [--include ID] --why TEXT [--command-id ID]\n  forget TARGET --why TEXT [--command-id ID]\n";
+pub const HELP: &str = "Human-only Memento review and portable export console\nUsage: memento-admin --data-dir PATH {list|inventory|backup|compact|history|export|approve|reject|merge|forget}\n  history {park|status|release-candidates}\n  export --output PATH\n  approve|reject PROPOSAL --why TEXT [--command-id ID]\n  merge CLUSTER [--into ID] [--exclude ID] [--include ID] --why TEXT [--command-id ID]\n  forget TARGET --why TEXT [--command-id ID]\n";
 #[derive(Debug)]
 pub struct AdminArgs {
     pub data: PathBuf,
@@ -155,9 +155,9 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
         return Err(usage("--output is required"));
     }
     if parsed.operation == "history"
-        && !["park", "status"].contains(&parsed.positional.as_deref().unwrap_or(""))
+        && !["park", "status", "release-candidates"].contains(&parsed.positional.as_deref().unwrap_or(""))
     {
-        return Err(usage("History action must be park or status"));
+        return Err(usage("History action must be park, status or release-candidates"));
     }
     if ["approve", "reject", "merge", "forget"].contains(&parsed.operation.as_str())
         && parsed.why.is_none()

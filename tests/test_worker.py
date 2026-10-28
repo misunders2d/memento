@@ -56,7 +56,10 @@ def native(tmp_path,monkeypatch):
             elif message['type']=='abort':
                 emit(dict(type='agent_end',willRetry=False))
                 emit(dict(type='agent_settled',aborted=True))
-            elif message['type']=='new_session':catalog()
+                emit(dict(type='response',id=message['id'],command='abort',success=True))
+            elif message['type']=='new_session':
+                catalog()
+                emit(dict(type='response',id=message['id'],command='new_session',success=True,data=dict(cancelled=False)))
     '''))
     script.chmod(0o700)
     monkeypatch.setenv('WORKER_TEST_TRACE',str(trace))

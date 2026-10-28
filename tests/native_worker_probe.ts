@@ -44,6 +44,14 @@ export default async function probe() {
   assert(state.empty_kinds.includes("extract") && state.empty_kinds.includes("consolidate"), "both exhausted kinds survive context projection");
   assert(handlers.tool_call({ toolName: "memento_work", input: { action: "claim", command: { kinds: ["extract"] } } })?.block,
     "repeated empty request blocked");
+  result({ action: "claim", command: { kinds: ["consolidate"] } }, {
+    work: [{ id: "valid-consolidation", owner: "private-next", kind: "consolidate", input: {} }],
+    lease_seconds: 180, backlog: { pending_extract_conversations: 0, pending_extract_jobs: 0, leased_extract_jobs: 0 } });
+  const completionWithEmptyNext: any = { toolName: "memento_work", input: { action: "submit", command: {
+    complete: { id: "valid-consolidation", output: {} }, next: { kinds: ["extract"] } } } };
+  assert(!handlers.tool_call(completionWithEmptyNext)?.block, "empty next kind must never block a valid completion");
+  assert(!completionWithEmptyNext.input.command.next && completionWithEmptyNext.input.command.complete.owner === "private-next",
+    "commit current work while omitting the known empty next claim");
   console.error("WORKER_CALLBACK_PROBE " + JSON.stringify({ passed: true, demand_job: true,
-    foreign_lease: true, private_capability: true, bounded_context: true, continuity: true }));
+    foreign_lease: true, private_capability: true, bounded_context: true, continuity: true, empty_next_commit: true }));
 }

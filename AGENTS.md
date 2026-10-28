@@ -18,6 +18,8 @@ The owner-controlled **Memento: immutable top-level requirement** in the [Person
 
 **Stop expanding after acceptance:** once agreed implementation and acceptance checks pass, finish the authorized rollout and housekeeping. Add a check only for a concrete unresolved failure or new material risk. Say deployment started only after its command is running; distinguish build, switch and verified runtime. Repeated deployment promises are not progress.
 
+**Background handover:** before reporting a worker started, verify a committed unit of the requested kind and identify its actual service owner. Reap task-owned hung tests; do not confuse them with production work. Report historical admission exclusions explicitly. Owner-authorized `history release-candidates` admits already extracted older candidates without raw-history replay.
+
 ## Local development
 
 Installation, Drive/native-agent polish and production acceptance run locally. Use isolated local clients and private TLS to exercise remote-client behavior. Do not deploy, test, profile or diagnose Memento on Contabo without new explicit user authorization; these operational instructions do not grant it.

@@ -26,6 +26,7 @@ Use work(action=submit,command={complete:{id,output},next:{kinds:[KIND],batch_si
 to commit and get fresh next work in one operation. Compare/resolve all same-batch identities before submitting.
 Do not reread completed evidence. Repair failed quotes/plans from current source or retain explicit uncertainty.
 If an operation outcome is uncertain, inspect status before retrying. Never assume a rejected plan committed.
+Start with consolidation. After each successful unit, alternate extraction and consolidation when both are available.
 When a kind returns no work, try the other kind. Finish only after both kinds return no currently available work.
 This is eligible-work exhaustion, not proof all history/reviews/obligations are complete.
 When session_boundary is true, stop immediately; the host continues in a fresh bounded session.
@@ -91,9 +92,11 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
         leases.thread.start()
         completed, model_calls, failures = 0, 0, 0
         done = set()
+        job_kinds = {}
         empty = set()
         deadline = time.monotonic() + config['deadline_seconds']
         qualified, rotating = False, False
+        rotation_ack = False
         terminal_error = False
         premature = 0
         turns_without_result = 0
@@ -105,7 +108,7 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
 
         def prompt():
             send({'type': 'prompt', 'id': 'work', 'message':
-                  'Process the available pool. Inspect metadata as useful; claim one work kind and continue.'})
+                  'Process the available pool. Start with consolidation, then alternate work kinds while both are available.'})
 
         try:
             with selectors.DefaultSelector() as selector:
@@ -124,6 +127,7 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                         print(api.encode({'stage':'worker_reconciled','id':ident,'state':'done'}).decode(), flush=True)
                     if lost and not leases.active:
                         rotating = True
+                        rotation_ack = False
                         send({'type':'abort','id':'reconcile'})
                     if time.monotonic() > deadline:
                         raise api.RunnerError('worker unit deadline or lease lost')
@@ -166,12 +170,13 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                 if event.get('active') != [TOOL] or event.get('all') != expected:
                                     raise api.RunnerError('native worker tool catalog is not isolated')
                                 qualified = True
-                                rotating = False
                                 empty.clear()
                                 terminal_error = False
                                 turns_without_result = 0
                                 deadline = time.monotonic() + config['deadline_seconds']
-                                prompt()
+                                if not rotating or rotation_ack:
+                                    rotating = False
+                                    prompt()
                             elif kind == 'memento_worker_state':
                                 if not qualified:
                                     raise api.RunnerError('native work before catalog qualification')
@@ -189,6 +194,8 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                         if field == 'completed' and event[field] not in done:
                                             done.add(event[field])
                                             completed += 1
+                                            print(api.encode({'stage':'worker_committed','id':event[field],
+                                                              'kind':job_kinds.get(event[field]),'completed_jobs':completed}).decode(), flush=True)
                                 held = event.get('claimed', [])
                                 if held:
                                     seconds = event.get('lease_seconds')
@@ -201,14 +208,16 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                             if set(item) != {'id','owner','kind'} or item['kind'] not in api.KINDS:
                                                 raise api.RunnerError('invalid worker claim')
                                             leases.active[item['id']] = item['owner']
+                                            job_kinds[item['id']] = item['kind']
                                     empty.clear()
                                 if event.get('empty') and event.get('kind') in api.KINDS:
                                     empty.add(event['kind'])
                                 empty.update(kind for kind in event.get('empty_kinds', []) if kind in api.KINDS)
                                 if held or event.get('completed'):
                                     deadline = time.monotonic() + config['deadline_seconds']
-                                if event.get('boundary') and not leases.active:
+                                if event.get('boundary') and not leases.active and not rotating:
                                     rotating = True
+                                    rotation_ack = False
                                     send({'type': 'abort', 'id': 'boundary'})
                                 if not leases.active and empty == set(api.KINDS):
                                     print(api.encode({'stage':'worker_done','completed_jobs':completed,
@@ -225,11 +234,10 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                            if key in ('input','output','cacheRead','cacheWrite','totalTokens')
                                            and type(value) in (int, float)}
                                 print(api.encode({'stage':'worker_model','model':event.get('model'),
-                                                  'usage':numeric}).decode(), flush=True)
+                                                  'usage':numeric,'stop_reason':event.get('stop_reason') if event.get('stop_reason') in ('error','aborted','stop','toolUse','length') else None}).decode(), flush=True)
                             elif kind == 'agent_settled':
                                 if rotating:
-                                    qualified = False
-                                    send({'type': 'new_session', 'id': 'rotate'})
+                                    pass  # abort response proves native command handling is idle
                                 elif terminal_error:
                                     raise api.RunnerError('native worker generation failed')
                                 elif premature < 2:
@@ -237,8 +245,22 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                     prompt()
                                 else:
                                     raise api.RunnerError('native worker stopped before eligible work was checked')
-                            elif kind == 'response' and event.get('success') is False and not rotating:
-                                raise api.RunnerError('native worker command failed')
+                            elif kind == 'response':
+                                if event.get('success') is False:
+                                    command=event.get('command')
+                                    print(api.encode({'stage':'worker','error':'native_command_rejected',
+                                                      'command':command if command in ('prompt','abort','new_session') else 'unknown'}).decode(), flush=True)
+                                    raise api.RunnerError('native worker command failed')
+                                if rotating and event.get('id') in ('boundary','reconcile'):
+                                    qualified = False
+                                    send({'type':'new_session','id':'rotate'})
+                                elif rotating and event.get('id') == 'rotate':
+                                    if event.get('data',{}).get('cancelled'):
+                                        raise api.RunnerError('native session rotation cancelled')
+                                    rotation_ack = True
+                                    if qualified:
+                                        rotating = False
+                                        prompt()
         finally:
             # The host, not the model, owns cancellation and renewal lifetime.
             with contextlib.suppress(ProcessLookupError):

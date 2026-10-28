@@ -85,6 +85,7 @@ impl AdminServices {
             "compact" => (self.compact)(),
             "history_status" => self.processing.history_status(),
             "history_park" => self.processing.park_history(),
+            "history_release-candidates" => self.processing.release_history_candidates(),
             "approve" | "reject" => self.graph.decide_review(dto::Review {
                 command_id: text(request, "command_id")?.into(),
                 actor,
@@ -500,7 +501,7 @@ pub fn request(data: &Path, value: &Value) -> Result<Value> {
         ));
     }
     stream.write_all(&bytes)?;
-    if ["backup", "export", "compact", "history_park"]
+    if ["backup", "export", "compact", "history_park", "history_release-candidates"]
         .contains(&value["operation"].as_str().unwrap_or(""))
     {
         stream.set_read_timeout(None)?;

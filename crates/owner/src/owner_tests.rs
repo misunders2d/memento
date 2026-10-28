@@ -166,6 +166,15 @@ fn owner_history_cutover_idempotent_and_export_is_complete_native_archive() {
     let first = f.call(json!({"operation":"history_park"}));
     assert!(first.get("error").is_none());
     assert_eq!(f.call(json!({"operation":"history_park"})), first);
+    f.graph.store.write(|tx| {
+        tx.sql().execute("INSERT INTO historical_parked_candidates(candidate_id) VALUES ('preserved-candidate')",[])?;
+        Ok(())
+    }).unwrap();
+    let released=f.call(json!({"operation":"history_release-candidates"}));
+    assert_eq!(released["result"]["released_now"],1);
+    assert_eq!(released["result"]["parked_candidates"],0);
+    assert_eq!(released["result"]["parked_conversations"],first["result"]["parked_conversations"]);
+    assert_eq!(f.call(json!({"operation":"history_release-candidates"}))["result"]["released_now"],0);
     let archive = f.dir.path().join("owner.tar");
     let result = f.call(json!({"operation":"export","output":archive}));
     assert_eq!(result["result"]["complete"], true);
@@ -395,6 +404,7 @@ fn cli_operational_commands_need_no_tty_and_compact_incomplete_is_nonzero() {
         (vec!["backup"], "backup"),
         (vec!["history", "park"], "history_park"),
         (vec!["history", "status"], "history_status"),
+        (vec!["history", "release-candidates"], "history_release-candidates"),
         (vec!["compact"], "compact"),
     ] {
         let mut values = vec!["--data-dir", "synthetic"];

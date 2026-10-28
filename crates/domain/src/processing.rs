@@ -255,6 +255,17 @@ impl Processing {
             // Native header5 is never lowered to the older Python parkingheader3.
         }historical_status(tx.sql())})
     }
+    /// Explicit owner admission of already extracted historical candidates; no raw replay.
+    pub fn release_history_candidates(&self) -> Result<Value> {
+        self.graph.store.write(|tx| {
+            let targets=rows(tx.sql(),"SELECT candidate_id FROM historical_parked_candidates WHERE released_at IS NULL",[])?;
+            let count=tx.sql().execute("UPDATE historical_parked_candidates SET released_at=? WHERE released_at IS NULL",[format_time(Utc::now())])?;
+            for row in targets { tx.touch_target(get_str(&row,"candidate_id")?)?; }
+            let mut result=historical_status(tx.sql())?;
+            result["released_now"]=json!(count);
+            Ok(result)
+        })
+    }
     pub fn maintain(&self, command: Maintenance) -> Result<Value> {
         if command.target_ids.is_empty()
             || command.target_ids.len() > 48

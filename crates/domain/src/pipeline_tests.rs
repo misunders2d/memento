@@ -173,10 +173,12 @@ fn shared_work_api_pages_pool_and_commits_a_larger_related_batch() {
 #[test]
 fn smaller_admission_repartitions_only_uncommitted_released_work() {
     let f=Fixture::new();
-    f.seed(); f.extract("contract","thread",FACT,"knowledge",false);
     let other="The copper observatory uses a calibrated spectrometer.";
-    f.capture("second","thread",other,"user","contract",json!({}),"2026-10-19T12:00:00Z");
-    f.extract("contract","thread",other,"knowledge",false);
+    let raw=format!("{FACT} {other}");
+    f.capture("two","thread",&raw,"user","contract",json!({}),"2026-10-19T12:00:00Z");
+    let extraction=f.claim("contract","thread",Some(vec!["extract".into()]))["work"][0].clone();
+    let mut second=draft(other,"knowledge",false); second["key"]=json!("second");
+    f.complete(&extraction,json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false),second]}]})).unwrap();
     let old=f.consolidate_work();
     assert_eq!(old["input"]["candidates"].as_array().unwrap().len(),2);
     let request=|exclude:Value|serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"continuous":true,"consolidate_now":true,"batch_size":1,"exclude":exclude}})).unwrap();
