@@ -35,6 +35,40 @@ def tag(graph, id, role, evidence, key):
         command_id=key, actor='owner', why='Explicit source-grounded responsibility')
 
 
+@pytest.mark.parametrize('role,text', [('owner', 'I need to renew my passport.'),
+                                      ('other', 'Lena owes me signed approval.')])
+def test_automatic_role_commits_with_new_assertion(tmp_path, role, text):
+    from test_extraction import draft
+    store = Store(tmp_path)
+    try:
+        graph = Graph(store)
+        processing = Processing(graph)
+        source = 'native:role-pipeline:pi'
+        episode, _ = store.capture(dict(source=source, event_id='role', conversation_id='thread',
+            kind='user', text=text, occurred_at='2026-01-01T00:00:00+00:00', metadata={}))
+        work, = processing.claim(agent='fixture', timezone_name='UTC',
+            compaction=dict(source=source, conversation_id='thread'), kinds=['extract'])['work']
+        candidate = draft('task', 'memory', 'knowledge', text, text)
+        candidate.update(open_loop=True, responsibility=role)
+        processing.complete(id=work['id'], owner=work['owner'], agent='fixture', output=dict(
+            windows=[dict(id=work['input']['windows'][0]['id'], candidates=[candidate])]))
+        work, = processing.claim(agent='fixture', timezone_name='UTC', consolidate_now=True,
+            kinds=['consolidate'])['work']
+        candidate, = work['input']['candidates']
+        fields = {key: None for key in ('target', 'src', 'dst', 'relation', 'change_kind', 'valid_at',
+                                        'valid_from', 'valid_to', 'category', 'sensitive')}
+        fields.update(candidate_id=candidate['id'], operation='remember', type='knowledge', text=text,
+            scope=['professional'], open_loop=True, responsibility=role, why='Original pending obligation',
+            evidence=[dict(episode_id=episode['id'], quote=text, occurrence=None)])
+        result = processing.complete(id=work['id'], owner=work['owner'], agent='fixture',
+                                     output=dict(actions=[fields]))
+        target = result['results'][candidate['id']]['id']
+        assert graph.loop(action='list', responsibility=role)['loops'][0]['id'] == target
+        assert graph.history(target)[-1]['evidence'][0]['episode_id'] == episode['id']
+    finally:
+        store.close()
+
+
 def test_legacy_unknown_owner_and_other_wait_are_independent_of_scope(world):
     store, graph, (owner, other), evidence = world
     assert graph.loop(action='list', responsibility='unknown')['total'] == 2

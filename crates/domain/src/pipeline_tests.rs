@@ -136,6 +136,43 @@ fn action(candidate: &Value, op: &str) -> Value {
 }
 
 #[test]
+fn automatic_loop_responsibility_commits_with_new_assertion() {
+    for (role, text) in [
+        ("owner", "I need to renew my passport."),
+        ("other", "Lena owes me signed approval."),
+    ] {
+        let f = Fixture::new();
+        let source = "native:role-pipeline:pi";
+        let episode = f.capture(
+            "role",
+            "thread",
+            text,
+            "user",
+            source,
+            json!({}),
+            "2026-10-18T12:00:00Z",
+        );
+        let extract = f.claim(source, "thread", Some(vec!["extract".into()]))["work"][0].clone();
+        let mut candidate = draft(text, "knowledge", true);
+        candidate["responsibility"] = json!(role);
+        f.complete(&extract, json!({"windows":[{"id":extract["input"]["windows"][0]["id"],"candidates":[candidate]}]})).unwrap();
+        let work = f.claim(source, "thread", Some(vec!["consolidate".into()]))["work"][0].clone();
+        let candidate = &work["input"]["candidates"][0];
+        let mut remember = action(candidate, "remember");
+        remember["open_loop"] = json!(true);
+        remember["responsibility"] = json!(role);
+        let result = f.complete(&work, json!({"actions":[remember]})).unwrap();
+        let target = result["results"][candidate["id"].as_str().unwrap()]["id"]
+            .as_str()
+            .unwrap();
+        let history = f.graph.history(target).unwrap();
+        assert_eq!(history[0]["loop"]["state"], "open");
+        assert_eq!(history[0]["loop"]["responsibility"], role);
+        assert_eq!(history[0]["evidence"][0]["episode_id"], episode);
+    }
+}
+
+#[test]
 fn actual_scheduled_extract_consolidate_history_and_immutable_schema_contract() {
     let f = Fixture::new();
     let episode = f.seed();

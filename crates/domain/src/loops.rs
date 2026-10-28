@@ -160,7 +160,15 @@ pub fn assign(
     if !valid_responsibility(value) {
         return Err(Error::Validation("Invalid loop responsibility"));
     }
-    let active = target(tx.sql(), target_id)?.ok_or(Error::Validation(
+    // A newly created assertion is visible inside this transaction before its
+    // graph_commits row exists. Attribution needs its state/protection fields,
+    // not the viewer's committed-history summary.
+    let active = match one(tx.sql(),
+        "SELECT n.* FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)",
+        [target_id])? {
+        Some(node) => Some(node),
+        None => target(tx.sql(), target_id)?,
+    }.ok_or(Error::Validation(
         "Responsibility requires an active visible target",
     ))?;
     if one(

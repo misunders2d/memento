@@ -85,8 +85,12 @@ def assign(graph, commit, target, value, sources, *, manual=False):
     """Ground role metadata without changing lifecycle, deadlines or deferrals."""
     if value not in RESPONSIBILITIES:
         raise ValueError('Invalid loop responsibility')
-    node = _target(graph, target)
     db = graph.store._db
+    # New assertions precede their graph_commits row within the same write.
+    # Role validation needs state/protection, not committed viewer details.
+    node = db.execute('''SELECT n.* FROM node_versions n WHERE n.id=? AND n.state='active'
+        AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)''', (target,)).fetchone()
+    node = dict(node) if node is not None else _target(graph, target)
     if node is None or db.execute('SELECT 1 FROM forgotten_targets WHERE target=?', (target,)).fetchone():
         raise ValueError('Responsibility requires an active visible target')
     previous = current(graph, target)
