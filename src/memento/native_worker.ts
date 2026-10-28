@@ -35,6 +35,7 @@ export default function worker(pi: any) {
   });
   let current: any[] = [], last: any = {}, model: string | undefined, usage: any;
   let completed = 0;
+  let contextStart = 0, resetContext = true;
   const cooling = new Map<string, number>();
   const claims = new Map<string, any>();
   const emptyKinds = new Set<string>();
@@ -56,6 +57,7 @@ export default function worker(pi: any) {
   }
   pi.on("session_start", async () => {
     current = []; last = initialPool; completed = 0; claims.clear(); emptyKinds.clear();
+    contextStart = 0; resetContext = true;
     const until = Date.now() + 15000;
     while (!pi.getActiveTools().includes(TOOL) && Date.now() < until)
       await new Promise(resolve => setTimeout(resolve, 25));
@@ -125,11 +127,11 @@ export default function worker(pi: any) {
       || (action === "status" && value.state === "done" && claims.has(value.id) ? value.id : null);
     if (completedId) {
       claims.delete(completedId); current = current.filter(item => item.id !== completedId);
-      cooling.set(completedId, Date.now() + 900000); completed++;
+      cooling.set(completedId, Date.now() + 900000); completed++; resetContext = true;
     }
     if (action === "release" && value.released) {
       claims.delete(event.input.command.id); current = [];
-      cooling.set(event.input.command.id, Date.now() + 900000);
+      cooling.set(event.input.command.id, Date.now() + 900000); resetContext = true;
     }
     const offered = action === "claim" ? value : value.next;
     const held: any[] = [];
@@ -154,10 +156,24 @@ export default function worker(pi: any) {
       empty_kinds: [...emptyKinds],
       completed: completedId, released: action === "release" && value.released ? event.input.command.id : null,
       boundary: completed >= 8 && !current.length, empty: !!offered && !current.length });
-    return { content: [{ type: "text", text: JSON.stringify({ current, receipt: last,
+    return { content: [{ type: "text", text: JSON.stringify({ current_work: current.map(item => ({ id: item.id, kind: item.kind })), receipt: last,
       empty_kinds: [...emptyKinds],
       session_boundary: completed >= 8 && !current.length }) }], structuredContent: undefined };
   });
-  pi.on("context", () => ({ messages: [{ role: "user", timestamp: Date.now(),
-    content: [{ type: "text", text: JSON.stringify({ current, receipt: last, empty_kinds: [...emptyKinds] }) }] }] }));
+  pi.on("context", (event: any = { messages: [] }) => {
+    // Keep native reasoning/tool history within a unit. Dropping it after every
+    // tool creates amnesia loops; clear completed work only at a verified boundary.
+    if (resetContext) { contextStart = event.messages.length; resetContext = false; }
+    return { messages: [{ role: "user", timestamp: Date.now(),
+      content: [{ type: "text", text: JSON.stringify({ current, receipt: last, empty_kinds: [...emptyKinds] }) }] },
+      ...event.messages.slice(contextStart).map((message: any) => {
+        if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
+        return { ...message, content: message.content.map((block: any) => {
+          if (block.type !== "toolCall" || block.name !== TOOL || !block.arguments?.command) return block;
+          const command = { ...block.arguments.command }; delete command.owner;
+          if (command.complete) { command.complete = { ...command.complete }; delete command.complete.owner; }
+          return { ...block, arguments: { ...block.arguments, command } };
+        }) };
+      })] };
+  });
 }

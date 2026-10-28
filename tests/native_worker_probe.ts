@@ -13,6 +13,7 @@ export default async function probe() {
   worker(fake);
   const assert = (value: any, label: string) => { if (!value) throw new Error(label); };
   await handlers.session_start();
+  handlers.context({ messages: [] });
   assert(definition.name === "memento_work", "one work definition");
   const result = (input: any, value: any) => handlers.tool_result({ toolName: "memento_work", input,
     content: [{ type: "text", text: JSON.stringify(value) }], isError: false });
@@ -29,6 +30,10 @@ export default async function probe() {
     lease_seconds: 180, backlog: { pending_extract_conversations: 0, pending_extract_jobs: 0, leased_extract_jobs: 1 } });
   const foreign = handlers.tool_call({ toolName: "memento_work", input: { action: "complete", command: { id: "foreign", output: {} } } });
   assert(foreign?.block, "foreign lease rejected before service call");
+  const attempts = [{ role: "assistant", content: [{ type: "toolCall", name: "memento_work", id: "synthetic-call",
+    arguments: { action: "renew", command: { id: "held", owner: "private-capability" } } }] }];
+  assert(handlers.context({ messages: attempts }).messages.length === 2, "native attempt history retained within current unit");
+  assert(!JSON.stringify(handlers.context({ messages: attempts })).includes("private-capability"), "native history cannot expose bound lease capabilities");
   let context = handlers.context().messages[0].content[0].text;
   assert(!context.includes("private-capability") && context.includes("old synthetic evidence"), "evidence retained, lease capability private");
   const submit: any = { toolName: "memento_work", input: { action: "complete", command: { id: "held", output: {} } } };
@@ -53,5 +58,5 @@ export default async function probe() {
   assert(!completionWithEmptyNext.input.command.next && completionWithEmptyNext.input.command.complete.owner === "private-next",
     "commit current work while omitting the known empty next claim");
   console.error("WORKER_CALLBACK_PROBE " + JSON.stringify({ passed: true, demand_job: true,
-    foreign_lease: true, private_capability: true, bounded_context: true, continuity: true, empty_next_commit: true }));
+    foreign_lease: true, private_capability: true, bounded_context: true, continuity: true, empty_next_commit: true, native_task_history: true }));
 }
