@@ -28,7 +28,7 @@ export default function worker(pi: any) {
       if (!response.ok) {
         let reason = "processing_request_failed";
         try { const value = JSON.parse(text); if (typeof value.detail === "string") reason = value.detail; } catch {}
-        throw new Error(reason);
+        throw new Error("MEMENTO_HTTP_" + response.status + ": " + reason);
       }
       return { content: [{ type: "text", text }], details: undefined };
     },
@@ -93,9 +93,18 @@ export default function worker(pi: any) {
         input.command = { id: leased.id, owner: leased.owner,
           ...(input.action === "release" ? { error: "service_rejected" } : {}) };
       } else if (!["pool", "status"].includes(input.action)) throw new Error("Unknown processing action");
-    } catch {
-      last = { error: "invalid_or_foreign_work", action: ["pool","claim","submit","complete","status","release","renew"].includes(input.action) ? input.action : "unknown" };
-      emit({ type: "memento_worker_state", error: true, code: "invalid_or_foreign_work" });
+    } catch (error: any) {
+      const causes: Record<string,string> = {
+        "Complete or release current work first":"current_work_held",
+        "Choose one work kind":"invalid_kind",
+        "That work kind is empty; try the other kind or finish":"empty_kind",
+        "Work identifier is not held by this worker":"foreign_job",
+        "Unknown processing action":"unknown_action",
+      };
+      const cause = causes[error?.message] || "invalid_command";
+      last = { error: "invalid_or_foreign_work", cause, action: ["pool","claim","submit","complete","status","release","renew"].includes(input.action) ? input.action : "unknown" };
+      emit({ type: "memento_worker_state", error: true, code: "invalid_or_foreign_work", cause,
+        action: ["pool","claim","submit","complete","status","release","renew"].includes(input.action) ? input.action : "unknown" });
       return { block: true, reason: "Invalid or foreign processing work; use the current work and supplied schema" };
     }
   });
@@ -107,7 +116,8 @@ export default function worker(pi: any) {
       last = { error: "processing_request_failed", detail: event.content };
       const text = event.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
       emit({ type: "memento_worker_state", error: true,
-        code: text.match(/\b(?:candidate|consolidation)_[a-z_]+\b/)?.[0] });
+        code: text.match(/\b(?:candidate|consolidation)_[a-z_]+\b/)?.[0],
+        http_status: Number(text.match(/MEMENTO_HTTP_(\d{3})/)?.[1]) || undefined });
       return;
     }
     const action = event.input.action;

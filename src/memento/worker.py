@@ -25,6 +25,8 @@ For each item, produce its COMPLETE exact-schema output. No invented quotes, ide
 Use work(action=submit,command={complete:{id,output},next:{kinds:[KIND],batch_size:N}})
 to commit and get fresh next work in one operation. Compare/resolve all same-batch identities before submitting.
 Do not reread completed evidence. Repair failed quotes/plans from current source or retain explicit uncertainty.
+After a rejected submission, release that job and continue unrelated work; a fresh later claim supplies rejection feedback.
+Do not repeat an unchanged failed submission. For adapter argument errors, fix the stated cause using the current job id.
 If an operation outcome is uncertain, inspect status before retrying. Never assume a rejected plan committed.
 Start with consolidation. After each successful unit, alternate extraction and consolidation when both are available.
 When a kind returns no work, try the other kind. Finish only after both kinds return no currently available work.
@@ -185,6 +187,14 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                     receipt={'stage':'worker','error':'processing_request_failed'}
                                     if event.get('code') in api.WORK_REJECTION_CODES:
                                         receipt['detail_code']=event['code']
+                                    if event.get('code') == 'invalid_or_foreign_work':
+                                        receipt['category']='adapter_guard'
+                                    if event.get('cause') in ('current_work_held','invalid_kind','empty_kind','foreign_job','unknown_action','invalid_command'):
+                                        receipt['cause']=event['cause']
+                                    if event.get('action') in ('pool','claim','submit','complete','status','release','renew','unknown'):
+                                        receipt['action']=event['action']
+                                    if type(event.get('http_status')) is int and 400 <= event['http_status'] <= 599:
+                                        receipt['http_status']=event['http_status']
                                     print(api.encode(receipt).decode(), flush=True)
                                 else:
                                     turns_without_result = 0
