@@ -45,7 +45,8 @@ COPY src/memento ./src/memento
 COPY THIRD_PARTY_NOTICES.md ./
 RUN --mount=type=cache,id=memento-native-cargo-amd64,target=/usr/local/cargo/registry \
     --mount=type=cache,id=memento-native-target-amd64,target=/build/target \
-    cargo build --locked --release -p memento-server --bin memento \
+    touch crates/server/src/assets.rs \
+    && cargo build --locked --release -p memento-server --bin memento \
     && mkdir -p /out/bin \
     && cp target/release/memento /out/bin/memento \
     && cargo build --locked --release -p memento-owner --features legacy-import \
