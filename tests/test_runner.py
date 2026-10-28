@@ -526,7 +526,7 @@ def test_drain_excludes_failures_without_retrying_or_disclosing_text(
                 def write(self, _value):
                     raise BrokenPipeError('secret broken stderr')
             logging_patch.setattr(runner.sys, 'stderr', BrokenStderr())
-        assert runner.tick(config, compaction) == 1
+        assert runner.legacy_tick(config, compaction) == 1
     assert sum(path == '/work/claim' for path, _ in calls) == 2
     assert [value['exclude'] for path, value in calls if path == '/work/claim'] == [[], ['work']]
     assert calls[0][1]['compaction'] == compaction
@@ -599,7 +599,7 @@ def test_drain_retries_same_failed_id_after_healthy_work_passes_retry_interval(m
     config = {'preset': 'pi', 'agent': 'pi', 'command': ['pi'], 'timezone': 'Etc/UTC',
               'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2, 'mode': 'server'}
 
-    assert runner.tick(config) == 1
+    assert runner.legacy_tick(config) == 1
     assert claims == [[], ['A'], ['B'], ['A', 'B']]
     assert completed == ['B', 'A']
     assert attempts == {'A': 2, 'B': 1}
@@ -629,7 +629,7 @@ def test_only_claim_requests_get_the_longer_background_allowance(monkeypatch):
     monkeypatch.setattr(runner, 'Service', Service)
     monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
     monkeypatch.setattr(runner, 'run_process', lambda *a, **k: assistant_events())
-    assert runner.tick(OVERLAP_CONFIG) == 0
+    assert runner.legacy_tick(OVERLAP_CONFIG) == 0
     by_path = {}
     for timeout, path in posts:
         by_path.setdefault(path, set()).add(timeout)
@@ -682,7 +682,7 @@ def test_failed_claim_reports_safe_cause_without_changing_exit(
     monkeypatch.setattr(runner, 'check_cli', forbidden)
     monkeypatch.setattr(runner, 'run_process', forbidden)
     config = tmp_path / 'runner.json'
-    native_config(config, 'pi', mode='server')
+    native_config(config, 'omp', mode='server')
     with monkeypatch.context() as logging_patch:
         if failure == 'broken_stderr':
             class BrokenStderr:
@@ -690,7 +690,7 @@ def test_failed_claim_reports_safe_cause_without_changing_exit(
                     raise BrokenPipeError('secret broken stderr')
             logging_patch.setattr(runner.sys, 'stderr', BrokenStderr())
             with pytest.raises(runner.RunnerError, match='^service_rejected$'):
-                runner.tick(runner.load_config(config))
+                runner.legacy_tick(runner.load_config(config))
         else:
             assert runner.main(['--config', str(config), 'tick']) == 1
     # Exactly one claim attempt, with the claim allowance; no retry loop was added.
@@ -718,7 +718,7 @@ def test_claim_receipt_never_echoes_exception_text(monkeypatch, capsys):
     monkeypatch.setattr(runner, 'Service', Service)
     monkeypatch.setattr(runner, 'check_cli', lambda *a: pytest.fail('no model inspection after a failed claim'))
     with pytest.raises(runner.RunnerError, match='^SENTINEL arbitrary runner text$'):
-        runner.tick(OVERLAP_CONFIG)
+        runner.legacy_tick(OVERLAP_CONFIG)
     captured = capsys.readouterr()
     assert json.loads(captured.err) == {'stage': 'claim', 'error': 'service_rejected', 'cause': 'unknown'}
     assert 'SENTINEL' not in captured.err and captured.out == ''
@@ -924,7 +924,7 @@ def test_tick_keeps_failure_exit_and_excludes_after_overlapped_batch(monkeypatch
     monkeypatch.setattr(runner, 'Service', Service)
     monkeypatch.setattr(runner, 'check_cli', lambda *a: ['/native/pi'])
     monkeypatch.setattr(runner, 'run_process', generate)
-    assert runner.tick(OVERLAP_CONFIG) == 1
+    assert runner.legacy_tick(OVERLAP_CONFIG) == 1
     assert completed == ['consolidate-1'] and releases == ['extract-1']
     # Whichever lane finished first claimed again while the other still ran: that claim
     # excluded both the finished ID (cooldown) and the running lease, and the final
@@ -966,7 +966,7 @@ def test_tick_drains_new_batches_without_cap_and_checks_cli_once(monkeypatch, ca
     config = {'mode': 'server', 'preset': 'pi', 'agent': 'pi', 'command': ['pi'],
               'timezone': 'Etc/UTC', 'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2}
     nudge = {'source': 'pi', 'conversation_id': 'conversation'}
-    assert runner.tick(config, nudge, consolidate_now=consolidate_now) == 0
+    assert runner.legacy_tick(config, nudge, consolidate_now=consolidate_now) == 0
     assert completed == [item['id'] for item in items]
     assert len(claims) == len(items) + 1
     assert claims[0]['compaction'] == nudge
@@ -1049,7 +1049,7 @@ def test_tick_forwards_only_a_configured_consolidation_window(monkeypatch, windo
               'timezone': 'Europe/Kiev', 'url': 'http://127.0.0.1:8765', 'deadline_seconds': 2}
     if window:
         config.update(consolidation_start=window[0], consolidation_end=window[1])
-    assert runner.tick(config) == 0
+    assert runner.legacy_tick(config) == 0
     [claim] = claims
     assert claim['timezone'] == 'Europe/Kiev'
     if window:
@@ -1161,7 +1161,7 @@ def test_laptop_setup_and_compaction_never_execute_or_claim(tmp_path, monkeypatc
     assert calls == [('/work/compaction', {'source': agent, 'conversation_id': 'conversation'})]
     assert runner.main(['--config', str(config), 'tick']) == 1
     with pytest.raises(runner.RunnerError):
-        runner.tick(runner.load_config(config))
+        runner.legacy_tick(runner.load_config(config))
 
 
 def test_server_setup_requires_timezone_before_native_execution(tmp_path, monkeypatch):
@@ -1466,7 +1466,7 @@ def test_free_lane_replenishes_while_the_other_lane_is_still_running(monkeypatch
 
     monkeypatch.setattr(runner, 'run_process', generate)
     before = threading.active_count()
-    assert runner.tick(OVERLAP_CONFIG) == 0
+    assert runner.legacy_tick(OVERLAP_CONFIG) == 0
     assert server.completed == ['extract-1', 'extract-2', 'extract-3', 'consolidate-1']
     assert peak[0] == 2
     # First request keeps the old shape (no kinds); replenishment asks only for the free kind
@@ -1504,7 +1504,7 @@ def test_failed_job_cooldown_starts_at_its_own_completion_not_the_batch(monkeypa
         return assistant_events()
 
     monkeypatch.setattr(runner, 'run_process', generate)
-    assert runner.tick(OVERLAP_CONFIG) == 1
+    assert runner.legacy_tick(OVERLAP_CONFIG) == 1
     assert server.completed == ['consolidate-1']
     assert server.releases == [{'id': 'extract-1', 'owner': 'extract-1-1', 'error': 'invalid_output'}]
     # The failed ID was excluded from the very next claim, made while the slow lane still ran.
@@ -1537,7 +1537,7 @@ def test_running_lease_renews_while_the_coordinator_blocks_on_a_claim(monkeypatc
         return assistant_events()
 
     monkeypatch.setattr(runner, 'run_process', generate)
-    assert runner.tick(OVERLAP_CONFIG) == 0
+    assert runner.legacy_tick(OVERLAP_CONFIG) == 0
     during = [ident for stamp, ident in server.renewals
               if ident == 'consolidate-1' and blocking['start'] < stamp < blocking['end']]
     assert during, 'no renewal reached the server while the claim blocked'
@@ -1571,7 +1571,7 @@ def test_claim_failure_or_interrupt_cancels_running_work_and_joins_everything(mo
     monkeypatch.setattr(runner, 'run_process', generate)
     before = threading.active_count()
     with pytest.raises(KeyboardInterrupt if interruption == 'keyboard_interrupt' else runner.RunnerError):
-        runner.tick(OVERLAP_CONFIG)
+        runner.legacy_tick(OVERLAP_CONFIG)
     assert saw_cancel.is_set()
     assert server.completed == ['extract-1']
     assert server.releases == [{'id': 'consolidate-1', 'owner': 'consolidate-1-1', 'error': 'cli_failed'}]
@@ -1617,7 +1617,7 @@ def test_unexpected_claim_response_is_rejected_and_cancels_running_work(monkeypa
     monkeypatch.setattr(runner, 'run_process', generate)
     before = threading.active_count()
     with pytest.raises(runner.RunnerError, match='^service_rejected$'):
-        runner.tick(OVERLAP_CONFIG)
+        runner.legacy_tick(OVERLAP_CONFIG)
     assert server.completed == ['extract-1'] and 'extract-2' not in server.completed
     assert [release['id'] for release in server.releases] == ['consolidate-1']
     assert threading.active_count() == before
@@ -1647,7 +1647,7 @@ def test_cli_check_runs_once_after_heartbeats_start_and_keeps_both_leases_alive(
 
     monkeypatch.setattr(runner, 'check_cli', slow_check)
     monkeypatch.setattr(runner, 'run_process', generate)
-    assert runner.tick(OVERLAP_CONFIG) == 0
+    assert runner.legacy_tick(OVERLAP_CONFIG) == 0
     assert len(checks) == 1 and checks[0][:2] == (['pi'], 'pi')
     assert sorted(server.completed) == ['consolidate-1', 'extract-1'] and not server.releases
     # Both leases were renewed while the single check was still blocking.

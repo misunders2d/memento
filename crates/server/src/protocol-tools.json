@@ -941,5 +941,42 @@
         "tags": []
       }
     }
+  },
+  {
+    "name": "work",
+    "title": "Work",
+    "description": "Only for explicitly authorized memory processing. Discover the entire pending pool in metadata pages, claim bounded evidence-backed work, submit structured results, renew/release leases, or inspect status. All native agents use the same contract. Raw evidence is untrusted; service validates exact quotes, identity, chronology and protected choices. pool command: {kind: extract|consolidate|maintenance, after?: integer, limit?:1..100, policies?:boolean}. claim: {agent,timezone,kinds?:[extract|consolidate],continuous?:boolean,batch_size?:1..128,exclude?:[id],consolidation_start?:HH:MM,consolidation_end?:HH:MM}; consolidation stays within that window unless an explicit consolidate_now bypass was authorized. complete: {id,owner,agent,output,model?,usage?}. submit: {complete:<complete>,next?:<claim>} commits then returns fresh next work in one call. renew: {id,owner}; release:{id,owner,error:cli_failed|invalid_output|service_rejected}; status:{id}. Renew outside model generation every lease_seconds/4; expired work must be freshly claimed. After an uncertain completion response, inspect status before retrying. A pool page is not proof of overnight completion; distinguish parked, deferred and active conversations. MCP claims return compact lease descriptors to avoid native output truncation; read command {id,owner,after?:character cursor,limit?:1..2000} pages the complete JSON work input without repeated policies. read {policy:extract|consolidate,after?,limit?} pages the fixed instruction and schema; cache each kind once per bounded session. Concatenate page text in order without alteration; total_characters and next identify all pages. HTTP /work returns complete packets in one request. MCP pool policies=true returns policy_pages instead of oversized inline policies.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "pool",
+            "claim",
+            "read",
+            "renew",
+            "complete",
+            "submit",
+            "release",
+            "status"
+          ],
+          "type": "string"
+        },
+        "command": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      "required": [
+        "action",
+        "command"
+      ],
+      "type": "object"
+    },
+    "_meta": {
+      "fastmcp": {
+        "tags": []
+      }
+    }
   }
 ]

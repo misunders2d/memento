@@ -571,6 +571,23 @@ KINDS = ('extract', 'consolidate')
 
 
 def tick(config, compaction=None, *, consolidate_now=False):
+    if config.get('preset') == 'pi':
+        if __package__:
+            from . import worker
+        else:
+            # An older frontdoor can install the new runner before these optional
+            # processor assets. Complete that normal, hash-checked installation.
+            directory = Path(__file__).parent
+            if any(not (directory / name).is_file() for name in PROCESSING_FILES):
+                files = release_files(Service(config['url']).download('/client-release'), processing=True)
+                for name in PROCESSING_FILES:
+                    private_write(directory / name, files[name])
+            import worker
+        return worker.tick(sys.modules[__name__], config, compaction, consolidate_now=consolidate_now)
+    return legacy_tick(config, compaction, consolidate_now=consolidate_now)
+
+
+def legacy_tick(config, compaction=None, *, consolidate_now=False):
     """Drain due work, spacing repeated IDs by the existing polling cadence.
 
     One future per work kind keeps at most two native processes alive. A lane that
@@ -987,17 +1004,20 @@ def setup(args):
     return config_path
 
 RELEASE_FILES = ('runner.py', 'bridge.py', 'native_pi.ts', 'native_omp.ts', 'native_shared.ts')
+PROCESSING_FILES = ('worker.py', 'native_worker.ts')
 
 
-def release_files(raw):
+def release_files(raw, *, processing=False):
     """Reject incomplete/corrupt bundles before touching any installed code."""
     try:
         bundle = decode(raw)
         if bundle['format'] != 1 or set(bundle['files']) != set(RELEASE_FILES):
             raise ValueError('unsupported release')
         files = {}
-        for name in RELEASE_FILES:
-            entry = bundle['files'][name]
+        if processing and set(bundle.get('processing_files', {})) != set(PROCESSING_FILES):
+            raise ValueError('missing processing assets')
+        for name in (*RELEASE_FILES, *(PROCESSING_FILES if processing else ())):
+            entry = bundle['processing_files' if name in PROCESSING_FILES else 'files'][name]
             content = base64.b64decode(entry['content'], validate=True)
             if (not content or len(content) > MAX_OUTPUT
                     or hashlib.sha256(content).hexdigest() != entry['sha256']):
@@ -1142,7 +1162,8 @@ def update_agent(args):
         fcntl.flock(lock, fcntl.LOCK_EX)
         # Validate every asset before touching installed code. Keep native settings
         # and loader paths stable; rerunning completes an interrupted cutover.
-        files = release_files(Service(config['url']).download('/client-release'))
+        files = release_files(Service(config['url']).download('/client-release'),
+                              processing=config['mode'] == 'server' and config['preset'] == 'pi')
         targets = [(config_path.parent / 'bridge.py', 'bridge.py')]
         if args.agent in ('pi', 'omp'):
             root = (args.native_config_dir.expanduser().absolute() if args.native_config_dir else
@@ -1157,9 +1178,14 @@ def update_agent(args):
                         (extension / 'native_shared.ts', 'native_shared.ts')]
         # Publish the stable standalone command last, never the package/repo module.
         if standalone.exists():
+            if config['mode'] == 'server' and config['preset'] == 'pi':
+                targets += [(standalone.parent / name, name) for name in PROCESSING_FILES]
             targets.append((standalone, 'runner.py'))
         modes = []
         for target, name in targets:
+            if name in PROCESSING_FILES and not target.exists() and not target.is_symlink():
+                modes.append(0o600)
+                continue
             if target.is_symlink() or not target.is_file():
                 raise RunnerError('installed code must be a regular file; run agent add first')
             info = target.stat()

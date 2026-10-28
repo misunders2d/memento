@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 680" role="img" aria-labelledby="title desc" style="color-scheme:light dark">
   <title id="title">Memento architecture and trust boundaries</title>
-  <desc id="desc">Ordinary-user native agents (Pi, OMP, Claude Code, Codex, AGY) capture conversations and receive automatic recall and 6 MCP tools from a private service running under dedicated UID 10001. One native processor runs an independent two-lane coordinator (one extraction and one consolidation) with tool-free model calls. The service stores compressed raw evidence, current-node FTS5 and reused vec0 embeddings, validates exact source spans and technical traces with bounded retry feedback, and optionally offloads cold artifacts and manual backups to an app-owned Google Drive folder.</desc>
+  <desc id="desc">Ordinary-user native agents (Pi, OMP, Claude Code, Codex, AGY) capture conversations and receive automatic recall and 6 MCP tools from a private service running under dedicated UID 10001. One designated local agent processes extraction, consolidation and maintenance through the shared work API; Pi keeps a persistent native process with only the Memento work tool. The service stores compressed raw evidence, current-node FTS5 and reused vec0 embeddings, validates exact source spans and technical traces with bounded retry feedback, and optionally offloads cold artifacts and manual backups to an app-owned Google Drive folder.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M1 1 9 5 1 9" fill="none" stroke="currentColor" stroke-width="1.5"/>
@@ -66,8 +66,8 @@
   <rect class="box" x="38" y="334" width="250" height="162" rx="10"/>
   <text class="label" x="54" y="360">One designated processor</text>
   <text x="54" y="383">Pi, OMP or Claude Code</text>
-  <text class="small" x="54" y="405">Existing CLI login · tool-free calls</text>
-  <text class="small" x="54" y="425">2-lane coordinator (extract +</text>
+  <text class="small" x="54" y="405">Existing CLI login · shared work API</text>
+  <text class="small" x="54" y="425">Persistent agent (extract +</text>
   <text class="small" x="54" y="443">consolidate refill independently)</text>
   <text class="small" x="54" y="463">Lease heartbeats · 15m retry wait</text>
   <text class="small" x="54" y="481">(Codex &amp; AGY are client-only)</text>

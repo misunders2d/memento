@@ -33,7 +33,7 @@ For example, “I still owe Mira the release checklist” can become an open loo
 
 ## One owner, several agents, shared context
 
-![Memento architecture: native capture and automatic recall across Pi, OMP, Claude Code, Codex and AGY, separate service identity, independent two-lane processor, strict validation gate with bounded feedback, and optional Drive storage](docs/images/architecture.svg)
+![Memento architecture: native capture and automatic recall across Pi, OMP, Claude Code, Codex and AGY, separate service identity, shared processing API and local native agent, strict validation gate with bounded feedback, and optional Drive storage](docs/images/architecture.svg)
 
 ```mermaid
 flowchart LR
@@ -41,7 +41,7 @@ flowchart LR
     accDescr: Native agents across your machines capture conversations and retrieve context from one private Memento service over loopback or Tailscale Serve HTTPS. Optional Google Drive holds cold artifacts and manual backups.
     L["Laptop (Pi · Codex · AGY)"] <-->|"Capture + auto recall + 6 MCP tools"| M["Private Memento Service (UID 10001)"]
     W["Workstation (Claude Code · OMP)"] <-->|"Capture + auto recall + 6 MCP tools"| M
-    P["Designated Processor (Pi / OMP / Claude)"] <-->|"2-lane tool-free extract & consolidate"| M
+    P["Designated Processor (Pi / OMP / Claude)"] <-->|"Shared work API · extract & consolidate"| M
     M --> D["Optional Google Drive (drive.file)"]
 ```
 
@@ -56,7 +56,7 @@ The automatic learning path keeps original conversations separate from inferred 
 ```mermaid
 flowchart TB
     accTitle: From original conversation to verified memory and recall
-    accDescr: Raw episodes are losslessly compressed and chunked. New captures flow through the independent two-lane processor, while an optional one-time historical cutover parks older backlog as searchable unverified history that promotes on demand when cited.
+    accDescr: Raw episodes are losslessly compressed and chunked. New captures flow through the shared processing API and local native agent, while an optional one-time historical cutover parks older backlog as searchable unverified history that promotes on demand when cited.
     H["Raw Episodes & Media (Immutable + raw_frame compressed)"] --> E["Extraction Lane (Live captures + cited historical chunks)"]
     E --> C["Unconfirmed Candidates (Span-verified, legacy instructions filtered)"]
     C --> N["Nightly Consolidation Lane (configured local window, default 02:00-07:00, compact existing-evidence spans)"]
@@ -71,7 +71,7 @@ flowchart TB
 
 | Stage | How it works in the current architecture |
 | --- | --- |
-| **Independent 2-lane processing** | The runner maintains one extraction lane and one consolidation lane (at most two tool-free native CLI calls). When the faster lane finishes, it claims its next job (`kinds` filter on `/work/claim`) without waiting for the slower lane. |
+| **Agent-owned processing** | Pi uses one persistent native process with only the Memento work tool. The agent discovers the eligible pool, chooses related batches and submits validated updates through the existing API. OMP/Claude retain the two-lane headless runner. |
 | **Optional historical pool & on-demand promotion** | A one-time owner cutover (`memento-admin --data-dir /data history park`) parks the remaining historical backlog and pending candidates in place without deleting history or falsifying extraction cursors, while all subsequent captures continue full extraction and consolidation. When no current fact or lesson matches an unscoped query, recall can surface bounded unverified historical context; citing a parked chunk or candidate promotes it into the normal extraction/consolidation pipeline on demand. |
 | **Compact consolidation context** | Existing graph nodes and relations supply their exact stored quotes, character spans and native trace metadata without repeating surrounding `±400`-character raw windows (`~49%` smaller consolidation payloads). |
 | **Self-correcting validation feedback** | Every batch is validated atomically. If a batch fails a quote, span, coverage or grounding check, nothing commits; the job records a bounded private `previous_rejection` (fixed code + up to 3 offending quote references) so the next retry can fix the exact error instead of repeating it blind. |
@@ -241,13 +241,27 @@ sudo loginctl enable-linger YOUR_AGENT_USER
 
 Keep one server processing config/timer. Do not silently convert it into a client when installing another harness. A sleeping or powered-off host cannot process memory; keep it awake for an overnight acceptance check.
 
-During a long import, a failed processing job can be retried after a 15-minute wait following its batch, while other work continues. A rejected consolidation batch stays pending, unchanged, for that retry while other ready candidates consolidate in separate batches; at most one consolidation runs at a time, and one extraction can run alongside it. The faster of the two lanes claims its next job as soon as it finishes instead of waiting for the slower one, within the same two-process limit; update the service before the designated processing runner, while other capture/recall clients need no update. When the service rejected the batch for an exact validation reason, the retry receives that fixed reason and the offending reference privately with its input, so the next attempt can fix it instead of repeating it blind; nothing from a rejected attempt is committed. A run still exits nonzero if any attempt failed, even if a later retry succeeded.
+With the OMP/Claude legacy runner, a failed processing job can be retried after a 15-minute wait following its batch, while other work continues. A rejected consolidation batch stays pending, unchanged, for that retry while other ready candidates consolidate in separate batches; at most one consolidation runs at a time, and one extraction can run alongside it. The faster of the two lanes claims its next job as soon as it finishes instead of waiting for the slower one, within the same two-process limit; update the service before the designated processing runner, while other capture/recall clients need no update. When the service rejected the batch for an exact validation reason, the retry receives that fixed reason and the offending reference privately with its input, so the next attempt can fix it instead of repeating it blind; nothing from a rejected attempt is committed. A run still exits nonzero if any attempt failed, even if a later retry succeeded.
 
 Failed attempts write a JSON diagnostic to stderr, visible in `journalctl --user -u memento-runner.service`: job ID, work kind, error category and, when available, HTTP status with an allowlisted Memento rejection code or a safe failure cause. Diagnostics exclude memory text, model output, URLs and arbitrary server error messages.
 
 Generic `service_rejected` or HTTP 422 is not a diagnosis. Identify the exact safe rejection reason and verify an affected retry before declaring the worker recovered; successful unrelated batches do not establish that a reported failure is fixed.
 
-Requesting the next batch allows up to 60 seconds, because the server prepares the batch context before answering; renewals, completions, releases and foreground commands keep their 15-second bound. If that request fails, the run still exits with the generic `service_rejected` message, preceded by a `stage: claim` diagnostic with the same safe status or cause classification. The run does not retry the request; the next timer run claims again.
+In the legacy runner, requesting the next batch allows up to 60 seconds, because the server prepares the batch context before answering; renewals, completions, releases and foreground commands keep their 15-second bound. If that request fails, the run still exits with the generic `service_rejected` message, preceded by a `stage: claim` diagnostic with the same safe status or cause classification. The run does not retry the request; the next timer run claims again.
+
+### Shared processing API and the Pi worker
+
+The service never calls a model. The designated local agent uses its existing native login/model and the common **`POST /work`** or MCP **`work`** contract. Pi, Claude, Codex, OMP and AGY can use this API; API compatibility does not qualify an unattended native launcher. Automatic Pi processing uses the persistent worker below, OMP/Claude retain the headless runner, and automatic Codex/AGY processing remains refused under the documented isolation limits.
+
+The `work` tool supports `pool`, `claim`, `read`, `renew`, `complete`, `submit`, `release` and `status`. Paginated pool metadata exposes all eligible extraction conversations, consolidation candidates and existing-memory maintenance groups, with parked/deferred work counted separately. Claims supply bounded evidence and the existing exact output schemas; only the service validates and commits. Full processing includes facts, entities, meaningful relations, loop closure/responsibility, supported experiences and behavioral suggestions, plus existing-memory reconciliation. Protected choices and chronology still apply.
+
+Pi keeps one native process alive across work units, using only its `memento_work` adapter to this same API. The host verifies the complete effective tool catalog before the first model prompt, renews leases independently, fixes actor/schedule/lease capabilities and releases unfinished work on cancellation. Static task policies are supplied once per bounded session. Model context retains current evidence, a compact receipt and which work kinds were empty; completed source text is removed. After eight commits the host starts a fresh session in that same process. No new service, database, model account or dependency is required. This path was qualified with Pi 1.4.0.
+
+The agent can select consolidation batches of **1–128** related candidates (Pi starts at 64; legacy default 16), reduce a batch when needed and commit/request fresh work together with `submit`. Overlapping source windows from the same episode and authority are combined without adding uncited gaps or changing raw history. Continuous claims admit new eligible candidates within the configured night window; compaction/inactivity, parking and deferrals remain enforced. Only one consolidation lease runs at a time. Reducing an oversized uncommitted batch retains its original job payload while making untouched candidates available to smaller batches; live or already committed work is never repartitioned.
+
+HTTP returns complete packets. MCP returns compact claim descriptors because native clients can truncate large tool results. Use `read` with the supplied job/owner and character cursor to concatenate every evidence page; read/cache each kind's policy and schema separately using `read` with `policy`. Never treat a descriptor or partial page as complete evidence. Renew leases outside model generation every `lease_seconds / 4`. After an uncertain completion, inspect `status` before retrying the identical result. A rejected plan commits nothing and retains the existing bounded validation feedback.
+
+Update the service **before** the processing runner. The version-1 client release keeps its original five client assets and supplies two optional processor assets, `worker.py` and `native_worker.ts`; the normal `memento agent update pi` installs them with hash validation. The standalone runner can also fetch missing processor assets from that same release. Other capture/recall clients need no update for processing. The normal timer/window is unchanged; the host must stay awake. Completion means the currently eligible pool was exhausted, not that parked history or unresolved obligations were completed.
 
 ### Codex limitation
 
@@ -377,7 +391,7 @@ That flag bypasses **only the consolidation night window**, not extraction eligi
 
 Leave an evidence-backed candidate pending before the window starts in the server config's timezone (02:00 unless you configured `--consolidation-start`). Keep the host awake and the timer enabled. Observe the normal service journal and memory history after the first completed in-window tick, without running a forced tick or modifying the clock.
 
-The window is the whole configured span (**02:00–07:00** by default), not exactly its first minute. The first in-window claim freezes that night's eligible-candidate boundary; later candidates wait for another night. Processing duration shifts the next tick. Give pending extraction/consolidation time to finish before calling a miss a failure. There is no daytime catch-up for a missed night window.
+The window is the whole configured span (**02:00–07:00** by default), not exactly its first minute. The Pi worker's continuous claims include newly eligible candidates during the same window. Legacy OMP/Claude claims freeze that night's eligible-candidate boundary; later candidates wait for another night. Processing duration shifts the next tick. Give pending extraction/consolidation time to finish before calling a miss a failure. There is no daytime catch-up for a missed night window.
 
 </details>
 
@@ -457,7 +471,7 @@ An agent can attach an exact native quote with `--quote TEXT --conversation-id I
 
 ## MCP and memory semantics
 
-The six MCP tools are:
+The six ordinary memory tools are:
 
 | Tool | Purpose |
 | --- | --- |

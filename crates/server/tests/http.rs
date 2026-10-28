@@ -274,7 +274,7 @@ async fn actual_http_capture_graph_raw_recall_and_history_share_one_authority() 
     );
 }
 #[tokio::test]
-async fn actual_mcp_lists_six_tools_normalizes_only_optional_empties_and_wraps_history() {
+async fn actual_mcp_lists_shared_tools_normalizes_only_optional_empties_and_wraps_history() {
     let (_dir, state) = fixture();
     let (_, created) = request(
         &state,
@@ -295,7 +295,7 @@ async fn actual_mcp_lists_six_tools_normalizes_only_optional_empties_and_wraps_h
         .collect::<Vec<_>>();
     assert_eq!(
         names,
-        ["recall", "remember", "link", "supersede", "history", "loop"]
+        ["recall", "remember", "link", "supersede", "history", "loop", "work"]
     );
     let command = json!({"command_id":"tool-save","actor":"synthetic","why":"Grounded fixture","type":"knowledge","text":"Remembered source","scope":["personal"],"valid_from":"","source":"","conversation_id":"","evidence":[{"episode_id":created["id"],"quote":"Exact quoted source"}]});
     let saved = rpc(
@@ -330,6 +330,52 @@ async fn actual_mcp_lists_six_tools_normalizes_only_optional_empties_and_wraps_h
         empty["result"]["structuredContent"]["memories"][0]["id"],
         created["id"]
     );
+}
+
+#[tokio::test]
+async fn shared_processing_tool_uses_checked_api_and_one_evidence_envelope() {
+    let (_dir,state)=fixture();
+    request(&state,"POST","/episodes",Some(capture("🧠 The synthetic laboratory uses a copper spectrometer."))).await;
+    let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"pool","command":{"kind":"extract","policies":true}}})).await;
+    assert_eq!(response["result"]["isError"],false);
+    assert!(response["result"].get("structuredContent").is_none());
+    let page:Value=serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(page["worker_protocol"],1);
+    assert_eq!(page["items"].as_array().unwrap().len(),1);
+    assert!(page["items"][0].get("text").is_none());
+    assert_eq!(page["policy_pages"]["consolidate"]["policy"],"consolidate");
+    let mut after=0;
+    let mut policy=String::new();
+    loop {
+        let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"read","command":{"policy":"consolidate","after":after}}})).await;
+        let text=response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.len()<16_000);
+        let part:Value=serde_json::from_str(text).unwrap();
+        policy.push_str(part["text"].as_str().unwrap());
+        if part["next"].is_null(){break;}
+        after=part["next"].as_u64().unwrap();
+    }
+    let policy:Value=serde_json::from_str(&policy).unwrap();
+    assert_eq!(policy["schema"]["properties"]["actions"]["maxItems"],128);
+    let (_,bad)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"pool","command":{"kind":"extract","path":"/private"}}})).await;
+    assert_eq!(bad["result"]["isError"],true);
+    let (status,_)=request(&state,"POST","/work",Some(json!({"action":"pool","command":{"kind":"extract"}}))).await;
+    assert_eq!(status,StatusCode::OK);
+    let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["extract"],"compaction":{"source":"native:synthetic:pi","conversation_id":"thread"}}}})).await;
+    let claim:Value=serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let mut read=claim["work"][0]["read"].clone();
+    assert!(claim["work"][0].get("input").is_none());
+    read["limit"]=json!(61);
+    let mut payload=String::new();
+    loop {
+        let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"read","command":read}})).await;
+        let part:Value=serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        payload.push_str(part["text"].as_str().unwrap());
+        if part["next"].is_null(){break;}
+        read["after"]=part["next"].clone();
+    }
+    let restored:Value=serde_json::from_str(&payload).unwrap();
+    assert_eq!(restored["input"]["windows"][0]["text"],"🧠 The synthetic laboratory uses a copper spectrometer.");
 }
 #[tokio::test]
 async fn actual_mcp_scoped_recall_validates_since_before_dispatch() {

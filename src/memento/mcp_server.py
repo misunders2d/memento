@@ -1,10 +1,12 @@
 """MCP shares the HTTP service's sole writer; no approval tool is exposed."""
 
 from typing import Annotated, Literal
+import json
 from pydantic import AwareDatetime, BeforeValidator
 from fastmcp import FastMCP
 from fastmcp.tools.base import ToolResult
 
+from .processing import WORK_DESCRIPTION, processing_view
 from .commands import Evidence, Link, Loop, MediaInput, Remember, Supersede
 
 
@@ -129,5 +131,17 @@ def create_mcp(state):
             arguments.pop('id', None)
             arguments.pop('days', None)
         return state.graph.loop(**arguments)
+
+    @mcp.tool(description=WORK_DESCRIPTION)
+    def work(action: Literal['pool', 'claim', 'read', 'renew', 'complete', 'submit', 'release', 'status'],
+             command: dict) -> ToolResult:
+        """Process explicitly authorized memory work through the shared pool/lease/validation API.
+
+        pool pages the eligible manifest; claim returns bounded evidence and schemas;
+        submit accepts {complete: <completion>, next?: <claim>} to commit and continue.
+        Renew leases independently during generation; status reconciles uncertain outcomes.
+        No raw database access, arbitrary URLs, approval or forgetting is exposed.
+        """
+        return ToolResult(content=json.dumps(processing_view(state.processing.work(action=action, command=command)),ensure_ascii=False))
 
     return mcp

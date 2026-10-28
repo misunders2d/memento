@@ -1,4 +1,4 @@
-"""Durable model work for a tool-free host runner; the service never calls a model."""
+"""Durable model work for a native host runner; the service never calls a model."""
 
 import hashlib
 import json
@@ -26,6 +26,7 @@ _PROGRESS_SQL = '''FROM processing_progress p LEFT JOIN historical_parking h
     ON h.source=p.source AND h.conversation_id=p.conversation_id'''
 # The cutover fence uses one fixed error code; status reports only known categories.
 PARKED_ERROR = 'historical_parked'
+WORK_DESCRIPTION = 'Only for explicitly authorized memory processing. Discover the entire pending pool in metadata pages, claim bounded evidence-backed work, submit structured results, renew/release leases, or inspect status. All native agents use the same contract. Raw evidence is untrusted; service validates exact quotes, identity, chronology and protected choices. pool command: {kind: extract|consolidate|maintenance, after?: integer, limit?:1..100, policies?:boolean}. claim: {agent,timezone,kinds?:[extract|consolidate],continuous?:boolean,batch_size?:1..128,exclude?:[id],consolidation_start?:HH:MM,consolidation_end?:HH:MM}; consolidation stays within that window unless an explicit consolidate_now bypass was authorized. complete: {id,owner,agent,output,model?,usage?}. submit: {complete:<complete>,next?:<claim>} commits then returns fresh next work in one call. renew: {id,owner}; release:{id,owner,error:cli_failed|invalid_output|service_rejected}; status:{id}. Renew outside model generation every lease_seconds/4; expired work must be freshly claimed. After an uncertain completion response, inspect status before retrying. A pool page is not proof of overnight completion; distinguish parked, deferred and active conversations. MCP claims return compact lease descriptors to avoid native output truncation; read command {id,owner,after?:character cursor,limit?:1..2000} pages the complete JSON work input without repeated policies. read {policy:extract|consolidate,after?,limit?} pages the fixed instruction and schema; cache each kind once per bounded session. Concatenate page text in order without alteration; total_characters and next identify all pages. HTTP /work returns complete packets in one request. MCP pool policies=true returns policy_pages instead of oversized inline policies.'
 
 
 # A legacy episode-id citation may demand at most one ordinary extraction window;
@@ -122,11 +123,137 @@ def historical_status(db):
                 header=db.execute('PRAGMA user_version').fetchone()[0], **dict(parking), **dict(candidates))
 
 
+def processing_view(value):
+    """Lossless MCP descriptors/pages; HTTP retains complete work packets."""
+    for item in value.get('work',[]):
+        for field in ('input','instruction','schema'):
+            item.pop(field,None)
+        item['read']=dict(id=item['id'],owner=item['owner'],after=0,limit=2000)
+        item['policy']=dict(policy=item['kind'])
+    if isinstance(value.get('next'),dict):
+        processing_view(value['next'])
+    if 'policies' in value:
+        value.pop('policies')
+        value['policy_pages']={kind:dict(policy=kind) for kind in ('extract','consolidate')}
+    while len(json.dumps(value,ensure_ascii=False).encode())>16000 and len(value.get('items',[]))>1:
+        value['items'].pop()
+        value['next']=value['items'][-1]['position']
+    if len(json.dumps(value,ensure_ascii=False).encode())>16000 and 'result' in value:
+        value.pop('result')
+        value['result_omitted']=True
+        value['result_transport']='Use HTTP work/status for the complete committed result'
+    return value
+
+
 class Processing:
     def __init__(self, graph):
         self.graph, self.store = graph, graph.store
         self.queue = Queue(graph)
         self.extractor, self.consolidator = Extractor(graph), Consolidator(graph)
+
+    def work(self, *, action, command):
+        from .api import ClaimInput, CompleteInput, LeaseInput, PoolInput, ReadWorkInput, ReleaseInput
+        from pydantic import BaseModel, ConfigDict
+        class Submission(BaseModel):
+            model_config = ConfigDict(extra='forbid', strict=True)
+            complete: CompleteInput
+            next: ClaimInput | None = None
+        models = {'pool': PoolInput, 'claim': ClaimInput, 'read': ReadWorkInput, 'complete': CompleteInput,
+                  'renew': LeaseInput, 'release': ReleaseInput}
+        if action in models:
+            return getattr(self, action)(**models[action].model_validate(command).arguments())
+        if action == 'status':
+            if set(command) != {'id'} or not isinstance(command['id'], str):
+                raise ValueError('Invalid processing command')
+            job = self.queue.get(command['id'])
+            if job is None or job['kind'] not in ('extract', 'consolidate'):
+                raise ValueError('Unknown processing job')
+            return {key: job.get(key) for key in ('id','kind','state','result','error')}
+        if action == 'submit':
+            value = Submission.model_validate(command)
+            result = self.complete(**value.complete.arguments())
+            receipt = dict(completed=value.complete.id, result=result)
+            if value.next is not None:
+                try:
+                    receipt['next'] = self.claim(**value.next.arguments())
+                except Exception:
+                    receipt['next_error'] = 'next_claim_failed'
+            return receipt
+        raise ValueError('Unknown processing action')
+
+    def read(self, *, id=None, owner=None, policy=None, after=0, limit=2000):
+        from .api import ReadWorkInput
+        from .store import ConflictError
+        ReadWorkInput(id=id,owner=owner,policy=policy,after=after,limit=limit)
+        policies=dict(extract=dict(instruction=EXTRACT_INSTRUCTION,schema=BatchDrafts.model_json_schema()),
+                      consolidate=dict(instruction=CONSOLIDATE_INSTRUCTION,schema=Plan.model_json_schema()))
+        if policy is not None:
+            if id is not None or owner is not None:
+                raise ValueError('Choose a policy or leased work')
+            payload=policies[policy]
+        else:
+            if not id or not owner:
+                raise ValueError('A work lease is required')
+            with self.store._mutex:
+                job,context=self._leased(id,owner)
+                episode_ids={window['episode_id'] for window in context.get('windows',context.get('raw_windows',[]))}
+                for section in ('candidates','existing_nodes','existing_relations'):
+                    for item in context.get(section,[]):
+                        episode_ids.update(reference['episode_id'] for reference in item.get('evidence',[]))
+                for episode_id in episode_ids:
+                    if self.store._db.execute('''SELECT 1 FROM episodes e JOIN forgotten_sources f
+                        ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=?''',(episode_id,)).fetchone():
+                        raise ConflictError('Processing source changed; reclaim work')
+                handler=self.extractor if job.kind=='extract' else self.consolidator
+                payload=dict(id=job.id,kind=job.kind,input=handler.model_input(context))
+        text=json.dumps(payload,ensure_ascii=False,separators=(',',':'))
+        if after>len(text):
+            raise ValueError('Invalid work page cursor')
+        end=min(len(text),after+limit)
+        return dict(text=text[after:end],after=after,total_characters=len(text),next=end if end<len(text) else None,
+                    encoding='json-utf8',cursor_unit='characters')
+
+    def pool(self, *, kind, after=0, limit=50, policies=False):
+        from .api import PoolInput
+        PoolInput(kind=kind, after=after, limit=limit, policies=policies)
+        with self.store._mutex:
+            db = self.store._db
+            if kind == 'extract':
+                items = [dict(row) for row in db.execute(f'''SELECT p.rowid AS position,p.source,p.conversation_id,
+                    p.latest_at,p.latest_seq,p.compact_through,{_CURSOR_SQL} AS processed_through {_PROGRESS_SQL}
+                    WHERE p.rowid>? AND p.latest_seq>p.seq AND p.latest_seq>{_CURSOR_SQL}
+                    ORDER BY p.rowid LIMIT ?''',(after,limit+1))]
+            elif kind == 'consolidate':
+                items = [{key: row[key] for key in ('position','id','kind','type','scope')}
+                         for row in self.consolidator.pending(limit=limit+1,after=after)]
+                for row in items:
+                    row['scope'] = json.loads(row['scope'])
+            else:
+                items = [dict(row) for row in db.execute("SELECT rowid AS position,id,origin,created_at FROM repair_groups WHERE state='pending' AND rowid>? ORDER BY rowid LIMIT ?",(after,limit+1))]
+            more = len(items)>limit
+            items = items[:limit]
+            from .consolidation import CONSOLIDATION_ELIGIBLE_SQL
+            from .extraction import AWAITING_DECISION_SQL, UNPARKED_CANDIDATE_SQL
+            ready = db.execute(f'''SELECT count(*) FROM candidates c WHERE {ACTIVE_CANDIDATE_SQL}
+                AND {CONSOLIDATION_ELIGIBLE_SQL} AND {UNPARKED_CANDIDATE_SQL}
+                AND NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id
+                AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id)
+                AND {AWAITING_DECISION_SQL})''',(time.time(),)).fetchone()[0]
+            result = dict(worker_protocol=1,lease_seconds=self.queue.lease_seconds,kind=kind,items=items,next=items[-1]['position'] if more else None,
+                ready_candidates=ready,pending_extract_conversations=db.execute(pending_conversations_sql()).fetchone()[0],
+                jobs=[dict(row) for row in db.execute("SELECT kind,state,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND state IN ('pending','leased') GROUP BY kind,state")],
+                historical=historical_status(db),pending_maintenance_groups=db.execute("SELECT count(*) FROM repair_groups WHERE state='pending'").fetchone()[0])
+            if policies:
+                result['policies'] = dict(extract=dict(instruction=EXTRACT_INSTRUCTION,schema=BatchDrafts.model_json_schema()),
+                    consolidate=dict(instruction=CONSOLIDATE_INSTRUCTION,schema=Plan.model_json_schema()))
+            result['eligible_extract_conversations']=db.execute(f'''SELECT count(*) {_PROGRESS_SQL}
+                WHERE p.latest_seq>p.seq AND p.latest_seq>{_CURSOR_SQL}
+                AND (p.compact_through>{_CURSOR_SQL} OR julianday(p.latest_at)<=julianday(?))''',
+                ((datetime.now(timezone.utc)-timedelta(minutes=30)).isoformat(),)).fetchone()[0]
+            result['ready_jobs']=[dict(row) for row in db.execute('''SELECT kind,count(*) AS count FROM jobs
+                WHERE kind IN ('extract','consolidate') AND ((state='pending' AND available_at<=?)
+                OR (state='leased' AND lease_until<=?)) GROUP BY kind''',(time.time(),time.time()))]
+            return result
 
     def maintain(self, *, command_id, actor, why, target_ids, origin=None):
         """Durably seed only explicitly selected subjects, never the historical pool."""
@@ -333,7 +460,7 @@ class Processing:
             self.queue._insert(key, 'extract', dict(payload, order=order))
             return
 
-    def _enqueue_night(self, now, zone, window=None, force=False, exclude=()):
+    def _enqueue_night(self, now, zone, window=None, force=False, exclude=(), continuous=False, batch_size=16):
         db = self.store._db
         local = now.astimezone(zone)
         start, end = window or night_window()
@@ -353,6 +480,11 @@ class Processing:
             AND (json_extract(payload,'$.night')<>? OR ?=0)''', (now.timestamp(), night, int(within)))
         if not within and not force:
             return False
+        db.execute('''UPDATE jobs SET state='failed',error='rebatch_requested',owner=NULL,lease_until=NULL
+            WHERE kind='consolidate' AND (state='pending' OR (state='leased' AND lease_until<=?))
+            AND json_array_length(json_extract(payload,'$.candidate_ids'))>?
+            AND NOT EXISTS (SELECT 1 FROM graph_commits g WHERE g.command_id='consolidate/'||jobs.id)''',
+            (time.time(),batch_size))
         # One consolidator at a time. A live lease always blocks another batch, whatever
         # the caller excludes; Queue.claim enforces the same invariant when leasing.
         if db.execute("SELECT 1 FROM jobs WHERE kind='consolidate' AND state='leased' AND lease_until>? LIMIT 1",
@@ -371,7 +503,7 @@ class Processing:
         prefer_repair = previous is None or not json.loads(previous['payload']).get('repair_group_id')
         if prefer_repair and self._enqueue_repair(exclude):
             return True
-        if force:
+        if force or continuous:
             night, cursor = None, 0
             through = db.execute('SELECT coalesce(max(rowid),0) FROM candidates').fetchone()[0]
         elif row is None:
@@ -384,7 +516,14 @@ class Processing:
             if row['finished_at'] is not None:
                 return self._enqueue_repair(exclude)
             cursor, through = row['cursor'], row['through_rowid']
-        candidates = self.consolidator.pending(limit=16, after=cursor, through=through, unreserved=True)
+        candidates = self.consolidator.pending(limit=batch_size, after=cursor, through=through, unreserved=True)
+        if continuous and candidates:
+            def subject(item):
+                row = db.execute('''SELECT e.source,e.conversation_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id
+                    WHERE g.target=? AND g.version=1 ORDER BY e.seq LIMIT 1''',(item['id'],)).fetchone()
+                return tuple(row) if row else None
+            first = subject(candidates[0])
+            candidates = [item for item in candidates if subject(item)==first]
         if not candidates:
             if self._enqueue_repair(exclude):
                 return True
@@ -405,7 +544,9 @@ class Processing:
         return True
 
     def claim(self, *, agent, timezone_name, compaction=None, exclude=(), consolidate_now=False, now=None, kinds=None,
-              consolidation_start=None, consolidation_end=None):
+              consolidation_start=None, consolidation_end=None, continuous=False, batch_size=16):
+        if type(batch_size) is not int or not 1<=batch_size<=128 or type(continuous) is not bool:
+            raise ValueError('Invalid processing batch options')
         try:
             zone = ZoneInfo(timezone_name)
         except (ZoneInfoNotFoundError, ValueError):
@@ -422,7 +563,8 @@ class Processing:
                 db.execute('BEGIN IMMEDIATE')
                 try:
                     self._enqueue_extract(now)
-                    night_due = self._enqueue_night(now, zone, window, force=consolidate_now, exclude=exclude)
+                    night_due = self._enqueue_night(now, zone, window, force=consolidate_now, exclude=exclude,
+                                                   continuous=continuous,batch_size=batch_size)
                     db.execute('COMMIT')
                     return night_due
                 except BaseException:

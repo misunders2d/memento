@@ -4,6 +4,8 @@ use memento_core::{Result, raw};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 const RUNNER: &[u8] = include_bytes!("../../../src/memento/runner.py");
+const WORKER: &[u8] = include_bytes!("../../../src/memento/worker.py");
+const NATIVE_WORKER: &[u8] = include_bytes!("../../../src/memento/native_worker.ts");
 const BRIDGE: &[u8] = include_bytes!("../../../src/memento/bridge.py");
 const PI: &[u8] = include_bytes!("../../../src/memento/native_pi.ts");
 const OMP: &[u8] = include_bytes!("../../../src/memento/native_omp.ts");
@@ -17,6 +19,8 @@ impl ClientAssets {
     pub fn build() -> Result<Self> {
         let files = BTreeMap::from([
             ("runner.py", RUNNER),
+            ("worker.py", WORKER),
+            ("native_worker.ts", NATIVE_WORKER),
             ("bridge.py", BRIDGE),
             ("native_pi.ts", PI),
             ("native_omp.ts", OMP),
@@ -37,7 +41,7 @@ impl ClientAssets {
         let bridge = source
             .replacen(marker, &format!("CLIENT_REVISION = '{revision}'"), 1)
             .into_bytes();
-        let records = files
+        let mut records = files
             .into_iter()
             .map(|(name, original)| {
                 let bytes = if name == "bridge.py" {
@@ -51,7 +55,8 @@ impl ClientAssets {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let release = json!({"format":1,"revision":revision,"files":records});
+        let processing = ["worker.py","native_worker.ts"].into_iter().map(|name|(name,records.remove(name).unwrap())).collect::<BTreeMap<_,_>>();
+        let release = json!({"format":1,"revision":revision,"files":records,"processing_files":processing});
         Ok(Self {
             revision,
             bridge,

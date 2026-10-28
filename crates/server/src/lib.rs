@@ -376,6 +376,8 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}", get(job))
         .route("/recall", get(recall))
         .route("/work/claim", post(claim))
+        .route("/work/pool", post(pool))
+        .route("/work", post(work))
         .route("/work/compaction", post(compact))
         .route("/work/renew", post(renew))
         .route("/work/complete", post(complete))
@@ -518,6 +520,8 @@ command!(supersede, dto::Supersede, graph, supersede);
 command!(loop_command, dto::Loop, graph, loop_command);
 command!(usage, dto::Citation, graph, cite);
 command!(claim, processing::Claim, processing, claim);
+command!(pool, processing::Pool, processing, pool);
+command!(work, processing::Work, processing, work);
 command!(compact, processing::Compaction, processing, compact);
 command!(renew, processing::Lease, processing, renew);
 command!(complete, processing::Complete, processing, complete);

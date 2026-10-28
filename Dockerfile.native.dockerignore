@@ -6,6 +6,8 @@
 !src/
 !src/memento/
 !src/memento/runner.py
+!src/memento/worker.py
+!src/memento/native_worker.ts
 !src/memento/bridge.py
 !src/memento/native_pi.ts
 !src/memento/native_omp.ts

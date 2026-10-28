@@ -751,11 +751,11 @@ pub(super) fn prepare(
             }
         }
     }
-    let mut windows = builder
+    let mut windows = coalesce_windows(builder
         .windows
         .into_iter()
         .map(|(_, value)| value)
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>());
     windows.sort_by_key(|window| {
         (
             window["sequence"].as_i64().unwrap_or(0),
@@ -782,6 +782,45 @@ pub(super) fn prepare(
     Ok(
         json!({"loop_policy_version":VERSION,"candidates":candidates,"existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),"existing_relations":builder.edges.into_values().collect::<Vec<_>>(),"raw_windows":windows,"resolved_candidates":resolutions,"loop_snapshots":snapshots,"behavior_exposures":exposures,"maintenance_ids":maintenance_ids,"context_truncated":pending,"retirement_ready":ready,"_unchecked":unchecked,"_continuity":builder.continuity,"_retirement":builder.retirement}),
     )
+}
+
+/// Exact union of overlapping source spans with identical provenance/authority.
+/// This removes repeated context, never adds a gap or combines native trace kinds.
+fn coalesce_windows(mut windows: Vec<Value>) -> Vec<Value> {
+    windows.sort_by_key(|w| (w["episode_id"].as_str().unwrap_or("").to_owned(), w["start"].as_u64().unwrap_or(0)));
+    let metadata = |w: &Value| { let mut fields = w.as_object().unwrap().clone(); for key in ["start","end","text"] { fields.remove(key); } fields };
+    let mut merged: Vec<Value> = vec![];
+    for window in windows {
+        if let Some(previous) = merged.last_mut() {
+            let end = previous["end"].as_u64().unwrap();
+            let start = window["start"].as_u64().unwrap();
+            if start <= end && metadata(previous) == metadata(&window) {
+                let next_end = window["end"].as_u64().unwrap();
+                if next_end > end {
+                    let mut text = previous["text"].as_str().unwrap().to_owned();
+                    text.push_str(&substring(window["text"].as_str().unwrap(), (end-start) as usize, (next_end-start) as usize));
+                    previous["text"] = json!(text);
+                    previous["end"] = json!(next_end);
+                }
+                continue;
+            }
+        }
+        merged.push(window);
+    }
+    merged
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    #[test]
+    fn exact_unicode_union_preserves_gaps_and_authority() {
+        let w = |start,end,text,authority| json!({"episode_id":"e","start":start,"end":end,"text":text,"behavior_ground_truth":authority});
+        let result = coalesce_windows(vec![w(0,3,"a🧠б",true),w(2,5,"бcd",true),w(6,7,"x",true),w(1,2,"🧠",false)]);
+        assert_eq!(result.len(),4); // Different authority interrupts merging; never broaden it.
+        let result = coalesce_windows(vec![w(0,3,"a🧠б",true),w(2,5,"бcd",true),w(6,7,"x",true)]);
+        assert_eq!(result,vec![w(0,5,"a🧠бcd",true),w(6,7,"x",true)]);
+    }
 }
 
 use rusqlite::OptionalExtension;

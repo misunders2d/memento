@@ -32,16 +32,18 @@ MAX_BLOB_BYTES = 1024 * 1024 * 1024
 def client_release_assets():
     """Fingerprint source assets before stamping the served bridge identity."""
     files = {name: Path(__file__).with_name(name).read_bytes() for name in
-             ('runner.py', 'bridge.py', 'native_pi.ts', 'native_omp.ts', 'native_shared.ts')}
+             ('runner.py', 'bridge.py', 'native_pi.ts', 'native_omp.ts', 'native_shared.ts', 'worker.py', 'native_worker.ts')}
     hashes = {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}
     revision = hashlib.sha256(json.dumps(hashes, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     marker = b'CLIENT_REVISION = None'
     if files['bridge.py'].count(marker) != 1:
         raise RuntimeError('Client bridge revision marker is missing or ambiguous')
     files['bridge.py'] = files['bridge.py'].replace(marker, ('CLIENT_REVISION = ' + repr(revision)).encode())
-    release = {'format': 1, 'revision': revision, 'files': {
+    records = {
         name: {'content': base64.b64encode(content).decode('ascii'),
-               'sha256': hashlib.sha256(content).hexdigest()} for name, content in files.items()}}
+               'sha256': hashlib.sha256(content).hexdigest()} for name, content in files.items()}
+    processing = {name: records.pop(name) for name in ('worker.py','native_worker.ts')}
+    release = {'format': 1, 'revision': revision, 'files': records, 'processing_files': processing}
     return revision, files['bridge.py'], json.dumps(release)
 
 
@@ -143,6 +145,8 @@ class ClaimInput(WorkInput):
     compaction: CompactionInput | None = None
     exclude: list[str] = Field(default_factory=list)
     consolidate_now: bool = False
+    continuous: bool = False
+    batch_size: int = Field(default=16, ge=1, le=128)
     # Optional lane filter for a runner whose other lane is still busy; omitted means both.
     kinds: list[Literal['extract', 'consolidate']] | None = Field(default=None, min_length=1, max_length=2)
     # The runner's configured local-time consolidation window; an older runner omits
@@ -167,6 +171,26 @@ class ClaimInput(WorkInput):
 class LeaseInput(WorkInput):
     id: str = Field(min_length=1, max_length=128)
     owner: str = Field(min_length=1, max_length=128)
+
+
+class PoolInput(WorkInput):
+    kind: Literal['extract', 'consolidate', 'maintenance']
+    after: int = Field(default=0, ge=0)
+    limit: int = Field(default=50, ge=1, le=100)
+    policies: bool = False
+
+
+class ProcessingInput(WorkInput):
+    action: Literal['pool', 'claim', 'read', 'renew', 'complete', 'submit', 'release', 'status']
+    command: dict[str, JsonValue]
+
+
+class ReadWorkInput(WorkInput):
+    id: str | None = None
+    owner: str | None = None
+    policy: Literal['extract','consolidate'] | None = None
+    after: int = Field(default=0,ge=0)
+    limit: int = Field(default=2000,ge=1,le=2000)
 
 
 class MaintenanceInput(WorkInput):
@@ -693,6 +717,14 @@ Drive is connected. Complete these steps when the human requests Drive:
     @app.post('/work/claim')
     def claim_work(command: ClaimInput):
         return graph_command(app.state.processing.claim, command)
+
+    @app.post('/work/pool')
+    def processing_pool(command: PoolInput):
+        return graph_command(app.state.processing.pool, command)
+
+    @app.post('/work')
+    def processing_work(command: ProcessingInput):
+        return graph_command(app.state.processing.work, command)
 
     @app.post('/work/maintenance')
     def seed_maintenance(command: MaintenanceInput):

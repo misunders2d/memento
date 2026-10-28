@@ -213,9 +213,26 @@ class Action(BaseModel):
     why: str = Field(min_length=1, max_length=2048, pattern=r'\S')
 
 
+def coalesce_windows(windows):
+    """Exact overlapping/adjacent union, retaining distinct authority/trace metadata."""
+    merged = []
+    def metadata(window):
+        return {key:value for key,value in window.items() if key not in ('start','end','text')}
+    for window in sorted(windows,key=lambda item:(item['episode_id'],item['start'])):
+        window = dict(window)
+        if merged and window['start']<=merged[-1]['end'] and metadata(window)==metadata(merged[-1]):
+            previous = merged[-1]
+            if window['end']>previous['end']:
+                previous['text'] += window['text'][previous['end']-window['start']:]
+                previous['end'] = window['end']
+        else:
+            merged.append(window)
+    return merged
+
+
 class Plan(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    actions: list[Action] = Field(max_length=16)
+    actions: list[Action] = Field(max_length=128)
     repairs: list['Repair'] = Field(default_factory=list, max_length=8)
     continue_with: list[str] = Field(default_factory=list, max_length=8)
 
@@ -885,7 +902,7 @@ class Consolidator:
             job.payload['candidate_ids'], job.payload.get('maintenance_ids', ()), job.payload.get('reviewed_ids', ()), discovery=discovery)
         return dict(loop_policy_version=VERSION,
                     candidates=candidates, existing_nodes=list(nodes.values()), existing_relations=list(edges.values()),
-                    raw_windows=sorted(windows.values(), key=lambda item: (item['sequence'], item['start'])),
+                    raw_windows=sorted(coalesce_windows(windows.values()), key=lambda item: (item['sequence'], item['start'])),
                     resolved_candidates=resolutions, loop_snapshots=loop_snapshots,
                     behavior_exposures=exposures,
                     maintenance_ids=list(dict.fromkeys(canonical(self.graph, target)['id']

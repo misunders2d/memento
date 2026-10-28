@@ -1,4 +1,4 @@
-//! Stateless Streamable HTTP MCP; exactly the six shipped tools.
+//! Stateless Streamable HTTP MCP; memory tools and agent-neutral processing.
 use crate::{AppState, CAPTURE_BYTES, RecallRequest, blocking, parse};
 use axum::{
     Json,
@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use memento_core::{Error, Result};
-use memento_domain::dto;
+use memento_domain::{dto, processing};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -168,11 +168,17 @@ pub async fn request(State(state): State<AppState>, request: Request) -> Respons
                 return Json(rpc_error(id, -32602, "Invalid tool name")).into_response();
             };
             let name = name.to_owned();
+            let processing_tool = name == "work";
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             let result = blocking(move || call(&state, &name, arguments)).await;
             match result {
-                Ok((value, text)) => {
-                    json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":false})
+                Ok((mut value, text)) => {
+                    if processing_tool {
+                        processing_view(&mut value);
+                        json!({"content":[{"type":"text","text":serde_json::to_string(&value).unwrap()}],"isError":false})
+                    } else {
+                        json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":false})
+                    }
                 }
                 Err(error) => {
                     json!({"content":[{"type":"text","text":error.0.to_string()}],"isError":true})
@@ -187,6 +193,32 @@ pub async fn request(State(state): State<AppState>, request: Request) -> Respons
         axum::http::HeaderValue::from_static("no-store"),
     );
     response
+}
+/// Native clients have different output caps. MCP exposes lossless read pages;
+/// the shared HTTP API still returns a complete packet in one request.
+fn processing_view(value: &mut Value) {
+    if let Some(work) = value["work"].as_array_mut() {
+        for item in work {
+            let id=item["id"].clone(); let owner=item["owner"].clone();
+            for key in ["input","instruction","schema"] { item.as_object_mut().unwrap().remove(key); }
+            item["read"]=json!({"id":id,"owner":owner,"after":0,"limit":2000});
+            item["policy"]=json!({"policy":item["kind"]});
+        }
+    }
+    if let Some(next)=value.get_mut("next").filter(|next|next.is_object()) { processing_view(next); }
+    if value.get("policies").is_some() {
+        value.as_object_mut().unwrap().remove("policies");
+        value["policy_pages"]=json!({"extract":{"policy":"extract"},"consolidate":{"policy":"consolidate"}});
+    }
+    while serde_json::to_vec(value).unwrap().len()>16_000 && value["items"].as_array().is_some_and(|items|items.len()>1) {
+        value["items"].as_array_mut().unwrap().pop();
+        value["next"]=value["items"].as_array().unwrap().last().unwrap()["position"].clone();
+    }
+    if serde_json::to_vec(value).unwrap().len()>16_000 && value.get("result").is_some() {
+        value.as_object_mut().unwrap().remove("result");
+        value["result_omitted"]=json!(true);
+        value["result_transport"]=json!("Use HTTP work/status for the complete committed result");
+    }
 }
 fn omit_empty(value: Value) -> Value {
     match value {
@@ -224,6 +256,7 @@ fn optional(value: Option<String>) -> Option<String> {
 }
 fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String)> {
     let value = match name {
+        "work" => state.processing.work(parse::<processing::Work>(arguments)?)?,
         "recall" => {
             let args: RecallArgs = parse(arguments)?;
             let since = optional(args.since);

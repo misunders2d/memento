@@ -43,7 +43,48 @@ pub struct Claim {
     pub consolidation_start: Option<String>,
     #[serde(default)]
     pub consolidation_end: Option<String>,
+    #[serde(default)]
+    pub continuous: bool,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
 }
+fn default_batch_size() -> usize { 16 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pool {
+    pub kind: String,
+    #[serde(default)]
+    pub after: i64,
+    #[serde(default = "default_pool_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub policies: bool,
+}
+fn default_pool_limit() -> usize { 50 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Work {
+    pub action: String,
+    pub command: Value,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Submit { complete: Complete, #[serde(default)] next: Option<Claim> }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkStatus { id: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadWork {
+    #[serde(default)] id: Option<String>,
+    #[serde(default)] owner: Option<String>,
+    #[serde(default)] policy: Option<String>,
+    #[serde(default)] after: usize,
+    #[serde(default = "read_limit")] limit: usize,
+}
+fn read_limit() -> usize { 2000 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lease {
@@ -88,6 +129,104 @@ pub struct Processing {
     pub consolidator: Consolidator,
 }
 impl Processing {
+    /// One agent-neutral entrypoint over the existing checked queue operations.
+    pub fn work(&self, request: Work) -> Result<Value> {
+        fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
+            serde_json::from_value(value).map_err(|_| Error::Validation("Invalid processing command"))
+        }
+        match request.action.as_str() {
+            "read" => {
+                let command: ReadWork = decode(request.command)?;
+                if !(1..=2000).contains(&command.limit) { return Err(Error::Validation("read limit must be 1..2000 characters")); }
+                let policy = |kind: &str| -> Result<Value> { match kind {
+                    "extract" => Ok(json!({"instruction":pipeline_schema::EXTRACTION_INSTRUCTION,"schema":*pipeline_schema::EXTRACTION})),
+                    "consolidate" => Ok(json!({"instruction":pipeline_schema::CONSOLIDATION_INSTRUCTION,"schema":*pipeline_schema::CONSOLIDATION})),
+                    _ => Err(Error::Validation("Invalid processing policy")),
+                }};
+                let payload = if let Some(kind) = &command.policy {
+                    if command.id.is_some() || command.owner.is_some() { return Err(Error::Validation("Choose a policy or leased work")); }
+                    policy(kind)?
+                } else {
+                    let (Some(id),Some(owner)) = (&command.id,&command.owner) else { return Err(Error::Validation("A work lease is required")); };
+                    let (job,context)=self.leased(id,owner)?;
+                    self.graph.store.read(|tx| {
+                        let mut episodes=std::collections::BTreeSet::new();
+                        for window in context[if job.kind=="extract" {"windows"} else {"raw_windows"}].as_array().into_iter().flatten() {
+                            episodes.insert(get_str(window,"episode_id")?.to_owned());
+                        }
+                        for section in ["candidates","existing_nodes","existing_relations"] {
+                            for item in context[section].as_array().into_iter().flatten() {
+                                for reference in item["evidence"].as_array().into_iter().flatten() { episodes.insert(get_str(reference,"episode_id")?.to_owned()); }
+                            }
+                        }
+                        for episode in episodes {
+                            if one(tx.sql(),"SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=?",[episode])?.is_some() { return Err(Error::Conflict("Processing source changed; reclaim work")); }
+                        }
+                        Ok(())
+                    })?;
+                    json!({"id":job.id,"kind":job.kind,"input":if job.kind=="extract" { Extractor::model_input(&context) } else { Consolidator::model_input(&context) }})
+                };
+                let text=encode_json(&payload)?;
+                let total=text.chars().count();
+                if command.after>total { return Err(Error::Validation("Invalid work page cursor")); }
+                let end=command.after.saturating_add(command.limit).min(total);
+                Ok(json!({"text":substring(&text,command.after,end),"after":command.after,"total_characters":total,"next":if end<total {json!(end)}else{Value::Null},"encoding":"json-utf8","cursor_unit":"characters"}))
+            },
+            "pool" => self.pool(decode(request.command)?),
+            "claim" => self.claim(decode(request.command)?),
+            "renew" => self.renew(decode(request.command)?),
+            "complete" => self.complete(decode(request.command)?),
+            "release" => self.release(decode(request.command)?),
+            "status" => {
+                let command: WorkStatus = decode(request.command)?;
+                let job = self.queue.get(&command.id)?.ok_or(Error::Validation("Unknown processing job"))?;
+                if !["extract","consolidate"].contains(&job["kind"].as_str().unwrap_or("")) { return Err(Error::Validation("Unknown processing job")); }
+                Ok(json!({"id":job["id"],"kind":job["kind"],"state":job["state"],"result":job["result"],"error":job["error"]}))
+            },
+            "submit" => {
+                let command: Submit = decode(request.command)?;
+                let id = command.complete.id.clone();
+                let result = self.complete(command.complete)?;
+                let mut receipt = json!({"completed":id,"result":result});
+                // A failed next claim cannot erase or misreport an accepted commit.
+                if let Some(next) = command.next {
+                    match self.claim(next) {
+                        Ok(work) => receipt["next"] = work,
+                        Err(_) => receipt["next_error"] = json!("next_claim_failed"),
+                    }
+                }
+                Ok(receipt)
+            },
+            _ => Err(Error::Validation("Unknown processing action")),
+        }
+    }
+    /// Metadata-only discovery. Evidence is read only through a fresh leased claim.
+    pub fn pool(&self, request: Pool) -> Result<Value> {
+        if request.after < 0 || !(1..=100).contains(&request.limit) || !["extract", "consolidate", "maintenance"].contains(&request.kind.as_str()) {
+            return Err(Error::Validation("Invalid processing pool page"));
+        }
+        self.graph.store.read(|tx| {
+            let db = tx.sql();
+            let mut items = match request.kind.as_str() {
+                "extract" => rows(db, &format!("SELECT p.rowid AS position,p.source,p.conversation_id,p.latest_at,p.latest_seq,p.compact_through,coalesce(h.live_seq,p.seq) AS processed_through {PROGRESS} WHERE p.rowid>? AND p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY p.rowid LIMIT ?"), params![request.after, request.limit as i64 + 1])?,
+                "consolidate" => consolidation::pending_in(db, request.limit + 1, request.after, i64::MAX, false)?.into_iter().map(|item| json!({"position":item["position"],"id":item["id"],"kind":item["kind"],"type":item["type"],"scope":item["scope"]})).collect(),
+                _ => rows(db,"SELECT rowid AS position,id,origin,created_at FROM repair_groups WHERE state='pending' AND rowid>? ORDER BY rowid LIMIT ?",params![request.after,request.limit as i64 + 1])?,
+            };
+            let more = items.len() > request.limit;
+            items.truncate(request.limit);
+            let next = if more { items.last().map(|item| item["position"].clone()).unwrap_or(Value::Null) } else { Value::Null };
+            let ready = db.query_row(&format!("SELECT count(*) FROM candidates c WHERE {ACTIVE_CANDIDATE} AND {} AND {} AND NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {})",consolidation::ELIGIBLE,consolidation::UNPARKED,consolidation::AWAITING),params![rusqlite::types::Null,rusqlite::types::Null,timestamp()],|row|row.get::<_,i64>(0))?;
+            let jobs = rows(db,"SELECT kind,state,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND state IN ('pending','leased') GROUP BY kind,state",[])?;
+            let mut result = json!({"worker_protocol":1,"kind":request.kind,"items":items,"next":next,"ready_candidates":ready,"pending_extract_conversations":pending_conversations(db,None)?,"jobs":jobs,"historical":historical_status(db)?,"pending_maintenance_groups":db.query_row("SELECT count(*) FROM repair_groups WHERE state='pending'",[],|row|row.get::<_,i64>(0))?});
+            if request.policies {
+                result["policies"] = json!({"extract":{"instruction":pipeline_schema::EXTRACTION_INSTRUCTION,"schema":*pipeline_schema::EXTRACTION},"consolidate":{"instruction":pipeline_schema::CONSOLIDATION_INSTRUCTION,"schema":*pipeline_schema::CONSOLIDATION}});
+            }
+            result["lease_seconds"] = json!(self.queue.lease_seconds);
+            result["eligible_extract_conversations"] = json!(db.query_row(&format!("SELECT count(*) {PROGRESS} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) AND (p.compact_through>coalesce(h.live_seq,p.seq) OR julianday(p.latest_at)<=julianday(?))"),[format_time(Utc::now()-Duration::minutes(30))],|row|row.get::<_,i64>(0))?);
+            result["ready_jobs"] = json!(rows(db,"SELECT kind,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND ((state='pending' AND available_at<=?1) OR (state='leased' AND lease_until<=?1)) GROUP BY kind",[timestamp()])?);
+            Ok(result)
+        })
+    }
     pub fn new(graph: Graph) -> Self {
         Self {
             queue: Queue::new(graph.clone()),
@@ -150,6 +289,7 @@ impl Processing {
         self.claim_at(command, Utc::now())
     }
     pub fn claim_at(&self, command: Claim, instant: DateTime<Utc>) -> Result<Value> {
+        if !(1..=128).contains(&command.batch_size) { return Err(Error::Validation("batch_size must be 1..128")); }
         required(&command.agent, 64, "Invalid processing agent")?;
         required(&command.timezone_name, 128, "Invalid timezone")?;
         let zone: Tz = command
@@ -191,6 +331,8 @@ impl Processing {
                     window,
                     command.consolidate_now,
                     &command.exclude,
+                    command.continuous,
+                    command.batch_size,
                 )
             })
         };
@@ -668,6 +810,8 @@ fn enqueue_night(
     window: (u32, u32),
     force: bool,
     exclude: &[String],
+    continuous: bool,
+    batch_size: usize,
 ) -> Result<bool> {
     let local = instant.with_timezone(&zone);
     let minute = local.hour() * 60 + local.minute();
@@ -689,6 +833,10 @@ fn enqueue_night(
     if !within && !force {
         return Ok(false);
     }
+    // batch_size is an admission maximum, including a released oversized unit.
+    // Keep its original payload/context for audit; untouched candidates become
+    // available to smaller fresh jobs. Never retire a live or committed unit.
+    tx.sql().execute("UPDATE jobs SET state='failed',error='rebatch_requested',owner=NULL,lease_until=NULL WHERE kind='consolidate' AND (state='pending' OR (state='leased' AND lease_until<=?1)) AND json_array_length(json_extract(payload,'$.candidate_ids'))>?2 AND NOT EXISTS (SELECT 1 FROM graph_commits g WHERE g.command_id='consolidate/'||jobs.id)",params![timestamp(),batch_size as i64])?;
     if one(
         tx.sql(),
         "SELECT 1 FROM jobs WHERE kind='consolidate' AND state='leased' AND lease_until>? LIMIT 1",
@@ -722,7 +870,7 @@ fn enqueue_night(
     if prefer && enqueue_repair(tx)? {
         return Ok(true);
     }
-    let (night, cursor, through) = if force {
+    let (night, cursor, through) = if force || continuous {
         (
             None,
             0,
@@ -755,7 +903,16 @@ fn enqueue_night(
         )?;
         (Some(night), 0, through)
     };
-    let candidates = consolidation::pending_in(tx.sql(), 16, cursor, through, true)?;
+    let mut candidates = consolidation::pending_in(tx.sql(), batch_size, cursor, through, true)?;
+    // A native agent selects the batch size. Keep related conversation evidence
+    // together; continuous admission has no frozen cursor that could skip others.
+    if continuous && !candidates.is_empty() {
+        let subject = |candidate: &Value| -> Result<Option<Value>> { one(tx.sql(),"SELECT e.source,e.conversation_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=1 ORDER BY e.seq LIMIT 1",[get_str(candidate,"id")?]) };
+        let first = subject(&candidates[0])?;
+        let mut related = vec![];
+        for candidate in candidates { if subject(&candidate)? == first { related.push(candidate); } }
+        candidates = related;
+    }
     if candidates.is_empty() {
         if enqueue_repair(tx)? {
             return Ok(true);

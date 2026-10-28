@@ -67,6 +67,8 @@ impl Fixture {
                 kinds,
                 consolidation_start: None,
                 consolidation_end: None,
+                continuous: false,
+                batch_size: 16,
             })
             .unwrap()
     }
@@ -133,6 +135,61 @@ fn draft(quote: &str, typ: &str, open_loop: bool) -> Value {
 fn action(candidate: &Value, op: &str) -> Value {
     let evidence=candidate["evidence"].as_array().unwrap().iter().map(|reference|json!({"episode_id":reference["episode_id"],"quote":reference["quote"],"occurrence":reference["occurrence"]})).collect::<Vec<_>>();
     json!({"candidate_id":candidate["id"],"operation":op,"type":candidate["type"],"text":candidate["text"],"scope":candidate["scope"],"open_loop":false,"closed_targets":[],"target":null,"src":null,"dst":null,"relation":null,"change_kind":null,"valid_at":null,"valid_from":null,"valid_to":null,"category":null,"sensitive":null,"behavior":null,"evidence":evidence,"why":"Preserve exact durable subject and source"})
+}
+
+#[test]
+fn shared_work_api_pages_pool_and_commits_a_larger_related_batch() {
+    let f = Fixture::new();
+    let facts = (0..40).map(|n|format!("Module {n} uses copper shielding.")).collect::<Vec<_>>();
+    let raw = facts.join(" ");
+    let episode = f.capture("bulk", "thread", &raw, "user", "bulk-fixture", json!({}), "2026-10-18T12:00:00Z");
+    let extraction = f.claim("bulk-fixture", "thread", Some(vec!["extract".into()]))["work"][0].clone();
+    let candidates = facts.iter().enumerate().map(|(n,text)| { let mut item=draft(text,"knowledge",false); item["key"]=json!(format!("k{n}")); item }).collect::<Vec<_>>();
+    f.complete(&extraction,json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":candidates}]})).unwrap();
+    let mut after = 0;
+    let mut ids = std::collections::BTreeSet::new();
+    loop {
+        let page = f.processing.work(serde_json::from_value(json!({"action":"pool","command":{"kind":"consolidate","after":after,"limit":7}})).unwrap()).unwrap();
+        assert_eq!(page["ready_candidates"],40);
+        for item in page["items"].as_array().unwrap() { assert!(item.get("text").is_none()); ids.insert(item["id"].as_str().unwrap().to_owned()); }
+        if page["next"].is_null() { break; }
+        after = page["next"].as_i64().unwrap();
+    }
+    assert_eq!(ids.len(),40);
+    let claimed = f.processing.work(serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"consolidate_now":true,"continuous":true,"batch_size":64}})).unwrap()).unwrap();
+    let task = &claimed["work"][0];
+    assert_eq!(task["input"]["candidates"].as_array().unwrap().len(),40);
+    let output = json!({"actions":task["input"]["candidates"].as_array().unwrap().iter().map(|candidate| action(candidate,"reject")).collect::<Vec<_>>()});
+    let submitted = f.processing.work(serde_json::from_value(json!({"action":"submit","command":{"complete":{"id":task["id"],"owner":task["owner"],"agent":"fixture","output":output},"next":{"agent":"fixture","timezone":"No/Such_Zone"}}})).unwrap()).unwrap();
+    assert_eq!(submitted["completed"],task["id"]);
+    assert_eq!(submitted["next_error"],"next_claim_failed");
+    let status = f.processing.work(serde_json::from_value(json!({"action":"status","command":{"id":task["id"]}})).unwrap()).unwrap();
+    assert_eq!(status["state"],"done");
+    assert_eq!(f.graph.store.read(|tx|tx.original_text(&episode)).unwrap().unwrap(),raw);
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidate_decisions"),40);
+    assert!(f.processing.work(serde_json::from_value(json!({"action":"pool","command":{"kind":"consolidate","path":"/private"}})).unwrap()).is_err());
+}
+
+#[test]
+fn smaller_admission_repartitions_only_uncommitted_released_work() {
+    let f=Fixture::new();
+    f.seed(); f.extract("contract","thread",FACT,"knowledge",false);
+    let other="The copper observatory uses a calibrated spectrometer.";
+    f.capture("second","thread",other,"user","contract",json!({}),"2026-10-19T12:00:00Z");
+    f.extract("contract","thread",other,"knowledge",false);
+    let old=f.consolidate_work();
+    assert_eq!(old["input"]["candidates"].as_array().unwrap().len(),2);
+    let request=|exclude:Value|serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"continuous":true,"consolidate_now":true,"batch_size":1,"exclude":exclude}})).unwrap();
+    assert!(f.processing.work(request(json!([]))).unwrap()["work"].as_array().unwrap().is_empty());
+    f.processing.release(serde_json::from_value(json!({"id":old["id"],"owner":old["owner"],"error":"service_rejected"})).unwrap()).unwrap();
+    let fresh=f.processing.work(request(json!([old["id"]]))).unwrap();
+    assert_ne!(fresh["work"][0]["id"],old["id"]);
+    assert_eq!(fresh["work"][0]["input"]["candidates"].as_array().unwrap().len(),1);
+    let retained=f.graph.store.read(|tx|util::one(tx.sql(),"SELECT state,error,payload FROM jobs WHERE id=?",[old["id"].as_str().unwrap()])).unwrap().unwrap();
+    assert_eq!(retained["state"],"failed");
+    assert_eq!(retained["error"],"rebatch_requested");
+    assert_eq!(serde_json::from_str::<Value>(retained["payload"].as_str().unwrap()).unwrap()["candidate_ids"].as_array().unwrap().len(),2);
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidate_decisions"),0);
 }
 
 #[test]
@@ -310,7 +367,9 @@ fn actual_scheduled_extract_consolidate_history_and_immutable_schema_contract() 
                 consolidate_now: true,
                 kinds: None,
                 consolidation_start: None,
-                consolidation_end: None
+                consolidation_end: None,
+                continuous: false,
+                batch_size: 16,
             })
             .unwrap()["work"]
             .as_array()
@@ -400,6 +459,8 @@ fn bad_schedule_and_kind_filters_fail_before_compaction_mutation() {
             kinds,
             consolidation_start: start.map(str::to_owned),
             consolidation_end: end.map(str::to_owned),
+            continuous: false,
+            batch_size: 16,
         };
     for command in [
         request("not/a-zone", None, None, None),
@@ -474,6 +535,7 @@ fn human_forget_after_claim_fences_extraction_without_erasing_original() {
         .forget_preview(node["id"].as_str().unwrap())
         .unwrap();
     f.graph.forget(serde_json::from_value(json!({"command_id":"forget","actor":"owner","why":"Explicit active-memory exclusion","target":node["id"],"token":preview["token"]})).unwrap()).unwrap();
+    assert!(f.processing.work(serde_json::from_value(json!({"action":"read","command":{"id":claimed["work"][0]["id"],"owner":claimed["work"][0]["owner"]}})).unwrap()).is_err());
     let result = f
         .complete(
             &claimed["work"][0],
