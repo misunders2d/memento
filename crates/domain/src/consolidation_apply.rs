@@ -467,6 +467,26 @@ fn validate(
         }
         validate_behavior(repair, &nodes[&target], &episodes, &traces)?;
     }
+    // A correction or world change keeps the memory ID and its relations; it
+    // may retire only supplied, fenced relations incident to that memory.
+    for item in actions.iter_mut().chain(repairs.iter_mut()) {
+        let relations = item.get("retire_relations").filter(|value| !value.is_null()).map(strings).transpose()?.unwrap_or_default();
+        if !relations.is_empty() {
+            let target = item["target"].as_str().filter(|target| nodes.contains_key(*target));
+            if item["operation"] != "supersede"
+                || !matches!(item["change_kind"].as_str(), Some("correction" | "change"))
+                || relations.iter().collect::<BTreeSet<_>>().len() != relations.len()
+                || target.is_none_or(|target| {
+                    relations.iter().any(|id| {
+                        edges.get(id).is_none_or(|edge| edge["src"] != target && edge["dst"] != target)
+                    })
+                })
+            {
+                return Err(reject("consolidation_supersede_invalid", vec![]));
+            }
+        }
+        item["retire_relations"] = json!(relations);
+    }
     Ok(Prepared {
         selected,
         nodes,
@@ -667,13 +687,13 @@ pub(super) fn apply(
             if state=="promote"{if let Some(target)=&target{let marker=loops::current(tx.sql(),candidate_id)?;if !(action["open_loop"]==false&&loops::decline_extracted(tx,commit,candidate_id)?){loops::transfer(tx,commit,candidate_id,target)?;}importance::transfer_usage(tx,candidate_id,target)?;loops::mark(tx,commit,target,action["open_loop"].as_bool(),Some(candidate_id),marker.as_ref())?;}}else if state=="review"{loops::mark(tx,commit,candidate_id,action["open_loop"].as_bool(),None,None)?;}
             let role_target=if state=="promote"{target.as_deref()}else if state=="review"{Some(candidate_id)}else{None};if let (Some(role_target),Some(value))=(role_target,action["responsibility"].as_str()){if loops::current(tx.sql(),role_target)?.is_some(){let role=loops::assign_automatic(tx,commit,role_target,value,&action["evidence"])?;if let Some(map)=role["loop_responsibilities"].as_object(){loop_responsibilities.extend(map.clone());}}}
             tx.sql().execute("INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",params![id(),candidate_id,commit,state,target,if state=="defer"{Some(timestamp()+3600.0)}else{None}])?;if ["promote","reject"].contains(&state){tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='candidate' AND target=?)",[candidate_id])?;}tx.touch_target(candidate_id)?;
-            if state=="promote"{if let Some(target)=&target{resolutions.insert(candidate_id.into(),json!(target));if action["operation"]=="supersede"{if let Some(previous)=action["target"].as_str(){let previous=resolutions.get(previous).and_then(Value::as_str).unwrap_or(previous);destinations.insert(previous.into(),json!(target));}}}}
+            if state=="promote"{if let Some(target)=&target{resolutions.insert(candidate_id.into(),json!(target));if action["operation"]=="supersede"{if let Some(previous)=action["target"].as_str(){let previous=resolutions.get(previous).and_then(Value::as_str).unwrap_or(previous);if previous!=target{destinations.insert(previous.into(),json!(target));}}}}}
             result["decision"]=json!(state);results.insert(candidate_id.into(),result);
         }
         let mut repair_results=Map::new();for repair in &prepared.repairs{let original=get_str(repair,"target")?;let target=follow_refinements(tx.sql(),original,&destinations)?;let evidence=&repair["evidence"];let result=match get_str(repair,"operation")?{
             "link"=>{let dst=follow_refinements(tx.sql(),get_str(repair,"dst")?,&destinations)?;if !visible_link_endpoint(tx.sql(),&target)?||!visible_link_endpoint(tx.sql(),&dst)?{return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan"));}link(tx,commit,&target,get_str(repair,"relation")?,&dst,evidence)?},
             "absorb"=>{let mut absorbed=vec![];for source in strings(&repair["absorbed"])?{absorbed.push(follow_refinements(tx.sql(),&source,&destinations)?);}let result=curation::absorb(tx,commit,&target,&absorbed,Some(evidence),false,None)?;if result["status"]=="absorbed"{for source in absorbed{if node(tx.sql(),&source)?["state"]=="merged"{destinations.insert(source,json!(target));}}}result},
-            "supersede"=>{let result=TxGraph::supersede(tx,commit,&json!({"op":"supersede","old":target,"new":{"type":repair["type"],"text":repair["text"],"scope":repair.get("scope").filter(|scope|!scope.is_null()).unwrap_or(&prepared.nodes[original]["scope"])},"kind":repair["change_kind"],"valid_at":repair["valid_at"],"evidence":evidence}),false)?;if let Some(new)=result["superseded_by"].as_str(){destinations.insert(target.clone(),json!(new));}result},
+            "supersede"=>TxGraph::supersede(tx,commit,&json!({"op":"supersede","old":target,"new":{"type":repair["type"],"text":repair["text"],"scope":repair.get("scope").filter(|scope|!scope.is_null()).unwrap_or(&prepared.nodes[original]["scope"])},"kind":repair["change_kind"],"valid_at":repair["valid_at"],"evidence":evidence,"retire_relations":repair["retire_relations"]}),false)?,
             "decline_loop"=>loops::decline_automatic(tx,commit,&target,&loop_snapshots[original])?,
             "assign_loop"=>{let result=loops::assign_automatic(tx,commit,&target,get_str(repair,"responsibility")?,evidence)?;if let Some(map)=result["loop_responsibilities"].as_object(){loop_responsibilities.extend(map.clone());}result},
             "retire"=>curation::retire(tx,commit,&target,evidence)?,
@@ -858,7 +878,7 @@ fn apply_action(
             TxGraph::supersede(
                 tx,
                 commit,
-                &json!({"op":"supersede","old":target,"new":{"type":action["type"],"text":action["text"],"scope":labels},"kind":action["change_kind"],"valid_at":action["valid_at"],"evidence":evidence}),
+                &json!({"op":"supersede","old":target,"new":{"type":action["type"],"text":action["text"],"scope":labels},"kind":action["change_kind"],"valid_at":action["valid_at"],"evidence":evidence,"retire_relations":action["retire_relations"]}),
                 false,
             )?
         }

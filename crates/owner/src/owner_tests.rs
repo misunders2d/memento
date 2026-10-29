@@ -4,7 +4,7 @@ use crate::{
     restore_cli,
 };
 use memento_core::{Error, Result, Store};
-use memento_domain::{Graph, processing::Processing};
+use memento_domain::{Graph, TxGraph, processing::Processing};
 use memento_maintenance::{
     binding::PublicBinding,
     cold::{ColdManager, ColdObject, ColdStore, RemoteBackup},
@@ -385,6 +385,13 @@ fn cli_mutations_and_export_require_tty_before_preview_or_socket_request() {
             "--output",
             "private.tar",
         ]),
+        argv(&[
+            "--data-dir",
+            "synthetic",
+            "recover-revisions",
+            "--why",
+            "Exact review",
+        ]),
     ] {
         let calls = AtomicUsize::new(0);
         let error = owner_cli::run(&args, &mut FakeConsole::default(), &|_, _| {
@@ -406,6 +413,7 @@ fn cli_operational_commands_need_no_tty_and_compact_incomplete_is_nonzero() {
         (vec!["history", "status"], "history_status"),
         (vec!["history", "release-candidates"], "history_release-candidates"),
         (vec!["compact"], "compact"),
+        (vec!["revisions"], "revision_plan"),
     ] {
         let mut values = vec!["--data-dir", "synthetic"];
         values.extend(op);
@@ -702,4 +710,114 @@ fn total_request_deadline_and_size_bound_hold_before_dispatch() {
     ));
     assert_eq!(f.call(json!({"operation":"list"})), json!({"result":[]}));
     server.close().unwrap();
+}
+// A replacement written by the retired supersede path: new ID plus marker and
+// supersedes edge in one commit.
+fn legacy_replace(f: &Fixture, key: &str, old: &str, text: &str, pinned: bool) -> String {
+    let evidence = json!([{"episode_id":f.episode,"quote":"Exact source Ω😀."}]);
+    let context = memento_domain::context(key.into(), "legacy".into(), "Legacy fixture".into());
+    let result = f.graph.store.command(&context, &json!({"legacy":key}), |tx, commit| {
+        let (version, kind, prior, scope, pin): (i64, String, String, String, i64) = tx.sql().query_row(
+            "SELECT version,type,text,scope,pinned FROM node_versions WHERE id=? ORDER BY version DESC LIMIT 1",
+            [old],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        let replacement = TxGraph::insert_node(tx, commit, &json!({"type":kind,"text":text,"scope":serde_json::from_str::<Value>(&scope)?,"valid_from":null,"valid_to":null,"evidence":evidence,"pinned":pinned}))?;
+        let id = replacement["id"].as_str().unwrap();
+        tx.sql().execute("INSERT INTO node_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)", rusqlite::params![old, version + 1, commit, kind, prior, "refined", None::<&str>, None::<&str>, id, pin, scope])?;
+        TxGraph::evidence(tx, old, version + 1, &evidence)?;
+        let edge = format!("edge-{key}");
+        tx.sql().execute("INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)", rusqlite::params![edge, 1, commit, id, "supersedes", old, "active"])?;
+        TxGraph::evidence(tx, &edge, 1, &evidence)?;
+        Ok(replacement)
+    });
+    result.unwrap()["id"].as_str().unwrap().to_owned()
+}
+#[test]
+fn owner_revision_recovery_applies_protected_chains_only_when_named() {
+    let f = Fixture::new();
+    let id = |value: Value| value["id"].as_str().unwrap().to_owned();
+    let a = id(f.save("plain", "knowledge", "Atlas rollout is pending."));
+    let d = id(f.save("guarded", "knowledge", "Atlas budget is draft."));
+    let b = legacy_replace(&f, "legacy-a", &a, "Atlas rollout shipped.", false);
+    let e = legacy_replace(&f, "legacy-d", &d, "Atlas budget is final.", true);
+    let server = OwnerServer::start(f.services()).unwrap();
+    let plan = f.call(json!({"operation":"revision_plan","limit":8,"exclude":[],"protected":[]}))["result"].clone();
+    assert_eq!(plan["chains"].as_array().unwrap().iter().map(|c| c["root"].clone()).collect::<Vec<_>>(), vec![json!(a)]);
+    assert_eq!(plan["protected"], json!([{"root":d,"members":[d,e],"reasons":["pinned"]}]));
+    let recover = |key: &str, token: &Value, protected: Value| {
+        f.call(json!({"operation":"recover_revisions","limit":8,"exclude":[],"protected":protected,"token":token,"why":"Owner reviewed plan","command_id":key}))
+    };
+    // Naming a protected root changes the plan, so the generic token cannot apply it.
+    assert!(recover("stale", &plan["token"], json!([d])).get("error").is_some());
+    let missing = f.call(json!({"operation":"recover_revisions","limit":8,"exclude":[],"token":plan["token"],"why":"Owner reviewed plan","command_id":"missing"}));
+    assert!(missing.get("error").is_some());
+    let generic = recover("generic", &plan["token"], json!([]));
+    assert_eq!(generic["result"]["recovered"], json!([{"id":a,"version":3,"merged":[b],"requeued_candidates":[]}]), "{generic}");
+    assert_eq!(recover("generic", &plan["token"], json!([])), generic);
+    assert_eq!(f.graph.history(&d).unwrap().iter().filter(|v| v["id"] == d.as_str()).count(), 2);
+    let named = f.call(json!({"operation":"revision_plan","limit":8,"exclude":[],"protected":[d]}))["result"].clone();
+    assert_eq!(named["chains"][0]["protected_reasons"], json!(["pinned"]));
+    let applied = recover("named", &named["token"], json!([d]));
+    assert_eq!(applied["result"]["recovered"][0]["id"], d.as_str(), "{applied}");
+    let history = f.graph.history(&a).unwrap();
+    let current = history.last().unwrap();
+    assert_eq!((current["id"].as_str(), current["text"].as_str()), (Some(a.as_str()), Some("Atlas rollout shipped.")));
+    let origin = &current["revision"]["recovered_from"];
+    assert_eq!((origin["id"].as_str(), origin["version"].as_i64(), origin["actor"].as_str(), origin["why"].as_str()), (Some(b.as_str()), Some(1), Some("legacy"), Some("Legacy fixture")));
+    assert!(current["actor"].as_str().unwrap().starts_with("human:uid:"));
+    assert_eq!(current["evidence"][0]["quote"], "Exact source Ω😀.");
+    assert!(history.iter().any(|v| v["id"] == a.as_str() && v["text"] == "Atlas rollout is pending."));
+    assert_eq!(f.graph.store.read(|tx| tx.original_text(&f.episode)).unwrap().unwrap(), TEXT);
+    server.close().unwrap();
+}
+#[test]
+fn cli_revision_recovery_requires_named_protected_roots_in_the_typed_confirmation() {
+    let plan = json!({"result":{"chains":[{"root":"a","protected_reasons":[]},{"root":"d","protected_reasons":["pinned"]}],"token":"plan-token"}});
+    for (answer, status) in [
+        ("recover 2 revision chains", 1),
+        ("recover 2 revision chains including protected d", 0),
+    ] {
+        let requests = RefCell::new(Vec::new());
+        let mut console = FakeConsole {
+            terminal: true,
+            answer: answer.into(),
+            ..Default::default()
+        };
+        let args = argv(&["--data-dir", "synthetic", "recover-revisions", "--limit", "8", "--protected", "d", "--exclude", "x", "--why", "Human choice", "--command-id", "stable-id"]);
+        let code = owner_cli::run(&args, &mut console, &|_, v| {
+            requests.borrow_mut().push(v.clone());
+            Ok(if v["operation"] == "revision_plan" { plan.clone() } else { json!({"result":{"recovered":[]}}) })
+        })
+        .unwrap();
+        assert_eq!(code, status);
+        let requests = requests.borrow();
+        assert_eq!(requests[0], json!({"limit":8,"exclude":["x"],"protected":["d"],"operation":"revision_plan"}));
+        assert_eq!(requests.len(), if status == 0 { 2 } else { 1 });
+        if status == 0 {
+            assert_eq!(requests[1], json!({"limit":8,"exclude":["x"],"protected":["d"],"operation":"recover_revisions","token":"plan-token","why":"Human choice","command_id":"stable-id"}));
+        }
+        assert!(console.prompts[0].contains("including protected d"));
+    }
+    let mut console = FakeConsole { terminal: true, ..Default::default() };
+    let code = owner_cli::run(&argv(&["--data-dir", "synthetic", "recover-revisions", "--why", "Human choice"]), &mut console, &|_, v| {
+        assert_eq!(v["operation"], "revision_plan");
+        Ok(json!({"result":{"chains":[],"token":"empty"}}))
+    })
+    .unwrap();
+    assert_eq!(code, 0);
+    assert!(console.prompts.is_empty());
+    assert!(console.printed.contains("nothing changed"));
+    for bad in [
+        vec!["revisions", "--limit", "0"],
+        vec!["revisions", "--limit", "257"],
+        vec!["revisions", "--limit", "many"],
+        vec!["revisions", "--why", "no apply"],
+        vec!["recover-revisions"],
+        vec!["approve", "proposal", "--why", "review", "--protected", "d"],
+    ] {
+        let mut values = vec!["--data-dir", "synthetic"];
+        values.extend(bad);
+        assert!(owner_cli::parse(&argv(&values)).is_err());
+    }
 }

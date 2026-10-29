@@ -148,6 +148,11 @@ impl Store {
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(include_str!("media_stage.sql"))?;tx.commit()?;
         }
+        // Append-only revision metadata for same-identity content versions.
+        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_revisions')",[],|r|r.get::<_,bool>(0))?{
+            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("node_revisions.sql"))?;tx.commit()?;
+        }
         let stage_indexes:i64=db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('media_stage_artifact','media_stage_source')",[],|r|r.get(0))?;
         if stage_indexes != 2 {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;

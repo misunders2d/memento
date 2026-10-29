@@ -121,16 +121,34 @@ fn loop_value(row: &Value, now: &str) -> Value {
     json!({"due_at":row["due_at"],"deferred":row["deferred_until"].as_str().is_some_and(|v|!v.is_empty()&&v>now),"overdue":row["due_at"].as_str().is_some_and(|v|!v.is_empty()&&v<now),"responsibility":row["responsibility"].as_str().unwrap_or("unknown")})
 }
 fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String, Value>> {
+    // A behavior comes from the content commit (creation or same-ID
+    // revision) that produced the current version, as in domain::behavior;
+    // recovered legacy content resolves through the replacement it came from.
     let owners = rows(
         db,
-        "SELECT n.id,n.commit_id FROM node_versions n WHERE n.version=1 AND n.type='experience' AND (?1 IS NULL OR n.id=?1)",
+        "WITH cur AS (SELECT c.id,c.version FROM node_versions c WHERE c.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=c.id) AND c.type='experience' AND (?1 IS NULL OR c.id=?1)), own AS (SELECT cur.id,coalesce(r.source_id,cur.id) AS source,coalesce(r.source_version,cur.version) AS at FROM cur LEFT JOIN node_revisions r ON r.id=cur.id AND r.version=(SELECT max(y.version) FROM node_revisions y WHERE y.id=cur.id AND y.version<=cur.version)) SELECT own.id,own.source,d.version,d.commit_id FROM own JOIN node_versions d ON d.id=own.source AND d.version=coalesce((SELECT max(r.version) FROM node_revisions r WHERE r.id=own.source AND r.version<=own.at),1)",
         [target],
     )?;
     let ids = owners
         .iter()
         .map(|n| n["commit_id"].clone())
         .collect::<Vec<_>>();
-    let mut parsed = HashMap::<String, HashMap<String, Value>>::new();
+    let mut parsed = HashMap::<String, HashMap<(String, i64), Value>>::new();
+    // Legacy supersedes produced a replacement at version 1; same-ID
+    // revisions produce the reported version of the revised memory.
+    let produced = |outcome: &Value, operation: &str| -> Option<(String, i64)> {
+        if let Some(id) = outcome["superseded_by"].as_str() {
+            return Some((id.into(), 1));
+        }
+        let id = outcome["id"].as_str()?.to_owned();
+        if operation == "remember" {
+            return Some((id, 1));
+        }
+        outcome["version"]
+            .as_i64()
+            .filter(|version| *version > 1)
+            .map(|version| (id, version))
+    };
     for record in rows(
         db,
         "SELECT id,request,result FROM graph_commits WHERE id IN (SELECT value FROM json_each(?))",
@@ -155,10 +173,7 @@ fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String,
                 .flatten()
             {
                 let outcome = &result["results"][action["candidate_id"].as_str().unwrap_or("")];
-                let id = outcome["superseded_by"]
-                    .as_str()
-                    .or_else(|| outcome["id"].as_str());
-                if let Some(id) = id {
+                if let Some(id) = produced(outcome, action["operation"].as_str().unwrap_or("")) {
                     if ["remember", "supersede"]
                         .contains(&action["operation"].as_str().unwrap_or(""))
                         && action["type"] == "experience"
@@ -167,7 +182,7 @@ fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String,
                             .is_some_and(|v| !v.is_empty())
                     {
                         found
-                            .entry(id.into())
+                            .entry(id)
                             .or_insert_with(|| action["behavior"].clone());
                     }
                 }
@@ -178,7 +193,7 @@ fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String,
                 .flatten()
             {
                 let outcome = &result["repair_results"][repair["target"].as_str().unwrap_or("")];
-                if let Some(id) = outcome["superseded_by"].as_str() {
+                if let Some(id) = produced(outcome, "supersede") {
                     if repair["operation"] == "supersede"
                         && repair["type"] == "experience"
                         && repair["behavior"]
@@ -186,7 +201,7 @@ fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String,
                             .is_some_and(|v| !v.is_empty())
                     {
                         found
-                            .entry(id.into())
+                            .entry(id)
                             .or_insert_with(|| repair["behavior"].clone());
                     }
                 }
@@ -197,9 +212,13 @@ fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String,
     let mut result = HashMap::new();
     for owner in owners {
         let id = owner["id"].as_str().unwrap();
+        let key = (
+            owner["source"].as_str().unwrap().to_owned(),
+            owner["version"].as_i64().unwrap_or(1),
+        );
         if let Some(value) = parsed
             .get(owner["commit_id"].as_str().unwrap())
-            .and_then(|m| m.get(id))
+            .and_then(|m| m.get(&key))
         {
             result.insert(id.into(), value.clone());
         }

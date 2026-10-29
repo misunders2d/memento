@@ -123,10 +123,20 @@ fn refinement_preserves_premises_relations_interval_and_manual_loop() {
     );
     let deferred = f.loop_op("later", old, "later", json!({"days":2.5}));
     let refined=f.graph.supersede(parse(json!({"command_id":"refine","actor":"user","why":"Additional legal condition","old":old,"kind":"refinement","new":{"type":"knowledge","text":"The launch report is pending legal approval.","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"The launch report is pending legal approval."}]}))).unwrap();
-    let new = refined["superseded_by"].as_str().unwrap();
+    // Same memory, next content version; no replacement identity.
+    assert_eq!(refined["id"], old);
+    assert_eq!(refined["version"], 2);
+    assert!(refined.get("superseded_by").is_none());
     let history = f.history(old);
-    assert_eq!(history, f.history(new));
-    let current = history.iter().find(|n| n["id"] == new).unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|n| n["id"] == old));
+    assert_eq!(history[0]["text"], "The launch report is pending.");
+    assert_eq!(history[0]["revised_by"], json!({"version":2,"kind":"refinement","valid_at":null}));
+    let current = &history[1];
+    assert_eq!(current["text"], "The launch report is pending legal approval.");
+    assert_eq!(current["state"], "active");
+    assert_eq!(current["revision"]["kind"], "refinement");
+    assert!(current["diff"].as_array().unwrap().iter().any(|part| part.to_string().contains("legal")));
     assert_eq!(current["valid_from"], "2026-10-01T00:00:00+00:00");
     assert_eq!(current["valid_to"], "2026-12-01T00:00:00+00:00");
     assert_eq!(current["evidence"].as_array().unwrap().len(), 2);
@@ -135,18 +145,29 @@ fn refinement_preserves_premises_relations_interval_and_manual_loop() {
         deferred["deferred_until"]
     );
     assert_eq!(current["loop"]["due_at"], "2035-01-02T00:00:00+00:00");
-    assert_eq!(
-        f.graph
-            .store
-            .read(|tx| Ok(rows(
-                tx.sql(),
-                "SELECT * FROM edge_versions WHERE src=? AND dst=? AND state='active'",
-                params![new, peer]
-            )?
-            .len()))
-            .unwrap(),
-        1
-    );
+    let (relations, replacements) = f
+        .graph
+        .store
+        .read(|tx| {
+            Ok((
+                rows(
+                    tx.sql(),
+                    "SELECT * FROM edge_versions e WHERE e.src=? AND e.dst=? AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)",
+                    params![old, peer],
+                )?
+                .len(),
+                rows(tx.sql(), "SELECT 1 FROM edge_versions WHERE rel='supersedes'", [])?.len()
+                    + rows(tx.sql(), "SELECT DISTINCT id FROM node_versions", [])?.len(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(relations, 1);
+    // Only the revised memory and its peer exist; no supersedes edge.
+    assert_eq!(replacements, 2);
+    let recalled = f.graph.recall_keywords("legal approval", 5, None).unwrap();
+    assert_eq!(recalled[0]["id"], old);
+    assert_eq!(recalled[0]["version"], 2);
+    assert!(f.graph.recall_keywords("Peer", 5, None).unwrap().iter().all(|n| n["id"] != old));
 }
 
 #[test]
@@ -159,16 +180,37 @@ fn correction_and_world_change_keep_exact_lineage_and_require_aware_time() {
     assert_eq!(f.history(old).len(), 1);
     change["valid_at"] = json!("2026-10-22T15:00:00+03:00");
     let changed = f.graph.supersede(parse(change)).unwrap();
-    let current = changed["superseded_by"].as_str().unwrap();
+    assert_eq!(changed["id"], old);
+    assert_eq!(changed["version"], 2);
     let history = f.history(old);
-    assert_eq!(history[1]["state"], "superseded");
-    assert_eq!(history[1]["valid_to"], "2026-10-22T12:00:00+00:00");
-    assert_eq!(history[2]["valid_from"], "2026-10-22T12:00:00+00:00");
-    let corrected=f.graph.supersede(parse(json!({"command_id":"correct","actor":"user","why":"Earlier belief wrong","old":current,"new":{"type":"knowledge","text":"corrected belief","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"old"}]}))).unwrap();
-    let history = f.history(corrected["superseded_by"].as_str().unwrap());
-    assert_eq!(history, f.history(old));
-    assert!(history.last().unwrap()["valid_from"].is_null());
-    assert!(history.last().unwrap()["valid_to"].is_null());
+    assert_eq!(history.len(), 2);
+    // The earlier version stays immutable; its world validity ends at the change.
+    assert_eq!(history[0]["state"], "active");
+    assert_eq!(history[0]["text"], "old belief");
+    assert_eq!(history[0]["revised_by"]["kind"], "change");
+    assert_eq!(history[0]["revised_by"]["valid_at"], "2026-10-22T12:00:00+00:00");
+    assert_eq!(history[1]["valid_from"], "2026-10-22T12:00:00+00:00");
+    assert!(history[1]["valid_to"].is_null());
+    assert_eq!(history[1]["revision"]["kind"], "change");
+    let corrected=f.graph.supersede(parse(json!({"command_id":"correct","actor":"user","why":"Earlier belief wrong","old":old,"new":{"type":"knowledge","text":"corrected belief","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"old"}]}))).unwrap();
+    assert_eq!(corrected["id"], old);
+    assert_eq!(corrected["version"], 3);
+    let history = f.history(old);
+    assert_eq!(history.len(), 3);
+    assert!(history.iter().all(|n| n["id"] == old));
+    assert_eq!(history[1]["revised_by"]["kind"], "correction");
+    let last = history.last().unwrap();
+    assert_eq!(last["revision"]["kind"], "correction");
+    assert_eq!(last["why"], "Earlier belief wrong");
+    assert_eq!(last["actor"], "user");
+    // A correction cites only its own evidence; earlier evidence stays in history.
+    assert_eq!(last["evidence"].as_array().unwrap().len(), 1);
+    assert_eq!(last["evidence"][0]["quote"], "old");
+    assert!(last["valid_from"].is_null());
+    assert!(last["valid_to"].is_null());
+    // An identical retry returns the committed result without another version.
+    assert_eq!(f.graph.supersede(parse(json!({"command_id":"correct","actor":"user","why":"Earlier belief wrong","old":old,"new":{"type":"knowledge","text":"corrected belief","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"old"}]}))).unwrap(), corrected);
+    assert_eq!(f.history(old).len(), 3);
 }
 
 #[test]
@@ -408,7 +450,10 @@ fn citation_usage_transfers_once_and_preserves_python_casefold_query_key() {
     assert_eq!(first["cited"], json!([old]));
     assert_eq!(f.graph.cite(command).unwrap(), first);
     let corrected=f.graph.supersede(parse(json!({"command_id":"fix","actor":"user","why":"Original mistaken","old":old,"new":{"type":"knowledge","text":"New belief","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"new"}]}))).unwrap();
-    let current = corrected["superseded_by"].as_str().unwrap();
+    // Usage stays with the same memory ID; no transfer can double count it.
+    assert_eq!(corrected["id"], old);
+    assert_eq!(corrected["version"], 2);
+    let current = corrected["id"].as_str().unwrap();
     let count = f
         .graph
         .store
@@ -705,4 +750,228 @@ fn explicit_reconcile_preserves_pin_and_scope_review_gates() {
         assert_eq!(f.history(b).last().unwrap()["state"], "active");
         assert_eq!(f.graph.pending_reviews().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn stable_id_revisions_survive_reopen_with_scope_and_protected_review() {
+    let f = Fixture::new();
+    let a = f.remember("a", "The launch report is pending.", "The launch report is pending.");
+    let a = a["id"].as_str().unwrap().to_owned();
+    f.graph.supersede(parse(json!({"command_id":"v2","actor":"user","why":"Legal condition","old":a,"kind":"refinement","new":{"type":"knowledge","text":"The launch report is pending legal approval.","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"The launch report is pending legal approval."}]}))).unwrap();
+    // A correction may also move the memory to another scope.
+    let v3=f.graph.supersede(parse(json!({"command_id":"v3","actor":"user","why":"Approved","old":a,"kind":"correction","new":{"type":"knowledge","text":"The launch report was approved.","scope":["personal"]},"evidence":[{"episode_id":f.episode,"quote":"The launch report was approved."}]}))).unwrap();
+    assert_eq!((v3["id"].as_str(), v3["version"].as_i64()), (Some(a.as_str()), Some(3)));
+    let Fixture { _dir: dir, graph, episode } = f;
+    drop(graph);
+    let graph = Graph::new(Store::open(dir.path()).unwrap());
+    let history = graph.history(&a).unwrap();
+    let versions = history.iter().map(|n| (n["id"].as_str().unwrap(), n["version"].as_i64().unwrap())).collect::<Vec<_>>();
+    assert_eq!(versions, vec![(a.as_str(), 1), (a.as_str(), 2), (a.as_str(), 3)]);
+    assert_eq!(history[1]["scope"], json!(["professional"]));
+    assert_eq!(history[1]["revised_by"]["kind"], "correction");
+    assert_eq!(history[2]["text"], "The launch report was approved.");
+    assert_eq!(history[2]["scope"], json!(["personal"]));
+    assert_eq!(history[2]["evidence"], json!([{"episode_id":episode,"start":210,"end":241,"quote":"The launch report was approved."}]));
+    assert!(history[2]["diff"].to_string().contains("approved"));
+    let recalled = graph.recall_keywords("approved", 5, Some("personal")).unwrap();
+    assert_eq!((recalled[0]["id"].as_str(), recalled[0]["version"].as_i64()), (Some(a.as_str()), Some(3)));
+    assert!(graph.recall_keywords("approved", 5, Some("professional")).unwrap().is_empty());
+    assert!(graph.recall_keywords("legal", 5, None).unwrap().is_empty());
+    // A pinned memory still needs review; approval revises the same ID.
+    let pin = json!({"op":"pin","node_id":a,"pinned":true,"evidence":[{"episode_id":episode,"quote":"Preserve this decision."}]});
+    let proposal = graph.store.command(&context("pin".into(),"model-fixture".into(),"Propose guarded change".into()),&pin,|tx,commit|curation::propose(tx,commit,&pin)).unwrap();
+    graph.decide_review(parse(json!({"command_id":"pin-ok","actor":"owner","why":"Explicit synthetic approval","proposal_id":proposal["id"],"decision":"approve"}))).unwrap();
+    let pinned = graph.history(&a).unwrap().len();
+    let pending=graph.supersede(parse(json!({"command_id":"v5","actor":"agent","why":"Supported detail","old":a,"kind":"refinement","new":{"type":"knowledge","text":"The launch report was approved. Preserve this decision.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":"Preserve this decision."}]}))).unwrap();
+    assert_eq!(pending["status"], "pending_review");
+    assert_eq!(graph.history(&a).unwrap().len(), pinned);
+    graph.decide_review(parse(json!({"command_id":"v5-ok","actor":"owner","why":"Explicit synthetic approval","proposal_id":pending["id"],"decision":"approve"}))).unwrap();
+    let history = graph.history(&a).unwrap();
+    assert_eq!(history.len(), pinned + 1);
+    let last = history.last().unwrap();
+    assert_eq!((last["id"].as_str(), last["pinned"].as_i64()), (Some(a.as_str()), Some(1)));
+    assert_eq!(last["revision"]["kind"], "refinement");
+    assert_eq!(graph.store.read(|tx| Ok(rows(tx.sql(), "SELECT DISTINCT id FROM node_versions", [])?.len())).unwrap(), 1);
+}
+
+fn legacy(f: &Fixture, key: &str, old: &str, kind: &str, text: &str, valid_at: Option<&str>) -> String {
+    replace(f, key, old, kind, json!({"type":"knowledge","text":text,"scope":["professional"]}), text, valid_at)
+}
+fn replace(f: &Fixture, key: &str, old: &str, kind: &str, new: Value, quote: &str, valid_at: Option<&str>) -> String {
+    let result = recovery::legacy_supersede(&f.graph, json!({"command_id":key,"old":old,"kind":kind,"valid_at":valid_at,"new":new,"evidence":[{"episode_id":f.episode,"quote":quote}]})).unwrap();
+    result["superseded_by"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn legacy_replacement_chains_recover_into_the_original_id_under_an_exact_plan() {
+    let f = Fixture::new();
+    let id = |value: Value| value["id"].as_str().unwrap().to_owned();
+    let a = id(f.remember("a", "The launch report is pending.", "The launch report is pending."));
+    let mut org = f.command("org", "Vega Incorporated", "Vega Incorporated");
+    org["type"] = json!("organization");
+    let org = id(f.graph.remember(parse(org)).unwrap());
+    let link = |key: &str, from: &str, rel: &str| id(f.graph.link(parse(json!({"command_id":key,"actor":"user","why":"Source-backed relation","a":from,"rel":rel,"b":org,"evidence":[{"episode_id":f.episode,"quote":"Orion belongs to Vega."}]}))).unwrap());
+    // A world change, then a refinement that carried B's link on to C.
+    let b = legacy(&f, "legacy-change", &a, "change", "The launch report was approved.", Some("2026-10-22T12:00:00+00:00"));
+    let before = link("before", &b, "concerns");
+    let c = replace(&f, "legacy-refine", &b, "refinement", json!({"type":"knowledge","text":"The launch report was approved and must be preserved.","scope":["professional"]}), "Preserve this decision.", None);
+    let after = link("after", &c, "mentions");
+    f.graph.cite(dto::Citation { event_id: "cite-c".into(), ids: vec![c.clone()], query: Some("launch report".into()), shown: vec![c.clone()] }).unwrap();
+    // The live end gained a same-ID revision after cutover.
+    f.graph.supersede(parse(json!({"command_id":"c-v2","actor":"user","why":"Decision detail","old":c,"kind":"correction","new":{"type":"knowledge","text":"The launch report was approved. Preserve this decision.","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"Preserve this decision."}]}))).unwrap();
+    // An unproven replacement pointer stays reported and untouched.
+    let g = id(f.remember("g", "old belief", "old"));
+    let h = id(f.remember("h", "new belief", "new"));
+    let i = id(f.remember("i", "third belief", "aaa"));
+    f.graph.store.command(&context("forged".into(),"fixture".into(),"Synthetic unproven legacy pointers".into()),&json!({"op":"fixture"}),|tx,commit|{for (old,new) in [(&g,&h),(&h,&i)] {tx.sql().execute("INSERT INTO node_versions SELECT id,2,?,type,text,'refined',valid_from,valid_to,?,pinned,scope FROM node_versions WHERE id=? AND version=1",params![commit,new,old])?;}Ok(json!({}))}).unwrap();
+    // A legacy correction left its link on R; recovery would make it current again.
+    let r = id(f.remember("r", "Orion belongs to Vega.", "Orion belongs to Vega."));
+    let referent = link("referent", &r, "concerns");
+    let rs = legacy(&f, "legacy-correct-r", &r, "correction", "Vega Incorporated", None);
+    // Type and audience changes may name different referents or readers.
+    let t = id(f.remember("t", "Orion is a plan.", "Orion belongs to Vega."));
+    let tu = replace(&f, "legacy-type", &t, "refinement", json!({"type":"project","text":"Orion","scope":["professional"]}), "Orion belongs to Vega.", None);
+    let v = id(f.remember("v", "The launch plan is shared.", "The launch report is pending."));
+    let vw = replace(&f, "legacy-scope", &v, "refinement", json!({"type":"knowledge","text":"The launch plan is private.","scope":["personal"]}), "The launch report is pending.", None);
+    // Legacy orphan links on retired ancestors before a later correction,
+    // including a post-cutover same-ID one, need the same decision.
+    let orphan = |key: &str, from: &str| {
+        f.graph.store.command(&context(key.into(),"fixture".into(),"Synthetic legacy orphan relation".into()),&json!({"op":"fixture","key":key}),|tx,commit|{tx.sql().execute("INSERT INTO edge_versions VALUES (?,1,?,?,'concerns',?,'active')",params![key,commit,from,org])?;TxGraph::evidence(tx,key,1,&json!([{"episode_id":f.episode,"quote":"Orion belongs to Vega."}]))?;Ok(json!({}))}).unwrap();
+    };
+    let k = id(f.remember("k", "The launch review is pending.", "The launch report is pending."));
+    let kl = replace(&f, "legacy-refine-k", &k, "refinement", json!({"type":"knowledge","text":"The launch review awaits legal.","scope":["professional"]}), "The launch report is pending legal approval.", None);
+    let km = replace(&f, "legacy-correct-k", &kl, "correction", json!({"type":"knowledge","text":"The launch review was approved.","scope":["professional"]}), "The launch report was approved.", None);
+    orphan("orphan-k", &k);
+    let n = id(f.remember("n", "The launch audit is pending.", "The launch report is pending."));
+    let no = replace(&f, "legacy-refine-n", &n, "refinement", json!({"type":"knowledge","text":"The launch audit awaits legal.","scope":["professional"]}), "The launch report is pending legal approval.", None);
+    f.graph.supersede(parse(json!({"command_id":"o-v2","actor":"user","why":"Audit correction","old":no,"kind":"correction","new":{"type":"knowledge","text":"The launch audit was approved.","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"The launch report was approved."}]}))).unwrap();
+    orphan("orphan-n", &n);
+    // A legacy correction whose replacement was later pinned through review.
+    let d = id(f.remember("d", "Vega and Vega Incorporated are one organization.", "Vega Incorporated and Vega are the same organization."));
+    let e = legacy(&f, "legacy-correct", &d, "correction", "Preserve this decision.", None);
+    let pin = f.propose("pin-e", json!({"op":"pin","node_id":e,"pinned":true}));
+    f.approve("pin-e-ok", &pin).unwrap();
+    f.loop_op("open-c", &c, "open", json!({}));
+    f.loop_op("open-e", &e, "open", json!({}));
+    f.loop_op("assign-e", &e, "assign", json!({"responsibility":"other","evidence":[{"episode_id":f.episode,"quote":"Preserve this decision."}]}));
+    let count = |sql: &str| f.graph.store.read(|tx| Ok(tx.sql().query_row(sql, [], |row| row.get::<_, i64>(0))?)).unwrap();
+    let commits = count("SELECT count(*) FROM graph_commits");
+    // A pinned chain is only reported until the owner names its root.
+    let guarded = f.graph.revision_recovery_plan(16, &[], &[]).unwrap();
+    assert_eq!(count("SELECT count(*) FROM graph_commits"), commits);
+    assert_eq!(guarded["chains"].as_array().unwrap().len(), 1);
+    assert_eq!(guarded["protected"], json!([{"root":d,"members":[d,e],"reasons":["pinned"]}]));
+    let ambiguous = |plan: &Value, root: &str| plan["ambiguous"].as_array().unwrap().iter().find(|item| item["root"] == root).cloned();
+    assert_eq!(ambiguous(&guarded, &g), Some(json!({"root":g,"members":[g,h,i],"reason":"unproven_lineage"})));
+    assert_eq!(ambiguous(&guarded, &r), Some(json!({"root":r,"members":[r,rs],"reason":"relations_need_review","relations":[referent]})));
+    assert_eq!(ambiguous(&guarded, &t), Some(json!({"root":t,"members":[t,tu],"reason":"type_changed"})));
+    assert_eq!(ambiguous(&guarded, &v), Some(json!({"root":v,"members":[v,vw],"reason":"scope_changed"})));
+    assert_eq!(ambiguous(&guarded, &k), Some(json!({"root":k,"members":[k,kl,km],"reason":"relations_need_review","relations":["orphan-k"]})));
+    assert_eq!(ambiguous(&guarded, &n), Some(json!({"root":n,"members":[n,no],"reason":"relations_need_review","relations":["orphan-n"]})));
+    assert_eq!(guarded["ambiguous_count"], 6);
+    // Neither an unprotected nor a blocked chain can be selected as protected.
+    for root in [&a, &r, &t] {
+        assert!(matches!(f.graph.revision_recovery_plan(16, &[], &[root.clone()]), Err(Error::Validation(_))));
+    }
+    assert!(matches!(f.graph.revision_recovery_plan(16, &[d.clone()], &[d.clone()]), Err(Error::Validation(_))));
+    let generic = f.graph.recover_revisions(parse(json!({"command_id":"recover-generic","actor":"owner","why":"Recover legacy revisions","limit":16,"token":guarded["token"]}))).unwrap();
+    assert_eq!(generic["recovered"].as_array().unwrap().len(), 1);
+    assert_eq!(generic["recovered"][0]["id"], a.as_str());
+    assert_eq!(f.history(&d).iter().filter(|n| n["id"] == d.as_str()).count(), 2);
+    let plan = f.graph.revision_recovery_plan(16, &[], &[d.clone()]).unwrap();
+    let chains = plan["chains"].as_array().unwrap();
+    assert_eq!(chains.len(), 1);
+    let corrected = &chains[0];
+    assert_eq!(corrected["root"], d.as_str());
+    assert_eq!(corrected["hops"][0]["kind"], "correction");
+    assert_eq!(corrected["hops"][0]["source"], json!({"id":e,"version":2}));
+    assert_eq!(corrected["protected_reasons"], json!(["pinned"]));
+    assert!(corrected["loops"][&e]["event_id"].is_string());
+    let chain = guarded["chains"].as_array().unwrap().iter().find(|chain| chain["root"] == a.as_str()).unwrap();
+    assert_eq!(chain["protected_reasons"], json!([]));
+    let members = chain["members"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(members, vec![a.as_str(), b.as_str(), c.as_str()]);
+    let kinds = chain["hops"].as_array().unwrap().iter().map(|h| h["kind"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(kinds, vec!["change", "refinement", "correction"]);
+    assert_eq!(chain["reattached_relations"], json!([]));
+    let excluded = f.graph.revision_recovery_plan(16, &[d.clone()], &[]).unwrap();
+    assert_eq!(excluded["excluded"], json!([d]));
+    assert!(excluded["chains"].as_array().unwrap().is_empty());
+    // A same-value manual choice after the preview still refuses the plan.
+    f.loop_op("reopen-e", &e, "open", json!({}));
+    let stale = f.graph.recover_revisions(parse(json!({"command_id":"recover-stale","actor":"owner","why":"Recover legacy revisions","limit":16,"protected":[d],"token":plan["token"]})));
+    assert!(matches!(stale, Err(Error::Conflict(_))));
+    let snapshot = |target: &str, version: i64| f.graph.store.read(|tx| loops::snapshot(tx.sql(), target, version)).unwrap();
+    let manual = snapshot(&e, 2)["manual_choice_at"].clone();
+    assert!(manual.is_string());
+    let commits = count("SELECT count(*) FROM graph_commits");
+    let plan = f.graph.revision_recovery_plan(16, &[], &[d.clone()]).unwrap();
+    let command = json!({"command_id":"recover","actor":"owner","why":"Recover legacy revisions","limit":16,"protected":[d],"token":plan["token"]});
+    let recovered = f.graph.recover_revisions(parse(command.clone())).unwrap();
+    assert_eq!(f.graph.recover_revisions(parse(command)).unwrap(), recovered);
+    assert_eq!(count("SELECT count(*) FROM graph_commits"), commits + 1);
+    assert_eq!(recovered["recovered"], json!([{"id":d,"version":3,"merged":[e],"requeued_candidates":[]}]));
+    assert_eq!(generic["recovered"][0]["version"], 5);
+    let history = f.history(&d);
+    assert!(history.iter().all(|n| n["id"] == d.as_str()));
+    assert_eq!(history[1]["state"], "corrected");
+    let restored = history.last().unwrap();
+    assert_eq!(restored["loop"]["state"], "open");
+    assert_eq!((restored["text"].as_str(), restored["state"].as_str(), restored["pinned"].as_i64()), (Some("Preserve this decision."), Some("active"), Some(1)));
+    // The original correction keeps its own commit; the recovery is this version's.
+    let origin = &restored["revision"]["recovered_from"];
+    assert_eq!((origin["id"].as_str(), origin["version"].as_i64(), origin["actor"].as_str(), origin["why"].as_str()), (Some(e.as_str()), Some(2), Some("legacy"), Some("Legacy replacement fixture")));
+    assert!(origin["commit_id"].is_string() && origin["recorded_at"].is_string());
+    assert_eq!((restored["revision"]["kind"].as_str(), restored["actor"].as_str(), restored["why"].as_str()), (Some("correction"), Some("owner"), Some("Recover legacy revisions")));
+    // Manual chronology and role follow the recovered lineage.
+    assert_eq!(snapshot(&d, 3)["manual_choice_at"], manual);
+    assert_eq!(f.graph.store.read(|tx| loops::responsibility(tx.sql(), &d)).unwrap(), "other");
+    assert_eq!(f.history(&e).last().unwrap()["superseded_by"], d.as_str());
+    let history = f.history(&a);
+    assert!(history.iter().all(|n| n["id"] == a.as_str()));
+    assert_eq!(history.len(), 5);
+    assert_eq!(history[0]["text"], "The launch report is pending.");
+    assert_eq!(history[1]["state"], "superseded");
+    assert_eq!(history[2]["text"], "The launch report was approved.");
+    assert_eq!(history[2]["revision"]["kind"], "change");
+    assert_eq!(history[2]["revision"]["valid_at"], "2026-10-22T12:00:00+00:00");
+    assert_eq!(history[2]["revision"]["recovered_from"]["id"], b.as_str());
+    assert_eq!(history[2]["valid_from"], "2026-10-22T12:00:00+00:00");
+    assert_eq!(history[3]["revision"]["kind"], "refinement");
+    assert_eq!(history[3]["revision"]["recovered_from"]["id"], c.as_str());
+    assert_eq!(history[3]["evidence"].as_array().unwrap().len(), 2);
+    let current = &history[4];
+    assert_eq!(current["state"], "active");
+    assert_eq!(current["text"], "The launch report was approved. Preserve this decision.");
+    let origin = &current["revision"]["recovered_from"];
+    assert_eq!((origin["id"].as_str(), origin["version"].as_i64(), origin["actor"].as_str(), origin["why"].as_str()), (Some(c.as_str()), Some(2), Some("user"), Some("Decision detail")));
+    assert_eq!(current["evidence"][0]["quote"], "Preserve this decision.");
+    assert_eq!(current["loop"]["state"], "open");
+    for old in [&b, &c] {
+        let n = f.history(old).last().unwrap().clone();
+        assert_eq!((n["state"].as_str(), n["superseded_by"].as_str()), (Some("merged"), Some(a.as_str())));
+        assert_eq!(f.graph.store.read(|tx| curation::canonical(tx.sql(), old)).unwrap()["id"], a.as_str());
+    }
+    let recalled = f.graph.recall_keywords("approved", 10, None).unwrap();
+    let hit = recalled.iter().find(|row| row["id"] == a.as_str()).unwrap();
+    assert_eq!(hit["version"], 5);
+    assert!(recalled.iter().all(|row| row["id"] != b.as_str() && row["id"] != c.as_str()));
+    for edge in [&before, &after] {
+        let last = f.history(edge).last().unwrap().clone();
+        assert_eq!((last["src"].as_str(), last["state"].as_str()), (Some(a.as_str()), Some("active")));
+    }
+    // Blocked chains, their links and legacy edges stay exactly as they were.
+    let last = f.history(&referent).last().unwrap().clone();
+    assert_eq!((last["src"].as_str(), last["state"].as_str(), last["version"].as_i64()), (Some(r.as_str()), Some("active"), Some(1)));
+    for (root, end) in [(&r, &rs), (&t, &tu), (&v, &vw)] {
+        assert_eq!(f.history(root).iter().filter(|n| n["id"] == root.as_str()).count(), 2);
+        assert_eq!(f.history(end).iter().filter(|n| n["id"] == end.as_str()).last().unwrap()["state"], "active");
+    }
+    assert_eq!(count("SELECT count(*) FROM edge_versions e WHERE e.rel='supersedes' AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)"), 6);
+    assert_eq!(count(&format!("SELECT access_count FROM node_stats WHERE node_id='{a}'")), 1);
+    assert_eq!(count("SELECT count(*) FROM episodes"), 1);
+    let remaining = f.graph.revision_recovery_plan(16, &[], &[]).unwrap();
+    assert!(remaining["chains"].as_array().unwrap().is_empty());
+    assert_eq!(remaining["ambiguous_count"], 6);
+    assert_eq!(f.history(&g).len(), 2);
 }

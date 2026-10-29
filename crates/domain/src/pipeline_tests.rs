@@ -1149,7 +1149,9 @@ fn continuity_repair_rechecks_loops_and_folds_only_the_frozen_identity_relation(
     );
     let project = save("project", "project", "Orion", "Orion belongs to Vega.");
     f.graph.link(serde_json::from_value(json!({"command_id":"original-edge","actor":"owner","why":"Explicit directional membership","a":project["id"],"rel":"belongs_to","b":old["id"],"evidence":[{"episode_id":source,"quote":"Orion belongs to Vega."}]})).unwrap()).unwrap();
-    let refined=f.graph.supersede(serde_json::from_value(json!({"command_id":"full-name","actor":"owner","why":"Same organization full name","old":old["id"],"kind":"refinement","new":{"type":"organization","text":"Vega Incorporated","scope":["professional"]},"evidence":[{"episode_id":source,"quote":"Vega Incorporated is its full name."}]})).unwrap()).unwrap();
+    // Continuity repair serves identities already split by the retired
+    // replacement-ID supersede path.
+    let refined=crate::recovery::legacy_supersede(&f.graph,json!({"command_id":"full-name","old":old["id"],"kind":"refinement","new":{"type":"organization","text":"Vega Incorporated","scope":["professional"]},"evidence":[{"episode_id":source,"quote":"Vega Incorporated is its full name."}]})).unwrap();
     let target = refined["superseded_by"].as_str().unwrap().to_owned();
     f.graph.store.command(&context("legacy-orphan-import".into(),"fixture".into(),"Synthetic legacy orphan relation for continuity recovery".into()),&json!({"op":"fixture"}),|tx,commit|{tx.sql().execute("INSERT INTO edge_versions VALUES ('legacy-orphan',1,?,?, 'belongs_to',?,'active')",params![commit,project["id"].as_str(),old["id"].as_str()])?;TxGraph::evidence(tx,"legacy-orphan",1,&json!([{"episode_id":source,"quote":"Orion belongs to Vega."}]))?;tx.sql().execute("UPDATE processing_progress SET seq=latest_seq",[])?;Ok(json!({"seeded":true}))}).unwrap();
     f.processing
@@ -1425,7 +1427,9 @@ fn committed_usage_and_query_feedback_transfer_once_through_refinement_and_revie
     let refinement:dto::Supersede=serde_json::from_value(json!({"command_id":"usage-refine","actor":"owner","why":"Supported additional legal condition","old":pending,"kind":"refinement","new":{"type":"knowledge","text":"The launch report is pending legal approval.","scope":["professional"]},"evidence":[{"episode_id":episode,"quote":"The launch report is pending legal approval."}]})).unwrap();
     let refined = f.graph.supersede(refinement.clone()).unwrap();
     assert_eq!(f.graph.supersede(refinement).unwrap(), refined);
-    let current = refined["superseded_by"].as_str().unwrap();
+    let current = refined["id"].as_str().unwrap();
+    assert_eq!(current, pending);
+    assert_eq!(refined["version"], 2);
     let stats = f
         .graph
         .store
@@ -1445,4 +1449,73 @@ fn committed_usage_and_query_feedback_transfer_once_through_refinement_and_revie
         })
         .unwrap();
     assert_eq!(stats, (1, (1, 1)));
+}
+
+#[test]
+fn one_consolidation_plan_revises_the_same_memory_twice() {
+    let f = Fixture::new();
+    let signed = "The copper observatory launch report is signed.";
+    let filed = "The copper observatory launch report was filed.";
+    let episode = f.capture("one", "thread", &format!("{FACT} {signed} {filed}"), "user", "contract", json!({}), "2026-10-18T12:00:00Z");
+    let existing=f.graph.remember(serde_json::from_value(json!({"command_id":"existing","actor":"owner","why":"Original pending fact","type":"knowledge","text":FACT,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":FACT}]})).unwrap()).unwrap();
+    let target = existing["id"].as_str().unwrap();
+    let extraction = f.claim("contract", "thread", Some(vec!["extract".into()]))["work"][0].clone();
+    let candidates = [signed, filed].iter().enumerate().map(|(n, text)| { let mut item = draft(text, "knowledge", false); item["key"] = json!(format!("k{n}")); item }).collect::<Vec<_>>();
+    f.complete(&extraction, json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":candidates}]})).unwrap();
+    let work = f.consolidate_work();
+    assert!(work["input"]["existing_nodes"].as_array().unwrap().iter().any(|node| node["id"] == target));
+    let mut actions = vec![];
+    for candidate in work["input"]["candidates"].as_array().unwrap() {
+        let mut revise = action(candidate, "supersede");
+        revise["target"] = json!(target);
+        if candidate["text"] == signed {
+            revise["change_kind"] = json!("refinement");
+        } else {
+            revise["change_kind"] = json!("change");
+            revise["valid_at"] = json!("2026-10-19T00:00:00Z");
+        }
+        actions.push(revise);
+    }
+    // Refinement first, then the world change, both against the same memory.
+    actions.sort_by_key(|item| item["change_kind"] != "refinement");
+    let result = f.complete(&work, json!({"actions":actions})).unwrap();
+    for item in &actions {
+        let outcome = &result["results"][item["candidate_id"].as_str().unwrap()];
+        assert_eq!(outcome["id"], target);
+        assert_eq!(outcome["decision"], "promote");
+    }
+    let history = f.graph.history(target).unwrap();
+    assert!(history.iter().all(|node| node["id"] == target));
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[1]["text"], signed);
+    assert_eq!(history[1]["revision"]["kind"], "refinement");
+    assert_eq!(history[2]["text"], filed);
+    assert_eq!(history[2]["revision"]["kind"], "change");
+    assert_eq!(history[2]["valid_from"], "2026-10-19T00:00:00+00:00");
+    assert_eq!(f.stored::<i64>("SELECT count(DISTINCT id) FROM node_versions"), 1);
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM edge_versions WHERE rel='supersedes'"), 0);
+}
+
+#[test]
+fn pre_revision_policy_lease_is_refused_and_rederived_without_losing_candidates() {
+    let f = Fixture::new();
+    f.seed();
+    let extraction = f.claim("contract", "thread", Some(vec!["extract".into()]))["work"][0].clone();
+    f.complete(&extraction, json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false)]}]})).unwrap();
+    let work = f.consolidate_work();
+    let ids = |work: &Value| work["input"]["candidates"].as_array().unwrap().iter().map(|c| c["id"].clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&work).len(), 1);
+    // A lease prepared under replacement-ID semantics cannot complete now.
+    f.graph.store.write(|tx| { tx.sql().execute("UPDATE jobs SET context=json_set(context,'$.loop_policy_version','consolidate-v8') WHERE kind='consolidate' AND state='leased'", [])?; Ok(()) }).unwrap();
+    let error = f.complete(&work, json!({"actions":[]})).unwrap_err();
+    assert_eq!(error.to_string(), "Consolidation loop policy changed; derive a fresh plan");
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidate_decisions"), 0);
+    f.processing.release(serde_json::from_value(json!({"id":work["id"],"owner":work["owner"],"error":"service_rejected"})).unwrap()).unwrap();
+    f.graph.store.write(|tx| { tx.sql().execute("UPDATE jobs SET available_at=0 WHERE kind='consolidate'", [])?; Ok(()) }).unwrap();
+    let retry = f.consolidate_work();
+    assert_eq!((&retry["id"], ids(&retry)), (&work["id"], ids(&work)));
+    assert_eq!(f.stored::<String>("SELECT json_extract(context,'$.loop_policy_version') FROM jobs WHERE kind='consolidate' AND state='leased'"), consolidation::VERSION);
+    let actions = retry["input"]["candidates"].as_array().unwrap().iter().map(|c| action(c, "reject")).collect::<Vec<_>>();
+    f.complete(&retry, json!({"actions":actions})).unwrap();
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidate_decisions"), 1);
 }

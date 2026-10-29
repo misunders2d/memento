@@ -8,6 +8,8 @@ Use remember for a new memory/entity; duplicate to corroborate an existing node 
 relations; supersede for a contradiction, supported refinement, or evidenced world-time change. A correction means the old assertion was
 wrong; a refinement adds source-supported detail to an assertion that remains true; a change means the world changed and requires an
 explicitly evidenced aware ISO valid_at. Unknown world valid_from/valid_to are null, never capture/conversation timestamps.
+A supersede revises the same memory ID as its next version and keeps its relations. For a correction or change, list in
+retire_relations only supplied relations of that memory whose new evidence shows a mistaken referent or ended state; omit it otherwise.
 Each candidate's identity lists supplied existing nodes of its type: exact (same text up to case/whitespace) and similar.
 exact_total counts every exact node, including any not supplied. Before remember, compare them with the original evidence:
 duplicate when it is the same thing; remember a same-named item only when evidence shows a distinct one.

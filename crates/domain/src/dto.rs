@@ -94,6 +94,9 @@ pub struct Supersede {
     pub kind: String,
     #[serde(default)]
     pub valid_at: Option<String>,
+    /// Incident relations a correction or world change shows no longer hold.
+    #[serde(default)]
+    pub retire_relations: Vec<String>,
 }
 
 fn seven() -> f64 {
@@ -175,4 +178,19 @@ pub struct Merge {
     pub token: String,
     #[serde(default)]
     pub include: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverRevisions {
+    pub command_id: String,
+    pub actor: String,
+    pub why: String,
+    pub limit: usize,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Roots of protected chains the owner explicitly chose to recover.
+    #[serde(default)]
+    pub protected: Vec<String>,
+    pub token: String,
 }

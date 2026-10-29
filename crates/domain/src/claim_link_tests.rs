@@ -239,22 +239,54 @@ fn link_and_duplicate_evidence_preserve_pin_and_sensitive_review_paths() {
 }
 
 #[test]
-fn existing_link_follows_only_same_plan_refinement_not_correction_or_world_change() {
+fn same_plan_link_reaches_the_same_identity_after_every_revision_kind() {
     for kind in ["refinement", "correction", "change"] {
         let f = Fixture::new();
         let (episode, claim, entity) = existing_pair(&f, false);
         let work = maintained_work(&f, &claim, &entity);
         let replacement = json!({"operation":"supersede","target":entity,"type":"project","text":SUBJECT,"scope":["personal"],"change_kind":kind,"valid_at":if kind=="change" {json!("2026-10-18T12:00:00Z")} else {Value::Null},"evidence":[{"episode_id":episode,"quote":CLAIM,"occurrence":null}],"why":"Synthetic same-plan lifecycle control"});
-        let result = f.complete(&work, json!({"actions":[],"repairs":[replacement,repair(&episode,&claim,&entity)]}));
-        if kind == "refinement" {
-            let result = result.unwrap();
-            let replacement = &result["repair_results"][&entity]["superseded_by"];
-            let edge = result["repair_results"][&claim]["id"].as_str().unwrap();
-            assert_eq!(f.graph.history(edge).unwrap()[0]["dst"], *replacement);
-        } else {
-            assert!(result.is_err());
-            assert_eq!(f.graph.history(&entity).unwrap().len(), 1);
-            assert_eq!(f.stored::<i64>("SELECT count(*) FROM edge_versions"), 0);
-        }
+        let result = f.complete(&work, json!({"actions":[],"repairs":[replacement,repair(&episode,&claim,&entity)]})).unwrap();
+        let revised = &result["repair_results"][&entity];
+        assert_eq!(revised["id"], entity.as_str());
+        assert_eq!(revised["version"], 2);
+        assert_eq!(revised["kind"], kind);
+        let edge = result["repair_results"][&claim]["id"].as_str().unwrap();
+        assert_eq!(f.graph.history(edge).unwrap()[0]["dst"], entity.as_str());
+        let history = f.graph.history(&entity).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1]["revision"]["kind"], kind);
+        assert_eq!(f.stored::<i64>("SELECT count(*) FROM edge_versions WHERE rel='supersedes'"), 0);
+        assert_eq!(f.stored::<i64>("SELECT count(DISTINCT id) FROM node_versions"), 2);
     }
+}
+
+#[test]
+fn revision_keeps_supported_links_and_retires_only_named_mistaken_ones() {
+    // World change: the subject link still holds and stays on the same ID.
+    let f = Fixture::new();
+    let (episode, claim, entity) = existing_pair(&f, false);
+    let work = maintained_work(&f, &claim, &entity);
+    let edge = f.complete(&work, json!({"actions":[],"repairs":[repair(&episode,&claim,&entity)]})).unwrap()["repair_results"][&claim]["id"].as_str().unwrap().to_owned();
+    let changed = f.graph.supersede(serde_json::from_value(json!({"command_id":"world","actor":"owner","why":"The archive moved","old":claim,"kind":"change","valid_at":"2026-10-20T00:00:00Z","new":{"type":"knowledge","text":"Orion expedition now preserves digital archives.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap()).unwrap();
+    assert_eq!(changed["id"], claim.as_str());
+    assert_eq!(changed["retired_relations"], json!([]));
+    assert_eq!(f.stored::<String>(&format!("SELECT state FROM edge_versions WHERE id='{edge}' ORDER BY version DESC LIMIT 1")), "active");
+    // A refinement never retires links.
+    let refused = f.graph.supersede(serde_json::from_value(json!({"command_id":"refine-drop","actor":"owner","why":"Detail","old":claim,"kind":"refinement","retire_relations":[edge],"new":{"type":"knowledge","text":"Orion expedition now preserves signed digital archives.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap());
+    assert!(matches!(refused, Err(Error::Validation(_))));
+    // Unknown or non-incident relations are rejected before any write.
+    let foreign = f.graph.supersede(serde_json::from_value(json!({"command_id":"foreign","actor":"owner","why":"Wrong subject","old":entity,"kind":"correction","retire_relations":["missing-edge"],"new":{"type":"project","text":"Vega expedition","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap());
+    assert!(matches!(foreign, Err(Error::Validation(_))));
+    assert_eq!(f.graph.history(&entity).unwrap().len(), 1);
+    // Correction of a mistaken referent: the named link is retired with audit evidence.
+    let corrected = f.graph.supersede(serde_json::from_value(json!({"command_id":"referent","actor":"owner","why":"The claim was about a different expedition","old":claim,"kind":"correction","retire_relations":[edge],"new":{"type":"knowledge","text":"Vega expedition preserves digital archives.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap()).unwrap();
+    assert_eq!(corrected["id"], claim.as_str());
+    assert_eq!(corrected["version"], 3);
+    assert_eq!(corrected["retired_relations"], json!([{"id":edge,"version":2}]));
+    let lineage = f.graph.history(&edge).unwrap();
+    assert_eq!(lineage.len(), 2);
+    assert_eq!(lineage[1]["state"], "inactive");
+    assert_eq!(lineage[1]["why"], "The claim was about a different expedition");
+    assert!(!lineage[1]["evidence"].as_array().unwrap().is_empty());
+    assert_eq!(f.graph.history(&entity).unwrap().len(), 1);
 }

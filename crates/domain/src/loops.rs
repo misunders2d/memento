@@ -1086,7 +1086,9 @@ mod responsibility_tests {
             f.store.read(|tx| snapshot(tx.sql(), &f.owner, 1)).unwrap()["manual_choice_at"],
             choice
         );
-        let refined=f.graph.supersede(parse(json!({"command_id":"refine","actor":"owner","why":"Clearer same obligation","old":f.owner,"kind":"refinement","new":{"type":"knowledge","text":"Passport renewal remains outstanding.","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"I need to renew my passport."}]}))).unwrap()["superseded_by"].as_str().unwrap().to_owned();
+        let refined=f.graph.supersede(parse(json!({"command_id":"refine","actor":"owner","why":"Clearer same obligation","old":f.owner,"kind":"refinement","new":{"type":"knowledge","text":"Passport renewal remains outstanding.","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"I need to renew my passport."}]}))).unwrap()["id"].as_str().unwrap().to_owned();
+        // A refinement is the next version of the same obligation memory.
+        assert_eq!(refined, f.owner);
         let result = f
             .store
             .command(

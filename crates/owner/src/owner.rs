@@ -110,6 +110,20 @@ impl AdminServices {
                 token: text(request, "token")?.into(),
                 include: list(request, "include")?,
             }),
+            "revision_plan" => self.graph.revision_recovery_plan(
+                limit(request)?,
+                &list(request, "exclude")?,
+                &list(request, "protected")?,
+            ),
+            "recover_revisions" => self.graph.recover_revisions(dto::RecoverRevisions {
+                command_id: text(request, "command_id")?.into(),
+                actor,
+                why: text(request, "why")?.into(),
+                limit: limit(request)?,
+                exclude: list_required(request, "exclude")?,
+                protected: list_required(request, "protected")?,
+                token: text(request, "token")?.into(),
+            }),
             "forget_preview" => self.graph.forget_preview(text(request, "target")?),
             "forget" => self.graph.forget(dto::Forget {
                 command_id: text(request, "command_id")?.into(),
@@ -140,6 +154,12 @@ fn list(v: &Value, key: &str) -> Result<Vec<String>> {
         Some(value) => serde_json::from_value(value.clone())
             .map_err(|_| Error::Validation("Invalid administrative request")),
     }
+}
+fn limit(v: &Value) -> Result<usize> {
+    v.get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .ok_or(Error::Validation("Invalid administrative request"))
 }
 fn list_required(v: &Value, key: &str) -> Result<Vec<String>> {
     if v.get(key).is_none() {
@@ -501,7 +521,7 @@ pub fn request(data: &Path, value: &Value) -> Result<Value> {
         ));
     }
     stream.write_all(&bytes)?;
-    if ["backup", "export", "compact", "history_park", "history_release-candidates"]
+    if ["backup", "export", "compact", "history_park", "history_release-candidates", "recover_revisions"]
         .contains(&value["operation"].as_str().unwrap_or(""))
     {
         stream.set_read_timeout(None)?;

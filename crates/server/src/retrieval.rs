@@ -1128,6 +1128,7 @@ mod tests {
     include!("raw_pool_tests.rs");
     include!("text_routing_tests.rs");
     include!("retrieval_snapshot_tests.rs");
+    include!("revision_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,

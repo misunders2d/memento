@@ -528,7 +528,7 @@
   {
     "name": "supersede",
     "title": "Supersede",
-    "description": "Atomically correct an old assertion with inline replacement and reason.",
+    "description": "Atomically revise an existing assertion: the same memory ID gains its next content version with reason and evidence.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -675,6 +675,16 @@
                 }
               ],
               "default": null
+            },
+            "retire_relations": {
+              "default": [],
+              "items": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 48,
+              "type": "array"
             }
           },
           "required": [

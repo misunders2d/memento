@@ -130,6 +130,14 @@
           "default": null,
           "title": "Responsibility"
         },
+        "retire_relations": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 48,
+          "title": "Retire Relations",
+          "type": "array"
+        },
         "scope": {
           "anyOf": [
             {
@@ -439,6 +447,14 @@
           ],
           "default": null,
           "title": "Responsibility"
+        },
+        "retire_relations": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 48,
+          "title": "Retire Relations",
+          "type": "array"
         },
         "scope": {
           "anyOf": [

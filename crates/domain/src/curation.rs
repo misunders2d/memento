@@ -41,7 +41,7 @@ pub fn union_evidence(
     tx.touch_target(target)?;
     Ok(())
 }
-fn copy_evidence(tx: &WriteTxn, target: &str, old: i64, new: i64) -> Result<()> {
+pub(crate) fn copy_evidence(tx: &WriteTxn, target: &str, old: i64, new: i64) -> Result<()> {
     tx.sql().execute("INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote FROM graph_evidence WHERE target=? AND version=?",params![new,target,old])?;
     tx.touch_target(target)?;
     Ok(())
@@ -409,7 +409,7 @@ pub fn redirect_edges(
     }
     Ok(moved)
 }
-fn requeue_stale(
+pub(crate) fn requeue_stale(
     tx: &WriteTxn,
     commit: &str,
     targets: &[String],

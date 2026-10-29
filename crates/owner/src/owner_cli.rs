@@ -49,7 +49,7 @@ impl Console for Stdio {
     }
 }
 pub type Requester<'a> = dyn Fn(&Path, &Value) -> Result<Value> + 'a;
-pub const HELP: &str = "Human-only Memento review and portable export console\nUsage: memento-admin --data-dir PATH {list|inventory|backup|compact|history|export|approve|reject|merge|forget}\n  history {park|status|release-candidates}\n  export --output PATH\n  approve|reject PROPOSAL --why TEXT [--command-id ID]\n  merge CLUSTER [--into ID] [--exclude ID] [--include ID] --why TEXT [--command-id ID]\n  forget TARGET --why TEXT [--command-id ID]\n";
+pub const HELP: &str = "Human-only Memento review and portable export console\nUsage: memento-admin --data-dir PATH {list|inventory|backup|compact|history|export|approve|reject|merge|forget|revisions|recover-revisions}\n  history {park|status|release-candidates}\n  export --output PATH\n  approve|reject PROPOSAL --why TEXT [--command-id ID]\n  merge CLUSTER [--into ID] [--exclude ID] [--include ID] --why TEXT [--command-id ID]\n  forget TARGET --why TEXT [--command-id ID]\n  revisions [--limit N] [--exclude ROOT] [--protected ROOT]\n  recover-revisions [--limit N] [--exclude ROOT] [--protected ROOT] --why TEXT [--command-id ID]\n";
 #[derive(Debug)]
 pub struct AdminArgs {
     pub data: PathBuf,
@@ -61,6 +61,8 @@ pub struct AdminArgs {
     pub into: Option<String>,
     pub exclude: Vec<String>,
     pub include: Vec<String>,
+    pub limit: Option<usize>,
+    pub protected: Vec<String>,
 }
 pub(crate) fn expanded(args: &[String]) -> Vec<String> {
     let mut out = Vec::new();
@@ -102,6 +104,8 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
         "reject",
         "merge",
         "forget",
+        "revisions",
+        "recover-revisions",
     ]
     .contains(&operation.as_str())
     {
@@ -119,6 +123,8 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
         into: None,
         exclude: Vec::new(),
         include: Vec::new(),
+        limit: None,
+        protected: Vec::new(),
     };
     while i < args.len() {
         let key = &args[i];
@@ -135,14 +141,28 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
             .ok_or(usage("Administrative option requires a value"))?;
         match (key.as_str(), parsed.operation.as_str()) {
             ("--output", "export") => parsed.output = Some(PathBuf::from(value)),
-            ("--why", "approve" | "reject" | "merge" | "forget") => {
+            ("--why", "approve" | "reject" | "merge" | "forget" | "recover-revisions") => {
                 parsed.why = Some(value.clone())
             }
-            ("--command-id", "approve" | "reject" | "merge" | "forget") => {
+            ("--command-id", "approve" | "reject" | "merge" | "forget" | "recover-revisions") => {
                 parsed.command_id = Some(value.clone())
             }
             ("--into", "merge") => parsed.into = Some(value.clone()),
-            ("--exclude", "merge") => parsed.exclude.push(value.clone()),
+            ("--exclude", "merge" | "revisions" | "recover-revisions") => {
+                parsed.exclude.push(value.clone())
+            }
+            ("--protected", "revisions" | "recover-revisions") => {
+                parsed.protected.push(value.clone())
+            }
+            ("--limit", "revisions" | "recover-revisions") => {
+                parsed.limit = Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|limit| (1..=256).contains(limit))
+                        .ok_or(usage("--limit must be a number from 1 to 256"))?,
+                )
+            }
             ("--include", "merge") => parsed.include.push(value.clone()),
             _ => return Err(usage("Unknown administrative option")),
         }
@@ -159,7 +179,8 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
     {
         return Err(usage("History action must be park, status or release-candidates"));
     }
-    if ["approve", "reject", "merge", "forget"].contains(&parsed.operation.as_str())
+    if ["approve", "reject", "merge", "forget", "recover-revisions"]
+        .contains(&parsed.operation.as_str())
         && parsed.why.is_none()
     {
         return Err(usage("--why is required"));
@@ -213,7 +234,10 @@ pub fn run(args: &[String], console: &mut dyn Console, request: &Requester<'_>) 
         "history" => {
             command["operation"] = json!(format!("history_{}", args.positional.as_ref().unwrap()))
         }
-        "approve" | "reject" | "merge" | "forget" => {
+        "revisions" => {
+            command = json!({"operation":"revision_plan","limit":args.limit.unwrap_or(32),"exclude":args.exclude,"protected":args.protected})
+        }
+        "approve" | "reject" | "merge" | "forget" | "recover-revisions" => {
             if !console.interactive() {
                 return Err(usage(
                     "Administrative decisions require an interactive human terminal",
@@ -239,6 +263,51 @@ pub fn run(args: &[String], console: &mut dyn Console, request: &Requester<'_>) 
                     command["include"] = json!(args.include);
                     command["token"] = json!(token);
                     format!("merge {} into {survivor}", absorbed.len())
+                }
+                "recover-revisions" => {
+                    let selection = json!({"limit":args.limit.unwrap_or(32),"exclude":args.exclude,"protected":args.protected});
+                    let mut query = selection.clone();
+                    query["operation"] = json!("revision_plan");
+                    let preview = request(&args.data, &query).map_err(|_| unavailable())?;
+                    if preview.get("error").is_some() {
+                        return Err(CliError {
+                            status: 1,
+                            message: "Administrative preview was rejected",
+                        });
+                    }
+                    let plan = preview.get("result").ok_or_else(unavailable)?;
+                    let chains = plan["chains"].as_array().ok_or_else(unavailable)?;
+                    let token = plan["token"].as_str().ok_or_else(unavailable)?;
+                    print(console, plan)?;
+                    if chains.is_empty() {
+                        console
+                            .output("No recoverable legacy revision chains; nothing changed.\n")
+                            .map_err(|_| unavailable())?;
+                        return Ok(0);
+                    }
+                    // Every protected chain must be named again in the typed confirmation.
+                    let mut guarded = vec![];
+                    for chain in chains {
+                        if !chain["protected_reasons"]
+                            .as_array()
+                            .ok_or_else(unavailable)?
+                            .is_empty()
+                        {
+                            guarded.push(chain["root"].as_str().ok_or_else(unavailable)?);
+                        }
+                    }
+                    command = selection;
+                    command["operation"] = json!("recover_revisions");
+                    command["token"] = json!(token);
+                    if guarded.is_empty() {
+                        format!("recover {} revision chains", chains.len())
+                    } else {
+                        format!(
+                            "recover {} revision chains including protected {}",
+                            chains.len(),
+                            guarded.join(" ")
+                        )
+                    }
                 }
                 "forget" => {
                     let target = args.positional.as_ref().unwrap();

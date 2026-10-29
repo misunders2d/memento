@@ -15,6 +15,7 @@ pub mod loops;
 pub mod pipeline_schema;
 pub mod processing;
 mod reconciliation;
+pub mod recovery;
 /// Frozen source-runtime word and casefold data, shared with retrieval.
 pub mod unicode;
 mod util;
@@ -122,10 +123,19 @@ impl Graph {
         let labels = self
             .store
             .read(|tx| scope(tx.sql(), &command.new.kind, &command.new.scope))?;
-        let request = json!({"op":"supersede","old":command.old,
+        if command.retire_relations.len() > 48 {
+            return Err(Error::Validation("At most 48 relations can be retired"));
+        }
+        for relation in &command.retire_relations {
+            required(relation, 64, "Invalid relation identifier")?;
+        }
+        let mut request = json!({"op":"supersede","old":command.old,
             "new":{"type":command.new.kind,"text":command.new.text,"scope":labels},
             "evidence":command.evidence,"kind":command.kind,"valid_at":valid_at,
             "source":command.source,"conversation_id":command.conversation_id});
+        if !command.retire_relations.is_empty() {
+            request["retire_relations"] = json!(command.retire_relations);
+        }
         let context = context(command.command_id, command.actor, command.why);
         self.store.command(&context, &request, |tx, commit| {
             TxGraph::supersede(tx, commit, &request, false)
@@ -170,6 +180,23 @@ impl Graph {
     }
     pub fn merge(&self, command: dto::Merge) -> Result<Value> {
         curation::merge(self, command)
+    }
+    pub fn revision_recovery_plan(
+        &self,
+        limit: usize,
+        exclude: &[String],
+        protected: &[String],
+    ) -> Result<Value> {
+        let (mut exclude, mut protected) = (exclude.to_vec(), protected.to_vec());
+        for ids in [&mut exclude, &mut protected] {
+            ids.sort();
+            ids.dedup();
+        }
+        self.store
+            .read(|tx| recovery::plan(tx.sql(), limit, &exclude, &protected))
+    }
+    pub fn recover_revisions(&self, command: dto::RecoverRevisions) -> Result<Value> {
+        recovery::recover(self, command)
     }
 
     pub fn recall_keywords(
@@ -515,48 +542,37 @@ impl TxGraph {
         } else {
             (Value::Null, Value::Null)
         };
-        let replacement = Self::insert_node(
-            tx,
-            commit,
-            &json!({"type":new_type,"text":new["text"],"scope":new["scope"],
-            "valid_from":from,"valid_to":to,"evidence":request["evidence"],"pinned":previous["pinned"].as_i64().unwrap_or(0) != 0}),
-        )?;
-        let replacement_id = get_str(&replacement, "id")?;
-        let version = get_i64(&previous, "version")? + 1;
-        let state = match kind {
-            "correction" => "corrected",
-            "change" => "superseded",
-            "refinement" => "refined",
-            _ => return Err(Error::Validation("Invalid supersession kind")),
-        };
+        // The memory keeps its identity: the revision is the next content
+        // version of the same ID. Earlier versions stay immutable history.
+        let before = get_i64(&previous, "version")?;
+        let version = before + 1;
         tx.sql().execute(
             "INSERT INTO node_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 old,
                 version,
                 commit,
-                get_str(&previous, "type")?,
-                get_str(&previous, "text")?,
-                state,
-                previous["valid_from"].as_str(),
-                if kind == "change" {
-                    valid_at
-                } else {
-                    previous["valid_to"].as_str()
-                },
-                replacement_id,
+                new_type,
+                get_str(new, "text")?,
+                "active",
+                from.as_str(),
+                to.as_str(),
+                Option::<&str>::None,
                 get_i64(&previous, "pinned")?,
-                get_str(&previous, "scope")?
+                encode_json(&new["scope"])?
+            ],
+        )?;
+        tx.sql().execute(
+            "INSERT INTO node_revisions(id,version,kind,valid_at,commit_id) VALUES (?,?,?,?,?)",
+            params![
+                old,
+                version,
+                kind,
+                if kind == "change" { valid_at } else { None },
+                commit
             ],
         )?;
         Self::evidence(tx, old, version, &request["evidence"])?;
-        curation::invalidate_vectors(tx, old)?;
-        let edge = short_id();
-        tx.sql().execute(
-            "INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)",
-            params![edge, 1, commit, replacement_id, "supersedes", old, "active"],
-        )?;
-        Self::evidence(tx, &edge, 1, &request["evidence"])?;
         if kind == "refinement" {
             let old_scope = decode_json(get_str(&previous, "scope")?)?;
             if labels.iter().all(|label| {
@@ -564,31 +580,124 @@ impl TxGraph {
                     .as_array()
                     .is_some_and(|labels| labels.iter().any(|old| old == label))
             }) {
-                curation::union_evidence(
-                    tx,
-                    replacement_id,
-                    1,
-                    &[(old.to_owned(), get_i64(&previous, "version")?)],
-                )?;
+                curation::union_evidence(tx, old, version, &[(old.to_owned(), before)])?;
             }
-            curation::redirect_edges(tx, commit, old, replacement_id, None)?;
         }
-        loops::transfer(tx, commit, old, replacement_id)?;
-        importance::transfer_usage(tx, old, replacement_id)?;
+        if previous["text"] == new["text"] && previous["type"] == new["type"] {
+            curation::copy_vector(tx, old, before, version)?;
+        } else {
+            tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='node' AND target=?)",[old])?;
+        }
+        let (retired, protected) = Self::retire_relations(tx, commit, old, kind, &request)?;
         tx.touch_target(old)?;
-        tx.touch_target(replacement_id)?;
-        Ok(json!({"id":old,"version":version,"superseded_by":replacement_id,"kind":kind}))
+        Ok(json!({"id":old,"version":version,"previous_version":before,"kind":kind,
+            "retired_relations":retired,"protected_relations":protected}))
+    }
+
+    /// Relations stay with the revised memory. A correction or world change may
+    /// name incident relations its evidence shows no longer hold; each becomes
+    /// an inactive edge version carrying its prior and the revision evidence.
+    /// Relations with loop state or protected endpoints are kept and reported.
+    fn retire_relations(
+        tx: &WriteTxn,
+        commit: &str,
+        target: &str,
+        kind: &str,
+        request: &Value,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let mut selected = Vec::new();
+        for id in request["retire_relations"].as_array().into_iter().flatten() {
+            let id = id.as_str().ok_or(Error::Validation("Invalid relation identifier"))?;
+            if !selected.contains(&id) {
+                selected.push(id);
+            }
+        }
+        if selected.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+        if kind == "refinement" {
+            return Err(Error::Validation(
+                "A refinement keeps every relation; retire relations only with a correction or change",
+            ));
+        }
+        let (mut retired, mut protected) = (vec![], vec![]);
+        for id in selected {
+            let edge = one(tx.sql(), "SELECT * FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1", [id])?
+                .filter(|edge| {
+                    edge["state"] == "active"
+                        && edge["rel"] != "supersedes"
+                        && (edge["src"] == target || edge["dst"] == target)
+                })
+                .ok_or(Error::Validation("Retired relations must be active relations of the revised memory"))?;
+            let version = get_i64(&edge, "version")?;
+            let other = if edge["src"] == target { get_str(&edge, "dst")? } else { get_str(&edge, "src")? };
+            let other = node(tx.sql(), other)?;
+            if loops::current(tx.sql(), id)?.is_some_and(|marker| marker["state"] == "open")
+                || !loops::snapshot(tx.sql(), id, version)?["manual_choice_at"].is_null()
+                || other["pinned"].as_i64().unwrap_or(0) != 0
+                || sensitive(tx.sql(), get_str(&other, "type")?)?
+            {
+                protected.push(json!({"id":id,"version":version}));
+                continue;
+            }
+            tx.sql().execute(
+                "INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)",
+                params![id, version + 1, commit, edge["src"].as_str(), edge["rel"].as_str(), edge["dst"].as_str(), "inactive"],
+            )?;
+            curation::copy_evidence(tx, id, version, version + 1)?;
+            Self::evidence(tx, id, version + 1, &request["evidence"])?;
+            tx.touch_target(get_str(&other, "id")?)?;
+            retired.push(json!({"id":id,"version":version + 1}));
+        }
+        Ok((retired, protected))
     }
 }
 
+/// Behavior of the current version of a memory.
 pub fn behavior(db: &Connection, target: &str) -> Result<Option<Value>> {
+    let latest = one(
+        db,
+        "SELECT max(version) AS version FROM node_versions WHERE id=?",
+        [target],
+    )?;
+    match latest.and_then(|row| row["version"].as_i64()) {
+        Some(version) => behavior_at(db, target, version),
+        None => Ok(None),
+    }
+}
+
+/// Behavior defined by the content commit (creation or same-ID revision)
+/// that produced this version; corroborations and pins keep it unchanged.
+pub fn behavior_at(db: &Connection, target: &str, version: i64) -> Result<Option<Value>> {
+    let defining = one(
+        db,
+        "SELECT r.version,r.source_id,r.source_version FROM node_revisions r WHERE r.id=?1 AND r.version<=?2 ORDER BY r.version DESC LIMIT 1",
+        params![target, version],
+    )?;
+    // Recovered legacy content keeps the behavior of the replacement it came from.
+    if let Some(source) = defining.as_ref().and_then(|row| row["source_id"].as_str()) {
+        return behavior_at(db, source, get_i64(defining.as_ref().unwrap(), "source_version")?);
+    }
+    let version = defining
+        .and_then(|row| row["version"].as_i64())
+        .unwrap_or(1);
     let record = one(
         db,
-        "SELECT g.request,g.result FROM node_versions n JOIN graph_commits g ON g.id=n.commit_id WHERE n.id=? AND n.version=1",
-        [target],
+        "SELECT g.request,g.result FROM node_versions n JOIN graph_commits g ON g.id=n.commit_id WHERE n.id=? AND n.version=?",
+        params![target, version],
     )?;
     let Some(record) = record else {
         return Ok(None);
+    };
+    // Version 1 comes from a remember (or a legacy replacement); later content
+    // versions come from a same-ID supersede of exactly this version.
+    let produced = |outcome: &Value, operation: &str| {
+        if version == 1 {
+            outcome["superseded_by"] == target
+                || operation == "remember" && outcome["id"] == target
+        } else {
+            operation == "supersede" && outcome["id"] == target && outcome["version"] == version
+        }
     };
     let request = decode_json(get_str(&record, "request")?)?;
     let result = decode_json(get_str(&record, "result")?)?;
@@ -602,11 +711,9 @@ pub fn behavior(db: &Connection, target: &str) -> Result<Option<Value>> {
         .flatten()
     {
         let outcome = &result["results"][action["candidate_id"].as_str().unwrap_or("")];
-        let id = outcome["superseded_by"]
-            .as_str()
-            .or_else(|| outcome["id"].as_str());
-        if id == Some(target)
-            && ["remember", "supersede"].contains(&action["operation"].as_str().unwrap_or(""))
+        let operation = action["operation"].as_str().unwrap_or("");
+        if ["remember", "supersede"].contains(&operation)
+            && produced(outcome, operation)
             && action["type"] == "experience"
             && action["behavior"].is_object()
         {
@@ -619,8 +726,8 @@ pub fn behavior(db: &Connection, target: &str) -> Result<Option<Value>> {
         .flatten()
     {
         let outcome = &result["repair_results"][repair["target"].as_str().unwrap_or("")];
-        if outcome["superseded_by"] == target
-            && repair["operation"] == "supersede"
+        if repair["operation"] == "supersede"
+            && produced(outcome, "supersede")
             && repair["type"] == "experience"
             && repair["behavior"].is_object()
         {
@@ -676,7 +783,7 @@ pub fn history(db: &Connection, data_dir: &std::path::Path, target: &str) -> Res
     }
     let mut values = rows(
         db,
-        "WITH RECURSIVE lineage(id) AS (SELECT id FROM node_versions WHERE id=? UNION SELECT CASE WHEN e.src=l.id THEN e.dst ELSE e.src END FROM edge_versions e JOIN lineage l ON e.src=l.id OR e.dst=l.id WHERE e.rel='supersedes') SELECT n.*,c.actor,c.why,c.recorded_at,lead(c.recorded_at) OVER (PARTITION BY n.id ORDER BY n.version) AS recorded_until FROM lineage l JOIN node_versions n ON n.id=l.id JOIN graph_commits c ON c.id=n.commit_id ORDER BY (SELECT v.rowid FROM node_versions v WHERE v.id=n.id ORDER BY v.version LIMIT 1),n.version",
+        "WITH RECURSIVE lineage(id) AS (SELECT id FROM node_versions WHERE id=? UNION SELECT CASE WHEN e.src=l.id THEN e.dst ELSE e.src END FROM edge_versions e JOIN lineage l ON e.src=l.id OR e.dst=l.id WHERE e.rel='supersedes' AND e.version=1 AND NOT EXISTS (SELECT 1 FROM edge_versions x WHERE x.id=e.id AND x.state<>'active')) SELECT n.*,c.actor,c.why,c.recorded_at,lead(c.recorded_at) OVER (PARTITION BY n.id ORDER BY n.version) AS recorded_until,r.kind AS revision_kind,r.valid_at AS revision_valid_at,r.source_id AS revision_source_id,r.source_version AS revision_source_version FROM lineage l JOIN node_versions n ON n.id=l.id JOIN graph_commits c ON c.id=n.commit_id LEFT JOIN node_revisions r ON r.id=n.id AND r.version=n.version ORDER BY (SELECT v.rowid FROM node_versions v WHERE v.id=n.id ORDER BY v.version LIMIT 1),n.version",
         [target],
     )?;
     if values.is_empty() {
@@ -694,6 +801,32 @@ pub fn history(db: &Connection, data_dir: &std::path::Path, target: &str) -> Res
         )?;
     }
     let mut previous = String::new();
+    for index in 0..values.len() {
+        // A same-ID revision records why this version replaced the prior one.
+        let object = values[index].as_object_mut().expect("SQL row");
+        let kind = object.remove("revision_kind").unwrap_or(Value::Null);
+        let valid_at = object.remove("revision_valid_at").unwrap_or(Value::Null);
+        let source = object.remove("revision_source_id").unwrap_or(Value::Null);
+        let source_version = object.remove("revision_source_version").unwrap_or(Value::Null);
+        if !kind.is_null() {
+            let version = values[index]["version"].clone();
+            values[index]["revision"] = json!({"kind":kind,"valid_at":valid_at});
+            if !source.is_null() {
+                // The original revision keeps its own commit; this version's
+                // actor, reason and time describe the recovery.
+                let original = one(db, "SELECT c.id AS commit_id,c.actor,c.why,c.recorded_at FROM graph_commits c WHERE c.id=coalesce((SELECT r.commit_id FROM node_revisions r WHERE r.id=?1 AND r.version<=?2 ORDER BY r.version DESC LIMIT 1),(SELECT n.commit_id FROM node_versions n WHERE n.id=?1 AND n.version=1))", params![source.as_str(), source_version.as_i64()])?.unwrap_or(json!({}));
+                let mut recovered = json!({"id":source,"version":source_version});
+                for key in ["commit_id", "actor", "why", "recorded_at"] {
+                    recovered[key] = original[key].clone();
+                }
+                values[index]["revision"]["recovered_from"] = recovered;
+            }
+            if index > 0 && values[index - 1]["id"] == values[index]["id"] {
+                values[index - 1]["revised_by"] =
+                    json!({"version":version,"kind":kind,"valid_at":valid_at});
+            }
+        }
+    }
     for value in &mut values {
         if let Some(labels) = value["scope"].as_str() {
             value["scope"] = decode_json(labels)?;
@@ -701,7 +834,7 @@ pub fn history(db: &Connection, data_dir: &std::path::Path, target: &str) -> Res
         let id = get_str(value, "id")?.to_owned();
         let version = get_i64(value, "version")?;
         if value["type"] == "experience" {
-            if let Some(behavior) = behavior(db, &id)? {
+            if let Some(behavior) = behavior_at(db, &id, version)? {
                 value["authority"] = behavior["authority"].clone();
                 value["behavior"] = behavior;
                 value["category"] = json!("behavioral_suggestion");
