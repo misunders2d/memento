@@ -257,7 +257,11 @@ The `work` tool supports `pool`, `claim`, `read`, `renew`, `complete`, `submit`,
 
 Pi keeps one native process alive across work units, using only its `memento_work` adapter to this same API. The host verifies the complete effective tool catalog before the first model prompt, renews leases independently, fixes actor/schedule/lease capabilities and releases unfinished work on cancellation. Static task policies are supplied once per bounded session. Model context retains current evidence, a compact receipt and native reasoning/tool history within the unfinished unit. Completed source text is removed only after a verified commit or release; lease capabilities are redacted from retained tool arguments. Failed calls remain visible so the agent can correct them instead of repeating them. After eight commits the host starts a fresh session in that same process. No new service, database, model account or dependency is required. This path was qualified with Pi 1.4.0.
 
+The host seeds the worker with the currently due work kinds. Claim receipts report per-kind `backlog.claimable` counts using the service's queue eligibility, exclusions and consolidation window. The adapter preserves availability across session rotation and reopens an empty kind only when the service reports claimable work. A failed claim preparation releases the failing lease, and any other leases withheld by the failed response return to pending without consuming an attempt or adding backoff. Work already committed stays committed.
+
 The agent can select consolidation batches of **1–128** related candidates (Pi starts at 64; legacy default 16), reduce a batch when needed and commit/request fresh work together with `submit`. Overlapping source windows from the same episode and authority are combined without adding uncited gaps or changing raw history. Continuous claims admit new eligible candidates within the configured night window; compaction/inactivity, parking and deferrals remain enforced. Only one consolidation lease runs at a time. Reducing an oversized uncommitted batch retains its original job payload while making untouched candidates available to smaller batches; live or already committed work is never repartitioned.
+
+Existing-node context stays bounded to 48 versions. Continuous and forced batches can leave candidates pending for a later batch when their top comparison targets do not fit, rather than decide them without that context; a relation waits with its deferred endpoint candidate. Existing-node evidence keeps up to four founding and four latest references by original source time, with undated evidence ordered after dated sources.
 
 HTTP returns complete packets. MCP returns compact claim descriptors because native clients can truncate large tool results. Use `read` with the supplied job/owner and character cursor to concatenate every evidence page; read/cache each kind's policy and schema separately using `read` with `policy`. Never treat a descriptor or partial page as complete evidence. Renew leases outside model generation every `lease_seconds / 4`. After an uncertain completion, inspect `status` before retrying the identical result. A rejected plan commits nothing and retains the existing bounded validation feedback.
 
@@ -437,6 +441,17 @@ The existing background worker losslessly compresses remaining raw native record
 `memento status --agent HARNESS` separates the local capture/upload queue from service processing. It reports captured episodes and conversations, indexing units and failures, extraction backlog, consolidation candidates and jobs, media jobs and Drive state. `service` contains the harness's native-source counts; `artifacts_service` separately covers explicit file saves made without a conversation quote. Disabled or unreachable stages are reported as unavailable. Zero consolidation jobs does not mean completion: candidates can be waiting for the nightly window. The counters do not prove the native processor is online.
 
 Extraction, consolidation and media include `errors` grouped by pending/failed state and safe category, such as `invalid_output` or `cli_failed`; unfamiliar stored values become `unknown_error`. These are last recorded failure classifications, not diagnoses or proof that a retry is running. Leased and completed jobs are excluded.
+
+For a repeatable capacity measurement from a checkout, take two status snapshots and summarize them with runner receipts from the same interval:
+
+```sh
+python3 src/memento/capacity.py snapshot http://127.0.0.1:8765 > /tmp/memento-before.json
+# Take the second snapshot after the measured interval.
+python3 src/memento/capacity.py snapshot http://127.0.0.1:8765 > /tmp/memento-after.json
+python3 src/memento/capacity.py summarize /tmp/memento-before.json /tmp/memento-after.json /path/to/runner-receipts.jsonl
+```
+
+The summary separates completed jobs, net candidate drain, indexing, model calls, tokens and failed attempts. New arrivals offset net drain; an ETA is an extrapolation of that interval, and a flat or growing queue has no drain ETA. Snapshots and receipts must describe the same interval. This measurement does not establish the quality of memory updates or prove overnight completion.
 
 Consolidation's `pending_candidates` and `ready_candidates` count only candidates consolidation can still admit. Stored candidates whose only evidence is legacy Codex instruction text are reported separately as `excluded_legacy_candidates`: they stay stored, explicitly searchable and in history, but never reach a model call or promote automatically. A lower pending count from this exclusion is not model completion.
 

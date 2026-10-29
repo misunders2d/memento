@@ -170,6 +170,144 @@ fn shared_work_api_pages_pool_and_commits_a_larger_related_batch() {
     assert!(f.processing.work(serde_json::from_value(json!({"action":"pool","command":{"kind":"consolidate","path":"/private"}})).unwrap()).is_err());
 }
 
+/// Frozen 16/36/64 update batches against the fixed 48-node context ceiling:
+/// every candidate revises its own existing assertion sharing type and first word.
+/// Returns (decided with target supplied, deferred) for the first update batch.
+fn update_target_coverage(n: usize) -> (usize, usize) {
+    let f = Fixture::new();
+    let (c, v) = (b"bdfgklmnprstvz", b"aeiou");
+    let names = (0..n).map(|i| format!("{}{}{}{}lor", (c[i % 14] as char).to_ascii_uppercase(), v[i / 14 % 5] as char, c[(i * 5 + 3) % 14] as char, v[i % 5] as char)).collect::<Vec<_>>();
+    let mut targets = std::collections::BTreeMap::new();
+    let claim = || f.processing.work(serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"consolidate_now":true,"continuous":true,"batch_size":n}})).unwrap()).unwrap()["work"][0].clone();
+    // Every supplied candidate must see its old target; returns the deferred count.
+    let check = |task: &Value, targets: &std::collections::BTreeMap<String, String>| -> (Vec<Value>, usize) {
+        let context: Value = serde_json::from_str(&f.stored::<String>(&format!("SELECT context FROM jobs WHERE id='{}'", task["id"].as_str().unwrap()))).unwrap();
+        let supplied = context["existing_nodes"].as_array().unwrap().iter().map(|node| node["id"].as_str().unwrap().to_owned()).collect::<std::collections::BTreeSet<_>>();
+        let candidates = context["candidates"].as_array().unwrap().clone();
+        for candidate in &candidates {
+            let name = candidate["text"].as_str().unwrap().split(' ').nth(1).unwrap();
+            assert!(supplied.contains(&targets[name]), "candidate decided without its old target");
+        }
+        (candidates, context["_deferred"].as_array().unwrap().len())
+    };
+    for (round, month) in [(0, "March"), (1, "April")] {
+        let facts = names.iter().map(|name| format!("Project {name} ships in {month}.")).collect::<Vec<_>>();
+        f.capture(&format!("bulk{round}"), "thread", &facts.join(" "), "user", "bulk-fixture", json!({}), "2026-10-18T12:00:00Z");
+        let extraction = f.claim("bulk-fixture", "thread", Some(vec!["extract".into()]))["work"][0].clone();
+        let drafts = facts.iter().enumerate().map(|(i, text)| { let mut item = draft(text, "knowledge", false); item["key"] = json!(format!("k{i}")); item }).collect::<Vec<_>>();
+        f.complete(&extraction, json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":drafts}]})).unwrap();
+        let task = claim();
+        if round == 1 {
+            let (decided, deferred) = check(&task, &targets);
+            eprintln!("COVERAGE batch={n} decided_with_target={} deferred={deferred}", decided.len());
+            assert_eq!(decided.len() + deferred, n);
+            f.complete(&task, json!({"actions":decided.iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()})).unwrap();
+            if deferred > 0 {
+                // The deferred candidates continue in the next batch with their targets.
+                let (rest, again) = check(&claim(), &targets);
+                assert_eq!((rest.len(), again), (deferred, 0));
+            }
+            return (decided.len(), deferred);
+        }
+        let candidates = task["input"]["candidates"].as_array().unwrap().clone();
+        assert_eq!(candidates.len(), n);
+        f.complete(&task, json!({"actions":candidates.iter().map(|candidate| action(candidate, "remember")).collect::<Vec<_>>()})).unwrap();
+        for (name, text) in names.iter().zip(&facts) { targets.insert(name.clone(), f.stored::<String>(&format!("SELECT n.id FROM node_versions n WHERE n.text='{text}' AND n.state='active'"))); }
+    }
+    unreachable!()
+}
+
+#[test]
+fn update_batches_never_decide_a_candidate_without_its_old_target() {
+    assert_eq!(update_target_coverage(16), (16, 0));
+    assert_eq!(update_target_coverage(36), (36, 0));
+    let (decided, deferred) = update_target_coverage(64);
+    assert!(decided > 0 && deferred > 0);
+}
+
+#[test]
+fn batch_where_no_candidate_fits_its_old_target_is_narrowed() {
+    let f = Fixture::new();
+    let (c, v) = (b"bdfgklmnprstvz", b"aeiou");
+    let name = |i: usize, tail: &str| format!("{}{}{}{}{tail}", (c[i % 14] as char).to_ascii_uppercase(), v[i / 14 % 5] as char, c[(i * 5 + 3) % 14] as char, v[i % 5] as char);
+    // Each distinct subject's name-head match is a different memory from the one being
+    // updated, so the first comparison round fills the ceiling with no old target.
+    let n = 48;
+    let (targets, decoys): (Vec<_>, Vec<_>) = (0..n).map(|i| (format!("{} uses {} bearings.", name(i, "lor"), name(i, "zint")), format!("{} notes.", name(i, "lor")))).unzip();
+    let episode = f.capture("old", "earlier", &targets.iter().chain(&decoys).cloned().collect::<Vec<_>>().join(" "), "user", "bulk-fixture", json!({}), "2026-10-18T12:00:00Z");
+    let mut old = std::collections::BTreeMap::new();
+    for (i, text) in targets.iter().chain(&decoys).enumerate() {
+        let node = f.graph.remember(serde_json::from_value(json!({"command_id":format!("old{i}"),"actor":"owner","why":"Source-backed save","type":"knowledge","text":text,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":text}]})).unwrap()).unwrap();
+        old.insert(text.trim_end_matches('.').to_owned(), node["id"].as_str().unwrap().to_owned());
+    }
+    let facts = targets.iter().map(|text| text.replace('.', " now.")).collect::<Vec<_>>();
+    f.capture("new", "thread", &facts.join(" "), "user", "bulk-fixture", json!({}), "2026-10-19T12:00:00Z");
+    let extraction = f.claim("bulk-fixture", "thread", Some(vec!["extract".into()]))["work"][0].clone();
+    let drafts = facts.iter().enumerate().map(|(i, text)| { let mut item = draft(text, "knowledge", false); item["key"] = json!(format!("k{i}")); item }).collect::<Vec<_>>();
+    f.complete(&extraction, json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":drafts}]})).unwrap();
+    let claim = || f.processing.work(serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"consolidate_now":true,"continuous":true,"batch_size":n}})).unwrap()).unwrap()["work"][0].clone();
+    let mut decided = 0;
+    for _ in 0..n {
+        let task = claim();
+        if task.is_null() {
+            break;
+        }
+        let context: Value = serde_json::from_str(&f.stored::<String>(&format!("SELECT context FROM jobs WHERE id='{}'", task["id"].as_str().unwrap()))).unwrap();
+        let supplied = context["existing_nodes"].as_array().unwrap().iter().map(|node| node["id"].as_str().unwrap().to_owned()).collect::<std::collections::BTreeSet<_>>();
+        let candidates = context["candidates"].as_array().unwrap().clone();
+        let covered = candidates.iter().filter(|candidate| supplied.contains(&old[candidate["text"].as_str().unwrap().trim_end_matches(" now.")])).count();
+        eprintln!("COVERAGE narrowed candidates={} covered={covered} deferred={}", candidates.len(), context["_deferred"].as_array().unwrap().len());
+        assert_eq!(covered, candidates.len(), "candidate decided without its old target");
+        assert_eq!(candidates.len() + context["_deferred"].as_array().unwrap().len(), n - decided);
+        decided += candidates.len();
+        f.complete(&task, json!({"actions":candidates.iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()})).unwrap();
+    }
+    assert_eq!(decided, n);
+}
+
+#[test]
+fn lone_candidate_keeps_its_old_target_when_endpoints_fill_the_ceiling() {
+    let f = Fixture::new();
+    let (c, v) = (b"bdfgklmnprstvz", b"aeiou");
+    let name = |i: usize| format!("{}{}{}{}lor", (c[i % 14] as char).to_ascii_uppercase(), v[i / 14 % 5] as char, c[(i * 5 + 3) % 14] as char, v[i % 5] as char);
+    let (target, decoy, fact) = ("Kelor uses Zint bearings.", "Kelor notes.", "Kelor uses Zint bearings now.");
+    let episode = f.capture("old", "earlier", &format!("{target} {decoy}"), "user", "bulk-fixture", json!({}), "2026-10-18T12:00:00Z");
+    let mut old = vec![];
+    for (i, text) in [target, decoy].into_iter().enumerate() {
+        old.push(f.graph.remember(serde_json::from_value(json!({"command_id":format!("old{i}"),"actor":"owner","why":"Source-backed save","type":"knowledge","text":text,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":text}]})).unwrap()).unwrap()["id"].as_str().unwrap().to_owned());
+    }
+    // 47 promoted endpoints plus the decoy fill the ceiling before the lone fact's target.
+    let parts = (0..47).map(|i| format!("Module {} is ready.", name(i))).collect::<Vec<_>>();
+    f.capture("new", "thread", &format!("{} {fact}", parts.join(" ")), "user", "bulk-fixture", json!({}), "2026-10-19T12:00:00Z");
+    let extraction = f.claim("bulk-fixture", "thread", Some(vec!["extract".into()]))["work"][0].clone();
+    let mut drafts = parts.iter().enumerate().map(|(i, text)| { let mut item = draft(text, "knowledge", false); item["key"] = json!(format!("p{i}")); item }).collect::<Vec<_>>();
+    let mut subject = draft(fact, "knowledge", false);
+    subject["key"] = json!("fact");
+    drafts.push(subject);
+    for (i, text) in parts.iter().enumerate() {
+        let mut relation = draft(text, "knowledge", false);
+        relation["key"] = json!(format!("r{i}"));
+        relation["kind"] = json!("relation");
+        relation["type"] = json!("mentions");
+        relation["src_key"] = json!("fact");
+        relation["dst_key"] = json!(format!("p{i}"));
+        drafts.push(relation);
+    }
+    f.complete(&extraction, json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":drafts}]})).unwrap();
+    let claim = |size: usize| f.processing.work(serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"consolidate_now":true,"continuous":true,"batch_size":size}})).unwrap()).unwrap()["work"][0].clone();
+    let first = claim(47);
+    let promoted = first["input"]["candidates"].as_array().unwrap().clone();
+    assert_eq!(promoted.len(), 47);
+    f.complete(&first, json!({"actions":promoted.iter().map(|candidate| action(candidate, "remember")).collect::<Vec<_>>()})).unwrap();
+    let task = claim(48);
+    let context: Value = serde_json::from_str(&f.stored::<String>(&format!("SELECT context FROM jobs WHERE id='{}'", task["id"].as_str().unwrap()))).unwrap();
+    let supplied = context["existing_nodes"].as_array().unwrap().iter().map(|node| node["id"].as_str().unwrap().to_owned()).collect::<std::collections::BTreeSet<_>>();
+    eprintln!("COVERAGE lone candidates={} supplied={} target={}", context["candidates"].as_array().unwrap().len(), supplied.len(), supplied.contains(&old[0]));
+    assert_eq!(context["candidates"].as_array().unwrap().len(), 48);
+    assert!(supplied.contains(&old[0]), "lone candidate decided without its old target");
+    assert_eq!(supplied.len(), 48);
+}
+
 #[test]
 fn smaller_admission_repartitions_only_uncommitted_released_work() {
     let f=Fixture::new();
@@ -524,6 +662,81 @@ fn partial_kind_lane_claim_allows_extraction_beside_one_consolidation_lease() {
             .unwrap()["renewed"],
         false
     );
+}
+
+#[test]
+fn claim_backlog_reports_other_kind_claimability_after_scheduling() {
+    let f = Fixture::new();
+    f.seed();
+    use chrono::Timelike;
+    let hour = chrono::Utc::now().hour();
+    // Window chosen to exclude the current hour; force mirrors --consolidate-now.
+    let claim = |kind: &str, force: bool, exclude: Vec<String>| {
+        f.processing.claim(Claim { agent: "fixture".into(), timezone_name: "UTC".into(),
+            compaction: Some(Compaction { source: "contract".into(), conversation_id: "thread".into() }),
+            exclude, consolidate_now: force, kinds: Some(vec![kind.into()]),
+            consolidation_start: Some(format!("{:02}:00", (hour + 2) % 24)),
+            consolidation_end: Some(format!("{:02}:00", (hour + 3) % 24)),
+            continuous: true, batch_size: 16 }).unwrap()
+    };
+    let claimable = |value: &Value, kind: &str| value["backlog"]["claimable"][kind].as_i64().unwrap();
+    let first = claim("extract", false, vec![]);
+    assert_eq!(claimable(&first, "extract"), 0, "the claimed job is not counted again");
+    assert_eq!(claimable(&first, "consolidate"), 0);
+    let work = first["work"][0].clone();
+    f.complete(&work, json!({"windows":[{"id":work["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false)]}]})).unwrap();
+    // New candidates stay unclaimable while the window is closed.
+    assert_eq!(claimable(&claim("extract", false, vec![]), "consolidate"), 0);
+    // A forced/open window schedules them, and the extraction receipt says so.
+    assert_eq!(claimable(&claim("extract", true, vec![]), "consolidate"), 1);
+    // The pending unwindowed job is not claimable once the window closes again.
+    assert_eq!(claimable(&claim("extract", false, vec![]), "consolidate"), 0);
+    let job: String = f.stored("SELECT id FROM jobs WHERE kind='consolidate' AND state='pending'");
+    // A job the worker excludes during its cooldown is not reported as claimable.
+    assert_eq!(claimable(&claim("extract", true, vec![job.clone()]), "consolidate"), 0);
+    assert!(claim("consolidate", true, vec![job])["work"].as_array().unwrap().is_empty());
+    // Newly eligible extraction is reported to a consolidation claim.
+    f.capture("two", "thread", "A later source line needs extraction.", "user", "contract", json!({}), "2026-10-19T12:00:00Z");
+    let consolidation = claim("consolidate", true, vec![]);
+    assert_eq!(consolidation["work"].as_array().unwrap().len(), 1);
+    assert_eq!(claimable(&consolidation, "extract"), 1);
+}
+
+#[test]
+fn failed_consolidation_preparation_never_leaves_a_blocking_lease() {
+    let f = Fixture::new();
+    f.seed();
+    f.extract("contract", "thread", FACT, "knowledge", false);
+    // Test-only corruption so preparation fails after the queue leased the batch.
+    f.graph.store.write(|tx| { tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE target IN (SELECT id FROM candidates)")?; Ok(()) }).unwrap();
+    let failure = f.processing.claim(Claim { agent: "fixture".into(), timezone_name: "UTC".into(), compaction: None,
+        exclude: vec![], consolidate_now: true, kinds: Some(vec!["consolidate".into()]), consolidation_start: None,
+        consolidation_end: None, continuous: true, batch_size: 16 });
+    assert!(matches!(failure, Err(Error::Conflict(_))));
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM jobs WHERE kind='consolidate' AND state='leased'"), 0);
+    assert_eq!(f.stored::<String>("SELECT state||':'||error FROM jobs WHERE kind='consolidate'"), "failed:ConflictError");
+}
+
+#[test]
+fn failed_mixed_claim_returns_every_withheld_lease() {
+    let f = Fixture::new();
+    f.seed();
+    f.extract("contract", "thread", FACT, "knowledge", false);
+    let done = f.stored::<i64>("SELECT count(*) FROM jobs WHERE kind='extract' AND state='done'");
+    f.graph.store.write(|tx| { tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE target IN (SELECT id FROM candidates)")?; Ok(()) }).unwrap();
+    f.capture("two", "other", "The relay cabinet uses brass hinges.", "user", "contract", json!({}), "2026-10-18T13:00:00Z");
+    // Extraction prepares first; the consolidation in the same response then fails.
+    let failure = f.processing.claim(Claim { agent: "fixture".into(), timezone_name: "UTC".into(),
+        compaction: Some(Compaction { source: "contract".into(), conversation_id: "other".into() }),
+        exclude: vec![], consolidate_now: true, kinds: None, consolidation_start: None,
+        consolidation_end: None, continuous: true, batch_size: 16 });
+    assert!(matches!(failure, Err(Error::Conflict(_))));
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM jobs WHERE state='leased'"), 0);
+    assert_eq!(f.stored::<String>("SELECT state||':'||attempts||':'||ifnull(error,'') FROM jobs WHERE kind='extract' AND state<>'done'"), "pending:0:");
+    assert_eq!(f.stored::<String>("SELECT state||':'||error FROM jobs WHERE kind='consolidate'"), "failed:ConflictError");
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM jobs WHERE kind='extract' AND state='done'"), done);
+    let claimed = f.claim("contract", "other", Some(vec!["extract".into()]));
+    assert!(claimed["work"][0]["input"]["windows"][0]["text"].as_str().unwrap().contains("brass hinges"));
 }
 
 #[test]

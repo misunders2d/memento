@@ -28,8 +28,9 @@ Do not reread completed evidence. Repair failed quotes/plans from current source
 After a rejected submission, release that job and continue unrelated work; a fresh later claim supplies rejection feedback.
 Do not repeat an unchanged failed submission. For adapter argument errors, fix the stated cause using the current job id.
 If an operation outcome is uncertain, inspect status before retrying. Never assume a rejected plan committed.
-Start with consolidation. After each successful unit, alternate extraction and consolidation when both are available.
-When a kind returns no work, try the other kind. Finish only after both kinds return no currently available work.
+empty_kinds lists kinds with no currently claimable work, including a closed consolidation window; never claim them.
+The adapter updates it from service receipts. Prefer consolidation; after each successful unit, alternate kinds
+while both are available. Finish when empty_kinds lists both kinds.
 This is eligible-work exhaustion, not proof all history/reviews/obligations are complete.
 When session_boundary is true, stop immediately; the host continues in a fresh bounded session.
 '''
@@ -87,6 +88,8 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
         environment = dict(os.environ, MEMENTO_PROCESSING='1', MEMENTO_WORKER_URL=service.base_url,
                            MEMENTO_WORKER_OPTIONS=api.encode(options).decode(),
                            MEMENTO_WORKER_POOL=api.encode({key:value for key,value in pool.items() if key != 'policies'}).decode(),
+                           MEMENTO_WORKER_KINDS=api.encode([kind for kind, due in (('extract', extraction_due),
+                                                            ('consolidate', consolidation_due)) if due]).decode(),
                            MEMENTO_WORKER_LOG=str(Path(directory) / 'mcp.log'))
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, cwd=directory, env=environment, start_new_session=True)
@@ -110,7 +113,7 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
 
         def prompt():
             send({'type': 'prompt', 'id': 'work', 'message':
-                  'Process the available pool. Start with consolidation, then alternate work kinds while both are available.'})
+                  'Process the available pool. Claim only kinds absent from empty_kinds; prefer consolidation, then alternate.'})
 
         try:
             with selectors.DefaultSelector() as selector:
@@ -222,7 +225,10 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                     empty.clear()
                                 if event.get('empty') and event.get('kind') in api.KINDS:
                                     empty.add(event['kind'])
-                                empty.update(kind for kind in event.get('empty_kinds', []) if kind in api.KINDS)
+                                if isinstance(event.get('empty_kinds'), list):
+                                    # The adapter's current view replaces stale marks: a kind can reopen.
+                                    empty.clear()
+                                    empty.update(kind for kind in event['empty_kinds'] if kind in api.KINDS)
                                 if held or event.get('completed'):
                                     deadline = time.monotonic() + config['deadline_seconds']
                                 if event.get('boundary') and not leases.active and not rotating:

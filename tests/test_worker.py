@@ -37,6 +37,17 @@ def native(tmp_path,monkeypatch):
                     emit(dict(type='memento_worker_state',claimed=[dict(id='checkpoint',owner='lease-c',kind='consolidate')],lease_seconds=.12),True)
                     emit(dict(type='memento_worker_state',completed='checkpoint',boundary=True,claimed=[]),True)
                     continue
+                if os.environ.get('REOPEN'):
+                    # Consolidation exhausted, then extraction exhausted after the adapter reopened consolidation.
+                    emit(dict(type='memento_worker_state',empty=True,kind='consolidate',claimed=[],empty_kinds=['consolidate']),True)
+                    emit(dict(type='memento_worker_state',empty=True,kind='extract',claimed=[],empty_kinds=['extract']),True)
+                    emit(dict(type='memento_worker_state',claimed=[dict(id='late',owner='lease-l',kind='consolidate')],lease_seconds=.12,empty_kinds=['extract']),True)
+                    emit(dict(type='memento_worker_state',completed='late',claimed=[],empty_kinds=['extract']),True)
+                    emit(dict(type='memento_worker_state',empty=True,kind='consolidate',claimed=[],empty_kinds=['consolidate','extract']),True)
+                    continue
+                if os.environ.get('FAIL_DETAIL'):
+                    for code in (os.environ['FAIL_DETAIL'],'secret private evidence'):
+                        emit(dict(type='memento_worker_state',error=True,code=code,action='submit',http_status=422),True)
                 if os.environ.get('RETRY'):
                     emit(dict(type='memento_worker_model',model='synthetic',usage={},stop_reason='error'),True)
                     emit(dict(type='message_end',message=dict(role='assistant',stopReason='error')))
@@ -70,7 +81,8 @@ def native(tmp_path,monkeypatch):
             calls.append((path,command))
             if path=='/work/pool':
                 return dict(worker_protocol=1,lease_seconds=.12,policies=dict(extract={},consolidate={}),
-                            pending_extract_conversations=0,ready_candidates=2,jobs=[],pending_maintenance_groups=0)
+                            pending_extract_conversations=0,ready_candidates=2,jobs=[],pending_maintenance_groups=0,
+                            eligible_extract_conversations=int(os.environ.get('ELIGIBLE','0')))
             if path=='/work/renew':return {'renewed':True}
             if path=='/work/release':return {'released':True}
             raise AssertionError(path)
@@ -144,3 +156,32 @@ def test_committed_boundary_rotates_session_in_same_native_process(native,monkey
     records=[json.loads(row) for row in trace.read_text().splitlines()]
     assert len({row['pid'] for row in records})==1
     assert [row['type'] for row in records]==['prompt','abort','new_session','prompt']
+
+
+def test_rejected_submission_receipt_keeps_fixed_code_and_action_only(native,monkeypatch,capsys):
+    config,trace,calls=native
+    monkeypatch.setenv('FAIL_DETAIL','Loop responsibility requires exact source evidence')
+    assert worker.tick(runner,config,consolidate_now=True)==1
+    receipts=[json.loads(line) for line in capsys.readouterr().out.splitlines() if '"error"' in line]
+    assert receipts==[
+        dict(stage='worker',error='processing_request_failed',detail_code='Loop responsibility requires exact source evidence',
+             action='submit',http_status=422),
+        dict(stage='worker',error='processing_request_failed',action='submit',http_status=422)]
+
+
+def test_reopened_kind_is_not_treated_as_exhausted_and_due_kinds_reach_adapter(native,monkeypatch,capsys):
+    config,trace,calls=native
+    monkeypatch.setenv('REOPEN','1')
+    monkeypatch.setenv('ELIGIBLE','1')
+    hour=time.gmtime().tm_hour
+    config.update(consolidation_start=f'{(hour+2)%24:02}:00',consolidation_end=f'{(hour+3)%24:02}:00')
+    seen={}
+    original=worker.subprocess.Popen
+    def popen(argv,**kwargs):
+        if 'MEMENTO_WORKER_KINDS' in (kwargs.get('env') or {}):seen['kinds']=json.loads(kwargs['env']['MEMENTO_WORKER_KINDS'])
+        return original(argv,**kwargs)
+    monkeypatch.setattr(worker.subprocess,'Popen',popen)
+    assert worker.tick(runner,config)==0
+    assert seen['kinds']==['extract']  # closed window: consolidation never seeded as available
+    output=capsys.readouterr().out
+    assert '"id":"late"' in output and '"completed_jobs":1' in output

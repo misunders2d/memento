@@ -38,7 +38,9 @@ export default function worker(pi: any) {
   let contextStart = 0, resetContext = true;
   const cooling = new Map<string, number>();
   const claims = new Map<string, any>();
-  const emptyKinds = new Set<string>();
+  // Host-computed due kinds (window and pool) seed availability; later receipts update it.
+  const dueKinds: string[] = JSON.parse(process.env.MEMENTO_WORKER_KINDS || '["extract","consolidate"]');
+  const emptyKinds = new Set<string>(["extract", "consolidate"].filter(kind => !dueKinds.includes(kind)));
   function claim(command: any) {
     if (current.length) throw new Error("Complete or release current work first");
     if (!Array.isArray(command.kinds) || command.kinds.length !== 1 || !["extract", "consolidate"].includes(command.kinds[0]))
@@ -56,7 +58,8 @@ export default function worker(pi: any) {
       output: command.output, model, usage };
   }
   pi.on("session_start", async () => {
-    current = []; last = initialPool; completed = 0; claims.clear(); emptyKinds.clear();
+    // Rotation keeps the last service availability; only a receipt reopens a kind.
+    current = []; last = initialPool; completed = 0; claims.clear();
     contextStart = 0; resetContext = true;
     const until = Date.now() + 15000;
     while (!pi.getActiveTools().includes(TOOL) && Date.now() < until)
@@ -117,9 +120,11 @@ export default function worker(pi: any) {
     catch {
       last = { error: "processing_request_failed", detail: event.content };
       const text = event.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
-      emit({ type: "memento_worker_state", error: true,
-        code: text.match(/\b(?:candidate|consolidation)_[a-z_]+\b/)?.[0],
-        http_status: Number(text.match(/MEMENTO_HTTP_(\d{3})/)?.[1]) || undefined });
+      // Bounded service detail only; the host logs it solely when it is an allowlisted fixed code.
+      const failure = text.match(/MEMENTO_HTTP_(\d{3}): ([^\n]{1,160})/);
+      emit({ type: "memento_worker_state", error: true, code: failure?.[2],
+        action: ["pool","claim","submit","complete","status","release","renew"].includes(event.input?.action) ? event.input.action : "unknown",
+        http_status: Number(failure?.[1] ?? text.match(/MEMENTO_HTTP_(\d{3})/)?.[1]) || undefined });
       return;
     }
     const action = event.input.action;
@@ -136,7 +141,6 @@ export default function worker(pi: any) {
     const offered = action === "claim" ? value : value.next;
     const held: any[] = [];
     if (offered && Array.isArray(offered.work)) {
-      if (offered.work.length) emptyKinds.clear();
       for (const item of offered.work) {
         claims.set(item.id, { id: item.id, owner: item.owner, kind: item.kind });
         held.push({ id: item.id, owner: item.owner, kind: item.kind });
@@ -146,8 +150,13 @@ export default function worker(pi: any) {
       }
       current = offered.work;
       const requested = action === "claim" ? event.input.command.kinds?.[0] : event.input.command.next?.kinds?.[0];
-      if (!current.length && requested) emptyKinds.add(requested);
-      if (["pending_extract_conversations","pending_extract_jobs","leased_extract_jobs"].every(key => offered.backlog?.[key] === 0)) emptyKinds.add("extract");
+      // The requested kind is known only by its own claim; the other kind follows the
+      // service's post-scheduling claimable count (window, cooldown and exclusions).
+      for (const kind of ["extract", "consolidate"]) {
+        const count = offered.backlog?.claimable?.[kind];
+        if (kind === requested) current.length ? emptyKinds.delete(kind) : emptyKinds.add(kind);
+        else if (typeof count === "number") count > 0 ? emptyKinds.delete(kind) : emptyKinds.add(kind);
+      }
     }
     if (offered) delete offered.work;
     last = value;

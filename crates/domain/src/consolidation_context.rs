@@ -68,7 +68,9 @@ impl<'a> Builder<'a> {
         let mut refs = vec![];
         for row in rows(
             self.db,
-            "SELECT * FROM graph_evidence WHERE target=? AND version=? ORDER BY episode_id,start LIMIT 8",
+            // Bounded founding and latest original evidence (four each), chronological;
+            // undated sources sort last so a dated decisive correction is never displaced.
+            "WITH ranked AS (SELECT g.*,row_number() OVER (ORDER BY julianday(e.occurred_at) IS NULL,julianday(e.occurred_at),g.episode_id,g.start) AS early,row_number() OVER (ORDER BY julianday(e.occurred_at) IS NULL,julianday(e.occurred_at) DESC,g.episode_id DESC,g.start DESC) AS late FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?) SELECT * FROM ranked WHERE early<=4 OR late<=4 ORDER BY early",
             params![target, version],
         )? {
             let episode_id = get_str(&row, "episode_id")?;
@@ -514,6 +516,11 @@ pub(super) fn prepare(
         .transpose()?
         .unwrap_or_default();
     let mut builder = Builder::new(db, dir);
+    // Narrowing's terminal singleton (in-memory clone only): its at most three validated top
+    // targets precede promoted endpoints and continuity inside the same ceiling.
+    for target in job.payload.get("_priority").map(strings).transpose()?.unwrap_or_default() {
+        builder.add_node(&target)?;
+    }
     let mut candidates = rows(
         db,
         &format!(
@@ -556,6 +563,7 @@ pub(super) fn prepare(
     builder.continuity()?;
     builder.retirement()?;
     let mut identities: Vec<(String, Vec<String>, Vec<String>)> = vec![];
+    let mut relevant: Vec<(String, Vec<String>)> = vec![];
     let mut optional: Vec<(String, Vec<String>)> = vec![];
     for candidate in &candidates {
         let id = get_str(candidate, "id")?;
@@ -600,6 +608,11 @@ pub(super) fn prepare(
                 true,
             )?;
             let semantic = hinted(db, hint, "typed")?;
+            relevant.push((
+                id.into(),
+                // Top target per channel; longer exact lists keep their existing review gate.
+                unique(exact.first().into_iter().chain(lex.first()).chain(semantic.first()).cloned()),
+            ));
             let mut similar = heads;
             for index in 0..lex.len().max(semantic.len()) {
                 for value in [lex.get(index), semantic.get(index)].into_iter().flatten() {
@@ -686,6 +699,54 @@ pub(super) fn prepare(
     builder.allocate(&optional, None)?;
     builder.continuity()?;
     builder.retirement()?;
+    // Bounded continuation: in cursor-free admission, a candidate whose top exact,
+    // lexical or semantic target did not fit the ceiling stays pending for a later batch
+    // instead of being decided without them. At least one candidate always proceeds.
+    let mut deferred = vec![];
+    if job.payload["night"].is_null() {
+        let mut uncovered = BTreeSet::new();
+        for (id, targets) in &relevant {
+            for target in targets {
+                if !builder.nodes.contains_key(target) && one(db,&format!("SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND {VISIBLE}"),[target])?.is_some() {
+                    uncovered.insert(id.clone());
+                }
+            }
+        }
+        // A relation waits with a deferred endpoint candidate instead of a dependency defer.
+        for candidate in &candidates {
+            if ["src", "dst"].iter().any(|key| candidate[*key].as_str().is_some_and(|id| uncovered.contains(id))) {
+                uncovered.insert(get_str(candidate, "id")?.to_owned());
+            }
+        }
+        if uncovered.len() < candidates.len() {
+            candidates.retain(|candidate| !uncovered.contains(candidate["id"].as_str().unwrap()));
+            optional.retain(|(id, _)| !uncovered.contains(id));
+            deferred = uncovered.into_iter().collect();
+        } else if job.payload["_priority"].is_null() && candidates.iter().any(|candidate| candidate["kind"] != "relation") {
+            // None fits beside its targets: reprepare the first half of the non-relation
+            // candidates plus relations whose batch endpoints stay; the rest stays pending.
+            // A lone kept candidate's top targets are seeded first in the in-memory clone.
+            // Each level keeps fewer non-relation candidates or seeds once, so this terminates.
+            let batch = uncovered; // here: every candidate in this context
+            let entities = candidates.iter().filter(|candidate| candidate["kind"] != "relation").collect::<Vec<_>>();
+            let entities = &entities[..(entities.len() / 2).max(1)];
+            let mut kept = entities.iter().map(|candidate| get_str(candidate, "id").map(str::to_owned)).collect::<Result<BTreeSet<_>>>()?;
+            for candidate in candidates.iter().filter(|candidate| candidate["kind"] == "relation") {
+                if ["src", "dst"].iter().all(|key| candidate[*key].as_str().is_none_or(|id| !batch.contains(id) || kept.contains(id))) {
+                    kept.insert(get_str(candidate, "id")?.to_owned());
+                }
+            }
+            let mut narrowed = job.clone();
+            narrowed.payload["candidate_ids"] = json!(kept);
+            if let [only] = entities {
+                narrowed.payload["_priority"] = json!(relevant.iter().find(|(id, _)| only["id"] == *id).map(|(_, targets)| targets.clone()).unwrap_or_default());
+            }
+            let mut context = prepare(db, dir, &narrowed, discovery, configured)?;
+            let rest = batch.into_iter().filter(|id| !kept.contains(id));
+            context["_deferred"] = json!(unique(strings(&context["_deferred"])?.into_iter().chain(rest)));
+            return Ok(context);
+        }
+    }
     for candidate in &mut candidates {
         if let Some((_, exact, similar)) =
             identities.iter().find(|(id, _, _)| candidate["id"] == *id)
@@ -780,7 +841,7 @@ pub(super) fn prepare(
         .cloned()
         .collect::<Vec<_>>();
     Ok(
-        json!({"loop_policy_version":VERSION,"candidates":candidates,"existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),"existing_relations":builder.edges.into_values().collect::<Vec<_>>(),"raw_windows":windows,"resolved_candidates":resolutions,"loop_snapshots":snapshots,"behavior_exposures":exposures,"maintenance_ids":maintenance_ids,"context_truncated":pending,"retirement_ready":ready,"_unchecked":unchecked,"_continuity":builder.continuity,"_retirement":builder.retirement}),
+        json!({"loop_policy_version":VERSION,"candidates":candidates,"existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),"existing_relations":builder.edges.into_values().collect::<Vec<_>>(),"raw_windows":windows,"resolved_candidates":resolutions,"loop_snapshots":snapshots,"behavior_exposures":exposures,"maintenance_ids":maintenance_ids,"context_truncated":pending,"retirement_ready":ready,"_unchecked":unchecked,"_deferred":deferred,"_continuity":builder.continuity,"_retirement":builder.retirement}),
     )
 }
 
@@ -820,6 +881,29 @@ mod overlap_tests {
         assert_eq!(result.len(),4); // Different authority interrupts merging; never broaden it.
         let result = coalesce_windows(vec![w(0,3,"a🧠б",true),w(2,5,"бcd",true),w(6,7,"x",true)]);
         assert_eq!(result,vec![w(0,5,"a🧠бcd",true),w(6,7,"x",true)]);
+    }
+
+    #[test]
+    fn existing_evidence_keeps_founding_and_latest_original_sources() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+        let store = memento_core::Store::open(dir.path()).unwrap();
+        // Nine supports: the decisive correction is the ninth by id (dropped by the old
+        // id-order LIMIT 8) and the founding source has a middle id.
+        let days = ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05", "2026-01-06", "2026-01-01", "2026-01-07", "2026-01-08", "2026-01-09"];
+        store.write(|tx| {
+            for (index, day) in days.iter().enumerate() {
+                let text = if index == 8 { "Correction: the launch moved to Friday." } else { "The launch is on Monday." };
+                tx.sql().execute("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    params![format!("e{index}"), "fixture", format!("event{index}"), "thread", "user", text, format!("{day}T12:00:00Z"), "{}", "2026-02-01T00:00:00Z"])?;
+                tx.sql().execute("INSERT INTO graph_evidence(target,version,episode_id,start,end,quote) VALUES ('n1',1,?,0,?,?)",
+                    params![format!("e{index}"), text.chars().count() as i64, text])?;
+            }
+            Ok(())
+        }).unwrap();
+        let ids = store.read(|tx| Builder::new(tx.sql(), dir.path()).evidence("n1", 1, false)).unwrap()
+            .iter().map(|reference| reference["episode_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        assert_eq!(ids, ["e5", "e0", "e1", "e2", "e4", "e6", "e7", "e8"]);
     }
 }
 

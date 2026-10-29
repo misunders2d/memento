@@ -169,6 +169,10 @@ impl Queue {
     pub fn complete(&self, job: &Job, result: &Value) -> Result<()> {
         self.graph.store.write(|tx|{job.check_in(tx.sql())?;tx.sql().execute("UPDATE jobs SET state='done',result=?,error=NULL,owner=NULL,lease_until=NULL WHERE id=? AND owner=?",params![encode_json(result)?,job.id,job.owner])?;Ok(())})
     }
+    /// Returns a lease its client never received: no failure, backoff or attempt.
+    pub fn unclaim(&self, job: &Job) -> Result<()> {
+        self.graph.store.write(|tx|{tx.sql().execute("UPDATE jobs SET state='pending',owner=NULL,lease_until=NULL,attempts=max(attempts-1,0) WHERE id=? AND state='leased' AND owner=?",params![job.id,job.owner])?;Ok(())})
+    }
     pub fn fail(&self, job: &Job, failure: JobFailure) -> Result<()> {
         let delay = failure.retry_after.unwrap_or_else(|| {
             Duration::from_secs(

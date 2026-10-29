@@ -422,6 +422,11 @@ def test_heartbeat_renews_all_claimed_work_and_marks_lost():
     assert not leases.is_lost('one')
 
 
+def test_every_frozen_server_validation_code_is_a_safe_host_diagnostic():
+    codes = json.loads((Path(__file__).parents[1] / 'crates/domain/src/pipeline_assets/validation-codes.json').read_text())
+    assert set(codes) - runner.WORK_REJECTION_CODES == set()
+
+
 @pytest.mark.parametrize('failure,status,body,diagnostic', [
     ('http', 422, runner.encode({'detail': 'consolidation_candidate_coverage_invalid', 'private': 'secret'}),
      {'http_status': 422, 'detail_code': 'consolidation_candidate_coverage_invalid'}),

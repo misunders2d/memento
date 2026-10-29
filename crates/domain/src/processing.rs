@@ -353,6 +353,13 @@ impl Processing {
             .clone()
             .unwrap_or(vec!["extract".into(), "consolidate".into()]);
         let mut work = vec![];
+        // A failed response must not strand the leases it already prepared.
+        let mut held = vec![];
+        let withhold = |held: &[crate::jobs::Job]| {
+            for job in held {
+                let _ = self.queue.unclaim(job);
+            }
+        };
         for kind in if night_due {
             vec!["extract", "consolidate"]
         } else {
@@ -362,112 +369,137 @@ impl Processing {
                 continue;
             }
             loop {
-                let Some(job) = self.queue.claim(&[kind.into()], &command.exclude)? else {
+                let Some(job) = self
+                    .queue
+                    .claim(&[kind.into()], &command.exclude)
+                    .inspect_err(|_| withhold(&held))?
+                else {
                     break;
                 };
-                let discovery = if kind == "consolidate" {
-                    self.consolidator.prepare_discovery(&job)?
-                } else {
-                    None
-                };
-                let prior = self.graph.store.read(|tx| {
-                    one(
-                        tx.sql(),
-                        "SELECT result FROM graph_commits WHERE command_id=?",
-                        [format!("{kind}/{}", job.id)],
-                    )
-                })?;
-                if let Some(prior) = prior {
-                    self.queue
-                        .complete(&job, &decode_json(get_str(&prior, "result")?)?)?;
-                    schedule()?;
-                    continue;
-                }
-                let previous = self
-                    .graph
-                    .store
-                    .read(|tx| one(tx.sql(), "SELECT context FROM jobs WHERE id=?", [&job.id]))?;
-                let rejection = previous
-                    .and_then(|row| row["context"].as_str().map(str::to_owned))
-                    .map(|context| decode_json(&context))
-                    .transpose()?
-                    .and_then(|context| context.get("previous_rejection").cloned());
-                let mut prepared = if kind == "extract" {
-                    self.extractor.prepare(&job)?
-                } else {
-                    self.consolidator.prepare(&job, discovery.as_ref())?
-                };
-                if let Some(rejection) = rejection {
-                    prepared["previous_rejection"] = rejection;
-                }
-                self.graph.store.write(|tx| {
-                    job.check_in(tx.sql())?;
-                    tx.sql().execute(
-                        "UPDATE jobs SET context=? WHERE id=? AND owner=?",
-                        params![encode_json(&prepared)?, job.id, job.owner],
-                    )?;
-                    Ok(())
-                })?;
-                let input = if kind == "extract" {
-                    Extractor::model_input(&prepared)
-                } else {
-                    Consolidator::model_input(&prepared)
-                };
-                let output = if kind == "extract"
-                    && prepared["windows"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .all(|window| window["text"].as_str().is_none_or(str::is_empty))
-                {
-                    Some(
-                        json!({"windows":input["windows"].as_array().unwrap().iter().map(|window|json!({"id":window["id"],"candidates":[]})).collect::<Vec<_>>()}),
-                    )
-                } else if kind == "consolidate"
-                    && prepared["candidates"].as_array().unwrap().is_empty()
-                    && prepared["maintenance_ids"].as_array().unwrap().is_empty()
-                {
-                    Some(json!({"actions":[]}))
-                } else {
-                    None
-                };
-                if let Some(output) = output {
-                    let result = if kind == "extract" {
-                        self.extractor
-                            .apply(&job, &prepared, &output, &command.agent, None, None)
+                // A failed preparation must not leave a holderless lease: one live
+                // consolidation lease blocks every other consolidation claim.
+                let step = (|| -> Result<Option<Value>> {
+                    let discovery = if kind == "consolidate" {
+                        self.consolidator.prepare_discovery(&job)?
                     } else {
-                        self.consolidator.apply(
-                            &job,
-                            &prepared,
-                            &output,
-                            &command.agent,
-                            None,
-                            None,
+                        None
+                    };
+                    let prior = self.graph.store.read(|tx| {
+                        one(
+                            tx.sql(),
+                            "SELECT result FROM graph_commits WHERE command_id=?",
+                            [format!("{kind}/{}", job.id)],
                         )
+                    })?;
+                    if let Some(prior) = prior {
+                        self.queue
+                            .complete(&job, &decode_json(get_str(&prior, "result")?)?)?;
+                        schedule()?;
+                        return Ok(None);
                     }
-                    .map_err(|error| error.error)?;
-                    self.queue.complete(&job, &result)?;
-                    schedule()?;
-                    continue;
+                    let previous = self
+                        .graph
+                        .store
+                        .read(|tx| one(tx.sql(), "SELECT context FROM jobs WHERE id=?", [&job.id]))?;
+                    let rejection = previous
+                        .and_then(|row| row["context"].as_str().map(str::to_owned))
+                        .map(|context| decode_json(&context))
+                        .transpose()?
+                        .and_then(|context| context.get("previous_rejection").cloned());
+                    let mut prepared = if kind == "extract" {
+                        self.extractor.prepare(&job)?
+                    } else {
+                        self.consolidator.prepare(&job, discovery.as_ref())?
+                    };
+                    if let Some(rejection) = rejection {
+                        prepared["previous_rejection"] = rejection;
+                    }
+                    self.graph.store.write(|tx| {
+                        job.check_in(tx.sql())?;
+                        tx.sql().execute(
+                            "UPDATE jobs SET context=? WHERE id=? AND owner=?",
+                            params![encode_json(&prepared)?, job.id, job.owner],
+                        )?;
+                        Ok(())
+                    })?;
+                    let input = if kind == "extract" {
+                        Extractor::model_input(&prepared)
+                    } else {
+                        Consolidator::model_input(&prepared)
+                    };
+                    let output = if kind == "extract"
+                        && prepared["windows"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|window| window["text"].as_str().is_none_or(str::is_empty))
+                    {
+                        Some(
+                            json!({"windows":input["windows"].as_array().unwrap().iter().map(|window|json!({"id":window["id"],"candidates":[]})).collect::<Vec<_>>()}),
+                        )
+                    } else if kind == "consolidate"
+                        && prepared["candidates"].as_array().unwrap().is_empty()
+                        && prepared["maintenance_ids"].as_array().unwrap().is_empty()
+                    {
+                        Some(json!({"actions":[]}))
+                    } else {
+                        None
+                    };
+                    if let Some(output) = output {
+                        let result = if kind == "extract" {
+                            self.extractor
+                                .apply(&job, &prepared, &output, &command.agent, None, None)
+                        } else {
+                            self.consolidator.apply(
+                                &job,
+                                &prepared,
+                                &output,
+                                &command.agent,
+                                None,
+                                None,
+                            )
+                        }
+                        .map_err(|error| error.error)?;
+                        self.queue.complete(&job, &result)?;
+                        schedule()?;
+                        return Ok(None);
+                    }
+                    let instruction = if kind == "extract" {
+                        format!(
+                            "{}\nReturn windows with exactly the supplied ids and candidates for each. Entity keys are local to each window.",
+                            pipeline_schema::EXTRACTION_INSTRUCTION
+                        )
+                    } else {
+                        pipeline_schema::CONSOLIDATION_INSTRUCTION.into()
+                    };
+                    let schema = if kind == "extract" {
+                        pipeline_schema::EXTRACTION.clone()
+                    } else {
+                        pipeline_schema::CONSOLIDATION.clone()
+                    };
+                    Ok(Some(json!({"id":job.id,"owner":job.owner,"kind":kind,"instruction":instruction,"input":input,"schema":schema})))
+                })();
+                match step {
+                    Ok(None) => continue,
+                    Ok(Some(item)) => {
+                        work.push(item);
+                        held.push(job);
+                        break;
+                    }
+                    Err(error) => {
+                        // Extraction retries with backoff (its job key fences the cursor);
+                        // a consolidation batch fails so its candidates are rebatched.
+                        let _ = self.queue.fail(&job, crate::jobs::JobFailure { category: crate::jobs::error_category(&error), retryable: kind == "extract", retry_after: None });
+                        withhold(&held);
+                        return Err(error);
+                    }
                 }
-                let instruction = if kind == "extract" {
-                    format!(
-                        "{}\nReturn windows with exactly the supplied ids and candidates for each. Entity keys are local to each window.",
-                        pipeline_schema::EXTRACTION_INSTRUCTION
-                    )
-                } else {
-                    pipeline_schema::CONSOLIDATION_INSTRUCTION.into()
-                };
-                let schema = if kind == "extract" {
-                    pipeline_schema::EXTRACTION.clone()
-                } else {
-                    pipeline_schema::CONSOLIDATION.clone()
-                };
-                work.push(json!({"id":job.id,"owner":job.owner,"kind":kind,"instruction":instruction,"input":input,"schema":schema}));
-                break;
             }
         }
-        let backlog=self.graph.store.read(|tx|Ok(json!({"pending_extract_conversations":pending_conversations(tx.sql(),None)?,"pending_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='pending' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"leased_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='leased' AND kind='extract'",[],|row|row.get::<_,i64>(0))?})))?;
+        // Post-scheduling count of what this caller could claim now, using the queue's
+        // own predicate; consolidation only inside its window or an explicit force run.
+        let claimable=|db:&Connection,kind:&str|->Result<i64>{Ok(db.query_row("SELECT count(*) FROM jobs WHERE kind=?1 AND ((state='pending' AND available_at<=?2) OR (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value FROM json_each(?3)) AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE live.kind='consolidate' AND live.state='leased' AND live.lease_until>?2))",params![kind,timestamp(),encode_json(&json!(command.exclude))?],|row|row.get(0))?)};
+        let backlog=self.graph.store.read(|tx|Ok(json!({"pending_extract_conversations":pending_conversations(tx.sql(),None)?,"pending_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='pending' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"leased_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='leased' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"claimable":{"extract":claimable(tx.sql(),"extract")?,"consolidate":if night_due {claimable(tx.sql(),"consolidate")?} else {0}}}))).inspect_err(|_| withhold(&held))?;
         Ok(json!({"lease_seconds":self.queue.lease_seconds,"work":work,"backlog":backlog}))
     }
     fn leased(&self, id: &str, owner: &str) -> Result<(Job, Value)> {
