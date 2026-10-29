@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from .store import ConflictError, Store
-from .commands import Link, Loop, MediaInput, Remember, Supersede
+from .commands import Link, Loop, MediaInput, Remember, Supersede, Reconcile
 from .mcp_server import create_mcp, recall_memories, submit_media
 from .graph import Graph
 from .blobs import BlobStore
@@ -522,6 +522,10 @@ def create_app(data_dir: Path) -> FastAPI:
     def supersede(command: Supersede):
         return graph_command(app.state.graph.supersede, command)
 
+    @app.post('/reconcile')
+    def reconcile(command: Reconcile):
+        return graph_command(app.state.graph.reconcile, command)
+
     @app.post('/loop')
     def loop(command: Loop):
         return graph_command(app.state.graph.loop, command)
@@ -637,7 +641,7 @@ from which you fetched this guide, not the public product website.
    or a fresh native session. Native trust/permission prompts remain human
    decisions: surface just that approval if required; never grant it yourself
    or evade an owner-session admission guard.
-5. Verify the six native tools (recall, remember, link, supersede, history, loop),
+5. Verify the seven native tools (recall, remember, link, supersede, reconcile, history, loop),
    call recall, and verify a new native exchange was captured. Installation
    alone is not a connected result. Report any actual permission/reload blocker
    precisely instead of claiming success.

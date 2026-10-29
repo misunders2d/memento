@@ -367,6 +367,7 @@ pub fn router(state: AppState) -> Router {
         .route("/remember", post(remember))
         .route("/link", post(link))
         .route("/supersede", post(supersede))
+        .route("/reconcile", post(reconcile))
         .route("/loop", post(loop_command))
         .route("/history/{id}", get(history))
         .route("/usage", post(usage))
@@ -517,6 +518,7 @@ macro_rules! command {
 }
 command!(link, dto::Link, graph, link);
 command!(supersede, dto::Supersede, graph, supersede);
+command!(reconcile, dto::Reconcile, graph, reconcile);
 command!(loop_command, dto::Loop, graph, loop_command);
 command!(usage, dto::Citation, graph, cite);
 command!(claim, processing::Claim, processing, claim);

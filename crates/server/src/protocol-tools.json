@@ -704,6 +704,155 @@
     }
   },
   {
+    "name": "reconcile",
+    "title": "Reconcile",
+    "description": "On explicit user request, combine proven duplicates into survivor; absorb at most eight IDs.\n\nRead history first. Supply every member's current expected_versions and exact original evidence\nfor every member. Names or similarity alone do not prove identity; explain sameness in why.\nPreserves evidence, history, relations and loop choices. Pins, sensitive types or different\nscopes return a human review proposal; this tool cannot approve it. Stale versions fail atomically.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "additionalProperties": false,
+          "properties": {
+            "command_id": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "actor": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "why": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "evidence": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "episode_id": {
+                    "anyOf": [
+                      {
+                        "maxLength": 64,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null
+                  },
+                  "quote": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "occurrence": {
+                    "anyOf": [
+                      {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null
+                  }
+                },
+                "required": [
+                  "quote"
+                ],
+                "type": "object"
+              },
+              "maxItems": 100,
+              "minItems": 1,
+              "type": "array"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "conversation_id": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "survivor": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "absorbed": {
+              "items": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 8,
+              "minItems": 1,
+              "type": "array"
+            },
+            "expected_versions": {
+              "additionalProperties": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxProperties": 9,
+              "minProperties": 2,
+              "propertyNames": {
+                "maxLength": 64,
+                "minLength": 1
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "command_id",
+            "actor",
+            "why",
+            "evidence",
+            "survivor",
+            "absorbed",
+            "expected_versions"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "_meta": {
+      "fastmcp": {
+        "tags": []
+      }
+    }
+  },
+  {
     "name": "history",
     "title": "History",
     "description": "Read full supersession lineage, immutable versions, word diffs, reasons and exact evidence.",

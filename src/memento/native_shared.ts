@@ -417,6 +417,11 @@ function registerTools(api: NativeAPI, T: typeof SchemaType, harness: string,
       new: T.Object({ type: T.String({ minLength: 1, maxLength: 64 }), text: string(), scope }, { additionalProperties: false }),
       kind: optionalString(T.Union([T.Literal("correction"), T.Literal("change"), T.Literal("refinement")])), valid_at: date,
     }) }, { additionalProperties: false })],
+    ["reconcile", "On explicit user request, combine proven duplicates into survivor. Read history, supply current versions and exact original evidence for every member; explain sameness in why. Names alone do not prove identity. Preserves history, relations and loops. Pins, sensitive types and different scopes return a human review proposal, never approval. Native command identity and actor are supplied automatically.", T.Object({ command: command({
+      survivor: T.String({ minLength: 1, maxLength: 64 }),
+      absorbed: T.Array(T.String({ minLength: 1, maxLength: 64 }), { minItems: 1, maxItems: 8, uniqueItems: true }),
+      expected_versions: T.Record(T.String({ minLength: 1, maxLength: 64 }), T.Integer({ minimum: 1 }), { minProperties: 2, maxProperties: 9 }),
+    }) }, { additionalProperties: false })],
     ["loop", "When asked, list or adjust a follow-up marker on an existing memory. Later hides only the marker from loop lists, not the fact from recall. Only an explicit remind action sets a reminder time. Native mutation identity and actor are supplied automatically.", T.Object({
       action: T.Union(["list", "open", "close", "later", "remind"].map((value) => T.Literal(value))),
       limit: T.Optional(T.Integer({ minimum: 1, maximum: 100, default: 20 })),
@@ -449,7 +454,7 @@ function registerTools(api: NativeAPI, T: typeof SchemaType, harness: string,
           else if (hasCommand) args.command = { ...commandValue, ...identity };
         }
         const result = await bridge(loader, { ...base, tool: verb, arguments: args,
-          ...(["remember", "link", "supersede"].includes(verb) ? { entries: ctx.sessionManager.getEntries() } : {}),
+          ...(["remember", "link", "supersede", "reconcile"].includes(verb) ? { entries: ctx.sessionManager.getEntries() } : {}),
         }, verb === "recall" ? 45_000 : 15_000, signal);
         return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
       },

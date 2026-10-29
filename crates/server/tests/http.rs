@@ -295,7 +295,7 @@ async fn actual_mcp_lists_shared_tools_normalizes_only_optional_empties_and_wrap
         .collect::<Vec<_>>();
     assert_eq!(
         names,
-        ["recall", "remember", "link", "supersede", "history", "loop", "work"]
+        ["recall", "remember", "link", "supersede", "reconcile", "history", "loop", "work"]
     );
     let command = json!({"command_id":"tool-save","actor":"synthetic","why":"Grounded fixture","type":"knowledge","text":"Remembered source","scope":["personal"],"valid_from":"","source":"","conversation_id":"","evidence":[{"episode_id":created["id"],"quote":"Exact quoted source"}]});
     let saved = rpc(
@@ -760,4 +760,45 @@ async fn strict_json_media_and_drive_validation_fail_before_authority_or_provide
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(response.headers()["cache-control"], "no-store");
+}
+
+#[tokio::test]
+async fn explicit_reconcile_http_and_mcp_preserve_the_private_review_boundary() {
+    for transport in ["http", "mcp"] {
+        let (_dir, state) = fixture();
+        let (_, episode) = request(&state, "POST", "/episodes", Some(capture("Vega Incorporated is Vega."))).await;
+        let mut ids = Vec::new();
+        for name in ["Vega", "Vega Incorporated"] {
+            let (status, node) = request(&state, "POST", "/remember", Some(json!({
+                "command_id":name,"actor":"fixture","why":"Original identity evidence",
+                "type":"organization","text":name,"scope":["professional"],
+                "evidence":[{"episode_id":episode["id"],"quote":"Vega Incorporated is Vega."}]
+            }))).await;
+            assert_eq!(status, StatusCode::OK);
+            ids.push(node["id"].as_str().unwrap().to_owned());
+        }
+        let command = json!({"command_id":"merge","actor":"agent","why":"Owner requested same-referent merge",
+            "survivor":ids[0],"absorbed":[ids[1]],"expected_versions":{&ids[0]:1,&ids[1]:1},
+            "source":"native:synthetic:pi","conversation_id":"thread",
+            "evidence":[{"quote":"Vega Incorporated is Vega."}]});
+        let mut bypass = command.clone();
+        bypass["approved"] = json!(true);
+        assert_eq!(request(&state, "POST", "/reconcile", Some(bypass)).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut stale = command.clone();
+        stale["expected_versions"][&ids[0]] = json!(2);
+        assert_eq!(request(&state, "POST", "/reconcile", Some(stale)).await.0, StatusCode::CONFLICT);
+        let result = if transport == "http" {
+            let response = request(&state, "POST", "/reconcile", Some(command.clone())).await;
+            assert_eq!(response.0, StatusCode::OK);
+            assert_eq!(request(&state, "POST", "/reconcile", Some(command)).await.1, response.1);
+            response.1
+        } else {
+            let response = rpc(&state, "tools/call", json!({"name":"reconcile","arguments":{"command":command}})).await.1;
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            response["result"]["structuredContent"].clone()
+        };
+        assert_eq!(result["status"], "absorbed", "{result}");
+        let (_, history) = request(&state, "GET", &format!("/history/{}", ids[1]), None).await;
+        assert_eq!(history["versions"].as_array().unwrap().last().unwrap()["state"], "merged");
+    }
 }

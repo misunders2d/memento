@@ -67,14 +67,14 @@ def test_media_http_accepts_resolved_provenance_and_returns_exact_original(clien
     assert client.post('/media', json=dict(command, filename='changed.png')).status_code == 409
 
 
-def test_six_mcp_tools_accept_media_reference_without_bytes(client, monkeypatch):
+def test_mcp_tools_accept_media_reference_without_bytes(client, monkeypatch):
     _, _, command = media_command(client)
     state = enable_prepared_media(client, monkeypatch)
 
     async def scenario():
         async with Client(create_mcp(state)) as tools:
             assert {tool.name for tool in await tools.list_tools()} == {
-                'recall', 'remember', 'link', 'supersede', 'history', 'loop'}
+                'recall', 'remember', 'link', 'supersede', 'reconcile', 'history', 'loop', 'work'}
             accepted = (await tools.call_tool('remember', {'command': command})).data
             assert accepted['status'] == 'accepted'
             assert client.get(accepted['status_url']).json()['state'] == 'pending'

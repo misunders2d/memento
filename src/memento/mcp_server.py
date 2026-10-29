@@ -7,7 +7,7 @@ from fastmcp import FastMCP
 from fastmcp.tools.base import ToolResult
 
 from .processing import WORK_DESCRIPTION, processing_view
-from .commands import Evidence, Link, Loop, MediaInput, Remember, Supersede
+from .commands import Evidence, Link, Loop, MediaInput, Remember, Supersede, Reconcile
 
 
 def _empty_as_none(value):
@@ -104,6 +104,17 @@ def create_mcp(state):
     def supersede(command: Annotated[Supersede, BeforeValidator(_omit_empty_fields)]) -> dict:
         """Atomically correct an old assertion with inline replacement and reason."""
         return state.graph.supersede(**command.arguments())
+
+    @mcp.tool
+    def reconcile(command: Annotated[Reconcile, BeforeValidator(_omit_empty_fields)]) -> dict:
+        """On explicit user request, combine proven duplicates into survivor; absorb at most eight IDs.
+
+        Read history first. Supply every member's current expected_versions and exact original evidence
+        for every member. Names or similarity alone do not prove identity; explain sameness in why.
+        Preserves evidence, history, relations and loop choices. Pins, sensitive types or different
+        scopes return a human review proposal; this tool cannot approve it. Stale versions fail atomically.
+        """
+        return state.graph.reconcile(**command.arguments())
 
     @mcp.tool
     def history(id: str) -> list[dict]:

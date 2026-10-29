@@ -602,7 +602,7 @@ def test_quote_flush_does_not_claim_unmatched_or_embedded_tool_output_is_uploade
 
 
 @pytest.mark.parametrize('harness', ['pi', 'omp', 'claude', 'codex'])
-@pytest.mark.parametrize('tool', ['remember', 'link', 'supersede'])
+@pytest.mark.parametrize('tool', ['remember', 'link', 'supersede', 'reconcile'])
 def test_mutation_callers_flush_only_unresolved_quotes_without_permission_changes(tmp_path, monkeypatch, harness, tool):
     spool = spool_at(tmp_path)
     flushed = []

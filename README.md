@@ -39,8 +39,8 @@ For example, “I still owe Mira the release checklist” can become an open loo
 flowchart LR
     accTitle: Shared memory across your agents and devices
     accDescr: Native agents across your machines capture conversations and retrieve context from one private Memento service over loopback or Tailscale Serve HTTPS. Optional Google Drive holds cold artifacts and manual backups.
-    L["Laptop (Pi · Codex · AGY)"] <-->|"Capture + auto recall + 6 MCP tools"| M["Private Memento Service (UID 10001)"]
-    W["Workstation (Claude Code · OMP)"] <-->|"Capture + auto recall + 6 MCP tools"| M
+    L["Laptop (Pi · Codex · AGY)"] <-->|"Capture + auto recall + 7 memory tools"| M["Private Memento Service (UID 10001)"]
+    W["Workstation (Claude Code · OMP)"] <-->|"Capture + auto recall + 7 memory tools"| M
     P["Designated Processor (Pi / OMP / Claude)"] <-->|"Shared work API · extract & consolidate"| M
     M --> D["Optional Google Drive (drive.file)"]
 ```
@@ -63,7 +63,7 @@ flowchart TB
     N --> V{"Whole-Batch Validation Gate (Exact spans + technical_evidence trace)"}
     V -->|"Valid: atomic commit"| M["Durable Versioned Graph (Current-node FTS5 + reused FP32 vectors)"]
     V -.->|"Rejected: rollback + bounded previous_rejection"| N
-    C --> R["Hybrid Recall (Auto injection + 6 MCP tools)"]
+    C --> R["Hybrid Recall (Auto injection + 7 memory tools)"]
     M --> R
     H -->|"Deep recall / unverified historical fallback"| R
     R -.->|"Citation of parked chunk/candidate"| E
@@ -82,7 +82,7 @@ flowchart TB
 
 Extraction starts after native compaction or conversation inactivity. Candidates remain visibly unconfirmed and can be recalled before promotion; deeper consolidation runs in the configured night window. Learning takes processing time.
 
-Relevant facts, eligible behavioral suggestions and at most one matching media reference can appear automatically in later prompts, within a small shared context budget. They are labeled distinctly, and the result can legitimately be empty. A file match points to the original; it does not imply that facts or lessons were extracted from the image or recording. The six memory tools (`recall`, `remember`, `link`, `supersede`, `history`, `loop`) let an agent explicitly recall, save, connect, correct or inspect memories and manage loop markers.
+Relevant facts, eligible behavioral suggestions and at most one matching media reference can appear automatically in later prompts, within a small shared context budget. They are labeled distinctly, and the result can legitimately be empty. A file match points to the original; it does not imply that facts or lessons were extracted from the image or recording. The seven memory tools (`recall`, `remember`, `link`, `supersede`, `reconcile`, `history`, `loop`) let an agent explicitly recall, save, connect, correct or inspect memories and manage loop markers.
 
 History retains exact source quotes, dates and changes. **Old conversations keep their original dates:** age affects recall ranking, without deleting memories or making imported history appear new. Age alone never closes a task. Reminder dates can be stored and listed; there is no proactive reminder delivery.
 
@@ -296,7 +296,7 @@ Choose `pi`, `omp`, `claude`, `codex` or `agy`. The existing harness config or d
 
 | Harness | Installed integration |
 | --- | --- |
-| Pi / OMP | Native extension for capture, automatic context and six memory tools |
+| Pi / OMP | Native extension for capture, automatic context and seven memory tools |
 | Claude Code | Native capture/recall/compaction hooks and Memento MCP definition |
 | Codex | Native hooks and MCP definition; human `/hooks` trust and MCP permissions still required |
 | Antigravity (`agy`) | A `memento` named hook in `~/.gemini/config/hooks.json` (session provenance, per-turn automatic context, transcript capture, save provenance checks) and `mcp_config.json` server entry; other named hooks are untouched. Client only: it cannot be the server processor |
@@ -469,11 +469,11 @@ An agent can attach an exact native quote with `--quote TEXT --conversation-id I
 </details>
 
 <details>
-<summary><strong>Use the six memory tools, corrections, behavior and open loops</strong></summary>
+<summary><strong>Use the seven memory tools, corrections, behavior and open loops</strong></summary>
 
 ## MCP and memory semantics
 
-The six ordinary memory tools are:
+The seven ordinary memory tools are:
 
 | Tool | Purpose |
 | --- | --- |
@@ -481,6 +481,7 @@ The six ordinary memory tools are:
 | `remember` | Explicit evidence-backed save |
 | `link` | Connect memories with an evidence-backed directional predicate |
 | `supersede` | Correct, refine or record a world-time change |
+| `reconcile` | Combine evidenced duplicates into one identity on explicit request |
 | `history` | Inspect versions, differences, reasons and evidence |
 | `loop` | List, assign responsibility, open, close, decline false markers, defer or set an explicit reminder time |
 
@@ -489,6 +490,8 @@ The six ordinary memory tools are:
 Memory age affects ranking, not deletion or availability in normal searches. Recency uses the original supporting messages, with a 90-day half-life and renewal through committed citations; importing old chats does not make them new. Pinned memories and explicit behavioral guidance are exempt from aging. Automatic context shows the original source date when known; that date does not establish whether a past task is still active.
 
 Explicit saves require **nonempty verbatim quotes**, with zero-based `occurrence` for repeats; native hooks resolve current-conversation provenance. Mutations require a stable `command_id`, `actor` and `why`. Reuse a command ID only for an identical retry. Save/replacement scopes are `["personal"]`, `["professional"]` or both. World-time changes require an aware `valid_at`. Native/MCP empty optional strings are treated as omitted; required text and invalid nonempty dates still fail validation. HTTP commands remain strict.
+
+For “reconcile these duplicates,” the agent reads `history`, establishes the same referent or equivalent claim from original evidence, then calls `reconcile` (also `POST /reconcile`) with `survivor`, up to eight `absorbed` IDs, every member's `expected_versions`, and exact original evidence for every member. Ordinary compatible duplicates merge immediately, preserving aliases, links, loop choices, evidence and version history. Identical retries return the same result; stale versions or missing premises commit nothing. Pins, sensitive types and different scopes return an ordinary `pending_review` proposal through the existing private owner console; the tool cannot approve it. Names or similarity alone never establish identity. Update the native integration with the installation's existing config to expose the new tool; mandatory native trust and permission prompts remain human approvals.
 
 Relation names are open-ended lowercase snake_case identifiers, starting with a letter and at most 64 characters. Existing names such as `part_of`, `mentions` and `related_to` are examples. Agents should choose the most specific source-supported meaning and preserve its direction; `parent_of` and `has_sister` need actual kinship evidence. No relation registration is needed. `supersedes` remains reserved for atomic correction/refinement/world-change operations.
 

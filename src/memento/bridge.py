@@ -1244,7 +1244,7 @@ def native(spool, data, *, recall=automatic):
             return http(spool.config, '/history/' + urllib.parse.quote(str(arguments['id']), safe=''), timeout=5)
         if tool == 'loop':
             return http(spool.config, '/loop', arguments, timeout=5)
-        if tool not in ('remember', 'link', 'supersede'):
+        if tool not in ('remember', 'link', 'supersede', 'reconcile'):
             raise ValueError('unknown tool')
         command = {**arguments.get('command', arguments), 'source': source(spool.config, harness),
                    'conversation_id': conversation}
@@ -1316,11 +1316,11 @@ def hook(spool, harness, data, *, recall=automatic):
                   metadata={'extraction_mode': 'skip'})
     expected = {'source': source(spool.config, harness), 'conversation_id': conversation}
     provenance = 'Memento current-conversation quote context: ' + encode(expected).decode('utf-8')
-    provenance += '\nFor quote-only remember/link/supersede, use those exact command context fields; episode IDs are optional.'
+    provenance += '\nFor quote-only remember/link/supersede/reconcile, use those exact command context fields; episode IDs are optional.'
     if event == 'SessionStart' and data.get('source') != 'compact':
         return {'hookSpecificOutput': {'hookEventName': event, 'additionalContext': provenance}}
     if event == 'PreToolUse' and data.get('tool_name') in (
-            'mcp__memento__remember', 'mcp__memento__link', 'mcp__memento__supersede'):
+            'mcp__memento__remember', 'mcp__memento__link', 'mcp__memento__supersede', 'mcp__memento__reconcile'):
         original = data.get('tool_input')
         command = original.get('command') if isinstance(original, dict) else None
         if not isinstance(command, dict):
@@ -1377,7 +1377,7 @@ def agy_hook(spool, event, data, *, recall=automatic):
                       encode({'event': event, **data}).decode('utf-8'), metadata={'extraction_mode': 'skip'})
     expected = {'source': source(spool.config, 'agy'), 'conversation_id': conversation}
     provenance = 'Memento current-conversation quote context: ' + encode(expected).decode('utf-8')
-    provenance += '\nFor quote-only remember/link/supersede, use those exact command context fields; episode IDs are optional.'
+    provenance += '\nFor quote-only remember/link/supersede/reconcile, use those exact command context fields; episode IDs are optional.'
     if event == 'SessionStart':
         return {'injectSteps': [{'systemMessage': {'systemMessage': provenance}}]}
     if event == 'PreToolUse':
@@ -1387,7 +1387,7 @@ def agy_hook(spool, event, data, *, recall=automatic):
         call = data.get('toolCall') if isinstance(data.get('toolCall'), dict) else {}
         arguments = call.get('args') if isinstance(call.get('args'), dict) else {}
         if (call.get('name') != 'call_mcp_tool' or arguments.get('ServerName') != 'memento'
-                or arguments.get('ToolName') not in ('remember', 'link', 'supersede')):
+                or arguments.get('ToolName') not in ('remember', 'link', 'supersede', 'reconcile')):
             return passthrough
         original = arguments.get('Arguments')
         if isinstance(original, str):
@@ -1579,7 +1579,7 @@ def install(config_path, native_config_dir=None):
                       'timeout': 15 if event == 'PreToolUse' else 3 if harness == 'codex' and event in ('Interrupt', 'SessionEnd') else 5}
         if harness == 'codex' and event in ('SessionStart', 'UserPromptSubmit', 'PreToolUse'):
             definition['additionalContextLimit'] = 1500
-        groups.append({**({'matcher': '^mcp__memento__(remember|link|supersede)$'} if event == 'PreToolUse' else {}),
+        groups.append({**({'matcher': '^mcp__memento__(remember|link|supersede|reconcile)$'} if event == 'PreToolUse' else {}),
                        'hooks': [definition]})
         if harness == 'codex' and event == 'UserPromptSubmit':
             groups.append({'hooks': [{'type': 'command', 'command': late_command, 'async': True,

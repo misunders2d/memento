@@ -26,7 +26,7 @@ from which you fetched this guide, not the public product website.
    or a fresh native session. Native trust/permission prompts remain human
    decisions: surface just that approval if required; never grant it yourself
    or evade an owner-session admission guard.
-5. Verify the six native tools (recall, remember, link, supersede, history, loop),
+5. Verify the seven native tools (recall, remember, link, supersede, reconcile, history, loop),
    call recall, and verify a new native exchange was captured. Installation
    alone is not a connected result. Report any actual permission/reload blocker
    precisely instead of claiming success.

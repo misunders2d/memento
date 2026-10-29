@@ -324,7 +324,7 @@ fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String
                 state.graph.remember(parse(command)?)?
             }
         }
-        "link" | "supersede" => {
+        "link" | "supersede" | "reconcile" => {
             let mut outer = arguments
                 .as_object()
                 .cloned()
@@ -339,6 +339,8 @@ fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String
             }
             if name == "link" {
                 state.graph.link(parse::<dto::Link>(command)?)?
+            } else if name == "reconcile" {
+                state.graph.reconcile(parse::<dto::Reconcile>(command)?)?
             } else {
                 state.graph.supersede(parse::<dto::Supersede>(command)?)?
             }

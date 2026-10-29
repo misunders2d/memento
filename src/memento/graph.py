@@ -198,10 +198,17 @@ class Graph:
         return dict(request, evidence=sources)
 
     def _evidence(self, target, version, sources):
+        for episode, start, end, quote in self._evidence_spans(sources):
+            self.store._db.execute('''INSERT INTO graph_evidence SELECT ?,?,?,?,?,? WHERE NOT EXISTS (
+                SELECT 1 FROM graph_evidence WHERE target=? AND version=? AND episode_id=? AND start=? AND end=?)''',
+                (target, version, episode, start, end, quote, target, version, episode, start, end))
+
+    def _evidence_spans(self, sources):
         if not sources:
             raise ValueError('An assertion requires exact source evidence')
         db = self.store._db
         seen = set()
+        spans = []
         for source in sources:
             row = db.execute('''SELECT text,source,event_id,text_runs,raw_frame,text_sha256,conversation_id
                 FROM episodes WHERE id=?''',
@@ -234,10 +241,34 @@ class Graph:
             if identity in seen:
                 continue
             seen.add(identity)
-            db.execute('''INSERT INTO graph_evidence SELECT ?,?,?,?,?,? WHERE NOT EXISTS (
-                SELECT 1 FROM graph_evidence WHERE target=? AND version=? AND episode_id=? AND start=? AND end=?)''',
-                (target, version, source['episode_id'], start, start + len(quote), quote,
-                 target, version, source['episode_id'], start, start + len(quote)))
+            spans.append((*identity, quote))
+        return spans
+
+    def reconcile(self, *, command_id, actor, why, survivor, absorbed, expected_versions,
+                  evidence, source=None, conversation_id=None):
+        from .curation import absorb
+        members = {survivor, *absorbed}
+        if (not 1 <= len(absorbed) <= 8 or len(members) != len(absorbed) + 1
+                or members != set(expected_versions)
+                or any(type(version) is not int or version < 1 for version in expected_versions.values())):
+            raise ValueError('Reconcile requires distinct members and their exact versions')
+        request = dict(op='reconcile', survivor=survivor, absorbed=absorbed,
+                       expected_versions=expected_versions, evidence=evidence,
+                       source=source, conversation_id=conversation_id)
+
+        def apply(commit):
+            resolved = self._resolve_evidence(request)
+            spans = self._evidence_spans(resolved['evidence'])
+            for id, version in expected_versions.items():
+                if self._node(id)['version'] != version:
+                    raise ConflictError('Reconciliation members changed; read history again')
+                if not any(self.store._db.execute('''SELECT 1 FROM graph_evidence
+                        WHERE target=? AND version=? AND episode_id=? AND start<=? AND end>=? LIMIT 1''',
+                        (id, version, episode, start, end)).fetchone() for episode, start, end, _ in spans):
+                    raise ValueError('Reconcile must cite original evidence for every member')
+            return absorb(self, commit, survivor, absorbed, evidence=resolved['evidence'])
+
+        return self._command(command_id, actor, why, request, apply)
 
     def _command(self, command_id, actor, why, request, apply):
         if not command_id or not actor or not why.strip():

@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod loops;
 pub mod pipeline_schema;
 pub mod processing;
+mod reconciliation;
 /// Frozen source-runtime word and casefold data, shared with retrieval.
 pub mod unicode;
 mod util;
@@ -277,6 +278,15 @@ impl TxGraph {
     }
 
     pub fn evidence(tx: &WriteTxn, target: &str, version: i64, sources: &Value) -> Result<()> {
+        for (episode_id, start, end, quote) in Self::evidence_spans(tx, sources)? {
+            tx.sql().execute("INSERT INTO graph_evidence SELECT ?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM graph_evidence WHERE target=? AND version=? AND episode_id=? AND start=? AND end=?)",
+                params![target,version,episode_id,start,end,quote,target,version,episode_id,start,end])?;
+        }
+        tx.touch_target(target)?;
+        Ok(())
+    }
+
+    fn evidence_spans(tx: &WriteTxn, sources: &Value) -> Result<Vec<(String, i64, i64, String)>> {
         let list = sources
             .as_array()
             .filter(|values| !values.is_empty())
@@ -284,6 +294,7 @@ impl TxGraph {
                 "An assertion requires exact source evidence",
             ))?;
         let mut seen = std::collections::HashSet::new();
+        let mut spans = Vec::new();
         for source in list {
             let episode_id = get_str(source, "episode_id")?;
             let row = one(
@@ -341,11 +352,14 @@ impl TxGraph {
             if !seen.insert((episode_id.to_owned(), start, end)) {
                 continue;
             }
-            tx.sql().execute("INSERT INTO graph_evidence SELECT ?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM graph_evidence WHERE target=? AND version=? AND episode_id=? AND start=? AND end=?)",
-                params![target,version,episode_id,start as i64,end as i64,quote,target,version,episode_id,start as i64,end as i64])?;
+            spans.push((
+                episode_id.to_owned(),
+                start as i64,
+                end as i64,
+                quote.to_owned(),
+            ));
         }
-        tx.touch_target(target)?;
-        Ok(())
+        Ok(spans)
     }
 
     pub fn propose(tx: &WriteTxn, commit: &str, request: &Value, bases: &Value) -> Result<Value> {

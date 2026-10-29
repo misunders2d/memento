@@ -57,6 +57,22 @@ pub struct Replacement {
     pub scope: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reconcile {
+    pub command_id: String,
+    pub actor: String,
+    pub why: String,
+    pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    pub survivor: String,
+    pub absorbed: Vec<String>,
+    pub expected_versions: std::collections::BTreeMap<String, i64>,
+}
+
 fn correction() -> String {
     "correction".into()
 }

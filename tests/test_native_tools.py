@@ -209,14 +209,15 @@ def test_client_bundle_identity_tracks_each_original_asset_only(tmp_path, monkey
     from pathlib import Path
     from memento import api, runner
     source = Path(api.__file__).parent
-    for name in runner.RELEASE_FILES:
+    names = (*runner.RELEASE_FILES, *runner.PROCESSING_FILES)
+    for name in names:
         (tmp_path / name).write_bytes((source / name).read_bytes())
     monkeypatch.setattr(api, '__file__', str(tmp_path / 'api.py'))
     revision, bridge_bytes, release = api.client_release_assets()
     assert api.client_release_assets() == (revision, bridge_bytes, release)
     (tmp_path / 'api.py').write_text('Server-only changes are not client assets.')
     assert api.client_release_assets()[0] == revision
-    for name in runner.RELEASE_FILES:
+    for name in names:
         path = tmp_path / name
         original = path.read_bytes()
         path.write_bytes(original + b'\n')
@@ -252,6 +253,8 @@ export default async function(api) {
   const loop = {action:"list", id:"personal", days:7, due_at:"", due_before:"", scope:"personal"};
   const command = {why:"Explicit synthetic save", type:"knowledge", text:"Exact source fact",
     scope:["professional"], evidence:[{quote:"Exact source fact"}]};
+  const reconciliation = {why:"Owner requested same-referent merge", survivor:"canonical",
+    absorbed:["duplicate"], expected_versions:{canonical:1,duplicate:2}, evidence:command.evidence};
   const cases = [
     ["recorded_personal", "memento_loop", loop],
     ["recorded_all", "memento_loop", {...loop, id:"all"}],
@@ -267,6 +270,8 @@ export default async function(api) {
     ["optional_change_date", "memento_supersede", {command:{why:command.why, old:"memory",
       new:{type:"knowledge", text:command.text, scope:command.scope}, evidence:command.evidence,
       kind:"refinement", valid_at:""}}],
+    ["reconciliation", "memento_reconcile", {command:reconciliation}],
+    ["reconciliation_approval_rejected", "memento_reconcile", {command:{...reconciliation, approved:true}}],
     ["valid_date", "memento_loop", {...loop, due_at:"2099-01-01T09:00:00+00:00"}],
     ["invalid_date", "memento_loop", {...loop, due_at:"not-a-date"}],
     ["invalid_scope", "memento_loop", {...loop, scope:"unscoped"}],
@@ -298,4 +303,5 @@ export default async function(api) {
         'recorded_personal': True, 'recorded_all': True, 'optional_filters': True,
         'media_reference': True, 'media_binary_rejected': False, 'media_without_evidence': False,
         'optional_save_dates': True, 'optional_change_date': True, 'valid_date': True,
+        'reconciliation': True, 'reconciliation_approval_rejected': False,
         'invalid_date': False, 'invalid_scope': False, 'required_text': False, 'required_quote': False}

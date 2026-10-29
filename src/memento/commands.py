@@ -67,6 +67,13 @@ class Supersede(Command):
     valid_at: Annotated[AwareDatetime, Field(strict=False)] | None = None
 
 
+class Reconcile(Command):
+    survivor: str = Field(min_length=1, max_length=64)
+    absorbed: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(min_length=1, max_length=8)
+    expected_versions: dict[Annotated[str, Field(min_length=1, max_length=64)],
+                            Annotated[int, Field(ge=1)]] = Field(min_length=2, max_length=9)
+
+
 class MediaInput(Command):
     sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
     kind: Literal['image', 'audio', 'video', 'document']

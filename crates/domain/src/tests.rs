@@ -631,3 +631,78 @@ fn one_request_recency_timestamp_preserves_exact_ties_and_original_dates() {
         })
         .unwrap();
 }
+
+#[test]
+fn explicit_reconcile_is_grounded_versioned_atomic_and_idempotent() {
+    let f = Fixture::new();
+    let a = f.remember(
+        "duplicate-a",
+        "Vega",
+        "Vega Incorporated and Vega are the same organization.",
+    );
+    let b = f.remember(
+        "duplicate-b",
+        "Vega Incorporated",
+        "Vega Incorporated and Vega are the same organization.",
+    );
+    let a = a["id"].as_str().unwrap();
+    let b = b["id"].as_str().unwrap();
+    let command = json!({"command_id":"direct-reconcile","actor":"agent","why":"Owner requested equivalent-claim reconciliation",
+        "survivor":a,"absorbed":[b],"expected_versions":{a:1,b:1},
+        "source":"contract","conversation_id":"thread",
+        "evidence":[{"quote":"Vega Incorporated and Vega are the same organization."}]});
+    for mode in ["stale", "ungrounded", "invalid_quote", "duplicate", "extra"] {
+        let mut invalid = command.clone();
+        match mode {
+            "stale" => invalid["expected_versions"][a] = json!(2),
+            "ungrounded" => invalid["evidence"][0]["quote"] = json!("Preserve this decision."),
+            "invalid_quote" => invalid["evidence"][0]["quote"] = json!("Invented quote"),
+            "duplicate" => invalid["absorbed"] = json!([b, b]),
+            _ => invalid["expected_versions"]["unknown"] = json!(1),
+        }
+        assert!(f.graph.reconcile(parse(invalid)).is_err(), "{mode}");
+        assert_eq!(f.history(a).len(), 1);
+        assert_eq!(f.history(b).len(), 1);
+        assert!(f.graph.pending_reviews().unwrap().is_empty());
+    }
+    let result = f.graph.reconcile(parse(command.clone())).unwrap();
+    assert_eq!(result["status"], "absorbed");
+    assert_eq!(f.graph.reconcile(parse(command)).unwrap(), result);
+    assert_eq!(f.history(b).last().unwrap()["state"], "merged");
+    assert_eq!(f.history(b).last().unwrap()["superseded_by"], a);
+    assert_eq!(f.history(a).last().unwrap()["version"], 2);
+}
+
+#[test]
+fn explicit_reconcile_preserves_pin_and_scope_review_gates() {
+    for protection in ["scope", "pin"] {
+        let f = Fixture::new();
+        let mut left = f.command(
+            "left",
+            "Vega",
+            "Vega Incorporated and Vega are the same organization.",
+        );
+        left["type"] = json!("organization");
+        let a = f.graph.remember(parse(left.clone())).unwrap();
+        left["command_id"] = json!("right");
+        left["text"] = json!("Vega Incorporated");
+        if protection == "scope" {
+            left["scope"] = json!(["personal"]);
+        }
+        let b = f.graph.remember(parse(left)).unwrap();
+        let a = a["id"].as_str().unwrap();
+        let b = b["id"].as_str().unwrap();
+        if protection == "pin" {
+            let pin = f.propose("pin", json!({"op":"pin","node_id":a,"pinned":true}));
+            f.approve("pin-approved", &pin).unwrap();
+        }
+        let av = f.history(a).last().unwrap()["version"].clone();
+        let result = f.graph.reconcile(parse(json!({"command_id":"protected-reconcile","actor":"agent","why":"Owner requested duplicate reconciliation",
+            "survivor":a,"absorbed":[b],"expected_versions":{a:av,b:1},
+            "evidence":[{"episode_id":f.episode,"quote":"Vega Incorporated and Vega are the same organization."}]}))).unwrap();
+        assert_eq!(result["status"], "pending_review", "{protection}");
+        assert_eq!(f.history(a).last().unwrap()["version"], av);
+        assert_eq!(f.history(b).last().unwrap()["state"], "active");
+        assert_eq!(f.graph.pending_reviews().unwrap().len(), 1);
+    }
+}
