@@ -35,6 +35,7 @@ def native(tmp_path,monkeypatch):
                 if os.environ.get('BOUNDARY') and not boundary_sent:
                     boundary_sent=True
                     emit(dict(type='memento_worker_state',claimed=[dict(id='checkpoint',owner='lease-c',kind='consolidate')],lease_seconds=.12),True)
+                    time.sleep(float(os.environ.get('SUBMIT_DELAY','0')))
                     emit(dict(type='memento_worker_state',completed='checkpoint',boundary=True,claimed=[]),True)
                     continue
                 if os.environ.get('REOPEN'):
@@ -54,7 +55,8 @@ def native(tmp_path,monkeypatch):
                     emit(dict(type='agent_end',willRetry=True))
                 emit(dict(type='memento_worker_state',claimed=[dict(id='first',owner='lease-a',kind='consolidate')],lease_seconds=.12),True)
                 if os.environ.get('HANG'):time.sleep(30)
-                time.sleep(.15)
+                # Submit commits server-side, then its next claim may take longer than a renewal.
+                time.sleep(float(os.environ.get('SUBMIT_DELAY','.15')))
                 emit(dict(type='message_end',message=dict(role='assistant',model='synthetic',usage=dict(input=10,output=2,secret='do not print'),content='do not print')),False)
                 emit(dict(type='memento_worker_model',model='synthetic',usage=dict(input=10,output=2),stop_reason='toolUse'),True)
                 emit(dict(type='memento_worker_state',completed='first',claimed=[dict(id='second',owner='lease-b',kind='consolidate')],lease_seconds=.12),True)
@@ -83,7 +85,9 @@ def native(tmp_path,monkeypatch):
                 return dict(worker_protocol=1,lease_seconds=.12,policies=dict(extract={},consolidate={}),
                             pending_extract_conversations=0,ready_candidates=2,jobs=[],pending_maintenance_groups=0,
                             eligible_extract_conversations=int(os.environ.get('ELIGIBLE','0')))
-            if path=='/work/renew':return {'renewed':True}
+            if path=='/work/renew':return {'renewed':command['id'] not in os.environ.get('RENEW_FALSE','').split(',')}
+            if path=='/work' and command['action']=='status':
+                return dict(id=command['command']['id'],kind='consolidate',state=os.environ.get('STATUS_STATE','done'))
             if path=='/work/release':return {'released':True}
             raise AssertionError(path)
     monkeypatch.setattr(runner,'Service',Service)
@@ -169,6 +173,15 @@ def test_rejected_submission_receipt_keeps_fixed_code_and_action_only(native,mon
         dict(stage='worker',error='processing_request_failed',action='submit',http_status=422)]
 
 
+def test_worker_receipt_keeps_fixed_protocol_rejection_code(native,monkeypatch,capsys):
+    config,trace,calls=native
+    monkeypatch.setenv('FAIL_DETAIL','Invalid processing command')
+    assert worker.tick(runner,config,consolidate_now=True)==1
+    receipts=[json.loads(line) for line in capsys.readouterr().out.splitlines() if '"error"' in line]
+    assert receipts[0]==dict(stage='worker',error='processing_request_failed',detail_code='Invalid processing command',
+                             action='submit',http_status=422)
+
+
 def test_reopened_kind_is_not_treated_as_exhausted_and_due_kinds_reach_adapter(native,monkeypatch,capsys):
     config,trace,calls=native
     monkeypatch.setenv('REOPEN','1')
@@ -185,3 +198,56 @@ def test_reopened_kind_is_not_treated_as_exhausted_and_due_kinds_reach_adapter(n
     assert seen['kinds']==['extract']  # closed window: consolidation never seeded as available
     output=capsys.readouterr().out
     assert '"id":"late"' in output and '"completed_jobs":1' in output
+
+
+def test_committed_submit_reconciled_by_failed_renewal_keeps_its_delayed_next_lease(native,monkeypatch,capsys):
+    config,trace,calls=native
+    monkeypatch.setenv('RENEW_FALSE','first')
+    monkeypatch.setenv('SUBMIT_DELAY','.4')
+    assert worker.tick(runner,config,consolidate_now=True)==0
+    records=[json.loads(row) for row in trace.read_text().splitlines()]
+    assert [row['type'] for row in records]==['prompt']  # no abort: the in-flight submit settles
+    output=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [row for row in output if row.get('stage')=='worker_reconciled']==[dict(stage='worker_reconciled',id='first',state='done')]
+    assert [row['id'] for row in output if row.get('stage')=='worker_committed']==['second']
+    assert output[-1]['stage']=='worker_done' and output[-1]['completed_jobs']==2
+    assert any(path=='/work/renew' and command['id']=='second' for path,command in calls)
+    assert not any(path=='/work/release' for path,_ in calls)
+
+
+def test_failed_renewal_of_unfinished_work_still_stops_and_releases(native,monkeypatch):
+    config,trace,calls=native
+    monkeypatch.setenv('RENEW_FALSE','first')
+    monkeypatch.setenv('STATUS_STATE','leased')
+    with pytest.raises(runner.RunnerError,match='lease lost before completion'):
+        worker.tick(runner,config,consolidate_now=True)
+    assert [command for path,command in calls if path=='/work/release']==[dict(id='first',owner='lease-a',error='cli_failed')]
+
+
+def test_reconciled_submit_that_never_settles_is_bounded_by_unit_deadline(native,monkeypatch):
+    config,trace,calls=native
+    config['deadline_seconds']=.3
+    monkeypatch.setenv('RENEW_FALSE','first')
+    monkeypatch.setenv('HANG','1')
+    began=time.monotonic()
+    with pytest.raises(runner.RunnerError,match='deadline'):
+        worker.tick(runner,config,consolidate_now=True)
+    assert time.monotonic()-began<3
+    records=[json.loads(row) for row in trace.read_text().splitlines()]
+    assert [row['type'] for row in records]==['prompt']
+    assert not any(path=='/work/release' for path,_ in calls)  # committed work is never released
+    with pytest.raises(ProcessLookupError):os.kill(records[0]['pid'],0)
+
+
+def test_reconciled_boundary_commit_still_rotates_once_without_abandoning_work(native,monkeypatch,capsys):
+    config,trace,calls=native
+    monkeypatch.setenv('BOUNDARY','1')
+    monkeypatch.setenv('RENEW_FALSE','checkpoint')
+    monkeypatch.setenv('SUBMIT_DELAY','.4')
+    assert worker.tick(runner,config,consolidate_now=True)==0
+    records=[json.loads(row) for row in trace.read_text().splitlines()]
+    assert [row['type'] for row in records]==['prompt','abort','new_session','prompt']
+    output=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [row['id'] for row in output if row.get('stage')=='worker_reconciled']==['checkpoint']
+    assert output[-1]['stage']=='worker_done' and output[-1]['completed_jobs']==3
+    assert not any(path=='/work/release' for path,_ in calls)

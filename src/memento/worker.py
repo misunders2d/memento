@@ -130,10 +130,9 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                             done.add(ident)
                             completed += 1
                         print(api.encode({'stage':'worker_reconciled','id':ident,'state':'done'}).decode(), flush=True)
-                    if lost and not leases.active:
-                        rotating = True
-                        rotation_ack = False
-                        send({'type':'abort','id':'reconcile'})
+                        # A committed submit may still be claiming its next lease. Never
+                        # abort that response; the refreshed unit deadline bounds a stall.
+                        deadline = time.monotonic() + config['deadline_seconds']
                     if time.monotonic() > deadline:
                         raise api.RunnerError('worker unit deadline or lease lost')
                     if process.poll() is not None:
@@ -267,7 +266,7 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                     print(api.encode({'stage':'worker','error':'native_command_rejected',
                                                       'command':command if command in ('prompt','abort','new_session') else 'unknown'}).decode(), flush=True)
                                     raise api.RunnerError('native worker command failed')
-                                if rotating and event.get('id') in ('boundary','reconcile'):
+                                if rotating and event.get('id') == 'boundary':
                                     qualified = False
                                     send({'type':'new_session','id':'rotate'})
                                 elif rotating and event.get('id') == 'rotate':
