@@ -17,25 +17,34 @@
     <button type="button" data-view="unprocessed" aria-pressed="false">Unprocessed</button>
   </nav>
   <form id="search" role="search">
-    <input id="q" type="search" placeholder="Search memories" autocomplete="off" aria-label="Search memories">
+    <input id="q" type="search" placeholder="Search memories" autocomplete="off" aria-label="Search memories" enterkeyhint="search">
   </form>
-  <select id="scope" aria-label="Scope">
-    <option value="">Personal + professional</option>
-    <option value="personal">Personal</option>
-    <option value="professional">Professional</option>
-  </select>
-  <select id="responsibility" aria-label="Loop responsibility" hidden>
-    <option value="">All responsibilities</option>
-    <option value="owner">For owner</option>
-    <option value="other">Other person</option>
-    <option value="unknown">Unspecified</option>
-  </select>
-  <label class="toggle"><input id="all" type="checkbox"> Show all</label>
+  <button type="button" id="filters-toggle" aria-expanded="false" aria-controls="filters">Filters</button>
+  <div id="filters">
+    <select id="scope" aria-label="Scope">
+      <option value="">Personal + professional</option>
+      <option value="personal">Personal</option>
+      <option value="professional">Professional</option>
+    </select>
+    <select id="responsibility" aria-label="Loop responsibility" hidden>
+      <option value="">All responsibilities</option>
+      <option value="owner">For owner</option>
+      <option value="other">Other person</option>
+      <option value="unknown">Unspecified</option>
+    </select>
+    <label class="toggle"><input id="all" type="checkbox"> Show all</label>
+  </div>
 </header>
 <main>
   <section id="graph-view">
     <div id="canvas"></div>
     <div id="status" role="status"></div>
+    <div id="graph-tools" role="group" aria-label="Graph view">
+      <button type="button" id="zoom-in" aria-label="Zoom in">+</button>
+      <button type="button" id="zoom-out" aria-label="Zoom out">−</button>
+      <button type="button" id="zoom-fit" aria-label="Fit graph to screen">Fit</button>
+      <button type="button" id="legend-toggle" aria-expanded="false" aria-controls="legend">Key</button>
+    </div>
     <div id="legend"></div>
     <aside id="sidelist" hidden></aside>
   </section>
@@ -52,7 +61,7 @@
       <div class="pager"><button type="button" id="cand-prev">Newer</button><button type="button" id="cand-next">Older</button></div>
     </div>
   </section>
-  <aside id="panel" hidden>
+  <aside id="panel" hidden tabindex="-1" aria-label="Details">
     <button type="button" id="panel-close" aria-label="Close details">×</button>
     <div id="panel-body"></div>
   </aside>

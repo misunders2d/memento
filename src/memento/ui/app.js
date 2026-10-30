@@ -8,7 +8,7 @@ const $ = id => document.getElementById(id);
 
 const state = {view: 'memories', scope: '', responsibility: '', all: false, data: null, graph: null, renderer: null,
   selected: null, matches: new Set(), focus: new Set(), moved: new Set(), dragging: null, dragged: false,
-  conv: 0, cand: 0, candQuery: ''};
+  conv: 0, cand: 0, candQuery: '', sideCollapsed: false, returnFocus: null};
 const worker = new Worker('static/layout-worker.js');
 let layoutRun = 0;
 
@@ -24,6 +24,15 @@ function el(tag, props, ...children) {
   }
   return node;
 }
+
+// List rows act like buttons: reachable by Tab and activated with Enter or Space as well as a tap or click.
+function row(onActivate, ...children) {
+  return el('li', {tabindex: '0', role: 'button', onclick: onActivate,
+    onkeydown: event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onActivate(); } }}, ...children);
+}
+
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const motion = duration => reducedMotion.matches ? 0 : duration;
 
 async function api(path, params) {
   const url = new URL(path, location.href);
@@ -94,7 +103,7 @@ function layout(graph) {
     if (data.run !== run || state.graph !== graph) return;
     nodes.forEach((node, n) => state.moved.has(node) ||
       graph.mergeNodeAttributes(node, {x: data.positions[2 * n], y: data.positions[2 * n + 1]}));
-    if (data.done && state.renderer && !state.selected) state.matches.size ? fitMatches() : state.renderer.getCamera().animatedReset({duration: 300});
+    if (data.done && state.renderer && !state.selected) state.matches.size ? fitMatches() : state.renderer.getCamera().animatedReset({duration: motion(300)});
   };
   worker.postMessage({x: nodes.map(node => graph.getNodeAttribute(node, 'x')),
     y: nodes.map(node => graph.getNodeAttribute(node, 'y')), edges});
@@ -121,6 +130,7 @@ function drawHover(context, data, settings) {
 
 function render(graph) {
   if (state.renderer) state.renderer.kill();
+  state.dragging = null;
   const large = graph.order > 2000;
   const renderer = state.renderer = new Sigma(graph, $('canvas'), {
     renderEdgeLabels: true, zIndex: true, labelColor: {color: css('--text')},
@@ -138,7 +148,7 @@ function render(graph) {
     if (!renderer.getCustomBBox()) renderer.setCustomBBox(renderer.getBBox());
   });
   renderer.getMouseCaptor().on('mousemovebody', event => {
-    if (!state.dragging) return;
+    if (!state.dragging || !graph.hasNode(state.dragging)) return;
     const position = renderer.viewportToGraph(event);
     graph.mergeNodeAttributes(state.dragging, {x: position.x, y: position.y});
     state.moved.add(state.dragging);
@@ -150,6 +160,8 @@ function render(graph) {
   const drop = () => { state.dragging = null; setTimeout(() => { state.dragged = false; }, 0); };
   renderer.getMouseCaptor().on('mouseup', drop);
   renderer.getMouseCaptor().on('mouseleave', drop);
+  // A touch tap also fires downNode but never a mouseup, so end the grab when the finger lifts.
+  renderer.getTouchCaptor().on('touchup', drop);
 }
 
 function reduceNode(graph, node, data) {
@@ -193,10 +205,13 @@ function fitMatches() {
   const xs = points.map(point => point.x), ys = points.map(point => point.y);
   const [minX, maxX, minY, maxY] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
   renderer.getCamera().animate({x: (minX + maxX) / 2, y: (minY + maxY) / 2,
-    ratio: Math.min(1, Math.max(0.05, 1.3 * Math.max(maxX - minX, maxY - minY)))}, {duration: 400});
+    ratio: Math.min(1, Math.max(0.05, 1.3 * Math.max(maxX - minX, maxY - minY)))}, {duration: motion(400)});
 }
 
-function status(text) { $('status').textContent = text; }
+function status(text) {
+  $('status').textContent = text;
+  for (const id of ['zoom-in', 'zoom-out', 'zoom-fit']) $(id).disabled = !state.renderer;
+}
 
 function summary(data) {
   const shown = state.graph ? `${state.graph.order.toLocaleString()} of ${data.total_nodes.toLocaleString()} memories, ${state.graph.size.toLocaleString()} links` : '';
@@ -235,18 +250,24 @@ function sidelist() {
   const parts = [];
   if (state.matches.size || state.searchResults) {
     parts.push(el('h3', {}, `Search results (${state.searchResults.length})`),
-      el('ol', {class: 'rows'}, state.searchResults.map(item => el('li', {onclick: () => reveal(item.id)},
+      el('ol', {class: 'rows'}, state.searchResults.map(item => row(() => reveal(item.id),
         el('span', {class: 'badge'}, item.type), item.label))));
   }
   if (state.view === 'loops' && state.data) {
     const {candidates} = state.data.loops;
     parts.push(el('h3', {}, `Open loops waiting for processing (${candidates.total})`),
-      candidates.total ? el('ol', {class: 'rows'}, candidates.items.map(item => el('li', {onclick: () => showCandidate(item.id)},
+      candidates.total ? el('ol', {class: 'rows'}, candidates.items.map(item => row(() => showCandidate(item.id),
         el('span', {class: item.loop.overdue ? 'badge overdue' : 'badge loop'}, loopText(item.loop)), item.label)))
         : el('p', {class: 'meta'}, 'None.'));
     if (candidates.total > candidates.items.length) parts.push(el('p', {class: 'meta'}, `Showing ${candidates.items.length}; see Unprocessed for all candidates.`));
   }
-  box.replaceChildren(...parts);
+  const titles = parts.filter(part => part.tagName === 'H3').map(part => part.textContent);
+  const toggle = el('button', {type: 'button', class: 'sheet-toggle', 'aria-expanded': String(!state.sideCollapsed),
+    'aria-controls': 'sidelist-body', onclick: () => { state.sideCollapsed = !state.sideCollapsed; sidelist(); }},
+  state.sideCollapsed ? titles.join(' · ') : 'Hide list');
+  const body = el('div', {id: 'sidelist-body'}, parts);
+  body.hidden = state.sideCollapsed;
+  box.replaceChildren(toggle, body);
   box.hidden = !parts.length;
 }
 
@@ -254,6 +275,7 @@ async function select(node) {
   state.selected = node;
   state.renderer && state.renderer.refresh();
   if (!node) return closePanel();
+  if ($('panel').hidden) openPanel([el('p', {class: 'loading'}, 'Loading…')]);
   try {
     const [detail, history] = await Promise.all([api(`api/node/${encodeURIComponent(node)}`),
       api(`../history/${encodeURIComponent(node)}`).catch(() => ({versions: []}))]);
@@ -277,7 +299,7 @@ function nodePanel(detail, versions) {
   }
   if (detail.links.length) {
     parts.push(el('h3', {}, `Connections (${detail.links.length})`), el('ol', {class: 'rows'}, detail.links.map(link =>
-      el('li', {onclick: () => reveal(link.id)}, el('span', {class: 'meta'}, link.outgoing ? `${link.rel} → ` : `← ${link.rel} `),
+      row(() => reveal(link.id), el('span', {class: 'meta'}, link.outgoing ? `${link.rel} → ` : `← ${link.rel} `),
         el('span', {class: 'badge'}, link.type), link.label))));
   }
   parts.push(historyPanel(versions));
@@ -312,16 +334,33 @@ async function reveal(id) {
     }
   }
   const position = state.renderer.getNodeDisplayData(id);
-  if (position) state.renderer.getCamera().animate({x: position.x, y: position.y, ratio: 0.25}, {duration: 400});
+  if (position) state.renderer.getCamera().animate({x: position.x, y: position.y, ratio: 0.25}, {duration: motion(400)});
   select(id);
 }
 
-function openPanel(children) { $('panel-body').replaceChildren(...children.flat(Infinity).filter(child => child !== null && child !== undefined)); $('panel').hidden = false; }
-function closePanel() { $('panel').hidden = true; $('panel-body').replaceChildren(); }
+function openPanel(children) {
+  const panel = $('panel'), opening = panel.hidden;
+  $('panel-body').replaceChildren(...children.flat(Infinity).filter(child => child !== null && child !== undefined));
+  if (!opening) return;
+  // Remember where the reader was so closing the details returns them there.
+  state.returnFocus = panel.contains(document.activeElement) ? state.returnFocus : document.activeElement;
+  panel.hidden = false;
+  panel.scrollTop = 0;
+  panel.focus({preventScroll: true});
+}
+function closePanel() {
+  const panel = $('panel'), wasOpen = !panel.hidden, hadFocus = panel.contains(document.activeElement);
+  panel.hidden = true;
+  $('panel-body').replaceChildren();
+  const target = state.returnFocus;
+  state.returnFocus = null;
+  if (wasOpen && hadFocus && target && target.isConnected && target !== document.body) target.focus({preventScroll: true});
+}
 
 async function search(event) {
   event.preventDefault();
   const q = $('q').value.trim();
+  state.sideCollapsed = false;
   if (!q) {
     state.matches = new Set(); state.searchResults = null;
   } else {
@@ -338,7 +377,7 @@ async function search(event) {
   if (state.renderer) {
     state.renderer.refresh();
     if (state.matches.size) fitMatches();
-    else state.renderer.getCamera().animatedReset({duration: 300});
+    else state.renderer.getCamera().animatedReset({duration: motion(300)});
   }
   if (state.graph && state.matches.size && !state.focus.size) status('No matches in this graph; pick a result to reveal it.');
   else if (state.data && state.graph) status(summary(state.data));
@@ -348,7 +387,7 @@ async function search(event) {
 async function loadConversations() {
   const page = 50, {total, items} = await api('api/conversations', {offset: state.conv, limit: page});
   $('conv-total').textContent = `(${total.toLocaleString()})`;
-  $('conversations').replaceChildren(...items.map(item => el('li', {onclick: () => showConversation(item)},
+  $('conversations').replaceChildren(...items.map(item => row(() => showConversation(item),
     el('span', {class: 'badge'}, harness(item.source)), item.conversation_id,
     el('div', {class: 'meta'}, `last activity ${when(item.latest_at)}` +
       (item.parked ? ` · parked historical, not queued (live cursor ${item.live_cursor})` : '')))));
@@ -357,6 +396,7 @@ async function loadConversations() {
 }
 
 async function showConversation(item, after = item.cursor, previous = []) {
+  if (!previous.length && $('panel').hidden) openPanel([el('p', {class: 'loading'}, 'Loading…')]);
   try {
     const {items} = await api('api/conversation', {source: item.source, conversation_id: item.conversation_id, after, limit: 50});
     const episodes = previous.concat(items.map(episode => el('div', {class: 'episode'},
@@ -373,7 +413,7 @@ async function showConversation(item, after = item.cursor, previous = []) {
 async function loadCandidates() {
   const page = 50, {total, items} = await api('api/candidates', {q: state.candQuery, offset: state.cand, limit: page});
   $('cand-total').textContent = `(${total.toLocaleString()})`;
-  $('candidates').replaceChildren(...items.map(item => el('li', {onclick: () => showCandidate(item.id)},
+  $('candidates').replaceChildren(...items.map(item => row(() => showCandidate(item.id),
     el('span', {class: 'badge'}, item.type), item.loop ? el('span', {class: 'badge loop'}, 'open loop') : null,
     item.decision ? el('span', {class: 'badge'}, item.decision) : null, item.text,
     el('div', {class: 'meta'}, `confidence ${item.confidence.toFixed(2)} · ${item.scope.join(' + ')} · ${when(item.recorded_at)}`))));
@@ -382,6 +422,7 @@ async function loadCandidates() {
 }
 
 async function showCandidate(id) {
+  if ($('panel').hidden) openPanel([el('p', {class: 'loading'}, 'Loading…')]);
   try {
     const {versions} = await api(`../history/${encodeURIComponent(id)}`);
     const first = versions[0] || {};
@@ -392,9 +433,18 @@ async function showCandidate(id) {
   }
 }
 
+// On narrow screens the filters sit behind a toggle; mark it while any filter narrows the view.
+function markFilters() {
+  const active = state.scope || state.all || (state.view === 'loops' && state.responsibility);
+  $('filters-toggle').classList.toggle('active', Boolean(active));
+  $('filters-toggle').setAttribute('aria-label', active ? 'Filters (active)' : 'Filters');
+}
+
 function setView(view) {
   state.view = view;
   for (const button of document.querySelectorAll('#tabs button')) button.setAttribute('aria-pressed', String(button.dataset.view === view));
+  const active = document.querySelector(`#tabs [data-view="${view}"]`), tabs = $('tabs');
+  if (tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = Math.max(0, active.offsetLeft - (tabs.clientWidth - active.offsetWidth) / 2);
   const unprocessed = view === 'unprocessed';
   if (unprocessed) {
     worker.postMessage({stop: true}); layoutRun++;
@@ -404,6 +454,8 @@ function setView(view) {
   $('graph-view').hidden = unprocessed;
   $('unprocessed-view').hidden = !unprocessed;
   $('responsibility').hidden = view !== 'loops';
+  $('graph-tools').hidden = unprocessed;
+  markFilters();
   closePanel();
   if (unprocessed) {
     Promise.all([loadConversations(), loadCandidates()]).catch(error => openPanel([el('p', {}, `Could not load: ${error.message}`)]));
@@ -415,10 +467,22 @@ function setView(view) {
 document.querySelectorAll('#tabs button').forEach(button => button.addEventListener('click', () => setView(button.dataset.view)));
 $('search').addEventListener('submit', search);
 $('q').addEventListener('input', event => { if (!event.target.value && (state.matches.size || state.searchResults)) search(event); });
-$('scope').addEventListener('change', event => { state.scope = event.target.value; state.view === 'unprocessed' || loadGraph(); });
-$('responsibility').addEventListener('change', event => { state.responsibility = event.target.value; loadGraph(); });
-$('all').addEventListener('change', event => { state.all = event.target.checked; state.view === 'unprocessed' || loadGraph(); });
+$('scope').addEventListener('change', event => { state.scope = event.target.value; markFilters(); state.view === 'unprocessed' || loadGraph(); });
+$('responsibility').addEventListener('change', event => { state.responsibility = event.target.value; markFilters(); loadGraph(); });
+$('all').addEventListener('change', event => { state.all = event.target.checked; markFilters(); state.view === 'unprocessed' || loadGraph(); });
 $('panel-close').addEventListener('click', () => select(null));
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('panel').hidden) select(null); });
+$('filters-toggle').addEventListener('click', () => {
+  const open = document.querySelector('header').classList.toggle('filters-open');
+  $('filters-toggle').setAttribute('aria-expanded', String(open));
+});
+$('legend-toggle').addEventListener('click', () => {
+  const open = $('legend').classList.toggle('open');
+  $('legend-toggle').setAttribute('aria-expanded', String(open));
+});
+$('zoom-in').addEventListener('click', () => state.renderer && state.renderer.getCamera().animatedZoom({duration: motion(200)}));
+$('zoom-out').addEventListener('click', () => state.renderer && state.renderer.getCamera().animatedUnzoom({duration: motion(200)}));
+$('zoom-fit').addEventListener('click', () => state.renderer && state.renderer.getCamera().animatedReset({duration: motion(300)}));
 $('conv-prev').addEventListener('click', () => { state.conv = Math.max(0, state.conv - 50); loadConversations(); });
 $('conv-next').addEventListener('click', () => { state.conv += 50; loadConversations(); });
 $('cand-prev').addEventListener('click', () => { state.cand = Math.max(0, state.cand - 50); loadCandidates(); });
