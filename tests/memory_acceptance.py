@@ -1123,7 +1123,7 @@ def native_rows(memories, seeded):
     return rows
 
 
-def native_offer_analysis(fetched, offer, budget, seeded):
+def native_offer_analysis(fetched, offer, budget, seeded, *, returned=()):
     """Completeness against the current /history body, never the recall summary."""
     context = offer.get('context') or ''
     lines = context.split('\n')[1:] if context else []
@@ -1161,11 +1161,17 @@ def native_offer_analysis(fetched, offer, budget, seeded):
                 cut.append('bridge_budget' if item['text'].startswith(text) else 'bridge_render_differs')
             entry['cut_by'] = cut
         items.append(entry)
+    fetched_ids = [item['id'] for item in fetched['items']]
+    returned_ids = list(dict.fromkeys(row['id'] for row in returned
+                                     if isinstance(row, dict) and isinstance(row.get('id'), str)))
+    omitted = [identifier for identifier in dict.fromkeys(returned_ids + fetched_ids) if identifier not in shown]
+    withheld = [identifier for identifier in returned_ids if identifier not in fetched_ids]
     size = len(context.encode('utf-8'))
     return dict(budget=budget, context_bytes=size, overrun=size > budget, shown=shown,
                 shown_fixtures=[seeded['memory_ids'].get(identifier) for identifier in shown],
-                omitted_ids=[item['id'] for item in fetched['items'] if item['id'] not in shown],
-                omitted_fixtures=[seeded['memory_ids'].get(item['id']) for item in fetched['items'] if item['id'] not in shown],
+                omitted_ids=omitted, omitted_fixtures=[seeded['memory_ids'].get(identifier) for identifier in omitted],
+                withheld_before_packing_ids=withheld,
+                withheld_before_packing_fixtures=[seeded['memory_ids'].get(identifier) for identifier in withheld],
                 context_sha256=native_sha256(context.encode('utf-8')), update_notice='update_notice' in offer,
                 gold_delivered=None, items=items)
 
@@ -1205,7 +1211,8 @@ def native_automatic(spec, config, spool, seeded, label):
     for channel, budget, step in (('human', bridge.CONTEXT_BYTES, False), ('step', bridge.STEP_CONTEXT_BYTES, True)):
         offer = bridge.recall_offer(spool, f'{label}:{channel}', spec['q'], fetched, budget=budget,
                                     notice_in_context=not step, harness=None, step=step)
-        offers[channel] = native_offer_analysis(fetched, offer, budget, seeded)
+        offers[channel] = native_offer_analysis(fetched, offer, budget, seeded,
+                                                returned=observed['response']['memories'])
         offers[channel]['gold_delivered'] = {token: token in (offer.get('context') or '') for token in spec.get('gold', ())}
     return dict(params=params, elapsed_ms=elapsed, fetch_timeout_s=bridge.RECALL_LIFETIME,
                 foreground_wait_s=bridge.RECALL_WAIT, exceeded_automatic_wait=elapsed > bridge.RECALL_WAIT * 1000,
@@ -1306,6 +1313,7 @@ def native_observations(passes):
                     out['delivery'].setdefault(key + '/' + channel, {})[number] = dict(
                         context_bytes=offer['context_bytes'], shown=offer['shown_fixtures'],
                         omitted=offer['omitted_fixtures'],
+                        withheld_before_packing=offer.get('withheld_before_packing_fixtures', []),
                         cuts={item['fixture'] or item['id']: item['cut_by'] for item in offer['items'] if item.get('cut_by')})
                     if offer['update_notice']:
                         out['update_notices'].append({'pass': run['pass'], 'query': record['id'], 'channel': channel})

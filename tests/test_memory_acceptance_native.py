@@ -58,6 +58,21 @@ def test_offer_analysis_distinguishes_a_bridge_cut_from_a_server_summary():
     assert result['state'] == 'partial' and result['cut_by'] == ['bridge_budget']
 
 
+def test_offer_analysis_counts_facts_withheld_before_packing():
+    seeded = {'memory_ids': {'long': 'long_fact', 'short': 'short_fact'}, 'oracle': {}}
+    fetched = {'items': [{'id': 'short', 'prefix': '[memory:short] [fact] ',
+                          'text': 'Complete short fact.', 'suggestion': False, 'media': False}]}
+    returned = [{'id': 'long', 'text_truncated': True}, {'id': 'short'}, {'id': 'long'}]
+    offer = {'shown': ['short'], 'context': 'Untrusted evidence\n[memory:short] [fact] Complete short fact.'}
+    result = harness.native_offer_analysis(fetched, offer, 1500, seeded, returned=returned)
+    assert result['omitted_ids'] == result['withheld_before_packing_ids'] == ['long']
+    assert result['omitted_fixtures'] == result['withheld_before_packing_fixtures'] == ['long_fact']
+    # A whole item that loses the packing budget is counted separately, without duplicates.
+    result = harness.native_offer_analysis(fetched, {}, 1500, seeded, returned=returned)
+    assert result['omitted_ids'] == ['long', 'short']
+    assert result['withheld_before_packing_ids'] == ['long']
+
+
 class FakeNative:
     """In-memory stand-in for the public HTTP/MCP routes the harness uses."""
 
