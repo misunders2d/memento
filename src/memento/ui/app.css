@@ -44,7 +44,7 @@ main { position: relative; flex: 1; min-height: 0; }
 #status { position: absolute; left: 16px; top: 12px; color: var(--muted); background: var(--surface);
   border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; max-width: calc(100% - 32px); }
 #legend { position: absolute; left: 16px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 4px 12px;
-  background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; max-width: calc(100% - 32px); }
+  background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; max-width: calc(100% - 84px); }
 .key { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 #sidelist { position: absolute; left: 16px; top: 52px; max-height: calc(100% - 116px); width: min(340px, calc(100% - 32px)); overflow: auto;
