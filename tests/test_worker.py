@@ -219,6 +219,7 @@ def test_failed_renewal_of_unfinished_work_still_stops_and_releases(native,monke
     config,trace,calls=native
     monkeypatch.setenv('RENEW_FALSE','first')
     monkeypatch.setenv('STATUS_STATE','leased')
+    monkeypatch.setenv('SUBMIT_DELAY','.4')  # loss is observed while the unit is still in progress
     with pytest.raises(runner.RunnerError,match='lease lost before completion'):
         worker.tick(runner,config,consolidate_now=True)
     assert [command for path,command in calls if path=='/work/release']==[dict(id='first',owner='lease-a',error='cli_failed')]
