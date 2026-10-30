@@ -6,15 +6,23 @@ configuration is changed. Native generation uses the selected CLI's own login.
 """
 
 import argparse
+import contextlib
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 import shutil
 import socket
+import stat
 import tempfile
 from threading import Thread
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from urllib.parse import urlencode
 from unittest.mock import patch
 from uuid import uuid4
@@ -576,23 +584,925 @@ def learning(service, agent, report, *, directory, store, retrieval=None,
         raise RuntimeError('Acceptance failed; inspect required_path_failures and the independent evidence sections')
 
 
+# Native retrieval/delivery baseline (MEL-721 H1). Opt-in, model-free client
+# measurement against one owned, isolated native service that a launcher
+# describes in a private manifest. S0 replays one Pi history through the
+# shipped bridge import/upload, S3 seeds explicitly labelled retrieval-only
+# fixtures through public routes and S4 renders automatic context with the
+# shipped bridge. No /work, extraction, consolidation or native generation.
+NATIVE_SCHEMA = 'memento-native-acceptance-v1'
+NATIVE_REPORT_SCHEMA = 'memento-native-retrieval-report-v1'
+NATIVE_CORPUS_VERSION = 'native-retrieval-v1'
+NATIVE_SEED_ACTOR = 'claude-native-retrieval-fixture'
+NATIVE_FIXTURE_SOURCE = 'api-capture:memento-native-retrieval-fixture'
+NATIVE_PRODUCTION_PORT = 8765
+NATIVE_READY_TIMEOUT = 900
+NATIVE_CLIENT_FILES = {'__init__.py', 'bridge.py', 'runner.py'}
+# Every count must be exactly zero before the first write: the target is fresh.
+NATIVE_STATUS_ZERO = (
+    ('captured', 'episodes'), ('captured', 'conversations'), ('indexing', 'total'),
+    *(('extraction', key) for key in ('pending_jobs', 'leased_jobs', 'completed_jobs', 'failed_jobs',
+                                      'pending_conversations')),
+    *(('consolidation', key) for key in ('pending_jobs', 'leased_jobs', 'completed_jobs', 'failed_jobs',
+                                         'pending_candidates', 'ready_candidates', 'parked_candidates',
+                                         'excluded_legacy_candidates')),
+    ('artifact_storage', 'registered', 'objects'))
+NATIVE_GATES = ('scope_leak', 'superseded_surfaced', 'unrelated_offered', 'budget_overrun',
+                'partial_fact_delivered', 'out_of_quote_match')
+
+NATIVE_JUNIPER_QUOTE = ('juniper-archive: upload rejected with ERR_CHUNK_QUOTA_4096 for release 4.2.17 '
+                        'because chunk 51 exceeded the 50-record limit.')
+
+
+def _native_build_log():
+    # A large tool result: the cited line is one span; other text (including
+    # "saffron") lies outside every quote and must never match its memory.
+    lines = [f'build step {n:03d}: compiled module juniper_{n:03d} with cached dependencies in {n % 7 + 2} seconds'
+             for n in range(1, 61)]
+    lines.insert(20, 'Cafeteria notice copied into this log: saffron rice is served on Fridays.')
+    lines.insert(45, NATIVE_JUNIPER_QUOTE)
+    return '\n'.join(lines + ['cleanup: removed temporary chunk files', 'cleanup: archive session closed']) + '\n'
+
+
+NATIVE_KESTREL = (
+    'The Kestrel ingest pipeline reads partner CSV drops from the north bucket every twenty minutes, validates each '
+    'header row against the frozen column contract, and moves every rejected file into the quarantine prefix for manual review.',
+    'The Kestrel ingest pipeline deduplicates partner rows by the composite of account number, invoice date and line '
+    'sequence, keeping the earliest arrival and writing every discarded duplicate row to the audit table with its arrival time.',
+    "The Kestrel ingest pipeline converts all partner currency amounts to euros using the previous business day's closing "
+    'rate, and records the rate source and the rate timestamp beside each converted amount for later reconciliation checks.',
+    'The Kestrel ingest pipeline must finish its nightly load before 05:30 Europe/Berlin, because the morning finance '
+    'dashboard refresh starts at that time and reads only the tables that the pipeline has already marked as complete.',
+    'The Kestrel ingest pipeline pages the data on-call engineer when more than two percent of a partner drop is '
+    'quarantined, and then suppresses repeat pages for the same partner for ninety minutes after the first page was sent.',
+    'The Kestrel ingest pipeline keeps raw partner drops for thirty-five days in cold storage and then deletes them '
+    'automatically, while the cleaned tables and the audit table are retained for seven years under the retention policy.',
+)
+NATIVE_ORRERY = (
+    'The Orrery release signing key rotates every ninety days, the new public key is published to the internal key '
+    'server one week before activation, and build agents fetch it during their nightly refresh so that no manual copy '
+    'is ever needed; the rotation schedule applies only to signed offline snapshots, while online builds keep using '
+    'the hardware-backed key without rotation.')
+NATIVE_ORRERY_QUALIFIER = 'applies only to signed offline snapshots'
+
+NATIVE_CAPTURE = dict(
+    conversation='eval-capture-northwindow', search='NorthWindow', offset_days=2,
+    user='My personal NorthWindow project uses accent code BLUE7294.',
+    assistant='Noted: NorthWindow uses accent code BLUE7294.')
+# Retrieval-only fixtures (evidence kind api_capture): direct /episodes rows,
+# never presented as replayed native capture or extraction output.
+NATIVE_EPISODES = {
+    'timeout_a': dict(conversation='native-retrieval-larkspur', kind='user', offset_days=10,
+                      text='The deploy timeout for the Larkspur service is 15 seconds.'),
+    'timeout_b': dict(conversation='native-retrieval-larkspur', kind='user', offset_days=6,
+                      text='Correction: the Larkspur deploy timeout is 45 seconds, not 15.'),
+    'conflict_a': dict(conversation='native-retrieval-quillon-a', kind='user', offset_days=5,
+                       text='The Quillon backup window opens at 01:00 UTC.'),
+    'conflict_b': dict(conversation='native-retrieval-quillon-b', kind='user', offset_days=4,
+                       text='The Quillon backup window opens at 03:00 UTC.'),
+    'heron': dict(conversation='native-retrieval-heron', kind='user', offset_days=8,
+                  text='Nightly Heron backups retain seven daily copies; the start time is not recorded here.'),
+    'key': dict(conversation='native-retrieval-key', kind='user', offset_days=9,
+                text='I keep the spare house key in the blue tin on the hallway shelf.'),
+    'juniper_log': dict(conversation='native-retrieval-juniper', kind='tool', offset_days=3, text=_native_build_log()),
+    'marlow_log': dict(conversation='native-retrieval-marlow', kind='tool', offset_days=3,
+                       text='vendor-portal sync: Marlow Freight invoice attachment upload returned ERR_CHUNK_QUOTA_4096 after 3 retries.'),
+    'lease': dict(conversation='native-retrieval-lease', kind='user', offset_days=7,
+                  text='Договор аренды склада подписал Тарас Мирошниченко в понедельник.'),
+    'kestrel': dict(conversation='native-retrieval-kestrel', kind='user', offset_days=5, text=' '.join(NATIVE_KESTREL)),
+    'orrery': dict(conversation='native-retrieval-orrery', kind='user', offset_days=5, text=NATIVE_ORRERY),
+}
+NATIVE_MEMORIES = {
+    'timeout': dict(episode='timeout_a', quote='The deploy timeout for the Larkspur service is 15 seconds.',
+                    text='Larkspur service deploy timeout is 15 seconds.'),
+    'conflict_a': dict(episode='conflict_a', quote='The Quillon backup window opens at 01:00 UTC.',
+                       text='The Quillon backup window opens at 01:00 UTC.'),
+    'conflict_b': dict(episode='conflict_b', quote='The Quillon backup window opens at 03:00 UTC.',
+                       text='The Quillon backup window opens at 03:00 UTC.'),
+    'heron': dict(episode='heron', quote='Nightly Heron backups retain seven daily copies',
+                  text='Nightly Heron backups retain seven daily copies.'),
+    'key': dict(episode='key', quote='I keep the spare house key in the blue tin on the hallway shelf.',
+                text='The spare house key is kept in the blue tin on the hallway shelf.', scope=('personal',)),
+    # Exact-token (R1) probes: the identifier lives only in the quote, not the memory text.
+    'juniper': dict(episode='juniper_log', quote=NATIVE_JUNIPER_QUOTE,
+                    text='The Juniper archive rejects uploads whose chunks exceed the 50-record limit.'),
+    'marlow': dict(episode='marlow_log', quote=NATIVE_EPISODES['marlow_log']['text'],
+                   text='Marlow Freight invoice attachment sync failed on an upload quota.'),
+    'lease': dict(episode='lease', quote=NATIVE_EPISODES['lease']['text'],
+                  text='The warehouse lease agreement was signed on Monday.'),
+    **{f'kestrel_{n}': dict(episode='kestrel', quote=sentence, text=sentence)
+       for n, sentence in enumerate(NATIVE_KESTREL, 1)},
+    'orrery': dict(episode='orrery', quote=NATIVE_ORRERY, text=NATIVE_ORRERY),
+}
+NATIVE_SUPERSESSIONS = {
+    'timeout': dict(episode='timeout_b', quote='the Larkspur deploy timeout is 45 seconds',
+                    text='Larkspur service deploy timeout is 45 seconds.', kind='correction'),
+}
+NATIVE_QUERIES = [
+    dict(id='current_timeout', slice='current_version', q='What is the deploy timeout for the Larkspur service?',
+         modes=('normal', 'automatic'), expected=['timeout'], gold=['45 seconds']),
+    dict(id='scope_key_professional', slice='scope', q='Where is the spare house key kept?',
+         modes=('scoped',), scope='professional', forbidden=['key']),
+    dict(id='scope_key_unscoped', slice='scope_control', q='Where is the spare house key kept?',
+         modes=('normal', 'automatic'), expected=['key'], gold=['blue tin']),
+    dict(id='unrelated_clouds', slice='unrelated', q='Explain how clouds form above a mountain.', modes=('automatic',)),
+    dict(id='unrelated_menu', slice='unrelated', q='Translate this restaurant menu into Ukrainian.', modes=('automatic',)),
+    dict(id='insufficient_heron', slice='relevant_insufficient', q='What time does the nightly Heron backup start?',
+         modes=('normal', 'automatic'), relevant=['heron']),
+    dict(id='conflict_quillon', slice='conflicting', q='When does the Quillon backup window open?',
+         modes=('normal', 'automatic'), members=['conflict_a', 'conflict_b'], gold=['01:00', '03:00']),
+    dict(id='r1_error_code', slice='r1_exact_token', q='ERR_CHUNK_QUOTA_4096', modes=('normal', 'automatic'),
+         expected=['juniper', 'marlow']),
+    dict(id='r1_version', slice='r1_exact_token', q='4.2.17', modes=('normal', 'automatic'), expected=['juniper']),
+    dict(id='r1_cyrillic', slice='r1_exact_token', q='Мирошниченко', modes=('normal', 'automatic'), expected=['lease']),
+    dict(id='r1_distractor', slice='r1_lexical_distractor',
+         q='Why did the Juniper archive upload fail with ERR_CHUNK_QUOTA_4096?', modes=('normal', 'automatic'),
+         expected=['juniper'], distractors=['marlow']),
+    dict(id='r1_out_of_quote', slice='r1_out_of_quote_guard', q='saffron', modes=('normal', 'automatic'),
+         forbidden=['juniper']),
+    dict(id='delivery_kestrel', slice='delivery_budget_14a', q='How does the Kestrel ingest pipeline work?',
+         modes=('normal', 'automatic'), expected=[f'kestrel_{n}' for n in range(1, 7)]),
+    dict(id='delivery_orrery', slice='delivery_summary_14b', q='How often does the Orrery release signing key rotate?',
+         modes=('normal', 'automatic'), expected=['orrery'], gold=['ninety days', NATIVE_ORRERY_QUALIFIER]),
+]
+NATIVE_QUERY_BY_ID = {spec['id']: spec for spec in NATIVE_QUERIES}
+NATIVE_NOT_RUN = {
+    '14c_behavioral_suggestion_budget': 'not seedable: remember/supersede accept no behavior field, and model '
+                                        'consolidation stages are not released',
+    'model_stages_S1_S2_S5': 'extraction, consolidation and generation are not released; no /work request is made',
+    'compaction_processing': 'import compaction markers are withheld locally because /work is out of scope',
+    'native_hooks_and_detached_delivery': 'bridge fetch/offer primitives run in-process; native hooks, the detached '
+                                          'recall worker, delayed offers and exposure receipts are not exercised',
+}
+
+
+class NativePreflightError(Exception):
+    """A refusal before the first write; carries a fixed reason and safe detail."""
+
+    def __init__(self, reason, detail=None):
+        super().__init__(reason)
+        self.reason, self.detail = reason, detail
+
+
+def native_sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def native_corpus():
+    return dict(version=NATIVE_CORPUS_VERSION, seed_actor=NATIVE_SEED_ACTOR, fixture_source=NATIVE_FIXTURE_SOURCE,
+                capture=NATIVE_CAPTURE, episodes=NATIVE_EPISODES, memories=NATIVE_MEMORIES,
+                supersessions=NATIVE_SUPERSESSIONS, queries=NATIVE_QUERIES)
+
+
+def native_corpus_digest(corpus=None):
+    return native_sha256(json.dumps(corpus or native_corpus(), ensure_ascii=False, sort_keys=True,
+                                    separators=(',', ':')).encode('utf-8'))
+
+
+def _native_error(error):
+    """Fixed categories only; response bodies can carry private text."""
+    cause = error.__cause__ if error.__cause__ is not None else error
+    result = {'error': type(error).__name__, 'cause': type(cause).__name__}
+    if isinstance(cause, urllib.error.HTTPError):
+        result['http_status'] = cause.code
+    return result
+
+
+def _native_dig(value, path):
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value
+
+
+def native_manifest(path):
+    """Validate the launcher manifest; refusal never contacts the service."""
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except OSError:
+        raise NativePreflightError('manifest_missing') from None
+    if not stat.S_ISREG(info.st_mode):
+        raise NativePreflightError('manifest_not_regular_file')
+    if info.st_uid != os.getuid():
+        raise NativePreflightError('manifest_not_owned')
+    if info.st_mode & 0o077:
+        raise NativePreflightError('manifest_not_private')
+    raw = path.read_bytes()
+    try:
+        manifest = json.loads(raw)
+    except ValueError:
+        raise NativePreflightError('manifest_invalid_json') from None
+    if not isinstance(manifest, dict) or manifest.get('schema') != NATIVE_SCHEMA:
+        raise NativePreflightError('manifest_schema')
+    if manifest.get('owned_isolated') is not True:
+        raise NativePreflightError('manifest_not_owned_isolated')
+    url, port = manifest.get('url'), manifest.get('port')
+    if not isinstance(url, str) or type(port) is not int:
+        raise NativePreflightError('manifest_url')
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        parsed_port = None
+    if (parsed.scheme != 'http' or parsed.hostname not in ('127.0.0.1', '::1') or parsed.username
+            or parsed.password or parsed.path not in ('', '/') or parsed.query or parsed.fragment
+            or parsed_port != port):
+        raise NativePreflightError('manifest_url')
+    if not 1024 <= port <= 65535 or port == NATIVE_PRODUCTION_PORT:
+        raise NativePreflightError('manifest_port')
+    for field in ('created_at', 'container_id', 'container_name', 'image', 'fresh_data_volume',
+                  'baseline_pythonpath', 'model_identity_source'):
+        if not isinstance(manifest.get(field), str) or not manifest[field].strip():
+            raise NativePreflightError('manifest_field', field)
+    for field, pattern in (('image_id', r'sha256:[0-9a-f]{64}'), ('asserted_source_commit', r'[0-9a-f]{40}'),
+                           ('launcher_sha256', r'[0-9a-f]{64}')):
+        if not isinstance(manifest.get(field), str) or not re.fullmatch(pattern, manifest[field]):
+            raise NativePreflightError('manifest_field', field)
+    if '/' in manifest['fresh_data_volume'] or manifest.get('data_mount') != '/data':
+        raise NativePreflightError('manifest_data_volume')
+    assets = manifest.get('model_assets')
+    if not isinstance(assets, list) or not assets:
+        raise NativePreflightError('manifest_model_assets')
+    for asset in assets:
+        destination = asset.get('destination') if isinstance(asset, dict) else None
+        named = [isinstance(asset.get(key), str) and bool(asset[key]) for key in ('volume', 'path')] if destination else []
+        if (not isinstance(destination, str) or not destination.startswith('/') or asset.get('read_only') is not True
+                or named.count(True) != 1):
+            raise NativePreflightError('manifest_model_assets')
+        normalized = PurePosixPath(os.path.normpath(destination))
+        if normalized == PurePosixPath('/data') or PurePosixPath('/data') in normalized.parents:
+            raise NativePreflightError('manifest_model_assets')
+    if not isinstance(manifest.get('resources'), dict):
+        raise NativePreflightError('manifest_field', 'resources')
+    files = manifest.get('client_files')
+    if (not isinstance(files, dict) or 'bridge.py' not in files or not set(files) <= NATIVE_CLIENT_FILES
+            or any(not isinstance(entry, dict) or not isinstance(entry.get('path'), str)
+                   or not isinstance(entry.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', entry['sha256'])
+                   for entry in files.values())):
+        raise NativePreflightError('manifest_client_files')
+    return manifest, native_sha256(raw)
+
+
+def native_executed_client(manifest, harness=None):
+    """Digest the client module bytes this process imported, not a checkout."""
+    import memento
+    import memento.bridge
+    import memento.runner
+    package = Path(memento.__file__).resolve().parent
+    if package.parent != Path(manifest['baseline_pythonpath']).resolve():
+        raise NativePreflightError('client_not_baseline', str(package))
+    modules = {'__init__.py': memento, 'bridge.py': memento.bridge, 'runner.py': memento.runner}
+    executed, data = {}, {}
+    for name, module in modules.items():
+        location = Path(module.__file__).resolve()
+        if location.parent != package:
+            raise NativePreflightError('client_not_baseline', name)
+        data[name] = location.read_bytes()
+        executed[name] = {'path': str(location), 'sha256': native_sha256(data[name])}
+    for name, expected in manifest['client_files'].items():
+        if Path(expected['path']).resolve() != Path(executed[name]['path']):
+            raise NativePreflightError('client_path_mismatch', name)
+        if expected['sha256'] != executed[name]['sha256']:
+            raise NativePreflightError('client_digest_mismatch', name)
+    harness = Path(harness or __file__).resolve()
+    executed['harness'] = {'path': str(harness), 'sha256': native_sha256(harness.read_bytes())}
+    return executed, data['bridge.py'], data['runner.py']
+
+
+def native_target(service, bridge_bytes, runner_bytes):
+    """GET-only readiness/emptiness/staleness checks before any write."""
+    try:
+        health = service.get('/health')
+        status = service.get('/status')
+        served_bridge = service.download('/bridge')
+        served_runner = service.download('/runner')
+    except Exception as error:
+        raise NativePreflightError('target_unreachable', _native_error(error)) from None
+    if health.get('status') != 'ok' or health.get('search_ready') is not True:
+        raise NativePreflightError('target_not_ready', {key: health.get(key) for key in ('status', 'search_ready')})
+    values = {'.'.join(path): _native_dig(status, path) for path in NATIVE_STATUS_ZERO}
+    missing = sorted(key for key, value in values.items() if type(value) is not int)
+    if missing:
+        raise NativePreflightError('target_status_shape', missing)
+    nonzero = sorted(key for key, value in values.items() if value != 0)
+    if nonzero:
+        raise NativePreflightError('target_not_empty', nonzero)
+    if _native_dig(status, ('indexing', 'available')) is not True:
+        raise NativePreflightError('target_index_unavailable')
+    # The service stamps its bundle revision into the one shipped marker.
+    stamps = re.findall(rb"CLIENT_REVISION = '([0-9a-f]{64})'", served_bridge)
+    if len(stamps) != 1:
+        raise NativePreflightError('served_bridge_unstamped')
+    revision = stamps[0]
+    if served_bridge.replace(b"CLIENT_REVISION = '" + revision + b"'", b'CLIENT_REVISION = None', 1) != bridge_bytes:
+        raise NativePreflightError('stale_executed_bridge')
+    if served_runner != runner_bytes:
+        raise NativePreflightError('stale_executed_runner')
+    return dict(health=health, status_zero=values, served_revision=revision.decode(),
+                served_bridge_sha256=native_sha256(served_bridge), served_runner_sha256=native_sha256(served_runner))
+
+
+def _native_time(value):
+    return value.isoformat(timespec='seconds')
+
+
+def _native_same_time(stored, expected):
+    try:
+        return datetime.fromisoformat(stored.replace('Z', '+00:00')) == datetime.fromisoformat(expected)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def native_capture(service, config_path, config, run_start, *, sleep=time.sleep):
+    """S0: replay one Pi JSONL history through shipped import/upload."""
+    from memento import bridge
+    spec = NATIVE_CAPTURE
+    work = Path(config_path).parent
+    user_at = run_start - timedelta(days=spec['offset_days'])
+    assistant_at = user_at + timedelta(seconds=5)
+    journal = work / 'pi-history' / 'northwindow.jsonl'
+    journal.parent.mkdir(mode=0o700)
+    records = [
+        {'type': 'session', 'id': spec['conversation'], 'timestamp': _native_time(user_at - timedelta(seconds=5)),
+         'cwd': str(work)},
+        {'type': 'message', 'id': 'capture-user', 'parentId': None, 'timestamp': _native_time(user_at),
+         'message': {'role': 'user', 'content': [{'type': 'text', 'text': spec['user']}]}},
+        {'type': 'message', 'id': 'capture-assistant', 'parentId': 'capture-user',
+         'timestamp': _native_time(assistant_at),
+         'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': spec['assistant']}]}},
+    ]
+    journal.write_text(''.join(json.dumps(record, ensure_ascii=False) + '\n' for record in records), encoding='utf-8')
+
+    def queue_without_work():
+        spool = bridge.Spool(config_path, config)
+        try:
+            endpoints = dict(spool.db.execute("SELECT endpoint,COUNT(*) FROM outbox WHERE state='pending' GROUP BY endpoint"))
+            if not set(endpoints) <= {'/episodes', '/work/compaction'}:
+                raise RuntimeError('capture_unexpected_endpoint')
+            # Import makes the history eligible for extraction; /work is out of scope.
+            withheld = spool.db.execute("DELETE FROM outbox WHERE endpoint='/work/compaction'").rowcount
+            spool.commit()
+            return endpoints.get('/episodes', 0), withheld
+        finally:
+            spool.close()
+
+    spool = bridge.Spool(config_path, config)
+    try:
+        imported = bridge.import_history(spool, 'pi', [journal])
+    finally:
+        spool.close()
+    queued, withheld = queue_without_work()
+    uploaded = bridge.upload(config_path, config)
+    if uploaded.get('pending') or uploaded.get('conflicts') or uploaded.get('error'):
+        raise RuntimeError('capture_upload_incomplete')
+    source = bridge.source(config, 'pi')
+    query = '/episodes/search?' + urlencode({'q': spec['search'], 'conversation_id': spec['conversation'],
+                                             'source': source, 'limit': 20})
+    expected = {'user': (spec['user'], user_at), 'assistant': (spec['assistant'], assistant_at)}
+    found = {}
+    for _ in range(30):
+        # Search rows carry excerpts; exact text comes only from /episodes/{id}.
+        episodes = service.get(query).get('episodes') or []
+        for episode in episodes:
+            kind = episode.get('kind') if isinstance(episode, dict) else None
+            if kind in expected and kind not in found:
+                stored = service.get('/episodes/' + urllib.parse.quote(str(episode.get('id')), safe=''))
+                if stored.get('text') == expected[kind][0]:
+                    found[kind] = stored
+        if len(found) == len(expected):
+            break
+        sleep(1)
+    else:
+        raise RuntimeError('capture_not_searchable')
+    verified = {}
+    for kind, (text, at) in expected.items():
+        stored = found[kind]
+        checks = dict(text=stored.get('text') == text, kind=stored.get('kind') == kind,
+                      source=stored.get('source') == source,
+                      conversation=stored.get('conversation_id') == spec['conversation'],
+                      occurred_at=_native_same_time(stored.get('occurred_at'), _native_time(at)))
+        if not all(checks.values()):
+            raise RuntimeError('capture_mismatch:' + kind)
+        verified[kind] = dict(id=stored['id'], text_bytes=len(text.encode('utf-8')), checks=checks)
+    searched = len(episodes)
+    spool = bridge.Spool(config_path, config)
+    try:
+        again = bridge.import_history(spool, 'pi', [journal])
+    finally:
+        spool.close()
+    requeued, rewithheld = queue_without_work()
+    if again.get('records_added') or requeued:
+        raise RuntimeError('capture_reimport_not_idempotent')
+    if len(service.get(query).get('episodes') or []) != searched:
+        raise RuntimeError('capture_reimport_changed_search')
+    return dict(evidence_kind='replay_native_projection', harness='pi', source=source,
+                conversation=spec['conversation'], records=len(records), import_records_added=imported.get('records_added'),
+                import_coverage=imported.get('coverage'), episodes_uploaded=queued, compaction_markers_withheld=withheld,
+                upload=uploaded, verified=verified, search_hits=searched,
+                reimport=dict(records_added=again.get('records_added'), episodes_queued=requeued,
+                              compaction_markers_withheld=rewithheld))
+
+
+def native_seed(service, nonce, run_start):
+    """S3: retrieval-only fixtures through public routes, verified via /history."""
+    episodes, episode_ids, memories, memory_ids, oracle = {}, {}, {}, {}, {}
+    why = 'Frozen native-retrieval fixture: api_capture evidence, retrieval-only, not extracted'
+    for key, spec in NATIVE_EPISODES.items():
+        mode = 'tool_output' if spec['kind'] == 'tool' else 'message'
+        result = service.post('/episodes', dict(
+            source=NATIVE_FIXTURE_SOURCE, event_id=f'{nonce}:{key}', conversation_id=spec['conversation'],
+            kind=spec['kind'], text=spec['text'], occurred_at=_native_time(run_start - timedelta(days=spec['offset_days'])),
+            metadata={'extraction_mode': mode, 'fixture': key, 'evidence_kind': 'api_capture'}))
+        identifier = result.get('id')
+        if not isinstance(identifier, str) or not identifier:
+            raise RuntimeError('seed_episode_rejected:' + key)
+        stored = service.get('/episodes/' + urllib.parse.quote(identifier, safe=''))
+        if (stored.get('text') != spec['text'] or stored.get('kind') != spec['kind']
+                or stored.get('source') != NATIVE_FIXTURE_SOURCE):
+            raise RuntimeError('seed_episode_mismatch:' + key)
+        episodes[key], episode_ids[identifier] = identifier, key
+    for key, spec in NATIVE_MEMORIES.items():
+        result = service.post('/remember', dict(
+            command_id=f'native-retrieval:{nonce}:{key}', actor=NATIVE_SEED_ACTOR, why=why,
+            evidence=[{'episode_id': episodes[spec['episode']], 'quote': spec['quote']}],
+            type='knowledge', text=spec['text'], scope=list(spec.get('scope', ('professional',)))))
+        if result.get('status') == 'pending_review' or not isinstance(result.get('id'), str):
+            raise RuntimeError('seed_memory_not_committed:' + key)
+        memories[key], memory_ids[result['id']] = result['id'], key
+    returned = {}
+    for key, spec in NATIVE_SUPERSESSIONS.items():
+        base = NATIVE_MEMORIES[key]
+        result = service.post('/supersede', dict(
+            command_id=f'native-retrieval:{nonce}:{key}:supersede', actor=NATIVE_SEED_ACTOR, why=why,
+            evidence=[{'episode_id': episodes[spec['episode']], 'quote': spec['quote']}], old=memories[key],
+            new={'type': 'knowledge', 'text': spec['text'], 'scope': list(base.get('scope', ('professional',)))},
+            kind=spec['kind']))
+        if result.get('status') == 'pending_review':
+            raise RuntimeError('seed_supersede_not_committed:' + key)
+        returned[key] = result.get('id')
+        if isinstance(result.get('id'), str) and result['id'] != memories[key]:
+            memory_ids[result['id']] = key
+    for key, identifier in memories.items():
+        versions = service.get('/history/' + urllib.parse.quote(identifier, safe='')).get('versions')
+        versions = [entry for entry in versions or [] if isinstance(entry, dict) and type(entry.get('version')) is int]
+        if not versions:
+            raise RuntimeError('seed_history_missing:' + key)
+        current = max(versions, key=lambda entry: entry['version'])
+        final = NATIVE_SUPERSESSIONS.get(key, NATIVE_MEMORIES[key])
+        if current.get('text') != final['text']:
+            raise RuntimeError('seed_history_mismatch:' + key)
+        if final['quote'] not in [item.get('quote') for item in current.get('evidence') or [] if isinstance(item, dict)]:
+            raise RuntimeError('seed_history_evidence:' + key)
+        oracle[key] = dict(id=identifier, version=current['version'], text=current['text'], scope=current.get('scope'),
+                           state=current.get('state'),
+                           superseded_texts=sorted({entry['text'] for entry in versions if entry is not current
+                                                    and isinstance(entry.get('text'), str) and entry['text'] != current['text']}))
+    return dict(evidence_kind='api_capture', note='retrieval-only fixtures; not replayed native capture or extraction output',
+                episodes=episodes, episode_ids=episode_ids, memories=memories, memory_ids=memory_ids,
+                supersede_returned_ids=returned, oracle=oracle)
+
+
+def native_status_summary(status):
+    indexing = status.get('indexing') if isinstance(status.get('indexing'), dict) else {}
+    search = indexing.get('search') if isinstance(indexing.get('search'), dict) else {}
+    return dict(counts={'.'.join(path): _native_dig(status, path) for path in NATIVE_STATUS_ZERO},
+                indexing={key: indexing.get(key) for key in ('available', 'total', 'indexed', 'pending', 'failed',
+                                                            'unprepared_episodes')},
+                search={key: search.get(key) for key in ('engine', 'ready', 'cold_ready')})
+
+
+def native_wait_ready(service, timeout, *, poll=2.0, clock=time.monotonic, sleep=time.sleep):
+    """Complete indexing: zero pending/failed/unprepared and a stable snapshot."""
+    started, previous, timeline = clock(), None, []
+    while True:
+        summary = native_status_summary(service.get('/status'))
+        snapshot = dict(**summary['indexing'], search_ready=summary['search']['ready'],
+                        cold_ready=summary['search']['cold_ready'])
+        if not timeline or timeline[-1]['snapshot'] != snapshot:
+            timeline.append(dict(elapsed_s=round(clock() - started, 1), snapshot=snapshot))
+        if type(snapshot['failed']) is int and snapshot['failed'] > 0:
+            raise RuntimeError('index_failed')
+        ready = (snapshot['available'] is True and snapshot['pending'] == 0 and snapshot['failed'] == 0
+                 and snapshot['unprepared_episodes'] == 0 and snapshot['search_ready'] is True
+                 and type(snapshot['total']) is int and snapshot['total'] > 0)
+        if ready and snapshot == previous:
+            return dict(elapsed_s=round(clock() - started, 1), final=snapshot, timeline=timeline[-20:],
+                        cold_ready_basis='recorded only; Hot readiness does not imply Cold readiness')
+        if clock() - started > timeout:
+            raise RuntimeError('index_not_ready')
+        previous = snapshot if ready else None
+        sleep(poll)
+
+
+def native_rows(memories, seeded):
+    rows = []
+    for rank, memory in enumerate(memories, 1):
+        if not isinstance(memory, dict):
+            rows.append(dict(rank=rank, invalid=True))
+            continue
+        identifier = str(memory.get('id'))
+        fixture = seeded['memory_ids'].get(identifier)
+        if fixture is None and memory.get('tier') == 'raw':
+            fixture = 'raw:' + seeded['episode_ids'].get(str(memory.get('episode_id')), 'unmapped')
+        oracle = seeded['oracle'].get(fixture)
+        text, scope = memory.get('text'), memory.get('scope')
+        if isinstance(scope, str):
+            with contextlib.suppress(ValueError):
+                scope = json.loads(scope)
+        row = dict(rank=rank, id=identifier, fixture=fixture, version=memory.get('version'),
+                   current_version=oracle['version'] if oracle else None,
+                   tier=memory.get('tier'), type=memory.get('type'), category=memory.get('category'),
+                   scope=scope, server_fields={key: memory.get(key) for key in ('score', 'cosine', 'match')},
+                   text_bytes=len(text.encode('utf-8')) if isinstance(text, str) else None,
+                   text_sha256=native_sha256(text.encode('utf-8')) if isinstance(text, str) else None)
+        if oracle and isinstance(text, str):
+            row['text_state'] = ('complete' if oracle['text'] and oracle['text'] in text else
+                                 'superseded' if text in oracle['superseded_texts'] else
+                                 'server_summary' if oracle['text'].startswith(text) else 'differs')
+        rows.append(row)
+    return rows
+
+
+def native_offer_analysis(fetched, offer, budget, seeded):
+    """Completeness against the current /history body, never the recall summary."""
+    context = offer.get('context') or ''
+    lines = context.split('\n')[1:] if context else []
+    shown = list(offer.get('shown') or [])
+    items, delivered = [], {}
+    for item in fetched['items']:
+        for line in lines:
+            if line.startswith(item['prefix']):
+                delivered[item['id']] = line[len(item['prefix']):]
+                break
+    for rank, item in enumerate(fetched['items'], 1):
+        fixture = seeded['memory_ids'].get(item['id'])
+        oracle = seeded['oracle'].get(fixture)
+        kind = 'suggestion' if item['suggestion'] else 'media' if item.get('media') else 'fact'
+        text = delivered.get(item['id'])
+        entry = dict(rank=rank, id=item['id'], fixture=fixture, kind=kind, shown=item['id'] in shown,
+                     fetched_bytes=len(item['text'].encode('utf-8')),
+                     delivered_bytes=len(text.encode('utf-8')) if text is not None else None,
+                     body_bytes=len(oracle['text'].encode('utf-8')) if oracle else None)
+        if text is None:
+            entry['state'] = 'omitted'
+        elif kind != 'fact':
+            entry['state'] = 'whole_or_skip'
+            entry['rationale_included'] = ' Rationale: ' in text
+        elif oracle is None:
+            entry['state'] = 'unknown_body'
+        elif oracle['text'] and oracle['text'] in text:
+            entry['state'] = 'complete'
+        else:
+            entry['state'] = 'partial'
+            cut = []
+            if item['text'] != oracle['text']:
+                cut.append('server_summary' if oracle['text'].startswith(item['text']) else 'server_text_differs')
+            if text != item['text']:
+                cut.append('bridge_budget' if item['text'].startswith(text) else 'bridge_render_differs')
+            entry['cut_by'] = cut
+        items.append(entry)
+    size = len(context.encode('utf-8'))
+    return dict(budget=budget, context_bytes=size, overrun=size > budget, shown=shown,
+                shown_fixtures=[seeded['memory_ids'].get(identifier) for identifier in shown],
+                omitted_ids=[item['id'] for item in fetched['items'] if item['id'] not in shown],
+                omitted_fixtures=[seeded['memory_ids'].get(item['id']) for item in fetched['items'] if item['id'] not in shown],
+                context_sha256=native_sha256(context.encode('utf-8')), update_notice='update_notice' in offer,
+                gold_delivered=None, items=items)
+
+
+def native_http_recall(service, params, seeded):
+    started = time.perf_counter()
+    try:
+        result = service.get('/recall?' + urlencode(params))
+    except Exception as error:
+        return dict(params=params, elapsed_ms=round((time.perf_counter() - started) * 1000, 1), error=_native_error(error))
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    if not isinstance(result.get('memories'), list):
+        return dict(params=params, elapsed_ms=elapsed, error={'error': 'invalid_recall_response'})
+    return dict(params=params, elapsed_ms=elapsed, client_revision=result.get('client_revision'),
+                rows=native_rows(result['memories'], seeded))
+
+
+def native_automatic(spec, config, spool, seeded, label):
+    """S4: the shipped bridge fetch/offer on the real automatic /recall response."""
+    from memento import bridge
+    original, observed = bridge.http, {}
+
+    def observe(*args, **kwargs):
+        observed['response'] = original(*args, **kwargs)
+        return observed['response']
+    params = {'q': spec['q'], 'effort': 'cheap', 'limit': 6, 'automatic': 'true'}
+    started = time.perf_counter()
+    try:
+        with patch.object(bridge, 'http', observe):
+            # The full detached lifetime keeps a late result measurable; exceeding
+            # the foreground wait is reported, not hidden.
+            fetched = bridge.recall_fetch(config, {'query': spec['q'], 'previous': ''}, bridge.RECALL_LIFETIME)
+    except (OSError, ValueError, TypeError, bridge._http_exception()) as error:
+        return dict(params=params, elapsed_ms=round((time.perf_counter() - started) * 1000, 1), error=_native_error(error))
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    offers = {}
+    for channel, budget, step in (('human', bridge.CONTEXT_BYTES, False), ('step', bridge.STEP_CONTEXT_BYTES, True)):
+        offer = bridge.recall_offer(spool, f'{label}:{channel}', spec['q'], fetched, budget=budget,
+                                    notice_in_context=not step, harness=None, step=step)
+        offers[channel] = native_offer_analysis(fetched, offer, budget, seeded)
+        offers[channel]['gold_delivered'] = {token: token in (offer.get('context') or '') for token in spec.get('gold', ())}
+    return dict(params=params, elapsed_ms=elapsed, fetch_timeout_s=bridge.RECALL_LIFETIME,
+                foreground_wait_s=bridge.RECALL_WAIT, exceeded_automatic_wait=elapsed > bridge.RECALL_WAIT * 1000,
+                client_revision=fetched.get('revision'), rows=native_rows(observed['response']['memories'], seeded),
+                offers=offers)
+
+
+def native_pass(service, config, spool, seeded, nonce, index):
+    queries = []
+    for spec in NATIVE_QUERIES:
+        modes = {}
+        for mode in spec['modes']:
+            if mode == 'automatic':
+                modes[mode] = native_automatic(spec, config, spool, seeded,
+                                               f'native-retrieval:{nonce}:{index}:{spec["id"]}')
+            else:
+                params = {'q': spec['q'], 'effort': 'normal', 'limit': 10,
+                          **({'scope': spec['scope']} if mode == 'scoped' else {})}
+                modes[mode] = native_http_recall(service, params, seeded)
+        queries.append(dict(id=spec['id'], slice=spec['slice'], query=spec['q'], modes=modes))
+    return {'pass': index, 'loadavg_after': list(os.getloadavg()), 'queries': queries}
+
+
+def native_gates(passes, seeded):
+    gates = {name: [] for name in NATIVE_GATES}
+    oracle = seeded['oracle']
+    for run in passes:
+        for record in run['queries']:
+            spec = NATIVE_QUERY_BY_ID[record['id']]
+            for mode, result in record['modes'].items():
+                where = {'pass': run['pass'], 'query': record['id'], 'mode': mode}
+                for row in result.get('rows') or []:
+                    fixture, at = row.get('fixture'), {**where, 'id': row.get('id'), 'fixture': row.get('fixture')}
+                    stale = type(row.get('version')) is int and row['version'] != row.get('current_version')
+                    if fixture in oracle and (stale or row.get('text_state') == 'superseded'):
+                        gates['superseded_surfaced'].append(at)
+                    if mode == 'scoped' and (fixture in spec.get('forbidden', ())
+                                             or (fixture in oracle and spec['scope'] not in (oracle[fixture]['scope'] or []))
+                                             or (isinstance(row.get('scope'), list) and spec['scope'] not in row['scope'])):
+                        gates['scope_leak'].append(at)
+                    if spec['slice'] == 'r1_out_of_quote_guard' and fixture in spec.get('forbidden', ()):
+                        gates['out_of_quote_match'].append(at)
+                for channel, offer in (result.get('offers') or {}).items():
+                    at = {**where, 'channel': channel}
+                    if offer['overrun']:
+                        gates['budget_overrun'].append({**at, 'context_bytes': offer['context_bytes'],
+                                                        'budget': offer['budget']})
+                    if spec['slice'] == 'unrelated' and offer['shown']:
+                        gates['unrelated_offered'].append({**at, 'shown_fixtures': offer['shown_fixtures']})
+                    if spec['slice'] == 'r1_out_of_quote_guard' and set(offer['shown_fixtures']) & set(spec['forbidden']):
+                        gates['out_of_quote_match'].append({**at, 'offered': True})
+                    for item in offer['items']:
+                        if item['state'] == 'partial':
+                            gates['partial_fact_delivered'].append({**at, 'id': item['id'], 'fixture': item['fixture'],
+                                                                    'cut_by': item['cut_by']})
+    return {name: dict(violations=len(found), details=found) for name, found in gates.items()}
+
+
+def native_observations(passes):
+    out = dict(expected_ranks={}, relevant_insufficient={}, conflicting={}, r1={}, delivery={}, raw_rows={},
+               automatic_wait_exceeded=[], update_notices=[], gold_delivered={}, rows_missing_version=[],
+               rationale_included='not_applicable: no behavioral suggestion is seedable (14c not run)')
+    for run in passes:
+        number = str(run['pass'])
+        for record in run['queries']:
+            spec = NATIVE_QUERY_BY_ID[record['id']]
+            for mode, result in record['modes'].items():
+                key = record['id'] + '/' + mode
+                ranks = {}
+                for row in result.get('rows') or []:
+                    ranks.setdefault(row.get('fixture'), row['rank'])
+                offered = {channel: offer['shown_fixtures'] for channel, offer in (result.get('offers') or {}).items()}
+                if spec.get('expected'):
+                    out['expected_ranks'].setdefault(key, {})[number] = {name: ranks.get(name) for name in spec['expected']}
+                if spec['slice'] == 'relevant_insufficient':
+                    out['relevant_insufficient'].setdefault(key, {})[number] = dict(
+                        ranks={name: ranks.get(name) for name in spec['relevant']}, offered=offered)
+                if spec['slice'] == 'conflicting':
+                    out['conflicting'].setdefault(key, {})[number] = dict(
+                        returned={name: ranks.get(name) for name in spec['members']},
+                        delivered={channel: sorted(set(spec['members']) & set(shown)) for channel, shown in offered.items()})
+                if spec['slice'].startswith('r1_'):
+                    out['r1'].setdefault(key, {})[number] = dict(
+                        expected={name: ranks.get(name) for name in spec.get('expected', ())},
+                        distractors={name: ranks.get(name) for name in spec.get('distractors', ())},
+                        forbidden={name: ranks.get(name) for name in spec.get('forbidden', ())})
+                for row in result.get('rows') or []:
+                    if row.get('fixture') and type(row.get('version')) is not int:
+                        out['rows_missing_version'].append({'pass': run['pass'], 'query': record['id'],
+                                                            'mode': mode, 'id': row.get('id')})
+                raw = sum(1 for row in result.get('rows') or [] if row.get('tier') == 'raw')
+                if raw:
+                    out['raw_rows'].setdefault(key, {})[number] = raw
+                if result.get('exceeded_automatic_wait'):
+                    out['automatic_wait_exceeded'].append({'pass': run['pass'], 'query': record['id'],
+                                                            'elapsed_ms': result['elapsed_ms']})
+                for channel, offer in (result.get('offers') or {}).items():
+                    out['delivery'].setdefault(key + '/' + channel, {})[number] = dict(
+                        context_bytes=offer['context_bytes'], shown=offer['shown_fixtures'],
+                        omitted=offer['omitted_fixtures'],
+                        cuts={item['fixture'] or item['id']: item['cut_by'] for item in offer['items'] if item.get('cut_by')})
+                    if offer['update_notice']:
+                        out['update_notices'].append({'pass': run['pass'], 'query': record['id'], 'channel': channel})
+                    if offer['gold_delivered']:
+                        out['gold_delivered'].setdefault(key + '/' + channel, {})[number] = offer['gold_delivered']
+    return out
+
+
+def native_differences(first, second):
+    """Same-instance repeat: any ordering/offer change stays visible."""
+    changed, drift = [], []
+    for a, b in zip(first['queries'], second['queries']):
+        for mode, x in a['modes'].items():
+            y = b['modes'].get(mode, {})
+            order = [[row.get('id'), row.get('version')] for row in x.get('rows') or []]
+            again = [[row.get('id'), row.get('version')] for row in y.get('rows') or []]
+            if order != again or bool(x.get('error')) != bool(y.get('error')):
+                changed.append(dict(query=a['id'], mode=mode, field='rows', first=order, second=again))
+            for row, other in zip(x.get('rows') or [], y.get('rows') or []):
+                if row.get('id') != other.get('id'):
+                    continue
+                for field in ('score', 'cosine'):
+                    p, q = row['server_fields'].get(field), other['server_fields'].get(field)
+                    if isinstance(p, (int, float)) and isinstance(q, (int, float)) and p != q:
+                        drift.append(dict(query=a['id'], mode=mode, id=row['id'], field=field, delta=abs(p - q)))
+            for channel, offer in (x.get('offers') or {}).items():
+                again_offer = (y.get('offers') or {}).get(channel) or {}
+                if (offer['shown'], offer['context_sha256']) != (again_offer.get('shown'), again_offer.get('context_sha256')):
+                    changed.append(dict(query=a['id'], mode=mode, field='offer:' + channel,
+                                        first=offer['shown'], second=again_offer.get('shown')))
+    return dict(identical=not changed, nondeterministic=changed, score_drift=drift,
+                basis='two passes against the same instance after readiness')
+
+
+def native_mcp_parity(service, url, first):
+    """One recall through the existing MCP endpoint with stdlib HTTP only."""
+    spec = NATIVE_QUERY_BY_ID['current_timeout']
+    arguments = {'query': spec['q'], 'effort': 'normal', 'limit': 10}
+    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                       'params': {'name': 'recall', 'arguments': arguments}}).encode('utf-8')
+    request = urllib.request.Request(url.rstrip('/') + '/mcp/', data=body, method='POST', headers={
+        'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'})
+    http_rows = next(record for record in first['queries'] if record['id'] == spec['id'])['modes']['normal'].get('rows')
+    expected = [[row.get('id'), row.get('version')] for row in http_rows or []]
+    base = dict(query=spec['id'], arguments=arguments, http_order=expected,
+                transport='stdlib urllib through the runner Service opener (no proxies or redirects)')
+    started = time.perf_counter()
+    try:
+        with service.opener.open(request, timeout=service.timeout) as response:
+            raw = response.read(8 * 1024 * 1024 + 1)
+        payload = json.loads(raw)
+    except Exception as error:
+        return dict(base, state='error', error=_native_error(error))
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    result = payload.get('result') if isinstance(payload, dict) else None
+    structured = result.get('structuredContent') if isinstance(result, dict) else None
+    if not isinstance(result, dict) or result.get('isError') or not isinstance(structured, dict) \
+            or not isinstance(structured.get('memories'), list):
+        return dict(base, state='shape_unrecognized', elapsed_ms=elapsed,
+                    keys=sorted(structured) if isinstance(structured, dict) else None)
+    order = [[item.get('id'), item.get('version')] for item in structured['memories'] if isinstance(item, dict)]
+    return dict(base, state='run', elapsed_ms=elapsed, mcp_order=order, equal=order == expected)
+
+
+def native_latency(passes, loadavg_start):
+    samples = {}
+    for run in passes:
+        for record in run['queries']:
+            for mode, result in record['modes'].items():
+                if 'elapsed_ms' in result and not result.get('error'):
+                    samples.setdefault(mode, []).append(result['elapsed_ms'])
+
+    def nearest(values, fraction):
+        return values[max(0, math.ceil(fraction * len(values)) - 1)]
+    summary = {mode: dict(n=len(values), p50_ms=nearest(sorted(values), .5), p95_ms=nearest(sorted(values), .95),
+                          max_ms=max(values)) for mode, values in samples.items()}
+    return dict(per_mode=summary, cpu_count=os.cpu_count(), loadavg_start=loadavg_start,
+                loadavg_end=list(os.getloadavg()),
+                basis='descriptive client wall-clock on this host (nearest-rank); not a capacity or latency claim')
+
+
+def native_retrieval(manifest_path, report, *, service_factory=None, ready_timeout=NATIVE_READY_TIMEOUT,
+                     poll=2.0, sleep=time.sleep):
+    """Return 0 (gates clear), 3 (completed with gate violations) or 2 (refused before any write)."""
+    corpus_digest = native_corpus_digest()
+    report.update(schema=NATIVE_REPORT_SCHEMA, mode='native-retrieval', stage='preflight',
+                  corpus=dict(version=NATIVE_CORPUS_VERSION, sha256=corpus_digest, frozen_before_first_query=None))
+    try:
+        manifest, manifest_sha = native_manifest(manifest_path)
+        report['launcher_attested'] = dict(
+            manifest_path=str(Path(manifest_path).resolve()), manifest_sha256=manifest_sha,
+            basis='copied from the launcher manifest; provenance is the launcher\'s claim, not harness-verified',
+            **{key: manifest.get(key) for key in (
+                'created_at', 'url', 'port', 'container_id', 'container_name', 'image', 'image_id',
+                'asserted_source_commit', 'fresh_data_volume', 'data_mount', 'baseline_pythonpath', 'model_assets',
+                'model_identity_source', 'resources', 'launcher_sha256')})
+        executed, bridge_bytes, runner_bytes = native_executed_client(manifest)
+        report['executed_client'] = executed
+        if service_factory is None:
+            from memento.runner import Service as service_factory
+        service = service_factory(manifest['url'])
+        report['target'] = native_target(service, bridge_bytes, runner_bytes)
+    except NativePreflightError as refusal:
+        report['stage'] = 'preflight_refused'
+        report['preflight_refusal'] = dict(reason=refusal.reason, **({'detail': refusal.detail} if refusal.detail else {}))
+        report['exit_code'] = 2
+        return 2
+    from memento import bridge
+    loadavg_start = list(os.getloadavg())
+    run_start = datetime.now(timezone.utc).replace(microsecond=0)
+    nonce = uuid4().hex[:12]
+    report['run'] = dict(started_at=_native_time(run_start), nonce=nonce,
+                         date_basis='fixture occurred_at values are whole-day offsets before started_at')
+    with tempfile.TemporaryDirectory(prefix='memento-native-retrieval-') as directory:
+        work = Path(directory)
+        os.chmod(work, 0o700)
+        config_path = work / 'runner.json'
+        config = dict(uid=os.getuid(), client_uid='native-retrieval-' + nonce, mode='client', agent='pi',
+                      preset='pi', timezone='UTC', url=manifest['url'])
+        bridge.private_write(config_path, bridge.encode(config))
+        report['stage'] = 'capture'
+        report['capture'] = native_capture(service, config_path, config, run_start, sleep=sleep)
+        report['stage'] = 'seed'
+        seeded = native_seed(service, nonce, run_start)
+        report['seed'] = seeded
+        report['stage'] = 'readiness'
+        report['readiness'] = native_wait_ready(service, ready_timeout, poll=poll, sleep=sleep)
+        if native_corpus_digest() != corpus_digest:
+            raise RuntimeError('corpus_changed')
+        report['corpus']['frozen_before_first_query'] = True
+        report['stage'] = 'queries'
+        # Installed clients receive the service-stamped bridge; mirror that stamp
+        # in-process. The executed file digest above remains the unstamped bytes.
+        report['client_revision_runtime'] = report['target']['served_revision']
+        spool = bridge.Spool(config_path, config)
+        try:
+            with patch.object(bridge, 'CLIENT_REVISION', report['target']['served_revision']):
+                passes = [native_pass(service, config, spool, seeded, nonce, index) for index in (1, 2)]
+        finally:
+            spool.close()
+        report['passes'] = passes
+        report['mcp_parity'] = native_mcp_parity(service, manifest['url'], passes[0])
+        report['final_status'] = native_status_summary(service.get('/status'))
+    report['gates'] = native_gates(passes, seeded)
+    report['observations'] = native_observations(passes)
+    report['differences'] = native_differences(*passes)
+    report['latency'] = native_latency(passes, loadavg_start)
+    report['costs'] = dict(
+        generative_model_calls=dict(value=0, basis='by construction: no /work, extraction, consolidation or native CLI'),
+        non_generative_inference=dict(encoder='present', reranker='present', count='unknown: not exposed by the service'),
+        native_usage='unknown: no native session runs', tokens='unknown')
+    report['not_run'] = NATIVE_NOT_RUN
+    report['not_measured'] = [
+        'retrieval quality beyond this frozen corpus', 'production-scale latency, capacity or concurrency',
+        'cold-tier readiness beyond the recorded flag', 'encoder/reranker invocation counts',
+        'MCP beyond one parity query', 'update notices beyond the observed client revision']
+    errors = [{'pass': run['pass'], 'query': record['id'], 'mode': mode, 'error': result['error']}
+              for run in passes for record in run['queries'] for mode, result in record['modes'].items()
+              if result.get('error')]
+    report['query_errors'] = errors  # MCP parity state is reported separately and never sets the exit code
+    violated = sorted(name for name, gate in report['gates'].items() if gate['violations'])
+    report['interpretation'] = dict(
+        hard_gates_zero=not violated, violated=violated,
+        note=('Baseline observation, not an overall quality claim. Partial delivery (14a bridge budget, 14b server '
+              'summary) is an expected observed defect at this baseline; gates are not tuned to pass. '
+              'out_of_quote_match passes by construction before R1 and guards its later regression.'))
+    report['stage'] = 'completed'
+    report['exit_code'] = 1 if errors else 3 if violated else 0
+    return report['exit_code']
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['calibrate', 'learning', 'factual-scope'])
+    parser.add_argument('mode', choices=['calibrate', 'learning', 'factual-scope', 'native-retrieval'])
     parser.add_argument('--agent', choices=['pi', 'omp'], default='pi')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--calibrate', action='store_true', help='Reuse the isolated service model for frozen calibration first')
     parser.add_argument('--codex-executable', type=Path,
                         help='Opt in to fresh gpt-6.1/xhigh conduct, two paired controls and explicit MCP lookup using this existing binary')
     parser.add_argument('--injection', action='store_true', help='Opt in to the fresh Pi extension injection check; no native installation')
+    parser.add_argument('--instance-manifest', type=Path,
+                        help='native-retrieval: private launcher manifest of one owned, isolated native service')
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit('Choose a new output file')
     if args.mode != 'learning' and (args.codex_executable or args.injection):
         parser.error('Native conduct/injection options require learning mode')
+    if (args.mode == 'native-retrieval') != (args.instance_manifest is not None):
+        parser.error('--instance-manifest is required by, and only valid with, native-retrieval')
+    if args.mode == 'native-retrieval' and args.calibrate:
+        parser.error('--calibrate does not apply to native-retrieval')
     report = {}
+    code = 0
     try:
-        if args.mode == 'calibrate':
+        if args.mode == 'native-retrieval':
+            code = native_retrieval(args.instance_manifest, report)
+        elif args.mode == 'calibrate':
             from memento.embedder import load_model
             from memento.retrieval import MODEL_ID, MODEL_REVISION
             report['calibration'] = calibrate(load_model(MODEL_ID, MODEL_REVISION, text_only=False))
@@ -647,6 +1557,8 @@ def main():
         with os.fdopen(fd, 'w') as stream:
             json.dump(report, stream, ensure_ascii=False, indent=2)
             stream.write('\n')
+    if code:
+        raise SystemExit(code)
 
 
 if __name__ == '__main__':

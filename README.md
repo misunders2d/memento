@@ -752,6 +752,15 @@ cargo test --locked --workspace
 
 Native implementation areas: `crates/server` (HTTP/MCP, retrieval and asset startup), `crates/core`/`crates/domain` (SQLite authority, evidence and processing), `crates/ann` (disposable Hot/Cold search indexes), `crates/model`/`crates/media` (existing model and media operations), and `crates/owner`/`crates/maintenance` (administration, import, recovery and optional storage). The portable clients remain `src/memento/runner.py`, `bridge.py` and `native_*.ts`; Python stdlib on agent hosts remains supported.
 
+For opt-in native capture, retrieval and reminder-delivery acceptance, use the `native-retrieval` mode of `tests/memory_acceptance.py`. An operator must first launch a fresh, isolated native instance with the pinned models, read-only model assets and a separate data directory. Its private, launcher-created `memento-native-acceptance-v1` manifest records the loopback URL, image/source identity, model mounts and matching client files; `native_manifest()` documents the required fields. Production port 8765, nonempty instances and stale client files are refused before writes.
+
+```sh
+PYTHONPATH=/path/to/matching-client/src python3 tests/memory_acceptance.py native-retrieval \
+  --instance-manifest /private/native-instance.json --output /tmp/native-retrieval-result.json
+```
+
+The frozen synthetic corpus uses supplied memories, exact original quotes and current `/history` bodies. Reports distinguish retrieval, delivered context and unrun model/native-hook stages, record exact bytes and descriptive latency, and compare two query passes. Exit 0 means the corpus gates clear, 3 means measured gate violations, 2 means preflight refusal, and 1 means a runtime/query failure. Reports are private, created without overwriting, and belong outside Git. This is an occasional test run; remove its disposable instance afterward. The existing `learning` and `calibrate` modes exercise the Python comparison path.
+
 For the explicitly selected Python comparison/development service:
 
 ```sh
