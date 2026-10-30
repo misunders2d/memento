@@ -25,6 +25,8 @@ const AUTO_FLOOR: f64 = 0.66;
 // Fixed narrow text-passage validation decision. Behavior/media/entity contexts
 // are separate routes; this is not a universal semantic relevance probability.
 const SEMANTIC_TEXT_LOGIT_FLOOR: f64 = -3.63973325;
+// Automatic `full_text` stays within one native reminder budget, framing included.
+const FULL_TEXT_BYTES: usize = 1500;
 type TextScore<'a> = dyn Fn(&[&str], Instant) -> Result<Vec<f32>> + 'a;
 // Owned per-request results only, never an index handle or persistent cache.
 struct HotPreview {
@@ -116,6 +118,7 @@ fn text_passage(db: &rusqlite::Connection, row: &Value, or_only: bool) -> Result
     }
     Ok(true)
 }
+#[cfg(test)]
 fn filter_text_passages(
     db: &rusqlite::Connection,
     found: &mut BTreeMap<String, Value>,
@@ -123,6 +126,18 @@ fn filter_text_passages(
     deadline: Instant,
     score: Option<&TextScore<'_>>,
     or_only: &HashSet<String>,
+) -> Result<()> {
+    validate_text_passages(db, found, limit, deadline, score, or_only, false)
+}
+// `explain` only keeps each passing logit on its row; selection is identical.
+fn validate_text_passages(
+    db: &rusqlite::Connection,
+    found: &mut BTreeMap<String, Value>,
+    limit: usize,
+    deadline: Instant,
+    score: Option<&TextScore<'_>>,
+    or_only: &HashSet<String>,
+    explain: bool,
 ) -> Result<()> {
     let Some(score) = score else { return Ok(()) };
     let mut passages = Vec::new();
@@ -172,6 +187,8 @@ fn filter_text_passages(
         for (id, logit) in batch.iter().zip(logits) {
             if f64::from(logit) < SEMANTIC_TEXT_LOGIT_FLOOR {
                 rejected.push(id.clone());
+            } else if explain {
+                found.get_mut(id).unwrap()["_logit"] = json!(logit);
             }
         }
     }
@@ -435,7 +452,7 @@ impl Retrieval {
                 matches.insert(id, record);
             }
         }
-        filter_text_passages(db, &mut matches, limit, deadline, score, &or_only)?;
+        validate_text_passages(db, &mut matches, limit, deadline, score, &or_only, request.explain)?;
         let meaningful = matches.values().try_fold(false, |yes, v| {
             Ok::<_, Error>(yes || records::meaningful(db, v)?)
         })?;
@@ -471,13 +488,14 @@ impl Retrieval {
                     raw_matches.insert(key(&row).into(), row);
                 }
             }
-            filter_text_passages(
+            validate_text_passages(
                 db,
                 &mut raw_matches,
                 limit,
                 deadline,
                 score,
                 &HashSet::new(),
+                request.explain,
             )?;
             for (id, row) in raw_matches {
                 matches.entry(id).or_insert(row);
@@ -487,7 +505,7 @@ impl Retrieval {
             let fallback_hits = cold_search((fallback_limit * 4).max(8), Pool::RawFallback)?;
             let mut fallback = Self::raw_fallback_scored(
                 tx, fallback_hits, &request.query, fallback_limit,
-                !request.automatic, at, deadline, score,
+                !request.automatic, at, deadline, score, request.explain,
             )?;
             if request.automatic {
                 let mut parked = Vec::new();
@@ -504,9 +522,13 @@ impl Retrieval {
                             &mut row,
                             json!({"category":"memory","cosine":hit.cosine,"score":hit.cosine,"match":"semantic","related":[],"duplicate_ids":[]}),
                         );
+                        let label = source_label(&row);
+                        if let Some(full) = row["_full_text"].as_str() {
+                            row["_full_render"] =
+                                json!(format!("Unverified historical candidate{label}: {full}"));
+                        }
                         row["text"] = json!(format!(
-                            "Unverified historical candidate{}: {}",
-                            source_label(&row),
+                            "Unverified historical candidate{label}: {}",
                             row["text"].as_str().unwrap_or("")
                         ));
                         parked.push(row);
@@ -517,7 +539,7 @@ impl Retrieval {
                     .into_iter()
                     .map(|row| (key(&row).to_owned(), row))
                     .collect();
-                filter_text_passages(db, &mut eligible, limit, deadline, score, &HashSet::new())?;
+                validate_text_passages(db, &mut eligible, limit, deadline, score, &HashSet::new(), request.explain)?;
                 let mut parked: Vec<Value> = eligible.into_values().collect();
                 parked.sort_by(order);
                 if let Some(row) = parked.into_iter().next() {
@@ -545,6 +567,10 @@ impl Retrieval {
             }
             if request.automatic && row["type"] == "media" {
                 records::media_pointer(db, &mut row)?;
+            }
+            if request.automatic && row["category"] == "media_reference" {
+                // A file pointer is complete; the stored body length does not apply to it.
+                row.as_object_mut().unwrap().remove("text_truncated");
             }
             if !request.automatic {
                 let feedback: Option<(i64, i64)> = db
@@ -585,6 +611,8 @@ impl Retrieval {
             if emitted_ids.contains(key(&row)) {
                 continue;
             }
+            // Automatic only: the same framing applied to the complete stored assertion.
+            let mut full: Option<String> = None;
             if request.automatic {
                 let signature = format!(
                     "{}\0{}\0{}\0{}",
@@ -645,8 +673,17 @@ impl Retrieval {
                 }
                 grouped.insert(signature, output.len());
                 row["duplicate_ids"] = json!([]);
+                full = row
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("_full_render")
+                    .or_else(|| row.get("_full_text").cloned())
+                    .and_then(|v| v.as_str().map(str::to_owned));
                 if let Some(date) = row["source_occurred_at"].as_str() {
                     let prefix = format!("Source {}: ", &date[..10.min(date.len())]);
+                    if let Some(full) = full.as_mut() {
+                        *full = format!("{prefix}{full}");
+                    }
                     row["text"] = json!(format!("{prefix}{}", row["text"].as_str().unwrap_or("")));
                     if row["behavior"].is_object() {
                         row["behavior"]["applicability"] = json!(format!(
@@ -715,15 +752,63 @@ impl Retrieval {
                     }
                 }
                 if !provenance.is_empty() {
+                    // Same suffix for both renderings; `text` decides it, so legacy output is unchanged.
+                    if let Some(full) = full.as_mut() {
+                        *full = format!("{full} (Connected: {})", provenance.join("; "));
+                    }
                     row["text"] = json!(format!(
                         "{} (Connected: {})",
                         row["text"].as_str().unwrap_or(""),
                         provenance.join("; ")
                     ));
                 }
+                // Additive complete rendering for current-fact rows only; legacy `text` keeps
+                // its summary for old bridges. Long bodies stay withheld until the owner
+                // chooses broader automatic disclosure; sensitive types are also withheld.
+                if let Some(full) = full {
+                    if row["category"] == "memory"
+                        && row["text_truncated"] != true
+                        && row["type"] != "media"
+                        && row["behavior"].is_null()
+                        && full.len() <= FULL_TEXT_BYTES
+                        && !sensitive_type(db, row["type"].as_str().unwrap_or(""))?
+                    {
+                        row["full_text"] = json!(full);
+                    }
+                }
             }
             if records::meaningful(db, &row)? {
                 facts.push(row.clone());
+            }
+            if request.explain {
+                // Facts the pipeline already computed for this returned row; no extra search or clock.
+                let raw = row["tier"] == "raw" || row["type"] == "raw_episode";
+                let deep = request.effort == "deep" && !request.automatic && scope.is_none() && period.is_none();
+                let (route, gate) = if raw {
+                    (if deep { "deep_raw" } else { "raw_fallback" }, TEXT_FLOOR)
+                } else if row["tier"] == "candidate" && row["historical"] == true {
+                    ("parked_fallback", AUTO_FLOOR)
+                } else {
+                    ("ranked", floor(&row, request.automatic))
+                };
+                let logit = row.as_object_mut().unwrap().remove("_logit");
+                row["explain"] = json!({
+                    "route": route,
+                    "pass": if archive { "archive" } else { "hot" },
+                    "ann": {"cosine": row["cosine"], "floor": gate},
+                    "lexical": {
+                        "and_literal": and_targets.contains(key(&row)),
+                        "or_discovery": or_only.contains(key(&row)),
+                        "episode_fts": raw && matches!(row["match"].as_str(), Some("keyword" | "hybrid")),
+                    },
+                    "passage_validation": match logit {
+                        Some(logit) => json!({"status":"passed","logit":logit,"floor":SEMANTIC_TEXT_LOGIT_FLOOR}),
+                        None => json!({"status":"not_run","reason":if score.is_none() {"no_scorer"} else {"route_exempt"}}),
+                    },
+                    // Ranked rows only; anchors and connections are positional.
+                    "ordering": "sort_key",
+                    "sort_key": [relevance(&row), number(&row, "score", 0.), number(&row, "decay", 1.), number(&row, "importance", 0.5), number(&row, "_feedback", 0.), key(&row)],
+                });
             }
             row.as_object_mut().unwrap().remove("_full_text");
             row.as_object_mut().unwrap().remove("_feedback");
@@ -764,6 +849,17 @@ impl Retrieval {
                 &mut output,
                 limit,
             )?;
+        }
+        if request.explain {
+            for row in output.iter_mut().filter(|r| r.get("explain").is_none()) {
+                let route = match row["match"].as_str() {
+                    Some("entity_name") => "anchor",
+                    Some("partial_entity_name") => "partial_anchor",
+                    Some("recorded_connection") => "recorded_connection",
+                    _ => "positional",
+                };
+                row["explain"] = json!({"route":route,"pass":if archive { "archive" } else { "hot" },"ordering":"positional","sort_key":null,"passage_validation":{"status":"not_run","reason":"positional"}});
+            }
         }
         Ok((output, need_archive && !archive))
     }
@@ -890,6 +986,7 @@ impl Retrieval {
             at,
             Instant::now() + std::time::Duration::from_secs(5),
             None,
+            false,
         )
     }
     fn raw_fallback_scored(
@@ -901,6 +998,7 @@ impl Retrieval {
         at: DateTime<Utc>,
         deadline: Instant,
         score: Option<&TextScore<'_>>,
+        explain: bool,
     ) -> Result<Vec<Value>> {
         let mut found = BTreeMap::new();
         for hit in hits {
@@ -940,13 +1038,14 @@ impl Retrieval {
                 }
             }
         }
-        filter_text_passages(
+        validate_text_passages(
             tx.sql(),
             &mut found,
             limit,
             deadline,
             score,
             &HashSet::new(),
+            explain,
         )?;
         let mut result = Vec::new();
         for (_, mut row) in found {
@@ -1078,8 +1177,21 @@ pub(crate) fn finish(db: &rusqlite::Connection, row: &mut Value, at: DateTime<Ut
         }
         .map(Value::String)
         .unwrap_or(Value::Null);
+        // `text` is the stored assertion's 240-character summary (SQLite substr counts characters).
+        let truncated = row["_full_text"].as_str().map(|full| full.chars().count() > 240);
+        if let Some(truncated) = truncated {
+            row["text_truncated"] = json!(truncated);
+        }
     }
     Ok(())
+}
+fn sensitive_type(db: &rusqlite::Connection, kind: &str) -> Result<bool> {
+    Ok(records::one(
+        db,
+        "SELECT 1 FROM memory_types WHERE name=? AND sensitive=1",
+        [kind],
+    )?
+    .is_some())
 }
 fn hydrate(tx: &ReadTxn<'_>, hit: &SearchHit, historical: bool) -> Result<Option<Value>> {
     match hit.kind.as_str() {
@@ -1168,6 +1280,8 @@ mod tests {
     include!("retrieval_snapshot_tests.rs");
     include!("revision_tests.rs");
     include!("period_tests.rs");
+    include!("full_text_tests.rs");
+    include!("explain_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,

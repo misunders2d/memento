@@ -112,6 +112,9 @@ pub struct RecallRequest {
     pub automatic: bool,
     #[serde(default)]
     pub context: String,
+    /// HTTP-only per-row diagnostics for returned rows; never changes selection or order.
+    #[serde(default)]
+    pub explain: bool,
 }
 impl Default for RecallRequest {
     fn default() -> Self {
@@ -126,6 +129,7 @@ impl Default for RecallRequest {
             memory_until: None,
             automatic: false,
             context: String::new(),
+            explain: false,
         }
     }
 }
@@ -582,7 +586,18 @@ async fn recall(
     let revision = state.assets.revision.clone();
     let deadline =
         Instant::now() + std::time::Duration::from_secs(if query.automatic { 15 } else { 30 });
-    let memories = blocking(move || state.recall_memories(&query, deadline)).await?;
+    let memories = blocking(move || {
+        let mut rows = state.recall_memories(&query, deadline)?;
+        if query.explain {
+            // Period listings and literal raw evidence never enter semantic ranking.
+            for row in rows.iter_mut().filter(|r| r.get("explain").is_none()) {
+                let route = if row["match"] == "period" { "period_list" } else { "literal_raw" };
+                row["explain"] = json!({"route":route,"ordering":"route_specific","sort_key":null,"passage_validation":{"status":"not_run","reason":"route_exempt"}});
+            }
+        }
+        Ok(rows)
+    })
+    .await?;
     Ok(Json(
         json!({"client_revision":revision,"memories":memories}),
     ))

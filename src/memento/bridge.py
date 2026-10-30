@@ -855,10 +855,17 @@ def recall_fetch(config, request, timeout):
                                       or 'none recorded.'))
             if len(text.encode('utf-8')) > CONTEXT_BYTES:
                 continue
+        elif isinstance(memory.get('full_text'), str) and memory['full_text'].strip():
+            # The service's complete rendering of the current fact, framing included.
+            text = memory['full_text']
+        elif memory.get('text_truncated') is True:
+            continue  # A known-incomplete fact is omitted, never delivered partially.
         else:
             text = memory.get('text', memory.get('content', memory.get('summary', '')))
         if not isinstance(text, str):
             text = encode(text).decode('utf-8')
+        if len(text.encode('utf-8')) > CONTEXT_BYTES:
+            continue
         label = ('[behavioral suggestion; current instructions take priority] ' if suggestion else
                  '[media reference] ' if media else '[fact] ')
         authority = memory.get('authority') or (behavior.get('authority') if suggestion else None)
@@ -874,14 +881,10 @@ def recall_fetch(config, request, timeout):
         rationale = behavior.get('rationale') if suggestion else None
         version = memory.get('version')
         if media:
-            # Keep a file pointer complete, including its source and original URL.
-            if len(text.encode('utf-8')) > CONTEXT_BYTES:
-                continue
-            media_seen = True
-        items.append(dict(id=identifier, prefix=prefix, suggestion=suggestion, media=media,
-            text=text.encode('utf-8')[:CONTEXT_BYTES].decode('utf-8', 'ignore'),
-            rationale=' '.join(rationale.split()).encode('utf-8')[:CONTEXT_BYTES].decode('utf-8', 'ignore')
-                      if isinstance(rationale, str) else '',
+            media_seen = True  # A complete file pointer, including its source and original URL.
+        rationale = ' '.join(rationale.split()) if isinstance(rationale, str) else ''
+        items.append(dict(id=identifier, prefix=prefix, suggestion=suggestion, media=media, text=text,
+            rationale=rationale if len(rationale.encode('utf-8')) <= CONTEXT_BYTES else '',
             identity_version=version if type(version) is int and version > 0 else None,
             version=version if suggestion and isinstance(memory['id'], str) and len(identifier) <= 64
                     and type(version) is int and version > 0 else None))
@@ -901,25 +904,22 @@ def recall_offer(spool, conversation, query, result, *, budget, notice_in_contex
         excerpt = query.encode('utf-8')[:160].decode('utf-8', 'ignore')
         lines.append('Delayed recall for an earlier request: ' + json.dumps(excerpt, ensure_ascii=False) +
                      (' [excerpt]' if excerpt != query else '') + '. Check applicability to the current request.')
-    shown, exposure = [], []
+    shown, exposure, rendered = [], [], []
     for item in result['items']:
+        # Coverage first: every item is rendered whole in rank order, or skipped.
         available = budget - len(('\n'.join(lines) + '\n' + item['prefix']).encode('utf-8'))
-        if available <= 0:
-            break
-        text = item['text']
-        if item['suggestion'] or item.get('media'):
-            if len(text.encode('utf-8')) > available:
-                continue
-            with_rationale = text + ' Rationale: ' + item['rationale']
-            if item['rationale'] and len(with_rationale.encode('utf-8')) <= available:
-                text = with_rationale
-        else:
-            text = text.encode('utf-8')[:available].decode('utf-8', 'ignore')
-        if text:
-            lines.append(item['prefix'] + text)
-            shown.append(item['id'])
-            if item['version'] is not None:
-                exposure.append([item['id'], item['version']])
+        if not item['text'] or len(item['text'].encode('utf-8')) > available:
+            continue
+        lines.append(item['prefix'] + item['text'])
+        rendered.append((len(lines) - 1, item))
+        shown.append(item['id'])
+        if item['version'] is not None:
+            exposure.append([item['id'], item['version']])
+    for index, item in rendered:
+        # Optional rationale depth only after complete-item coverage.
+        extra = ' Rationale: ' + item['rationale']
+        if item['suggestion'] and item['rationale'] and len(('\n'.join(lines) + extra).encode('utf-8')) <= budget:
+            lines[index] += extra
     context = '\n'.join(lines) if shown else ''
     if not step:
         spool.db.execute('''INSERT INTO recall_cache(conversation,query,context,shown,updated) VALUES(?,?,?,?,?)

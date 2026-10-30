@@ -208,10 +208,11 @@ def test_processing_guard_before_stdin_and_spool(tmp_path, monkeypatch, capsys):
 def test_passive_recall_is_bounded_and_never_usage(tmp_path, monkeypatch):
     spool = spool_at(tmp_path)
     monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {
-        'memories': [{'id': 'abc', 'text': '🧠' * 10000}]})
+        'memories': [{'id': 'huge', 'text': '🧠' * 10000}, {'id': 'abc', 'text': '🧠' * 100}]})
     result = bridge.passive(spool, 'session', 'query')
     assert len(result['context'].encode('utf-8')) <= bridge.CONTEXT_BYTES
-    assert result['shown'] == ['abc']
+    # An oversized fact is omitted whole, never sliced; the complete one still fits.
+    assert result['shown'] == ['abc'] and result['context'].endswith('🧠' * 100)
     assert not pending(spool, '/usage')
     spool.close()
 

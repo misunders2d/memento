@@ -278,6 +278,7 @@ fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String
                 memory_until: optional(args.memory_until),
                 automatic: false,
                 context: String::new(),
+                explain: false,
             };
             let period = request.memory_since.is_some() || request.memory_until.is_some();
             let memories =
@@ -291,8 +292,14 @@ fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String
                         .filter(|_| period)
                         .map(|at| format!(" | source {at}"))
                         .unwrap_or_default();
+                    // A cut summary says so; history(id) returns the complete assertion.
+                    let cut = if item["text_truncated"] == true {
+                        " [truncated]"
+                    } else {
+                        ""
+                    };
                     format!(
-                        "{} | {} | {} | {:.3}{dated}",
+                        "{} | {} | {}{cut} | {:.3}{dated}",
                         item["id"].as_str().unwrap_or(""),
                         item["type"].as_str().unwrap_or(""),
                         item["text"]

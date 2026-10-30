@@ -355,7 +355,7 @@ def test_codex_async_can_start_before_sync_and_never_starts_another_request(clie
     monkeypatch.setattr(bridge, 'RECALL_LIFETIME', 2)
     gate = threading.Event()
     client.gates.append(gate)
-    client.routes['codex topic'] = gate, {'memories': [{'id': 'codex-late', 'text': 'Synthetic late memory. ' * 200}]}
+    client.routes['codex topic'] = gate, {'memories': [{'id': 'codex-late', 'text': 'Synthetic late memory. ' * 20}]}
     data = dict(session_id='codex-session', turn_id='native-turn', hook_event_name='UserPromptSubmit', prompt='codex topic')
     def async_hook():
         spool = bridge.Spool(client.spool.config_path, client.spool.config)

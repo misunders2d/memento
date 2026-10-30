@@ -386,3 +386,60 @@ async fn mcp_period_schema_omission_dates_and_errors() {
         assert_eq!(result["content"], json!([{"type":"text","text":message}]));
     }
 }
+
+#[tokio::test]
+async fn explicit_recall_marks_a_cut_summary_and_never_returns_the_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(Store::open(dir.path().join("data")).unwrap()).unwrap();
+    let tail = "MEMENTO_SYNTHETIC_CREDENTIAL_Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7";
+    let text = format!(
+        "{}Fixture key {tail}.",
+        "Synthetic long period assertion clause. ".repeat(7)
+    );
+    let (status, episode) = request(&state, "POST", "/episodes", Some(json!({"source":"native:synthetic:pi","event_id":"long","conversation_id":"period","kind":"user","text":text,"occurred_at":"2026-10-20T12:00:00Z","metadata":{}}))).await;
+    assert!(status.is_success(), "{status} {episode}");
+    let (status, node) = request(&state, "POST", "/remember", Some(json!({
+        "command_id":"period-long","actor":"fixture","why":"Exact synthetic period source",
+        "type":"knowledge","text":text,"scope":["personal"],
+        "evidence":[{"episode_id":episode["id"],"quote":text}]
+    }))).await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    let (status, body) = request(&state, "GET", &format!("/recall?{WINDOW}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let memory = &body["memories"][0];
+    assert_eq!(memory["text"].as_str().unwrap().chars().count(), 240);
+    assert_eq!(memory["text_truncated"], true);
+    assert!(memory.get("full_text").is_none());
+    assert!(!body.to_string().contains(tail));
+    let result = tool(&state, json!({"query":"","memory_since":"2026-10-16T00:00:00Z","memory_until":"2026-10-30T00:00:00Z"})).await;
+    assert_eq!(result["isError"], false);
+    assert!(!result.to_string().contains(tail));
+    let line = result["content"][0]["text"].as_str().unwrap();
+    assert!(line.contains(" [truncated] | "), "{line}");
+}
+
+#[tokio::test]
+async fn http_explain_labels_period_rows_without_changing_them() {
+    let f = fixture().await;
+    // Each request reads its own clock, so `decay` legitimately differs between calls.
+    let rows = |body: &Value| -> Vec<Value> {
+        body["memories"].as_array().unwrap().iter().cloned().map(|mut r| {
+            r.as_object_mut().unwrap().remove("decay");
+            r
+        }).collect()
+    };
+    let (_, plain) = request(&f.state, "GET", &format!("/recall?{WINDOW}"), None).await;
+    let (_, off) = request(&f.state, "GET", &format!("/recall?{WINDOW}&explain=false"), None).await;
+    let (status, on) = request(&f.state, "GET", &format!("/recall?{WINDOW}&explain=true"), None).await;
+    assert_eq!(status, StatusCode::OK, "{on}");
+    assert_eq!(rows(&plain), rows(&off));
+    assert!(rows(&off).iter().all(|r| r.get("explain").is_none()));
+    let mut explained = rows(&on);
+    assert!(!explained.is_empty());
+    for row in &mut explained {
+        let explain = row.as_object_mut().unwrap().remove("explain").unwrap();
+        assert_eq!(explain["route"], "period_list");
+        assert!(explain["sort_key"].is_null());
+    }
+    assert_eq!(explained, rows(&plain));
+}
