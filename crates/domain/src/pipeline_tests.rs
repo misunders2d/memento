@@ -1732,3 +1732,155 @@ fn pre_revision_policy_lease_is_refused_and_rederived_without_losing_candidates(
     f.complete(&retry, json!({"actions":actions})).unwrap();
     assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidate_decisions"), 1);
 }
+
+const PENDING: &str = "I still owe Lena the signed copper launch report.";
+const DONE: &str = "Sent Lena the signed copper launch report just now.";
+fn later_windows(work: &Value) -> Vec<Value> {
+    work["input"]["raw_windows"].as_array().unwrap().iter().filter(|w| w["later_context"] == true).cloned().collect()
+}
+/// One loop-flagged candidate whose same conversation later reports the completion.
+fn flagged_with_completion(f: &Fixture, completion_date: &str) -> (Value, Value, String) {
+    let pending = f.capture("pending", "thread", PENDING, "user", "contract", json!({}), "2026-10-18T12:00:00Z");
+    let done = f.capture("done", "thread", DONE, "assistant", "contract", json!({}), completion_date);
+    f.extract("contract", "thread", PENDING, "knowledge", true);
+    let work = f.consolidate_work();
+    assert_eq!(later_windows(&work).iter().map(|w| w["episode_id"].clone()).collect::<Vec<_>>(), vec![json!(done)]);
+    let candidate = work["input"]["candidates"][0].clone();
+    assert_eq!(candidate["evidence"][0]["episode_id"], json!(pending));
+    (work, candidate, done)
+}
+fn self_close(candidate: &Value, done: &str) -> Value {
+    let mut close = action(candidate, "remember");
+    close["open_loop"] = Value::Null;
+    close["closed_targets"] = json!([candidate["id"]]);
+    close["evidence"].as_array_mut().unwrap().push(json!({"episode_id":done,"quote":DONE,"occurrence":null}));
+    close
+}
+fn premise_episodes(f: &Fixture, target: &str) -> Vec<String> {
+    f.graph.history(target).unwrap()[0]["evidence"].as_array().unwrap().iter().map(|e| e["episode_id"].as_str().unwrap().to_owned()).collect()
+}
+
+#[test]
+fn later_context_supplies_only_bounded_communicated_follow_up_for_open_loops() {
+    let f = Fixture::new();
+    let long = format!("{}{}", "x".repeat(2000), DONE);
+    let mut expected = vec![];
+    f.capture("pending", "thread", PENDING, "user", "contract", json!({}), "2026-10-18T12:00:00Z");
+    for (event, conversation, kind, text, metadata, eligible) in [
+        ("tool", "thread", "tool", "report.pdf uploaded".to_owned(), json!({"extraction_mode":"tool_output"}), false),
+        ("attempt", "thread", "assistant", "[{\"type\":\"toolCall\",\"name\":\"send\"}]".to_owned(), json!({"evidence_eligible":false}), false),
+        ("thinking", "thread", "assistant", "[{\"type\":\"thinking\",\"thinking\":\"Lena has the report.\"}]".to_owned(), json!({}), false),
+        ("hook", "thread", "native_hook", "hook output".to_owned(), json!({}), false),
+        ("other", "elsewhere", "user", DONE.to_owned(), json!({}), false),
+        ("reply", "thread", "assistant", "[{\"type\":\"thinking\",\"thinking\":\"plan\"},{\"type\":\"text\",\"text\":\"Sending it.\"}]".to_owned(), json!({}), true),
+        ("long", "thread", "assistant", long.clone(), json!({}), true),
+    ] {
+        let id = f.capture(event, conversation, &text, kind, "contract", metadata, "2026-10-18T12:10:00Z");
+        if eligible { expected.push(id); }
+    }
+    for index in 0..8 {
+        let id = f.capture(&format!("chat{index}"), "thread", &format!("Unrelated chat {index}."), "user", "contract", json!({}), "2026-10-18T12:20:00Z");
+        if expected.len() < 8 { expected.push(id); }
+    }
+    f.extract("contract", "thread", PENDING, "knowledge", true);
+    let work = f.consolidate_work();
+    let later = later_windows(&work);
+    assert_eq!(later.iter().map(|w| w["episode_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>(), expected);
+    // Assistant records keep their bounded tail (the reply), exact offsets into the original.
+    let tail = later.iter().find(|w| w["episode_id"] == json!(expected[1])).unwrap();
+    assert_eq!((tail["start"].as_u64(), tail["end"].as_u64()), (Some(long.chars().count() as u64 - 1500), Some(long.chars().count() as u64)));
+    assert!(tail["text"].as_str().unwrap().ends_with(DONE) && tail["behavior_ground_truth"] == false);
+    assert!(work["input"].get("_later_context").is_none());
+
+    // An unflagged candidate gets no lifecycle context.
+    let g = Fixture::new();
+    g.capture("pending", "thread", PENDING, "user", "contract", json!({}), "2026-10-18T12:00:00Z");
+    g.capture("done", "thread", DONE, "assistant", "contract", json!({}), "2026-10-18T12:30:00Z");
+    g.extract("contract", "thread", PENDING, "knowledge", false);
+    assert!(later_windows(&g.consolidate_work()).is_empty());
+}
+
+#[test]
+fn later_completion_closes_own_loop_without_becoming_its_pending_premise() {
+    let f = Fixture::new();
+    let (work, candidate, done) = flagged_with_completion(&f, "2026-10-18T12:30:00Z");
+    let committed = f.complete(&work, json!({"actions":[self_close(&candidate, &done)]})).unwrap();
+    let closure = &committed["loop_closures"][0];
+    assert_eq!((closure["status"].as_str(), closure["source_occurred_at"].as_str()), (Some("closed"), Some("2026-10-18T12:30:00+00:00")));
+    let target = committed["results"][candidate["id"].as_str().unwrap()]["id"].as_str().unwrap().to_owned();
+    assert_eq!(closure["target"], json!(target));
+    assert_eq!(f.graph.history(&target).unwrap()[0]["loop"]["state"], "closed");
+    // The completion stays lifecycle evidence of the closure, never a premise of the memory.
+    assert!(!premise_episodes(&f, &target).contains(&done));
+}
+
+#[test]
+fn later_context_cannot_freshen_or_self_block_a_pending_obligation() {
+    let f = Fixture::new();
+    let (work, candidate, done) = flagged_with_completion(&f, "2026-10-18T12:30:00Z");
+    // Citing the later completion as a premise (kept open) would move the pending date.
+    let mut premise = action(&candidate, "remember");
+    premise["open_loop"] = json!(true);
+    premise["evidence"].as_array_mut().unwrap().push(json!({"episode_id":done,"quote":DONE,"occurrence":null}));
+    let error = f.complete(&work, json!({"actions":[premise]})).unwrap_err();
+    assert_eq!(error.to_string(), "consolidation_evidence_outside_context");
+    // A declined flag cannot pose as a chronology-checked closure.
+    let mut declined = self_close(&candidate, &done);
+    declined["open_loop"] = json!(false);
+    let error = f.complete(&work, json!({"actions":[declined]})).unwrap_err();
+    assert_eq!(error.to_string(), "consolidation_loop_state_contradictory");
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidate_decisions"), 0);
+    // Kept open on its original premise only, the later completion still closes it.
+    let mut open = action(&candidate, "remember");
+    open["open_loop"] = json!(true);
+    let committed = f.complete(&work, json!({"actions":[open]})).unwrap();
+    let target = committed["results"][candidate["id"].as_str().unwrap()]["id"].as_str().unwrap().to_owned();
+    assert!(!premise_episodes(&f, &target).contains(&done));
+    let closed = f.graph.loop_command(serde_json::from_value(json!({"action":"close","id":target,"command_id":"later-close","evidence":[{"episode_id":done,"quote":DONE}]})).unwrap()).unwrap();
+    assert_eq!(closed["status"], "closed");
+}
+
+#[test]
+fn later_context_closure_keeps_chronology_and_manual_choice_protection() {
+    // Captured later but dated before the pending source: never newer, stays open.
+    let f = Fixture::new();
+    let (work, candidate, done) = flagged_with_completion(&f, "2026-10-18T11:00:00Z");
+    let committed = f.complete(&work, json!({"actions":[self_close(&candidate, &done)]})).unwrap();
+    assert_eq!(committed["loop_closures"][0]["status"], "not_newer");
+    let target = committed["results"][candidate["id"].as_str().unwrap()]["id"].as_str().unwrap().to_owned();
+    assert_eq!(f.graph.history(&target).unwrap()[0]["loop"]["state"], "open");
+
+    // A manual open choice after the completion's source time keeps the loop open.
+    let g = Fixture::new();
+    g.capture("pending", "thread", PENDING, "user", "contract", json!({}), "2026-10-18T12:00:00Z");
+    let done = g.capture("done", "thread", DONE, "assistant", "contract", json!({}), "2026-10-18T12:30:00Z");
+    g.extract("contract", "thread", PENDING, "knowledge", true);
+    let id = g.stored::<String>("SELECT id FROM candidates");
+    g.graph.loop_command(serde_json::from_value(json!({"action":"open","id":id,"command_id":"manual-open","actor":"owner","why":"Still outstanding"})).unwrap()).unwrap();
+    let work = g.consolidate_work();
+    let candidate = work["input"]["candidates"][0].clone();
+    let committed = g.complete(&work, json!({"actions":[self_close(&candidate, &done)]})).unwrap();
+    assert_eq!(committed["loop_closures"][0]["status"], "not_newer");
+    let target = committed["results"][id.as_str()]["id"].as_str().unwrap().to_owned();
+    assert_eq!(g.graph.history(&target).unwrap()[0]["loop"]["state"], "open");
+}
+
+#[test]
+fn later_completion_redirected_to_existing_loop_rechecks_its_manual_choice() {
+    let f = Fixture::new();
+    let noted = f.capture("noted", "notes", PENDING, "user", "contract", json!({}), "2026-10-18T11:00:00Z");
+    let saved=f.graph.remember(serde_json::from_value(json!({"command_id":"pending-save","actor":"owner","why":"Outstanding signed report","type":"knowledge","text":PENDING,"scope":["professional"],"evidence":[{"episode_id":noted,"quote":PENDING}]})).unwrap()).unwrap();
+    let existing = saved["id"].as_str().unwrap().to_owned();
+    f.graph.loop_command(serde_json::from_value(json!({"action":"open","id":existing,"command_id":"manual-open","actor":"owner","why":"Still outstanding"})).unwrap()).unwrap();
+    f.graph.store.write(|tx| { tx.sql().execute("UPDATE processing_progress SET seq=latest_seq", [])?; Ok(()) }).unwrap();
+    let (work, candidate, done) = flagged_with_completion(&f, "2026-10-18T12:30:00Z");
+    assert!(work["input"]["existing_nodes"].as_array().unwrap().iter().any(|node| node["id"] == json!(existing)));
+    let mut close = self_close(&candidate, &done);
+    close["operation"] = json!("duplicate");
+    close["target"] = json!(existing);
+    let committed = f.complete(&work, json!({"actions":[close]})).unwrap();
+    // The candidate's own chronology passes, but the merged loop's newer manual choice wins.
+    assert_eq!((committed["loop_closures"][0]["target"].as_str(), committed["loop_closures"][0]["status"].as_str()), (Some(existing.as_str()), Some("not_newer")));
+    assert_eq!(f.graph.history(&existing).unwrap()[0]["loop"]["state"], "open");
+    assert!(!premise_episodes(&f, &existing).contains(&done));
+}

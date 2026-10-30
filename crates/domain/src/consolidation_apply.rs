@@ -247,6 +247,20 @@ fn validate(
                 .any(|(left, right)| *left <= start && end <= *right)
         })
     };
+    // later_context spans are lifecycle evidence only, never premises of stored memory.
+    let lifecycle_only = |source: &Value, start: usize, end: usize| {
+        let id = source["episode_id"].as_str().unwrap();
+        let covers = |window: &Value| {
+            window["episode_id"] == id
+                && window["start"].as_u64().unwrap() as usize <= start
+                && end <= window["end"].as_u64().unwrap() as usize
+        };
+        windows.iter().any(|window| window["later_context"] == true && covers(window))
+            && !windows.iter().any(|window| window["later_context"] != true && covers(window))
+            && !spans.get(id).is_some_and(|spans| {
+                spans.iter().any(|(left, right)| *left <= start && end <= *right)
+            })
+    };
     for action in &mut actions {
         for key in ["target", "src", "dst"] {
             if action[key].as_str().is_some_and(|id| !allowed.contains(id)) {
@@ -281,6 +295,25 @@ fn validate(
             ));
         }
         action["closed_targets"] = json!(closed);
+        let candidate_id = get_str(action, "candidate_id")?.to_owned();
+        // A candidate's own real loop closes only through later chronology, never a decline.
+        let own = closed.contains(&candidate_id);
+        if own && action["open_loop"] == false {
+            return Err(reject_item(
+                "consolidation_loop_state_contradictory",
+                action,
+                None,
+            ));
+        }
+        let candidate = &selected[&candidate_id];
+        let original = candidate["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|reference| reference["episode_id"].as_str())
+            .collect::<BTreeSet<_>>();
+        let anchor = &context["_later_context"][&candidate_id];
+        let (mut premises, mut lifecycle) = (vec![], vec![]);
         for source in action["evidence"].as_array().unwrap() {
             let (start, end) = span(&episodes, source).map_err(|error| match error {
                 Error::Validation(code) => reject_item(code, action, Some(source)),
@@ -293,14 +326,29 @@ fn validate(
                     Some(source),
                 ));
             }
+            let id = source["episode_id"].as_str().unwrap();
+            let episode = &episodes[id];
+            let later = !original.contains(id)
+                && anchor.is_object()
+                && episode["source"] == anchor["source"]
+                && episode["conversation_id"] == anchor["conversation_id"]
+                && matches!((episode["seq"].as_i64(), anchor["after_seq"].as_i64()), (Some(seq), Some(after)) if seq > after);
+            if own && later {
+                // Closing evidence for this candidate's own loop: kept out of its premises so
+                // a completion can never become (or freshen) the pending obligation's source.
+                lifecycle.push(source.clone());
+            } else if lifecycle_only(source, start, end) {
+                return Err(reject_item(
+                    "consolidation_evidence_outside_context",
+                    action,
+                    Some(source),
+                ));
+            } else {
+                premises.push(source.clone());
+            }
         }
-        let candidate = &selected[get_str(action, "candidate_id")?];
-        let original = candidate["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|reference| reference["episode_id"].as_str())
-            .collect::<BTreeSet<_>>();
+        action["evidence"] = json!(premises);
+        action["_closure_evidence"] = json!(lifecycle);
         if !matches!(action["operation"].as_str(), Some("reject" | "defer"))
             || !action["closed_targets"].as_array().unwrap().is_empty()
         {
@@ -402,7 +450,9 @@ fn validate(
         }
         for source in repair["evidence"].as_array().unwrap() {
             let (start, end) = span(&episodes, source)?;
-            if !authorized(source, start, end) {
+            if !authorized(source, start, end)
+                || (repair["operation"] != "close_loop" && lifecycle_only(source, start, end))
+            {
                 return Err(reject("consolidation_evidence_outside_context", vec![]));
             }
         }
@@ -680,7 +730,9 @@ pub(super) fn apply(
         job.check_in(tx.sql())?;check_continuity(tx.sql(),context_value)?;for repair in &prepared.repairs{if repair["operation"]=="retire"{check_retirement(tx.sql(),context_value,get_str(repair,"target")?)?;}if repair["operation"]=="link"{for key in ["target","dst"]{if !visible_link_endpoint(tx.sql(),get_str(repair,key)?)?{return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan"));}}}}
         if !ineligible(tx.sql(),&ids)?.is_empty(){return Err(Error::Conflict("Consolidation eligibility changed; derive a fresh plan"));}for(target,frozen)in &prepared.nodes{if node(tx.sql(),target)?["version"]!=frozen["version"]{return Err(Error::Conflict("Consolidation graph context changed; derive a fresh plan"));}}for(target,frozen)in &prepared.edges{if one(tx.sql(),"SELECT version FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1",[target])?.is_none_or(|current|current["version"]!=frozen["version"]){return Err(Error::Conflict("Consolidation relation context changed; derive a fresh plan"));}}
         let loop_snapshots=context_value["loop_snapshots"].as_object().unwrap();if !prepared.repairs.is_empty()||prepared.actions.iter().any(|action|!action["closed_targets"].as_array().unwrap().is_empty()){for(target,frozen)in loop_snapshots{let version=prepared.nodes.get(target).or_else(||prepared.edges.get(target)).and_then(|value|value["version"].as_i64()).unwrap_or(1);if loops::snapshot(tx.sql(),target,version)?!=*frozen{return Err(Error::Conflict("Consolidation loop state changed; derive a fresh plan"));}}}
-        let mut closures=vec![];let mut closure_sources:HashMap<String,Vec<Option<String>>>=HashMap::new();for action in &prepared.actions{let candidate_id=get_str(action,"candidate_id")?;let original=prepared.selected[candidate_id]["evidence"].as_array().unwrap().iter().map(|reference|reference["episode_id"].as_str().unwrap()).collect::<BTreeSet<_>>();let sources=action["evidence"].as_array().unwrap().iter().filter(|source|original.contains(source["episode_id"].as_str().unwrap())).map(|source|prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str().map(str::to_owned)).collect::<Vec<_>>();for target in action["closed_targets"].as_array().unwrap(){let target=target.as_str().unwrap();let(at,status)=loops::closure_time(&loop_snapshots[target],&sources)?;closures.push(json!({"candidate_id":candidate_id,"target":target,"source_occurred_at":at,"status":status}));}closure_sources.insert(candidate_id.into(),sources);}
+        let mut closures=vec![];let mut closure_sources:HashMap<(String,String),Vec<Option<String>>>=HashMap::new();for action in &prepared.actions{let candidate_id=get_str(action,"candidate_id")?;let original=prepared.selected[candidate_id]["evidence"].as_array().unwrap().iter().map(|reference|reference["episode_id"].as_str().unwrap()).collect::<BTreeSet<_>>();let dated=|items:&Value,originals:bool|items.as_array().unwrap().iter().filter(|source|!originals||original.contains(source["episode_id"].as_str().unwrap())).map(|source|prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str().map(str::to_owned)).collect::<Vec<_>>();for target in action["closed_targets"].as_array().unwrap(){let target=target.as_str().unwrap();
+            // Its own loop closes only on later lifecycle evidence; other targets on its original sources.
+            let sources=if target==candidate_id{dated(&action["_closure_evidence"],false)}else{dated(&action["evidence"],true)};let(at,status)=loops::closure_time(&loop_snapshots[target],&sources)?;closures.push(json!({"candidate_id":candidate_id,"target":target,"source_occurred_at":at,"status":status}));closure_sources.insert((candidate_id.into(),target.into()),sources);}}
         let mut results=Map::new();let mut loop_responsibilities=Map::new();let mut destinations:Map<String,Value>=Map::new();let mut resolutions=prepared.resolutions.clone();let mut actions=prepared.actions.clone();actions.sort_by_key(|action|(action["operation"]=="link",!matches!(action["operation"].as_str(),Some("remember"|"reject"|"defer"))));
         for action in &actions{let candidate_id=get_str(action,"candidate_id")?;let candidate=&prepared.selected[candidate_id];if one(tx.sql(),&format!("SELECT 1 FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"),[candidate_id])?.is_none(){continue;}let decision=one(tx.sql(),"SELECT id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1",[candidate_id])?;if decision.map(|decision|decision["id"].clone()).unwrap_or(Value::Null)!=candidate["decision_id"]{return Err(Error::Conflict("Candidate decision changed while consolidation was running"));}
             let(mut result,state)=apply_action(tx,commit,action,candidate,&resolutions,&prepared.nodes,&destinations)?;let target=result["superseded_by"].as_str().or_else(||result["merged_into"].as_str()).or_else(||result["id"].as_str()).map(str::to_owned);
@@ -700,7 +752,7 @@ pub(super) fn apply(
             "close_loop"=>{let sources=evidence.as_array().unwrap().iter().map(|source|prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str().map(str::to_owned)).collect::<Vec<_>>();let(at,mut status)=loops::closure_time(&loop_snapshots[original],&sources)?;if prepared.nodes[original]["pinned"].as_i64().unwrap_or(0)!=0{status=Some("protected_loop_choice");}if status.is_none(){let previous=loops::current(tx.sql(),&target)?.ok_or(Error::Conflict("Consolidation loop state changed; derive a fresh plan"))?;loops::append(tx,commit,&target,"closed",previous["due_at"].as_str(),None)?;status=Some("closed");}closures.push(json!({"target":target,"status":status,"source_occurred_at":at}));json!({"id":target,"status":status,"source_occurred_at":at})},
             _=>return Err(Error::Validation("consolidation_schema_invalid")),
         };repair_results.insert(original.into(),result);}
-        closures.sort_by(|a,b|b["source_occurred_at"].as_str().unwrap_or("").cmp(a["source_occurred_at"].as_str().unwrap_or("")));for closure in &mut closures{let original=get_str(closure,"target")?.to_owned();let mut target=resolutions.get(&original).and_then(Value::as_str).unwrap_or(&original).to_owned();let mut seen=BTreeSet::new();while let Some(next)=destinations.get(&target).and_then(Value::as_str){if !seen.insert(target.clone()){return Err(Error::Conflict("Consolidation identity cycle"));}target=next.into();}closure["target"]=json!(target);if !closure["status"].is_null(){continue;}let candidate_id=get_str(closure,"candidate_id")?.to_owned();if target!=original&&loop_snapshots.contains_key(&target){let(at,status)=loops::closure_time(&loop_snapshots[&target],&closure_sources[&candidate_id])?;closure["source_occurred_at"]=json!(at);closure["status"]=json!(status);if status.is_some(){continue;}}
+        closures.sort_by(|a,b|b["source_occurred_at"].as_str().unwrap_or("").cmp(a["source_occurred_at"].as_str().unwrap_or("")));for closure in &mut closures{let original=get_str(closure,"target")?.to_owned();let mut target=resolutions.get(&original).and_then(Value::as_str).unwrap_or(&original).to_owned();let mut seen=BTreeSet::new();while let Some(next)=destinations.get(&target).and_then(Value::as_str){if !seen.insert(target.clone()){return Err(Error::Conflict("Consolidation identity cycle"));}target=next.into();}closure["target"]=json!(target);if !closure["status"].is_null(){continue;}let candidate_id=get_str(closure,"candidate_id")?.to_owned();if target!=original&&loop_snapshots.contains_key(&target){let(at,status)=loops::closure_time(&loop_snapshots[&target],&closure_sources[&(candidate_id.clone(),original.clone())])?;closure["source_occurred_at"]=json!(at);closure["status"]=json!(status);if status.is_some(){continue;}}
             if !matches!(results.get(&candidate_id).and_then(|result|result["decision"].as_str()),Some("promote"|"reject")){closure["status"]=json!("decision_pending");continue;}let marker=loops::current(tx.sql(),&target)?;if marker.as_ref().is_none_or(|marker|marker["state"]!="open"){closure["status"]=json!("not_open");continue;}loops::append(tx,commit,&target,"closed",marker.as_ref().unwrap()["due_at"].as_str(),None)?;closure["status"]=json!("closed");
         }
         if !job.payload["night"].is_null(){tx.sql().execute("UPDATE consolidation_nights SET cursor=max(cursor,?) WHERE id=?",params![job.payload["next_cursor"].as_i64(),job.payload["night"].as_str()])?;}

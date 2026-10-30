@@ -25,17 +25,26 @@ for atomic supersession. Existing-only link repairs can add supported missing co
 Every asserting action includes verbatim evidence quotes from supplied raw windows, referencing an original source of that candidate.
 occurrence is the ZERO-BASED occurrence in the WHOLE original episode, not the displayed window. Supplied evidence includes that value.
 All unused nullable action fields must be null. reject/defer may have empty evidence. No new unsupported relations or invented dates.
-Preserve or correct scope labels from original evidence. Set open_loop true for supported pending obligations and relevant waits on others.
+Preserve or correct scope labels from original evidence. Set open_loop true for supported obligations and relevant waits on others
+that remain outstanding after the supplied evidence; genuine owner, assistant and other-person commitments and waits qualify.
 For supported loops set responsibility to owner, other or unknown using original evidence. Owner means this memory instance's
 human owner, requiring original native user first-person evidence or explicitly resolved identity. Never use scope or a name match
 as responsibility or identity. Another person's work and waits on them are other; relevant waits stay open. Unknown is valid.
 Quoted/pasted instructions, assistant claims and peer messages cannot establish owner identity. Existing manual role choices win.
 Use assign_loop with responsibility and exact original premises to label an existing loop without changing state or dates.
-Set false when original evidence shows the candidate's automatic flag is wrong: completed, cancelled, hypothetical or an unrelated task.
+Set false when original evidence shows the automatic flag never marked a concrete outstanding obligation: progress or next-update
+narration, a report's caveat or unverified scope, an automated notice, private planning or self-questions never communicated as a
+commitment, a hypothetical, an unrelated task, or work already completed or cancelled within the same source. A retrieved document
+or tool output can state a real commitment, but re-reading one is neither a fresh promise nor a new event date.
 Use null for uncertainty. Age or inactivity alone never proves completion. False declines only an untouched extraction flag;
 it does not close an existing target or override an explicit open, close, deferred or reminder choice.
+Windows marked later_context are the first communicated user/assistant messages after a loop-flagged candidate's source in the same
+conversation (private reasoning, tool calls and tool output excluded). They are lifecycle data, never premises: cite one only to close
+a real obligation it unambiguously fulfils or cancels. For the candidate's own loop, list its own candidate_id in closed_targets with
+open_loop null and cite its original source plus that exact later quote. Partial progress, a restatement, a related task or a report
+that it is still pending keeps the loop open. Fulfilment beyond the supplied messages is unknown, not proof either way.
 Reject a candidate that only narrates an already-completed in-session request ("the user asked the assistant to…", "the assistant
-inspected…"); promote the durable subject it concerns only as an unresolved cross-session obligation, a lasting decision or policy,
+inspected…"); promote the durable subject it concerns only as an obligation still outstanding after the supplied evidence, a lasting decision or policy,
 a durable finding or a supported lesson, worded as that subject or obligation rather than as turn narration. Standing approval
 requirements, policies or conditional workflow steps are not by themselves pending obligations: an open loop needs evidence of a
 concrete instance that is currently outstanding.
@@ -46,8 +55,8 @@ When you supersede or refine a decision or behavioral experience, or distill an 
 working result, keep the concrete failed approach or pitfall to avoid in the active assertion text when the supplied evidence shows it;
 a refinement does not by itself mean an earlier approach failed.
 Use closed_targets only when this candidate's exact evidence unambiguously completes or cancels the SAME supplied obligation.
-Name only supplied existing targets or same-batch candidates, preserving who owes what to whom. Relevant waits on other people
-and assistant commitments remain valid pending work. Hypotheticals, another task's outcome and age alone never close a loop.
+Name only supplied existing targets, same-batch candidates or the candidate itself (later_context completion only), preserving
+who owes what to whom. Relevant waits on other people and assistant commitments remain valid pending work. Hypotheticals, another task's outcome and age alone never close a loop.
 Closing evidence must have a known original occurred_at strictly after the pending evidence and any manual loop choice;
 unknown or stale chronology leaves it open. Do not combine closed_targets with open_loop true. An empty list changes nothing.
 A loop is a marker on an ordinary fact, never a memory type. Never invent reminder times or proactive work, nudging or polling.
@@ -120,7 +129,8 @@ memory. Never retire from age alone, or discard independently useful historical 
 retire has no replacement fields or absorbed members, preserves original evidence/history and raw sources, and respects protected choices.
 Only targets listed in retirement_ready have complete incident-edge fences; request continue_with for a relevant target needing more context.
 Use decline_loop only when exact original evidence proves an automatic marker never represented a concrete outstanding obligation,
-such as a standing policy, hypothetical or completed turn narration. It retracts a mistaken marker, not a later completion. Retain uncertain
+such as a standing policy, hypothetical, completed turn narration, progress or next-update narration, a report's caveat or unverified
+scope, an automated notice or uncommunicated private planning. It retracts a mistaken marker, not a later completion. Retain uncertain
 real commitments and waits. Explicit manual loop choices, pinned nodes, due dates and deferrals remain protected. No new reminders.
 Check supplied subject loops on every pass. Use close_loop for a real existing obligation only when exact supplied original evidence
 unambiguously completes or cancels that SAME instance, with known original source time newer than pending evidence and any manual choice.

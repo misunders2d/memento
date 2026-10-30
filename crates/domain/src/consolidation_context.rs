@@ -12,6 +12,16 @@ use std::{
 };
 
 pub(super) const VISIBLE: &str = "(NOT EXISTS (SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) OR EXISTS (SELECT 1 FROM captured_media cm JOIN captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON e.id=r.episode_id WHERE cm.node_id=n.id AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=cm.sha256)))";
+/// Communicated follow-up for a loop-flagged candidate: eligible user/assistant message
+/// projections after its newest source, excluding tool calls/output, hooks, instruction
+/// envelopes, forgotten sources and assistant records holding only private reasoning blocks.
+const LATER_MESSAGES: &str = "SELECT e.id FROM episodes e WHERE e.source=?1 AND e.conversation_id=?2 AND e.seq>?3 AND e.kind IN ('user','assistant') AND coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')='message' AND coalesce(json_extract(e.metadata,'$.evidence_eligible'),1)<>0 AND NOT legacy_native_context(e.source,e.kind,e.text,e.metadata) AND NOT (e.kind='assistant' AND json_valid(e.text) AND json_type(e.text)='array' AND NOT EXISTS (SELECT 1 FROM json_each(e.text) j WHERE json_extract(e.text,'$['||j.key||'].type')='text')) AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) ORDER BY e.seq LIMIT ?4";
+// Measured on a real Pi install/enroll request: its completion report was the fifth such
+// message (~13 minutes later) and its statement sat ~1.1k characters from the record's end.
+const LATER_MESSAGES_PER_CANDIDATE: i64 = 8;
+const LATER_MESSAGE_CHARS: usize = 1500;
+const LATER_CANDIDATE_CHARS: usize = 8000;
+const LATER_BATCH_CHARS: usize = 24000;
 type WindowKey = (String, usize, usize);
 struct Builder<'a> {
     db: &'a Connection,
@@ -450,6 +460,64 @@ impl<'a> Builder<'a> {
         }
         Ok(())
     }
+    /// Lifecycle-only windows (`later_context`) for candidates whose loop is open, plus the
+    /// private anchor apply uses to recognise a later completion. Apply never stores these
+    /// spans as premises, so they cannot freshen the pending obligation's source date.
+    fn later_context(&mut self, candidates: &[Value]) -> Result<Value> {
+        let mut anchors = Map::new();
+        let mut added = 0;
+        for candidate in candidates {
+            if candidate["loop"]["state"] != "open" {
+                continue;
+            }
+            let mut anchor: Option<Value> = None;
+            for reference in candidate["evidence"].as_array().unwrap() {
+                let episode = self.episode(get_str(reference, "episode_id")?)?;
+                if anchor
+                    .as_ref()
+                    .is_none_or(|current| current["seq"].as_i64() < episode["seq"].as_i64())
+                {
+                    anchor = Some(episode);
+                }
+            }
+            let Some(anchor) = anchor else { continue };
+            anchors.insert(
+                get_str(candidate, "id")?.into(),
+                json!({"source":anchor["source"],"conversation_id":anchor["conversation_id"],"after_seq":anchor["seq"]}),
+            );
+            let mut chars = 0;
+            for row in rows(
+                self.db,
+                LATER_MESSAGES,
+                params![anchor["source"].as_str(), anchor["conversation_id"].as_str(), anchor["seq"].as_i64(), LATER_MESSAGES_PER_CANDIDATE],
+            )? {
+                let episode = self.episode(get_str(&row, "id")?)?;
+                let id = get_str(&episode, "id")?;
+                let raw = get_str(&episode, "text")?;
+                let len = raw.chars().count();
+                // An assistant record ends with its reply; a user message starts with it.
+                let (start, end) = if episode["kind"] == "assistant" {
+                    (len.saturating_sub(LATER_MESSAGE_CHARS), len)
+                } else {
+                    (0, len.min(LATER_MESSAGE_CHARS))
+                };
+                if self.windows.iter().any(|(_, window)| {
+                    window["episode_id"] == id
+                        && window["start"].as_u64().unwrap() as usize <= start
+                        && window["end"].as_u64().unwrap() as usize >= end
+                }) {
+                    continue;
+                }
+                if chars + end - start > LATER_CANDIDATE_CHARS || added + end - start > LATER_BATCH_CHARS {
+                    break;
+                }
+                chars += end - start;
+                added += end - start;
+                self.window((id.into(),start,end),json!({"episode_id":id,"start":start,"end":end,"kind":episode["kind"],"text":substring(raw,start,end),"occurred_at":episode["occurred_at"],"source":episode["source"],"event_id":episode["event_id"],"conversation_id":episode["conversation_id"],"native_id":episode["metadata"]["native_id"],"behavior_ground_truth":false,"sequence":episode["seq"],"native_trace":null,"later_context":true}));
+            }
+        }
+        Ok(Value::Object(anchors))
+    }
 }
 fn push_unique(values: &mut Value, value: Value) {
     if !values.as_array().unwrap().contains(&value) {
@@ -780,6 +848,7 @@ pub(super) fn prepare(
         );
     }
     builder.technical_context(&candidates)?;
+    let later = builder.later_context(&candidates)?;
     let mut unchecked: Map<String, Value> = Map::new();
     for (key, queue) in &subjects {
         let missing = queue
@@ -841,7 +910,7 @@ pub(super) fn prepare(
         .cloned()
         .collect::<Vec<_>>();
     Ok(
-        json!({"loop_policy_version":VERSION,"candidates":candidates,"existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),"existing_relations":builder.edges.into_values().collect::<Vec<_>>(),"raw_windows":windows,"resolved_candidates":resolutions,"loop_snapshots":snapshots,"behavior_exposures":exposures,"maintenance_ids":maintenance_ids,"context_truncated":pending,"retirement_ready":ready,"_unchecked":unchecked,"_deferred":deferred,"_continuity":builder.continuity,"_retirement":builder.retirement}),
+        json!({"loop_policy_version":VERSION,"candidates":candidates,"existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),"existing_relations":builder.edges.into_values().collect::<Vec<_>>(),"raw_windows":windows,"resolved_candidates":resolutions,"loop_snapshots":snapshots,"behavior_exposures":exposures,"maintenance_ids":maintenance_ids,"context_truncated":pending,"retirement_ready":ready,"_unchecked":unchecked,"_deferred":deferred,"_continuity":builder.continuity,"_retirement":builder.retirement,"_later_context":later}),
     )
 }
 
