@@ -80,6 +80,13 @@ WORK_REJECTION_CODES = frozenset({
     'Owner responsibility requires original native user evidence',
     'Invalid loop responsibility', 'Responsibility requires an active visible target',
     'Responsibility requires an existing loop', 'Missing assertion commit',
+    # Fixed /work protocol and lease rejections (static server strings, no evidence).
+    'Invalid request fields', 'Invalid processing command', 'Unknown processing action',
+    'Unknown processing job', 'Unknown model work', 'A work lease is required',
+    'batch_size must be 1..128', 'Invalid processing agent', 'Invalid work identifier',
+    'Invalid lease owner', 'Invalid work release category', 'Model output and usage must be JSON objects',
+    'Work lease expired or was reassigned', 'Processing source changed; reclaim work',
+    'Invalid processing pool page', 'timezone must be an installed IANA timezone name',
 })
 SYSTEM = (
     'Process the supplied Memento task. Return exactly one JSON object matching its schema, '

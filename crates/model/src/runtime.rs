@@ -50,6 +50,9 @@ pub struct ModelConfig {
     pub tokenizer_path: Option<PathBuf>,
     /// Defaults to model_dir/onnx; supports separately mounted small graphs.
     pub graph_dir: Option<PathBuf>,
+    /// ORT intra-op threads for the background text session only (indexing).
+    /// Foreground recall, vision and audio sessions always use one thread.
+    pub background_text_threads: usize,
 }
 
 impl ModelConfig {
@@ -60,6 +63,7 @@ impl ModelConfig {
             revision: MODEL_REVISION.into(),
             tokenizer_path: None,
             graph_dir: None,
+            background_text_threads: 1,
         }
     }
 }
@@ -209,10 +213,10 @@ struct SessionSet {
 }
 
 impl SessionSet {
-    fn load(assets: Arc<Assets>) -> Result<Self> {
-        let text = Self::session(&assets, 0)?;
-        let vision = Self::session(&assets, 1)?;
-        let audio = Self::session(&assets, 2)?;
+    fn load(assets: Arc<Assets>, text_threads: usize) -> Result<Self> {
+        let text = Self::session(&assets, 0, text_threads)?;
+        let vision = Self::session(&assets, 1, 1)?;
+        let audio = Self::session(&assets, 2, 1)?;
         Ok(Self {
             text,
             vision,
@@ -220,7 +224,7 @@ impl SessionSet {
             _assets: assets,
         })
     }
-    fn session(assets: &Assets, index: usize) -> Result<Session> {
+    fn session(assets: &Assets, index: usize, threads: usize) -> Result<Session> {
         let name = GRAPH_FILES[index].0;
         // SAFETY: this lifetime extension is private to the SessionSet owner.
         // Assets are immutable and Arc-held after all three sessions; session
@@ -229,7 +233,7 @@ impl SessionSet {
         let buffer: &'static [u8] =
             unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&assets.mappings[index].map[..]) };
         Ok(Session::builder()?
-            .with_intra_threads(1)?
+            .with_intra_threads(threads)?
             .with_inter_threads(1)?
             .with_execution_providers([ort::ep::CPU::default()
                 .with_arena_allocator(false)
@@ -322,6 +326,9 @@ pub struct BackgroundLane {
 
 impl EmbeddingModel {
     pub fn load(config: ModelConfig) -> Result<Self> {
+        if !(1..=8).contains(&config.background_text_threads) {
+            return Err(Error::InvalidInput("background text threads must be 1..8"));
+        }
         initialize_runtime(&config.runtime_library)?;
         let tokenizer = config
             .tokenizer_path
@@ -329,8 +336,11 @@ impl EmbeddingModel {
             .unwrap_or_else(|| config.model_dir.join("tokenizer.json"));
         let preprocessor = Preprocessor::load(&tokenizer)?;
         let assets = Arc::new(Assets::load(&config)?);
-        let foreground = Mutex::new(SessionSet::load(assets.clone())?);
-        let background = Mutex::new(SessionSet::load(assets)?);
+        let foreground = Mutex::new(SessionSet::load(assets.clone(), 1)?);
+        let background = Mutex::new(SessionSet::load(
+            assets,
+            config.background_text_threads,
+        )?);
         Ok(Self {
             core: Arc::new(Core {
                 preprocessor,

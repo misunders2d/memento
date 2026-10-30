@@ -153,3 +153,15 @@ fn every_wrong_weight_length_fails_before_mapping_and_cleans_up() {
         fixture.clean();
     }
 }
+
+#[test]
+fn background_text_threads_outside_bounds_fail_before_runtime_or_assets() {
+    for threads in [0, 9] {
+        let mut config = ModelConfig::new("missing-model", "missing-runtime");
+        config.background_text_threads = threads;
+        assert!(matches!(
+            EmbeddingModel::load(config),
+            Err(Error::InvalidInput("background text threads must be 1..8"))
+        ));
+    }
+}
