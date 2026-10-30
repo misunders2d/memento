@@ -107,6 +107,19 @@ fn run() -> Result<()> {
         if let Some(path) = std::env::var_os("MEMENTO_GRAPH_DIR") {
             config.graph_dir = Some(path.into());
         }
+        // Indexing-only ORT threads; recall stays on its own one-thread session.
+        config.background_text_threads = std::env::var("MEMENTO_BACKGROUND_TEXT_THREADS")
+            .ok()
+            .map(|s| {
+                s.parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=8).contains(n))
+                    .ok_or(Error::Validation(
+                        "MEMENTO_BACKGROUND_TEXT_THREADS must be 1..8",
+                    ))
+            })
+            .transpose()?
+            .unwrap_or(1);
         Some(config)
     } else {
         None
