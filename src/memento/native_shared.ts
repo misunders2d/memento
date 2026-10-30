@@ -9,7 +9,8 @@ import type { Type as SchemaType, TSchema } from "typebox";
 type RecordValue = Record<string, unknown>;
 type Message = RecordValue & { role?: string; timestamp?: number; toolCallId?: string; content?: unknown };
 type Entry = RecordValue & { id: string; message?: Message };
-type NativeEvent = { message?: Message; prompt?: string; messages: Message[] };
+type NativeEvent = { message?: Message; prompt?: string; messages: Message[];
+  toolName?: string; input?: unknown; isError?: boolean };
 type Context = { cwd: string; sessionManager: {
   getSessionId(): string;
   getSessionFile(): string | undefined;
@@ -165,6 +166,13 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
   let generation = 0;
   let recallGeneration = 0;
   let pendingRecall: { turn: string; token: string; deadline: number } | undefined;
+  let activeTurn = "";
+  let stepEpoch = 0;
+  let pendingStep: { token: string; deadline: number } | undefined;
+  let startingStep: Promise<void> | undefined;
+  let stepCache = "";
+  let stepExpires = 0;
+  let stepStarted = false;
   let capturePending = false;
   let captureAgain = false;
   let warned = false;
@@ -200,6 +208,16 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
     query = "";
     injected = false;
     pendingRecall = undefined;
+    clearStep();
+  }
+  function clearStep(): void {
+    activeTurn = "";
+    stepEpoch++;
+    pendingStep = undefined;
+    startingStep = undefined;
+    stepCache = "";
+    stepExpires = 0;
+    stepStarted = false;
   }
   function envelope(action: string, ctx: Context): RecordValue {
     return { harness, session_id: ctx.sessionManager.getSessionId(),
@@ -282,6 +300,8 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
     const epoch = generation;
     const recallEpoch = ++recallGeneration;
     const turn = randomUUID();
+    clearStep();
+    activeTurn = turn;
     const deadline = Date.now() + 16000; // Fifteen-second worker lifetime plus startup slack.
     pendingRecall = undefined;
     query = prompt;
@@ -301,13 +321,38 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
     capture(ctx);
     await refresh(ctx, typeof event.prompt === "string" ? event.prompt : textOf(event.message ?? {}));
   });
+  function startStep(event: NativeEvent, ctx: Context, failed = false): void {
+    bind(ctx);
+    if (!activeTurn || !loader || !event.toolName || /memento/i.test(event.toolName)) return;
+    if (startingStep) {
+      const epoch = stepEpoch;
+      if (failed) void startingStep.then(() => { if (epoch === stepEpoch) startStep(event, ctx, true); });
+      return;
+    }
+    const turn = activeTurn, epoch = stepEpoch;
+    stepStarted = true;
+    // Start only local scheduling here. HTTP runs in the existing detached
+    // worker, while the native tool proceeds with its original arguments.
+    const request = bridge(loader, { ...envelope("step-recall", ctx), turn,
+      tool_name: event.toolName, arguments: event.input ?? {}, failed }, 1000).then(result => {
+      if (epoch !== stepEpoch || turn !== activeTurn) return;
+      if (typeof result.step_token === "string" && result.pending) {
+        pendingStep = { token: result.step_token, deadline: Date.now() + 16000 };
+        if (result.scheduled) { stepCache = ""; stepExpires = 0; }
+      }
+    }).catch(() => { /* Local contention skips this action; native work continues. */ });
+    startingStep = request;
+    void request.finally(() => { if (startingStep === request) startingStep = undefined; });
+  }
+  api.on("tool_call", (event, ctx) => startStep(event, ctx));
+  api.on("tool_result", (event, ctx) => { if (event.isError) startStep(event, ctx, true); });
   api.on("context", async (event, ctx) => {
     bind(ctx);
     if (pendingRecall && Date.now() >= pendingRecall.deadline) pendingRecall = undefined;
     const epoch = generation, recallEpoch = recallGeneration, pending = pendingRecall;
     if (pending && loader) {
       try {
-        // Local claim only: no HTTP and no new recall for tool-successor requests.
+        // Local claim only: the human lookup keeps its delivery priority.
         // Roll back claims after 200ms before commit; the 1s kill is a backstop
         // with return margin, rather than the normal claim deadline.
         const result = await bridge(loader, { ...envelope("recall-ready", ctx),
@@ -320,11 +365,32 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
       } catch { /* Keep the existing offer and next-human fallback. */ }
       if (epoch !== generation || recallEpoch !== recallGeneration) return;
     }
-    if (!cache) return;
+    if (startingStep) await startingStep;
+    if (epoch !== generation || recallEpoch !== recallGeneration) return;
+    const step = pendingStep, turn = activeTurn, stepGeneration = stepEpoch;
+    if (step && turn && loader) {
+      try {
+        const result = await bridge(loader, { ...envelope("step-ready", ctx), turn,
+          step_token: step.token, claim_before: Date.now() / 1000 + .2 }, 1000);
+        if (epoch !== generation || recallEpoch !== recallGeneration || stepGeneration !== stepEpoch) return;
+        if (pendingStep === step) {
+          if (!result.pending || Date.now() >= step.deadline) pendingStep = undefined;
+          if (result.error) warnRecall(); else if (!result.pending) recallWarned = false;
+          if (typeof result.context === "string") {
+            stepCache = Buffer.byteLength(result.context, "utf8") <= 1500 ? result.context : "";
+            stepExpires = Date.now() + 300000;
+          }
+        }
+      } catch { if (Date.now() >= step.deadline) pendingStep = undefined; }
+    }
+    if (epoch !== generation || recallEpoch !== recallGeneration || stepGeneration !== stepEpoch) return;
+    if (Date.now() >= stepExpires) stepCache = "";
+    const context = [cache, stepCache].filter(Boolean).join("\n");
+    if (!context) return;
     injected = true;
     // Request-local only: do not append to the journal or rewrite structured
     // native/provider messages. Reapply unchanged for tool-successor requests.
-    return { messages: [...event.messages, { role: "user", content: [{ type: "text", text: cache }], timestamp: 0 }] };
+    return { messages: [...event.messages, { role: "user", content: [{ type: "text", text: context }], timestamp: 0 }] };
   });
   if (harness === "omp") {
     api.on("message_end", (event, ctx) => {
@@ -335,12 +401,18 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
       capture(ctx);
     });
   }
-  for (const event of ["turn_end", "agent_end"]) {
-    api.on(event, (_event, ctx) => capture(ctx));
+  function endStep(ctx: Context): void {
+    const turn = activeTurn;
+    const started = stepStarted;
+    clearStep();
+    if (turn && started && loader) void bridge(loader, { ...envelope("step-end", ctx), turn }, 1000).catch(() => {});
   }
+  api.on("turn_end", (_event, ctx) => capture(ctx));
+  api.on("agent_end", (_event, ctx) => { capture(ctx); endStep(ctx); });
   api.on("session_shutdown", (_event, ctx) => {
     clearInterval(timer);
     capture(ctx);
+    endStep(ctx);
   });
   api.on("session_compact", (_event, ctx) => {
     bind(ctx);
@@ -354,6 +426,7 @@ export function installNative(api: NativeAPI, Type: typeof SchemaType, harness: 
       api.on(event, (_event, ctx) => {
         generation++;
         pendingRecall = undefined;
+        clearStep();
         cache = "";
         shown = [];
         injected = false;
