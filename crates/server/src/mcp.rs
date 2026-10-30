@@ -247,6 +247,10 @@ struct RecallArgs {
     since: Option<String>,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    memory_since: Option<String>,
+    #[serde(default)]
+    memory_until: Option<String>,
 }
 fn limit() -> usize {
     10
@@ -270,16 +274,25 @@ fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String
                 scope: optional(args.scope),
                 since,
                 source: optional(args.source),
+                memory_since: optional(args.memory_since),
+                memory_until: optional(args.memory_until),
                 automatic: false,
                 context: String::new(),
             };
+            let period = request.memory_since.is_some() || request.memory_until.is_some();
             let memories =
                 state.recall_memories(&request, Instant::now() + Duration::from_secs(30))?;
             let lines = memories
                 .iter()
                 .map(|item| {
+                    // Period results also show the source date the filter used.
+                    let dated = item["source_occurred_at"]
+                        .as_str()
+                        .filter(|_| period)
+                        .map(|at| format!(" | source {at}"))
+                        .unwrap_or_default();
                     format!(
-                        "{} | {} | {} | {:.3}",
+                        "{} | {} | {} | {:.3}{dated}",
                         item["id"].as_str().unwrap_or(""),
                         item["type"].as_str().unwrap_or(""),
                         item["text"]

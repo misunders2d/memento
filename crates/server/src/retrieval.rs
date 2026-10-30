@@ -1,6 +1,8 @@
 //! Relevance-first native recall. All index/payload/hydration reads share one authority cut.
 use crate::{
-    Recall, RecallRequest, anchors, records,
+    Recall, RecallRequest, anchors,
+    period::{self, Eligible, Period},
+    records,
     text_reranker::{MAX_CANDIDATES, TextReranker},
 };
 use chrono::{DateTime, Utc};
@@ -30,6 +32,8 @@ struct HotPreview {
     curated: Vec<SearchHit>,
     deep_raw: Vec<SearchHit>,
     parked: Option<Result<Vec<SearchHit>>>,
+    // Requested stored-memory period and its eligible IDs/points from this snapshot.
+    period: Option<(Period, Eligible)>,
 }
 
 fn number(v: &Value, key: &str, default: f64) -> f64 {
@@ -229,11 +233,15 @@ impl Retrieval {
         let query = effective_query(request);
         let score =
             |documents: &[&str], until: Instant| self.text_reranker.score(&query, documents, until);
-        let deep = request.effort == "deep" && !request.automatic && request.scope.is_none();
+        // A stored-memory period never reads raw history, so it needs no Cold cut.
+        let deep = request.effort == "deep"
+            && !request.automatic
+            && request.scope.is_none()
+            && Period::of(request)?.is_none();
         let (mut results, need_archive) =
             self.projection
                 .snapshot_hot_until(deep, deadline,
-                    |_, view| Self::hot_preview(view, request, vector, deep),
+                    |tx, view| Self::hot_preview(view, request, vector, deep, Self::period(tx, request)?),
                     |tx, hot, cold| Self::current_owned_scored(tx, hot,
                         |n, pool| cold.search(vector, n, "episode", pool, None, None),
                         request, vector, deep, deadline, Some(&score)))?;
@@ -243,7 +251,7 @@ impl Retrieval {
             let value = self
                 .projection
                 .snapshot_hot_until(true, deadline,
-                    |_, view| Self::hot_preview(view, request, vector, true),
+                    |tx, view| Self::hot_preview(view, request, vector, true, Self::period(tx, request)?),
                     |tx, hot, cold| Self::current_owned_scored(tx, hot,
                         |n, pool| cold.search(vector, n, "episode", pool, None, None),
                         request, vector, true, deadline, Some(&score)))?;
@@ -262,16 +270,23 @@ impl Retrieval {
     ) -> Result<(Vec<Value>, bool)> {
         Self::current_scored(tx, view, request, vector, archive, deadline, None)
     }
-    fn hot_preview(view: &SearchView<'_>, request: &RecallRequest, vector: &[f32; 768], archive: bool) -> Result<HotPreview> {
+    fn period(tx: &ReadTxn<'_>, request: &RecallRequest) -> Result<Option<(Period, Eligible)>> {
+        Period::of(request)?
+            .map(|p| Ok((p, period::eligible(tx, &p, request.scope.as_deref())?)))
+            .transpose()
+    }
+    fn hot_preview(view: &SearchView<'_>, request: &RecallRequest, vector: &[f32; 768], archive: bool, period: Option<(Period, Eligible)>) -> Result<HotPreview> {
         let at = Utc::now();
         let limit = if request.automatic { request.limit.min(6) } else { request.limit };
         let n = if request.automatic { (limit * 20).clamp(24, 120) } else { (limit * 20).min(1000) };
         let pool = if request.automatic { Pool::Automatic } else { Pool::Ordinary };
+        // Eligibility precedes the top-n cut: out-of-period neighbours never take slots.
+        let points = period.as_ref().map(|(_, eligible)| eligible.points.as_slice());
         let mut curated = Vec::new();
         for kind in ["node", "candidate", "segment"] {
-            curated.extend(view.search(Tier::Hot, vector, n, kind, pool, request.scope.as_deref(), None)?);
+            curated.extend(view.search_within(Tier::Hot, vector, n, kind, pool, request.scope.as_deref(), None, points)?);
         }
-        let deep_raw = if request.effort == "deep" && !request.automatic && request.scope.is_none() {
+        let deep_raw = if request.effort == "deep" && !request.automatic && request.scope.is_none() && period.is_none() {
             view.search(Tier::Hot, vector, n, "episode", Pool::Ordinary, None, None)?
         } else { Vec::new() };
         // A bounded preview may be unused if the archive cut has enough curated
@@ -279,7 +294,7 @@ impl Retrieval {
         let parked = if archive && request.automatic && request.scope.is_none() && limit > 0 {
             Some(view.search(Tier::Hot, vector, 4, "candidate", Pool::ParkedCandidate, None, None))
         } else { None };
-        Ok(HotPreview { at, curated, deep_raw, parked })
+        Ok(HotPreview { at, curated, deep_raw, parked, period })
     }
     #[cfg(test)]
     fn current_scored(
@@ -291,7 +306,7 @@ impl Retrieval {
         deadline: Instant,
         score: Option<&TextScore<'_>>,
     ) -> Result<(Vec<Value>, bool)> {
-        let hot = Self::hot_preview(view, request, vector, archive)?;
+        let hot = Self::hot_preview(view, request, vector, archive, Self::period(tx, request)?)?;
         Self::current_owned_scored(tx, hot,
             |n, pool| view.search(Tier::Cold, vector, n, "episode", pool, None, None),
             request, vector, archive, deadline, score)
@@ -308,13 +323,19 @@ impl Retrieval {
     ) -> Result<(Vec<Value>, bool)> {
         let db = tx.sql();
         let scope = request.scope.as_deref();
-        let HotPreview { at, curated, deep_raw, parked: parked_preview } = hot;
+        let HotPreview { at, curated, deep_raw, parked: parked_preview, period } = hot;
+        let allowed = period.as_ref().map(|(_, eligible)| eligible.ids_json.as_str());
         let limit = if request.automatic {
             request.limit.min(6)
         } else {
             request.limit
         };
-        let named = anchors::anchors(db, &request.query, limit, scope)?;
+        // Entity anchors/connections are recall context, not period-ranked memories.
+        let named = if period.is_some() {
+            Vec::new()
+        } else {
+            anchors::anchors(db, &request.query, limit, scope)?
+        };
         let mut matches = BTreeMap::<String, Value>::new();
         let mut keyword_targets = HashSet::new();
         let n = if request.automatic {
@@ -331,6 +352,7 @@ impl Retrieval {
                 &literal(&request.query, false),
                 limit,
                 scope,
+                allowed,
                 &mut matches,
                 &mut keyword_targets,
             )?;
@@ -345,6 +367,7 @@ impl Retrieval {
                 &literal(&request.query, false),
                 (limit * 4).min(100),
                 scope,
+                allowed,
             )? {
                 let hit = SearchHit {
                     seq: 0,
@@ -365,6 +388,7 @@ impl Retrieval {
             &literal(&request.query, true),
             limit,
             scope,
+            allowed,
             vector,
             request.automatic,
             &mut discoveries,
@@ -416,10 +440,11 @@ impl Retrieval {
             Ok::<_, Error>(yes || records::meaningful(db, v)?)
         })?;
         let need_archive = scope.is_none()
+            && period.is_none()
             && !meaningful
             && (request.effort != "deep" || request.automatic)
             && matches.len() + named.len() < limit;
-        if request.effort == "deep" && !request.automatic && scope.is_none() {
+        if request.effort == "deep" && !request.automatic && scope.is_none() && period.is_none() {
             let mut raw_matches = BTreeMap::new();
             let mut raw_hits = deep_raw;
             raw_hits.extend(cold_search(n, Pool::Ordinary)?);
@@ -511,6 +536,13 @@ impl Retrieval {
                 continue;
             }
             finish(db, &mut row, at)?;
+            // Exact half-open gate on the reported original source time.
+            if period
+                .as_ref()
+                .is_some_and(|(period, _)| !period.contains(&row["source_occurred_at"]))
+            {
+                continue;
+            }
             if request.automatic && row["type"] == "media" {
                 records::media_pointer(db, &mut row)?;
             }
@@ -632,7 +664,7 @@ impl Retrieval {
                 )?);
             }
             let mut connections = Vec::new();
-            if row["tier"] == "durable" && records::meaningful(db, &row)? {
+            if row["tier"] == "durable" && period.is_none() && records::meaningful(db, &row)? {
                 for endpoint in records::related(db, key(&row), 1, scope)? {
                     if !records::entity_type(db, endpoint["type"].as_str().unwrap_or(""))? {
                         continue;
@@ -721,16 +753,18 @@ impl Retrieval {
                 }
             }
         }
-        anchors::add_partials(
-            db,
-            &request.query,
-            vector,
-            scope,
-            TEXT_FLOOR,
-            &facts,
-            &mut output,
-            limit,
-        )?;
+        if period.is_none() {
+            anchors::add_partials(
+                db,
+                &request.query,
+                vector,
+                scope,
+                TEXT_FLOOR,
+                &facts,
+                &mut output,
+                limit,
+            )?;
+        }
         Ok((output, need_archive && !archive))
     }
     fn keywords(
@@ -738,10 +772,11 @@ impl Retrieval {
         query: &str,
         limit: usize,
         scope: Option<&str>,
+        allowed: Option<&str>,
         found: &mut BTreeMap<String, Value>,
         targets: &mut HashSet<String>,
     ) -> Result<()> {
-        for (kind, id, version) in keyword_ids(tx, query, (limit * 4).min(100), scope)? {
+        for (kind, id, version) in keyword_ids(tx, query, (limit * 4).min(100), scope, allowed)? {
             let hit = SearchHit {
                 seq: 0,
                 target: id,
@@ -762,11 +797,12 @@ impl Retrieval {
         query: &str,
         limit: usize,
         scope: Option<&str>,
+        allowed: Option<&str>,
         vector: &[f32; 768],
         automatic: bool,
         hits: &mut Vec<SearchHit>,
     ) -> Result<()> {
-        for (kind, id, version) in keyword_ids(tx, query, (limit * 4).min(100), scope)? {
+        for (kind, id, version) in keyword_ids(tx, query, (limit * 4).min(100), scope, allowed)? {
             let mut statement=tx.sql().prepare("SELECT i.seq,b.embedding,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind=? AND i.version=? AND b.current=1")?;
             for row in statement.query_map(params![id, kind, version], |r| {
                 Ok((
@@ -992,7 +1028,7 @@ fn automatic_allowed(db: &rusqlite::Connection, row: &Value) -> Result<bool> {
     }
     Ok(true)
 }
-fn finish(db: &rusqlite::Connection, row: &mut Value, at: DateTime<Utc>) -> Result<()> {
+pub(crate) fn finish(db: &rusqlite::Connection, row: &mut Value, at: DateTime<Utc>) -> Result<()> {
     records::scope(row)?;
     if row["tier"] == "candidate" {
         records::merge(row, records::candidate_details(db, key(row))?);
@@ -1077,43 +1113,45 @@ fn keyword_ids(
     query: &str,
     limit: usize,
     scope: Option<&str>,
+    allowed: Option<&str>,
 ) -> Result<Vec<(String, String, i64)>> {
     if query.is_empty() {
         return Ok(Vec::new());
     }
     let db = tx.sql();
+    // A period restricts lexical admission before its bm25 LIMIT, as for ANN.
+    let within = |column: &str| {
+        allowed
+            .map(|_| format!(" AND {column} IN (SELECT value FROM json_each(?4))"))
+            .unwrap_or_default()
+    };
+    let rows = |sql: String| match allowed {
+        Some(ids) => records::rows(db, &sql, params![query, scope, limit, ids]),
+        None => records::rows(db, &sql, params![query, scope, limit]),
+    };
     let mut out = Vec::new();
-    for row in records::rows(
-        db,
-        &format!(
-            "SELECT n.id,n.version FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)) ORDER BY bm25(node_fts),n.id LIMIT ?3",
-            visible_sql("n.id")
-        ),
-        params![query, scope, limit],
-    )? {
+    for row in rows(format!(
+        "SELECT n.id,n.version FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)){} ORDER BY bm25(node_fts),n.id LIMIT ?3",
+        visible_sql("n.id"),
+        within("n.id")
+    ))? {
         out.push((
             "node".into(),
             key(&row).into(),
             row["version"].as_i64().unwrap(),
         ));
     }
-    for row in records::rows(
-        db,
-        &format!(
-            "SELECT c.id FROM candidate_fts JOIN candidates c ON c.id=candidate_fts.id WHERE candidate_fts MATCH ?1 AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(c.scope) WHERE value=?2)) ORDER BY bm25(candidate_fts),c.id LIMIT ?3"
-        ),
-        params![query, scope, limit],
-    )? {
+    for row in rows(format!(
+        "SELECT c.id FROM candidate_fts JOIN candidates c ON c.id=candidate_fts.id WHERE candidate_fts MATCH ?1 AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(c.scope) WHERE value=?2)){} ORDER BY bm25(candidate_fts),c.id LIMIT ?3",
+        within("c.id")
+    ))? {
         out.push(("candidate".into(), key(&row).into(), 1));
     }
-    for row in records::rows(
-        db,
-        &format!(
-            "SELECT s.id,n.version FROM segment_fts JOIN segments s ON s.id=segment_fts.id JOIN media_files f ON f.node_id=s.node_id JOIN node_versions n ON n.id=s.node_id WHERE segment_fts MATCH ?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)) ORDER BY bm25(segment_fts),s.id LIMIT ?3",
-            visible_sql("n.id")
-        ),
-        params![query, scope, limit],
-    )? {
+    for row in rows(format!(
+        "SELECT s.id,n.version FROM segment_fts JOIN segments s ON s.id=segment_fts.id JOIN media_files f ON f.node_id=s.node_id JOIN node_versions n ON n.id=s.node_id WHERE segment_fts MATCH ?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)){} ORDER BY bm25(segment_fts),s.id LIMIT ?3",
+        visible_sql("n.id"),
+        within("n.id")
+    ))? {
         out.push(("segment".into(), key(&row).into(), 1));
     }
     Ok(out)
@@ -1129,6 +1167,7 @@ mod tests {
     include!("text_routing_tests.rs");
     include!("retrieval_snapshot_tests.rs");
     include!("revision_tests.rs");
+    include!("period_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,

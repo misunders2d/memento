@@ -2,7 +2,7 @@
   {
     "name": "recall",
     "title": "Recall",
-    "description": "Recall memories, or omit query for recent activity; since/source filter raw evidence.\n\nWhen choosing how to carry out a task and automatic context is insufficient, consult relevant prior experiences.",
+    "description": "Recall memories, or omit query for recent activity; since/source filter raw evidence. memory_since (inclusive) and memory_until (exclusive) filter stored memories, with or without a query, by the latest original source time of their current evidence; unknown dates are excluded. Resolve relative periods to aware timestamps.\n\nWhen choosing how to carry out a task and automatic context is insufficient, consult relevant prior experiences.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -60,6 +60,38 @@
         "source": {
           "anyOf": [
             {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "memory_since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "const": "",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "memory_until": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "const": "",
               "type": "string"
             },
             {

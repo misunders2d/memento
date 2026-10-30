@@ -9,6 +9,7 @@ mod legacy_text;
 pub mod mcp;
 mod media_input;
 pub mod operational_status;
+mod period;
 mod query_api;
 mod query_rows;
 mod records;
@@ -101,6 +102,12 @@ pub struct RecallRequest {
     pub since: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
+    /// Stored-memory period on the latest original source time: inclusive start.
+    #[serde(default)]
+    pub memory_since: Option<String>,
+    /// Stored-memory period: exclusive end.
+    #[serde(default)]
+    pub memory_until: Option<String>,
     #[serde(default)]
     pub automatic: bool,
     #[serde(default)]
@@ -115,6 +122,8 @@ impl Default for RecallRequest {
             scope: None,
             since: None,
             source: None,
+            memory_since: None,
+            memory_until: None,
             automatic: false,
             context: String::new(),
         }
@@ -225,6 +234,28 @@ impl AppState {
             return Err(Error::Validation(
                 "Recall text must be at most 4096 characters without NUL",
             ));
+        }
+        if let Some(period) = period::Period::of(request)? {
+            if request.since.is_some() || request.source.is_some() {
+                return Err(Error::Validation(
+                    "Raw since/source filters cannot be combined with a memory period",
+                ));
+            }
+            if request.automatic {
+                return Err(Error::Validation(
+                    "Automatic recall does not accept a memory period",
+                ));
+            }
+            // Stored memories only: no raw-history route or fallback.
+            if request.query.trim().is_empty() {
+                let at = chrono::Utc::now();
+                return self.store.read(|tx| period::list(tx, request, &period, at));
+            }
+            return self
+                .recall
+                .as_ref()
+                .ok_or(Error::Unavailable("Native embedding runtime is disabled"))?
+                .recall(request, deadline);
         }
         if !request.query.trim().is_empty() && request.since.is_none() && request.source.is_none() {
             return self

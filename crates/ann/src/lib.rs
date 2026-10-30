@@ -796,8 +796,23 @@ impl SearchView<'_> {
         scope: Option<&str>,
         memory_type: Option<&str>,
     ) -> Result<Vec<SearchHit>> {
+        self.search_within(tier, vector, limit, kind, pool, scope, memory_type, None)
+    }
+    /// Same exact search, optionally restricted to caller-selected point IDs
+    /// from the pinned authority snapshot (e.g. a stored-memory period).
+    pub fn search_within(
+        &self,
+        tier: Tier,
+        vector: &[f32; 768],
+        limit: usize,
+        kind: &str,
+        pool: Pool,
+        scope: Option<&str>,
+        memory_type: Option<&str>,
+        points: Option<&[u64]>,
+    ) -> Result<Vec<SearchHit>> {
         check(Some(self.deadline))?;
-        if limit == 0 {
+        if limit == 0 || points.is_some_and(<[u64]>::is_empty) {
             return Ok(Vec::new());
         }
         if !vector.iter().all(|v| v.is_finite()) || vector.iter().all(|v| *v == 0.0) {
@@ -821,6 +836,9 @@ impl SearchView<'_> {
         }
         if let Some(kind) = memory_type {
             must.push(json!({"key":"type","match":{"value":kind}}));
+        }
+        if let Some(points) = points {
+            must.push(json!({"has_id":points}));
         }
         let filter: Filter = serde_json::from_value(json!({"must":must}))?;
         let request = QueryRequestBuilder::new(limit)

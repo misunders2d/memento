@@ -259,6 +259,9 @@ export default async function(api) {
     ["recorded_personal", "memento_loop", loop],
     ["recorded_all", "memento_loop", {...loop, id:"all"}],
     ["optional_filters", "memento_recall", {query:"", effort:"", limit:3, scope:"", since:"", source:""}],
+    ["optional_memory_period", "memento_recall", {query:"", memory_since:"", memory_until:""}],
+    ["memory_period", "memento_recall", {query:"releases", memory_since:"2026-10-16T00:00:00+03:00", memory_until:"2026-10-30T00:00:00Z"}],
+    ["invalid_memory_period", "memento_recall", {query:"", memory_since:"past two weeks"}],
     ["optional_save_dates", "memento_remember", {command:{...command, valid_from:"", valid_to:"",
       evidence:[{episode_id:"", quote:"Exact source fact"}]}}],
     ["media_reference", "memento_remember", {command:{why:command.why, evidence:command.evidence,
@@ -301,6 +304,7 @@ export default async function(api) {
     assert result.returncode == 0, result.stderr
     assert json.loads(output.read_text()) == {
         'recorded_personal': True, 'recorded_all': True, 'optional_filters': True,
+        'optional_memory_period': True, 'memory_period': True, 'invalid_memory_period': False,
         'media_reference': True, 'media_binary_rejected': False, 'media_without_evidence': False,
         'optional_save_dates': True, 'optional_change_date': True, 'valid_date': True,
         'reconciliation': True, 'reconciliation_approval_rejected': False,

@@ -468,11 +468,12 @@ function registerTools(api: NativeAPI, T: typeof SchemaType, harness: string,
   const scopeLabel = T.Union([T.Literal("personal"), T.Literal("professional")]);
   const scope = T.Array(scopeLabel, { minItems: 1, maxItems: 2, uniqueItems: true });
   const definitions: [string, string, TSchema][] = [
-    ["recall", "Recall evidence-backed memory or raw activity excerpts with source/since filters or an empty query. When choosing how to carry out a task and automatic context is insufficient, consult relevant prior experiences. Use deep when passive context is insufficient. Cite used IDs as [memory:ID].", T.Object({
+    ["recall", "Recall evidence-backed memory or raw activity excerpts with source/since filters or an empty query. memory_since (inclusive) and memory_until (exclusive) instead filter stored memories, with or without a query, by the latest original source time of their current evidence; unknown dates are excluded. Resolve relative periods such as the past two weeks to aware timestamps. When choosing how to carry out a task and automatic context is insufficient, consult relevant prior experiences. Use deep when passive context is insufficient. Cite used IDs as [memory:ID].", T.Object({
       query: T.Optional(T.String({ default: "", maxLength: 4096 })), effort: optionalString(T.Union([T.Literal("cheap"), T.Literal("normal"), T.Literal("deep")])),
       limit: T.Optional(T.Integer({ minimum: 1, maximum: 100 })),
       scope: optionalString(scopeLabel),
       since: date, source: optionalString(T.String({ minLength: 1, maxLength: 256 })),
+      memory_since: date, memory_until: date,
     }, { additionalProperties: false })],
     ["history", "Read bidirectional supersession lineage, immutable versions, word diffs, reasons and evidence quotes.", T.Object({ id: string() }, { additionalProperties: false })],
     ["remember", "Explicitly save an assertion or an already-uploaded artifact reference with exact evidence. Use memento media save to upload a local file; never send base64 in tool arguments. Native provenance, command identity and actor are supplied automatically.", T.Object({ command: T.Union([command({

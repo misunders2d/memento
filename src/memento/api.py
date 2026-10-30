@@ -580,7 +580,12 @@ def create_app(data_dir: Path) -> FastAPI:
                scope: Literal['personal', 'professional'] | None = None,
                since: Annotated[AwareDatetime | None, Query()] = None,
                source: str | None = None, automatic: bool = False,
-               context: Annotated[str, Query(max_length=4096)] = ''):
+               context: Annotated[str, Query(max_length=4096)] = '',
+               memory_since: str | None = None, memory_until: str | None = None):
+        if memory_since is not None or memory_until is not None:
+            # The native Rust service owns stored-memory period filtering. Fail
+            # closed instead of silently returning unfiltered comparison results.
+            raise HTTPException(422, 'Memory period filters require the native service')
         if q.strip() and since is None and source is None and app.state.retrieval is None:
             raise HTTPException(503, 'Native embedding runtime is disabled')
         try:
