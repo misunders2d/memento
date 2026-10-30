@@ -68,11 +68,18 @@ impl Period {
         )
     }
     /// `in_range(id, kind, version, latest)` over current eligible memories.
-    /// Evidence is reached from episodes in the window through the existing
-    /// `episodes_activity` expression index (CROSS JOIN pins that order even for
-    /// a single bound); `occurred_at IS NOT NULL` removes the capture-time
-    /// fallback in that expression. Captured media use their newest
-    /// active reference, matching recall's reported media source time.
+    /// Work starts from current memory identities, never from raw history:
+    /// `episodes.occurred_at` is stored after the potentially large `text`
+    /// column, so reading it walks that row's overflow pages. `win` therefore
+    /// takes only window sequence numbers from the `episodes_activity`
+    /// expression index, and `touched` probes each current version's evidence
+    /// through covering primary/unique-key lookups without reading episode rows.
+    /// The unary `+` keeps window membership a filter on that `id` lookup:
+    /// as an index constraint SQLite would seek once per window row per probe.
+    /// Both are supersets (a known date equals the indexed coalesce). Only
+    /// touched memories read their evidence dates for the exact latest known
+    /// original source. Captured media use their newest active reference,
+    /// matching recall's reported media source time.
     pub(crate) fn sql(&self) -> String {
         let activity = "julianday(coalesce(e.occurred_at,e.captured_at))";
         let mut window = Vec::new();
@@ -93,14 +100,18 @@ impl Period {
             visible_sql("n.id")
         );
         format!(
-            "WITH touched AS (SELECT DISTINCT g.target,g.version FROM episodes e CROSS JOIN graph_evidence g ON g.episode_id=e.id WHERE {window} AND {known}),\
-             dated AS MATERIALIZED (SELECT t.target,t.version,(SELECT max(julianday(e.occurred_at)) FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=t.target AND g.version=t.version AND {known}) AS latest FROM touched t),\
-             media AS (SELECT DISTINCT cm.node_id FROM episodes e CROSS JOIN captured_media_refs r ON r.episode_id=e.id JOIN captured_media cm ON cm.sha256=r.sha256 WHERE cm.node_id IS NOT NULL AND {window} AND {known}),\
+            "WITH win AS MATERIALIZED (SELECT e.seq FROM episodes e WHERE {window}),\
+             touched AS MATERIALIZED (SELECT p.target,p.kind,p.version FROM (\
+             SELECT id AS target,'node' AS kind,max(version) AS version FROM node_versions GROUP BY id \
+             UNION ALL SELECT id,'candidate',1 FROM candidates) p \
+             WHERE EXISTS (SELECT 1 FROM graph_evidence g CROSS JOIN episodes e ON e.id=g.episode_id WHERE g.target=p.target AND g.version=p.version AND +e.seq IN (SELECT seq FROM win))),\
+             dated AS MATERIALIZED (SELECT t.target,t.kind,t.version,(SELECT max(julianday(e.occurred_at)) FROM graph_evidence g CROSS JOIN episodes e ON e.id=g.episode_id WHERE g.target=t.target AND g.version=t.version AND {known}) AS latest FROM touched t),\
+             media AS MATERIALIZED (SELECT cm.node_id FROM captured_media cm WHERE cm.node_id IS NOT NULL AND EXISTS (SELECT 1 FROM captured_media_refs r CROSS JOIN episodes e ON e.id=r.episode_id WHERE r.sha256=cm.sha256 AND +e.seq IN (SELECT seq FROM win)) GROUP BY cm.node_id),\
              media_dated AS MATERIALIZED (SELECT m.node_id AS target,(SELECT max(julianday(e.occurred_at)) FROM captured_media cm JOIN captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON e.id=r.episode_id WHERE cm.node_id=m.node_id AND {known}) AS latest FROM media m),\
              in_range AS (\
-             SELECT n.id,'node' AS kind,n.version,d.latest FROM dated d CROSS JOIN node_versions n ON n.id=d.target AND n.version=d.version WHERE NOT EXISTS (SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) AND {latest} AND {node} \
+             SELECT n.id,'node' AS kind,n.version,d.latest FROM dated d CROSS JOIN node_versions n ON n.id=d.target AND n.version=d.version WHERE d.kind='node' AND NOT EXISTS (SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) AND {latest} AND {node} \
              UNION ALL SELECT n.id,'node',n.version,d.latest FROM media_dated d CROSS JOIN node_versions n ON n.id=d.target WHERE {latest} AND {node} \
-             UNION ALL SELECT c.id,'candidate',1,d.latest FROM dated d CROSS JOIN candidates c ON c.id=d.target WHERE d.version=1 AND {latest} AND {ACTIVE_CANDIDATE} AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?3)))"
+             UNION ALL SELECT c.id,'candidate',1,d.latest FROM dated d CROSS JOIN candidates c ON c.id=d.target WHERE d.kind='candidate' AND {latest} AND {ACTIVE_CANDIDATE} AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?3)))"
         )
     }
     fn rows(&self, tx: &ReadTxn<'_>, select: &str, scope: Option<&str>) -> Result<Vec<Value>> {

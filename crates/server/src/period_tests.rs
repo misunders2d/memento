@@ -233,67 +233,184 @@ fn period_validation_rejects_naive_malformed_and_empty_or_reversed_ranges() {
     assert!(Period::of(&period_request("", 10, None, None, None)).unwrap().is_none());
 }
 
+/// Pager page fetches (cache hits plus misses) on this read connection since
+/// the previous call; overflow pages walked to reach a later column count too.
+fn page_fetches(tx: &ReadTxn<'_>) -> i64 {
+    use rusqlite::ffi;
+    let handle = unsafe { tx.sql().handle() };
+    [ffi::SQLITE_DBSTATUS_CACHE_HIT, ffi::SQLITE_DBSTATUS_CACHE_MISS]
+        .into_iter()
+        .map(|op| {
+            let (mut current, mut high) = (0, 0);
+            assert_eq!(unsafe { ffi::sqlite3_db_status(handle, op, &mut current, &mut high, 1) }, ffi::SQLITE_OK);
+            i64::from(current)
+        })
+        .sum()
+}
+/// Native-shaped raw history: large unextracted records inside the window,
+/// some without an original date. None of them is memory evidence.
+fn raw_history(f: &mut Fixture, count: usize, bytes: usize) {
+    let text = "x".repeat(bytes);
+    let first = f.seq;
+    f.seq += count as i64;
+    let context = memento_core::CommandContext { command_id: format!("raw-{first}"), actor: "fixture".into(), why: "Synthetic raw history".into() };
+    f.store.command(&context, &json!({"op":"fixture_raw"}), |tx, _| {
+        let mut insert = tx.sql().prepare("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(?1,'synthetic:native',?1,'raw','native_record',?2,?3,'{\"extraction_mode\":\"skip\"}',?4)")?;
+        for n in 0..count {
+            let at = format!("2026-10-{:02}T{:02}:00:00Z", 17 + n % 12, n % 24);
+            insert.execute(params![format!("raw-{}", first as usize + n), text, (n % 5 != 0).then_some(&at), at])?;
+        }
+        Ok(json!({}))
+    }).unwrap();
+}
+fn plan(f: &Fixture, period: &Period) -> Vec<(i64, i64, String)> {
+    f.store.read(|tx| {
+        let mut statement = tx.sql().prepare(&format!("EXPLAIN QUERY PLAN {} SELECT id FROM in_range", period.sql()))?;
+        let (since, until) = period.sql_bounds();
+        Ok(statement.query_map(params![since, until, Option::<String>::None], |r| Ok((r.get(0)?, r.get(1)?, r.get(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }).unwrap()
+}
+/// Plan lines below the node whose detail is exactly `root`.
+fn subtree(plan: &[(i64, i64, String)], root: &str) -> Vec<String> {
+    let top = plan.iter().find(|(_, _, detail)| detail == root).unwrap_or_else(|| panic!("{root}: {plan:?}")).0;
+    let mut ids = std::collections::HashSet::from([top]);
+    let mut lines = Vec::new();
+    for (id, parent, detail) in plan {
+        if ids.contains(parent) {
+            ids.insert(*id);
+            lines.push(detail.clone());
+        }
+    }
+    lines
+}
+
 #[test]
-fn period_prefilter_uses_existing_activity_and_evidence_indexes() {
+fn period_lookup_starts_from_current_memories_through_covering_indexes() {
     let f = Fixture::new();
     for (since, until) in [(Some(WEEK_START), Some(WEEK_END)), (Some(WEEK_START), None), (None, Some(WEEK_END))] {
-    let period = Period::of(&period_request("", 10, since, until, None)).unwrap().unwrap();
-    let plan = f.store.read(|tx| {
-        let sql = format!("EXPLAIN QUERY PLAN {} SELECT id FROM in_range", period.sql());
-        let mut statement = tx.sql().prepare(&sql)?;
-        let (since, until) = period.sql_bounds();
-        let rows = statement.query_map(params![since, until, Option::<String>::None], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows.join("\n"))
+        let lines = plan(&f, &Period::of(&period_request("", 10, since, until, None)).unwrap().unwrap());
+        let text = lines.iter().map(|(_, _, detail)| detail.as_str()).collect::<Vec<_>>().join("\n");
+        println!("{since:?} {until:?}\n{text}");
+        // The window contributes sequence numbers only, from the expression index.
+        assert!(subtree(&lines, "MATERIALIZE win").iter().any(|line| line.starts_with("SEARCH e USING COVERING INDEX episodes_activity")), "{text}");
+        // Current identities and their evidence are probed without reading an
+        // episode, node or candidate row (so no large raw text is walked).
+        for root in ["MATERIALIZE touched", "MATERIALIZE media"] {
+            for line in subtree(&lines, root) {
+                let table = line.split_whitespace().nth(1).unwrap_or("");
+                if (line.starts_with("SEARCH ") || line.starts_with("SCAN ")) && ["e", "g", "node_versions", "candidates"].contains(&table) {
+                    assert!(line.contains("COVERING INDEX"), "{root}: {line}\n{text}");
+                    // Window membership filters the evidence lookup; it must not
+                    // become a per-window-row `rowid` seek inside every probe.
+                    assert!(!line.contains("rowid="), "{root}: {line}\n{text}");
+                }
+            }
+        }
+        // Never a full raw-history or evidence-table scan.
+        for table in ["e", "episodes", "g", "graph_evidence"] {
+            assert!(lines.iter().all(|(_, _, line)| !(line == &format!("SCAN {table}") || line.starts_with(&format!("SCAN {table} ")))), "{table}: {text}");
+        }
+    }
+}
+
+#[test]
+fn period_lookup_cost_follows_current_memory_evidence_not_raw_history() {
+    let mut f = Fixture::new();
+    let inside = dated_node(&mut f, "Inventory decision recorded inside the window", &[Some("2026-10-20T00:00:00Z")], 0.9, "personal");
+    dated_candidate(&mut f, "period-cost-candidate", "Pending carrier proposal recorded inside the window", "2026-10-21T00:00:00Z", 0.9);
+    // Eleven historical versions cite sources inside the window; the current
+    // version cites only an older source, so the memory is outside the window.
+    let historic = dated_node(&mut f, "Warehouse lease note version 1", &[Some("2026-10-18T00:00:00Z")], 0.9, "personal");
+    for version in 2..=12 {
+        let text = format!("Warehouse lease note version {version}");
+        let date = if version == 12 { "2025-03-01T00:00:00Z" } else { "2026-10-19T00:00:00Z" };
+        let source = f.store.capture(serde_json::from_value(json!({"source":"synthetic:period","event_id":format!("lease-{version}"),"conversation_id":"lease","kind":"user","text":text,"occurred_at":date,"metadata":{}})).unwrap()).unwrap();
+        f.graph.supersede(serde_json::from_value(json!({"command_id":format!("lease-{version}"),"actor":"owner","why":"Refined lease note","old":historic,"kind":"correction","new":{"type":"knowledge","text":text,"scope":["personal"]},"evidence":[{"episode_id":source.id,"quote":text}]})).unwrap()).unwrap();
+    }
+    let request = period_request("", 10, Some(WEEK_START), Some(WEEK_END), None);
+    let period = Period::of(&request).unwrap().unwrap();
+    let measure = |f: &Fixture| f.store.read(|tx| {
+        page_fetches(tx);
+        let eligible = period::eligible(tx, &period, None)?;
+        let eligible_pages = page_fetches(tx);
+        let listed = period::list(tx, &request, &period, Utc::now())?;
+        Ok((eligible, eligible_pages, listed, page_fetches(tx)))
     }).unwrap();
-    println!("{plan}");
-    assert!(plan.contains("episodes_activity"), "{plan}");
-    assert!(plan.contains("search_evidence_episode"), "{plan}");
-    // No full episode, node or candidate scan: the window drives every lookup.
-    for table in ["e", "episodes", "n", "node_versions", "c", "candidates", "g", "graph_evidence"] {
-        assert!(plan.lines().all(|line| !(line == format!("SCAN {table}") || line.starts_with(&format!("SCAN {table} ")))), "{table}: {plan}");
-    }
-    }
+    let raw = 600;
+    // 32 KiB records span several overflow pages; reaching `occurred_at`
+    // after `text` in every raw row would cost thousands of page fetches.
+    raw_history(&mut f, raw, 32 * 1024);
+    let (eligible, eligible_pages, listed, list_pages) = measure(&f);
+    raw_history(&mut f, raw, 32 * 1024);
+    let (_, more_eligible_pages, more_listed, more_list_pages) = measure(&f);
+    println!("raw={raw}: eligible pages {eligible_pages}, list pages {list_pages}; raw={}: eligible pages {more_eligible_pages}, list pages {more_list_pages}", raw * 2);
+    let mut admitted = serde_json::from_str::<Vec<String>>(&eligible.ids_json).unwrap();
+    admitted.sort();
+    let mut expected = vec!["period-cost-candidate".to_owned(), inside.clone()];
+    expected.sort();
+    assert_eq!(admitted, expected);
+    assert_eq!(ids(&listed), ["period-cost-candidate".to_owned(), inside.clone()]);
+    assert_eq!(ids(&more_listed), ids(&listed));
+    // Fewer page fetches than unrelated raw records, and doubling them adds
+    // only window index pages, not a per-record row read.
+    assert!(eligible_pages < raw as i64 && list_pages < raw as i64, "{eligible_pages} {list_pages}");
+    assert!(more_eligible_pages - eligible_pages < raw as i64 / 20 && more_list_pages - list_pages < raw as i64 / 20, "{eligible_pages}->{more_eligible_pages} {list_pages}->{more_list_pages}");
 }
 
 #[test]
 #[ignore = "synthetic scale timing; run explicitly"]
 fn period_prefilter_synthetic_scale_timing() {
     let f = Fixture::new();
-    let (episodes, nodes, candidates) = (200_000usize, 30_000usize, 20_000usize);
+    // Native-shaped: dated message sources for memories spread over a year,
+    // plus a recent month of large unextracted native records (some undated).
+    let (messages, raw, raw_bytes, nodes, candidates) = (120_000usize, 30_000usize, 16 * 1024, 30_000usize, 20_000usize);
     let start = chrono::DateTime::parse_from_rfc3339("2025-09-25T00:00:00Z").unwrap().with_timezone(&Utc);
+    let end = start + chrono::Duration::days(400);
     let context = memento_core::CommandContext { command_id: "scale".into(), actor: "fixture".into(), why: "Synthetic scale".into() };
     let mut state = 12345u64;
     let mut next = move |n: usize| { state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((state >> 33) as usize) % n };
     let begun = Instant::now();
     f.store.command(&context, &json!({"op":"fixture_scale"}), |tx, commit| {
         let db = tx.sql();
-        let mut episode = db.prepare("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(?1,'synthetic:scale',?1,'scale','user','Synthetic scale text',?2,'{}','2026-10-30T00:00:00Z')")?;
-        for n in 0..episodes {
-            let at = start + chrono::Duration::seconds((n as i64) * 172);
-            let occurred = (n % 20 != 0).then(|| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
-            episode.execute(params![format!("e{n}"), occurred])?;
+        let text = "x".repeat(raw_bytes);
+        let mut native = db.prepare("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(?1,'synthetic:native',?1,'raw','native_record',?2,?3,'{\"extraction_mode\":\"skip\"}',?4)")?;
+        let mut message = db.prepare("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(?1,'synthetic:scale',?1,'scale','user','Synthetic scale text',?2,'{}','2026-10-30T00:00:00Z')")?;
+        let raw_start = end - chrono::Duration::days(30);
+        for n in 0..messages.max(raw) {
+            if n < messages {
+                let at = start + chrono::Duration::seconds((n as i64) * 400 * 86400 / messages as i64);
+                let occurred = (n % 20 != 0).then(|| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+                message.execute(params![format!("e{n}"), occurred])?;
+            }
+            if n < raw {
+                let at = (raw_start + chrono::Duration::seconds((n as i64) * 30 * 86400 / raw as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+                native.execute(params![format!("r{n}"), text, (n % 10 != 0).then_some(&at), at])?;
+            }
         }
-        let mut node = db.prepare("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) VALUES(?1,1,?2,'knowledge','Synthetic scale memory','active',0,'[\"personal\"]')")?;
-        let mut evidence = db.prepare("INSERT OR IGNORE INTO graph_evidence VALUES(?1,1,?2,0,20,'Synthetic scale text')")?;
-        let mut item = db.prepare("INSERT INTO vector_items(target,kind,version) VALUES(?1,?2,1)")?;
+        let mut node = db.prepare("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) VALUES(?1,?2,?3,'knowledge','Synthetic scale memory','active',0,'[\"personal\"]')")?;
+        let mut evidence = db.prepare("INSERT INTO graph_evidence VALUES(?1,?2,?3,?4,?4+20,'Synthetic scale text')")?;
+        let mut item = db.prepare("INSERT INTO vector_items(target,kind,version) VALUES(?1,?2,?3)")?;
         for n in 0..nodes {
             let id = format!("n{n}");
-            node.execute(params![id, commit])?;
-            for _ in 0..=next(3) { evidence.execute(params![id, format!("e{}", next(episodes))])?; }
-            item.execute(params![id, "node"])?;
+            // Historical versions cite their own sources; only the last is current.
+            let versions = 1 + next(3) as i64;
+            for version in 1..=versions {
+                node.execute(params![id, version, commit])?;
+                for span in 0..=next(3) { evidence.execute(params![id, version, format!("e{}", next(messages)), span])?; }
+            }
+            item.execute(params![id, "node", versions])?;
         }
         db.execute("INSERT INTO extraction_runs VALUES('scale-run',?1,'e1','test','test','[]','{}','2026-10-30T00:00:00Z')", [commit])?;
         let mut candidate = db.prepare("INSERT INTO candidates VALUES(?1,'scale-run','memory','knowledge','Synthetic scale candidate','Exact',NULL,NULL,1,NULL,NULL,'[\"personal\"]')")?;
         for n in 0..candidates {
             let id = format!("c{n}");
             candidate.execute([&id])?;
-            evidence.execute(params![id, format!("e{}", next(episodes))])?;
-            item.execute(params![id, "candidate"])?;
+            evidence.execute(params![id, 1, format!("e{}", next(messages)), 0])?;
+            item.execute(params![id, "candidate", 1])?;
         }
         Ok(json!({}))
     }).unwrap();
-    println!("populated {episodes} episodes, {nodes} nodes, {candidates} candidates in {:?}", begun.elapsed());
-    let end = start + chrono::Duration::seconds((episodes as i64) * 172);
+    println!("populated {messages} dated messages, {raw} raw native records of {raw_bytes} bytes, {nodes} nodes with history, {candidates} candidates in {:?}", begun.elapsed());
     for (label, since, until) in [
         ("14 days", Some(end - chrono::Duration::days(14)), None),
         ("90 days", Some(end - chrono::Duration::days(90)), None),
@@ -302,20 +419,18 @@ fn period_prefilter_synthetic_scale_timing() {
         ("until-only first 14 days", None, Some(start + chrono::Duration::days(14))),
     ] {
         let text = |at: Option<DateTime<Utc>>| at.map(|at| at.to_rfc3339());
-        let request = period_request("", 10, text(since).as_deref(), text(until).as_deref(), None);
+        let mut request = period_request("", 10, text(since).as_deref(), text(until).as_deref(), None);
+        request.effort = "cheap".into();
         let period = Period::of(&request).unwrap().unwrap();
-        let plan = f.store.read(|tx| {
-            let mut statement = tx.sql().prepare(&format!("EXPLAIN QUERY PLAN {} SELECT id FROM in_range", period.sql()))?;
-            let (since, until) = period.sql_bounds();
-            let rows = statement.query_map(params![since, until, Option::<String>::None], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows.into_iter().filter(|line| line.starts_with("SCAN") || line.contains("episodes_activity")).collect::<Vec<_>>().join(" | "))
+        let (eligible, eligible_pages, eligible_time, listed, list_pages, list_time) = f.store.read(|tx| {
+            page_fetches(tx);
+            let timed = Instant::now();
+            let eligible = period::eligible(tx, &period, None)?;
+            let (eligible_pages, eligible_time) = (page_fetches(tx), timed.elapsed());
+            let timed = Instant::now();
+            let listed = period::list(tx, &request, &period, Utc::now())?;
+            Ok((eligible, eligible_pages, eligible_time, listed, page_fetches(tx), timed.elapsed()))
         }).unwrap();
-        println!("{label} plan: {plan}");
-        let timed = Instant::now();
-        let eligible = f.store.read(|tx| period::eligible(tx, &period, None)).unwrap();
-        let eligible_time = timed.elapsed();
-        let timed = Instant::now();
-        let listed = listed(&f, &request);
-        println!("{label}: eligible ids={} points={} in {eligible_time:?}; period-only list={} in {:?}", serde_json::from_str::<Vec<String>>(&eligible.ids_json).unwrap().len(), eligible.points.len(), listed.len(), timed.elapsed());
+        println!("{label}: eligible ids={} points={} pages={eligible_pages} in {eligible_time:?}; period-only list={} pages={list_pages} in {list_time:?}", serde_json::from_str::<Vec<String>>(&eligible.ids_json).unwrap().len(), eligible.points.len(), listed.len());
     }
 }
