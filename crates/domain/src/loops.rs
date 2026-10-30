@@ -551,16 +551,30 @@ pub fn decline_extracted(tx: &WriteTxn, commit: &str, target: &str) -> Result<bo
     append(tx, commit, target, "closed", None, None)?;
     Ok(true)
 }
+/// `expected` is the loop snapshot frozen at `version`. Comparing at that
+/// version keeps the frozen-state check when an earlier step of the same plan
+/// appended a newer version with its own evidence.
 pub fn decline_automatic(
     tx: &WriteTxn,
     commit: &str,
     target: &str,
+    version: i64,
     expected: &Value,
 ) -> Result<Value> {
-    let n = self::target(tx.sql(), target)?.ok_or(Error::Validation(
+    // A version appended by this transaction has no graph_commits row yet; its
+    // guard fields need no committed-history summary. Any other version still
+    // resolves through the committed viewer target.
+    let pending = one(tx.sql(),
+        "SELECT n.* FROM node_versions n WHERE n.id=? AND n.commit_id=? AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)",
+        params![target, commit])?;
+    let n = match pending {
+        Some(node) => Some(node),
+        None => self::target(tx.sql(), target)?,
+    }
+    .ok_or(Error::Validation(
         "Loop markers require an active memory or unconfirmed candidate",
     ))?;
-    let live = snapshot(tx.sql(), target, get_i64(&n, "version")?)?;
+    let live = snapshot(tx.sql(), target, version)?;
     if live != *expected {
         return Err(Error::Conflict(
             "Consolidation loop state changed; derive a fresh plan",
@@ -905,8 +919,9 @@ pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
         }
         if command.action=="decline" || (command.action=="close" && !command.evidence.is_empty()) {
             let grounded=grounded_sources(tx,target_id,&request["evidence"],command.action=="decline",command.action=="decline")?;
-            let frozen=snapshot(tx.sql(),target_id,active.as_ref().unwrap()["version"].as_i64().unwrap())?;
-            let mut result=if command.action=="decline" {decline_automatic(tx,commit,target_id,&frozen)?} else {
+            let version=active.as_ref().unwrap()["version"].as_i64().unwrap();
+            let frozen=snapshot(tx.sql(),target_id,version)?;
+            let mut result=if command.action=="decline" {decline_automatic(tx,commit,target_id,version,&frozen)?} else {
                 let times=grounded["source_times"].as_array().unwrap().iter().map(|at|at.as_str().map(str::to_owned)).collect::<Vec<_>>();
                 let(at,mut status)=closure_time(&frozen,&times)?;
                 if protected(tx.sql(),active.as_ref().unwrap())? {status=Some("protected_loop_choice");}

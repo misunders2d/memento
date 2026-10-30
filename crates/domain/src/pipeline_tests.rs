@@ -1884,3 +1884,95 @@ fn later_completion_redirected_to_existing_loop_rechecks_its_manual_choice() {
     assert_eq!(f.graph.history(&existing).unwrap()[0]["loop"]["state"], "open");
     assert!(!premise_episodes(&f, &existing).contains(&done));
 }
+
+const FLAGGED: &str = "Lena mentioned the copper launch report draft.";
+const REVISED: &str = "Lena mentioned the copper launch report draft is in review.";
+/// An existing memory with an untouched automatic open marker.
+fn automatic_loop(f: &Fixture) -> (String, String) {
+    let flagged = f.capture("flagged", "thread", FLAGGED, "user", "contract", json!({}), "2026-10-18T12:00:00Z");
+    f.extract("contract", "thread", FLAGGED, "knowledge", true);
+    let work = f.consolidate_work();
+    let candidate = work["input"]["candidates"][0].clone();
+    let mut remember = action(&candidate, "remember");
+    remember["open_loop"] = json!(true);
+    let promoted = f.complete(&work, json!({"actions":[remember]})).unwrap();
+    let target = promoted["results"][candidate["id"].as_str().unwrap()]["id"].as_str().unwrap().to_owned();
+    assert_eq!(f.graph.history(&target).unwrap()[0]["loop"]["state"], "open");
+    (target, flagged)
+}
+/// A related candidate from the same conversation, prepared against `target`.
+fn candidate_work(f: &Fixture, target: &str, later: &str, date: &str) -> Value {
+    f.capture("later", "thread", later, "user", "contract", json!({}), date);
+    f.extract("contract", "thread", later, "knowledge", false);
+    let work = f.consolidate_work();
+    assert!(work["input"]["existing_nodes"].as_array().unwrap().iter().any(|node| node["id"] == json!(target)));
+    work
+}
+fn revise_with_decline(work: &Value, operation: &str, target: &str, flagged: &str) -> Value {
+    let mut revise = action(&work["input"]["candidates"][0], operation);
+    revise["target"] = json!(target);
+    if operation == "supersede" {
+        revise["change_kind"] = json!("refinement");
+    }
+    let decline = json!({"operation":"decline_loop","target":target,"evidence":[{"episode_id":flagged,"quote":FLAGGED,"occurrence":null}],"why":"Synthetic: the automatic marker is not a concrete obligation"});
+    json!({"actions":[revise],"repairs":[decline]})
+}
+
+#[test]
+fn same_plan_revision_then_decline_loop_commits_atomically() {
+    for (operation, later, date) in [
+        ("supersede", REVISED, "2026-10-18T12:00:00Z"),
+        // The plan's own newer evidence must not read as a concurrent loop change.
+        ("supersede", REVISED, "2026-10-18T13:00:00Z"),
+        ("duplicate", FLAGGED, "2026-10-18T13:00:00Z"),
+    ] {
+        let f = Fixture::new();
+        let (target, flagged) = automatic_loop(&f);
+        let work = candidate_work(&f, &target, later, date);
+        let committed = f.complete(&work, revise_with_decline(&work, operation, &target, &flagged));
+        let committed = committed.unwrap_or_else(|error| panic!("{operation} {date}: {error}"));
+        let candidate = work["input"]["candidates"][0]["id"].as_str().unwrap();
+        assert_eq!(committed["results"][candidate]["id"], json!(target));
+        assert_eq!(committed["repair_results"][&target]["status"], "declined_not_obligation", "{operation} {date}");
+        let history = f.graph.history(&target).unwrap();
+        assert_eq!(history.len(), 2, "{operation} {date}");
+        assert_eq!(history[1]["text"], later);
+        assert_eq!(history[1]["loop"]["state"], "closed");
+    }
+}
+
+#[test]
+fn same_plan_decline_keeps_protections_and_concurrent_loop_fence() {
+    // Manual choice and pin still protect the marker while the revision commits.
+    for protection in ["manual", "pin"] {
+        let f = Fixture::new();
+        let (target, flagged) = automatic_loop(&f);
+        if protection == "manual" {
+            f.graph.loop_command(serde_json::from_value(json!({"action":"open","id":target,"command_id":"manual-open","actor":"owner","why":"Still outstanding"})).unwrap()).unwrap();
+        } else {
+            f.graph.store.command(&context("owner-pin".into(),"owner".into(),"Manual synthetic protection".into()), &json!({"op":"pin","node_id":target,"pinned":true}), |tx,commit| curation::pin(tx,commit,&target,true)).unwrap();
+        }
+        let versions = f.graph.history(&target).unwrap().len();
+        let work = candidate_work(&f, &target, FLAGGED, "2026-10-18T13:00:00Z");
+        let committed = f.complete(&work, revise_with_decline(&work, "duplicate", &target, &flagged)).unwrap_or_else(|error| panic!("{protection}: {error}"));
+        assert_eq!(committed["repair_results"][&target]["status"], "protected_loop_choice", "{protection}");
+        let history = f.graph.history(&target).unwrap();
+        assert!(history.len() >= versions, "{protection}");
+        assert_eq!(history.last().unwrap()["loop"]["state"], "open", "{protection}");
+    }
+    // A manual loop change after the claim refuses the whole plan.
+    let f = Fixture::new();
+    let (target, flagged) = automatic_loop(&f);
+    let work = candidate_work(&f, &target, REVISED, "2026-10-18T13:00:00Z");
+    f.graph.loop_command(serde_json::from_value(json!({"action":"later","id":target,"command_id":"manual-later","actor":"owner","why":"Not now","days":7})).unwrap()).unwrap();
+    let error = f.complete(&work, revise_with_decline(&work, "supersede", &target, &flagged)).unwrap_err();
+    assert_eq!(error.to_string(), "Consolidation loop state changed; derive a fresh plan");
+    assert_eq!(f.graph.history(&target).unwrap().len(), 1);
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidate_decisions WHERE decision='promote'"), 1);
+    // The owner's explicit decline still uses the unchanged single-version check.
+    let g = Fixture::new();
+    let (target, flagged) = automatic_loop(&g);
+    let declined = g.graph.loop_command(serde_json::from_value(json!({"action":"decline","id":target,"command_id":"owner-decline","actor":"owner","why":"Not an obligation","evidence":[{"episode_id":flagged,"quote":FLAGGED}]})).unwrap()).unwrap();
+    assert_eq!(declined["status"], "declined_not_obligation");
+    assert_eq!(g.graph.history(&target).unwrap()[0]["loop"]["state"], "closed");
+}
