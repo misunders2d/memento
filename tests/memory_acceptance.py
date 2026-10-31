@@ -9,6 +9,7 @@ import argparse
 import contextlib
 from datetime import datetime, timedelta, timezone
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -1521,48 +1522,70 @@ LESSON_SCORE_RULE = (
     'empty_finds_before_success = finds without a hit before the first hit (all finds if none hit); '
     f'success_within_k = a hit among the first {LESSON_K} finds; answered_correctly = final answers contain '
     f'{LESSON_SIMILAR_ANSWER!r}. Primary: first_find_learned count per arm; lesson-arm metrics are also reported '
-    'restricted to sessions whose offered context carried the flag only through lesson ids.')
-# The fake executable prints nothing (exit 0) unless the archive ledger is searched. It compares argument
-# hashes so reading the script does not reveal the flag; unknown options get a generic error.
+    'restricted to sessions whose offered context carried the flag (or the word `ledger`) only through lesson ids.')
+# The fake tool's behavior lives in the harness process; the executable on PATH is a socket client, so
+# reading it reveals neither the flag nor the data. Run 2 leaked both through a self-contained script.
 LESSON_STOCKQ = r'''#!/usr/bin/env python3
-import hashlib, json, sys
-LOG = %(log)r
-HELP = %(help)r
-H = lambda value: hashlib.sha256(value.encode()).hexdigest()
-JOINED = 'a99ae075c3a00d15f2be4d55eb20ed9ef64432ea81eb4f3e360e47c8c05cb5a8'
-NAME = 'd7a6f345840c1aead5cdb27372d9aacaac8cf9432246bf207f8922b8eaafb8b7'
-VALUE = '0eb3e36bfb24dcd9bb1d1bece1531216b59539a8fde17ee80224af0653c92aa3'
-args = sys.argv[1:]
-
-def finish(outcome, code=0, out=None, err=None):
-    with open(LOG, 'a') as stream:
-        stream.write(json.dumps(dict(args=args, outcome=outcome)) + '\n')
-    if out:
-        print(out)
-    if err:
-        print(err, file=sys.stderr)
-    sys.exit(code)
-if not args or args[0] in ('-h', '--help', 'help') or (args[0] == 'find' and ({'-h', '--help'} & set(args))):
-    finish('help', out=HELP)
-if args[0] != 'find':
-    finish('error', 2, err='stockq: unknown command')
-wide, skus, rest, index = False, [], args[1:], 0
-while index < len(rest):
-    value = rest[index]
-    if H(value) == JOINED:
-        wide = True
-    elif H(value) == NAME and index + 1 < len(rest) and H(rest[index + 1]) == VALUE:
-        wide, index = True, index + 1
-    elif value.startswith('-'):
-        finish('error', 2, err='stockq: unknown option')
-    else:
-        skus.append(value)
-    index += 1
-if not skus:
-    finish('error', 2, err=HELP)
-rows = ['MB-2290 reorder_qty=180' for sku in skus if wide and sku.upper() == 'MB-2290']
-finish('hit' if rows else 'empty', out='\n'.join(rows))
+import json, socket, sys
+connection = socket.socket(socket.AF_UNIX)
+connection.connect(%(socket)r)
+connection.sendall(json.dumps(sys.argv[1:]).encode() + b'\n')
+reply = json.loads(connection.makefile().readline())
+sys.stdout.write(reply['out']); sys.stderr.write(reply['err']); sys.exit(reply['code'])
 '''
+
+
+def lesson_stockq_respond(args):
+    """(outcome, exit code, stdout, stderr): empty unless the undocumented archive ledger is searched."""
+    if not args or args[0] in ('-h', '--help', 'help') or (args[0] == 'find' and {'-h', '--help'} & set(args)):
+        return 'help', 0, LESSON_STOCKQ_HELP + '\n', ''
+    if args[0] != 'find':
+        return 'error', 2, '', 'stockq: unknown command\n'
+    wide, skus, rest, index = False, [], args[1:], 0
+    while index < len(rest):
+        value = rest[index]
+        if value == '--ledger=archive':
+            wide = True
+        elif value == '--ledger' and index + 1 < len(rest) and rest[index + 1] == 'archive':
+            wide, index = True, index + 1
+        elif value.startswith('-'):
+            return 'error', 2, '', 'stockq: unknown option\n'
+        else:
+            skus.append(value)
+        index += 1
+    if not skus:
+        return 'error', 2, '', LESSON_STOCKQ_HELP + '\n'
+    rows = [f'{sku.upper()} reorder_qty={LESSON_SIMILAR_ANSWER}' for sku in skus if wide and sku.upper() == 'MB-2290']
+    return ('hit' if rows else 'empty'), 0, ''.join(row + '\n' for row in rows), ''
+
+
+@contextlib.contextmanager
+def lesson_stockq_server(path):
+    """Serve one session's fake tool from this process; yields the invocation log kept harness-side."""
+    import socketserver
+    invocations = []
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            try:
+                args = json.loads(self.rfile.readline())
+                args = [str(value) for value in args] if isinstance(args, list) else []
+            except ValueError:
+                args = []
+            outcome, code, out, err = lesson_stockq_respond(args)
+            invocations.append(dict(args=args, outcome=outcome))
+            self.wfile.write(json.dumps(dict(code=code, out=out, err=err)).encode() + b'\n')
+    server = socketserver.ThreadingUnixStreamServer(str(path), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield invocations
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 LESSON_PI_FLAGS = ['--print', '--mode', 'json', '--no-session', '--no-extensions', '--no-mcp', '--no-skills',
                    '--no-prompt-templates', '--no-context-files', '--no-approve', '--no-themes', '--tools', 'bash']
 
@@ -1846,28 +1869,33 @@ def lesson_stages_processing(service, seed, captured):
                        and LESSON_TOKEN in seeded[ident]['text']]
             useful = [ident for ident in selected if seeded.get(ident, {}).get('role') == 'result'
                       and 'reorder_qty' in seeded[ident]['text']]
+            committed = ((entry.get('response') or {}).get('results') or {}).get(action.get('candidate_id')) or {}
             actions.append(dict(operation=action.get('operation'), type=action.get('type'), text=action.get('text'),
+                                committed_id=committed.get('id'), committed_decision=committed.get('decision'),
                                 behavior=action.get('behavior'), candidate_id=action.get('candidate_id'),
                                 technical_evidence=selected, technical_roles=roles,
                                 evidence_quotes=[ref.get('quote') for ref in action.get('evidence') or []],
                                 grounded=dict(all_seeded=bool(selected) and len(positions) == len(selected),
                                               attempt_then_later_result=bool(attempts and results and max(results) > max(attempts)),
                                               names_changed_attempt=bool(changed), names_useful_result=bool(useful))))
-    lesson_ids, histories = [], {}
+    # Resolve the lesson from the committed consolidation response, then read its current /history.
+    # Run 2 resolved it via /recall before readiness and missed it although it was offered and receipted.
+    histories = {}
     recalled = service.get('/recall?' + urlencode({'q': LESSON_SIMILAR_TASK, 'effort': 'normal', 'limit': 10}))
-    for memory in recalled.get('memories') or []:
-        if not isinstance(memory, dict) or memory.get('tier') == 'raw' or not isinstance(memory.get('id'), str):
-            continue
-        history = service.get('/history/' + urllib.parse.quote(memory['id'], safe=''))
+    recalled_ids = [memory['id'] for memory in recalled.get('memories') or []
+                    if isinstance(memory, dict) and memory.get('tier') != 'raw' and isinstance(memory.get('id'), str)]
+    committed_ids = [action['committed_id'] for action in actions if action['behavior'] and action['committed_id']]
+    for ident in dict.fromkeys(committed_ids + recalled_ids):
+        history = service.get('/history/' + urllib.parse.quote(ident, safe=''))
         versions = [item for item in history.get('versions') or [] if isinstance(item, dict)]
         current = max(versions, key=lambda item: item.get('version') or 0) if versions else {}
         evidence = [ref.get('episode_id') for ref in current.get('evidence') or [] if isinstance(ref, dict)]
-        histories[memory['id']] = dict(type=current.get('type'), text=current.get('text'), state=current.get('state'),
-                                       authority=current.get('authority'), behavior=current.get('behavior'),
-                                       version=current.get('version'), evidence_episode_ids=evidence,
-                                       evidence_seeded=[ident in seeded for ident in evidence])
-        if current.get('behavior') and any(ident in seeded for ident in evidence):
-            lesson_ids.append(memory['id'])
+        histories[ident] = dict(type=current.get('type'), text=current.get('text'), state=current.get('state'),
+                                authority=current.get('authority'), behavior=current.get('behavior'),
+                                version=current.get('version'), evidence_episode_ids=evidence,
+                                evidence_seeded=[item in seeded for item in evidence])
+    lesson_ids = [ident for ident, current in histories.items()
+                  if current['behavior'] and any(current['evidence_seeded'])]
     grounded = [action for action in actions if action['behavior'] and all(action['grounded'].values())]
     flag = LESSON_TOKEN.split()[0]
     specificity = {ident: dict(text_names_flag=flag in (histories[ident]['text'] or ''),
@@ -1878,6 +1906,7 @@ def lesson_stages_processing(service, seed, captured):
                    for ident in lesson_ids}
     stage2 = dict(passed=bool(grounded and lesson_ids), lesson_ids=lesson_ids, submitted_lesson_actions=actions,
                   committed_histories=histories, lesson_specificity=specificity,
+                  recall_returned_lesson=[ident for ident in lesson_ids if ident in recalled_ids],
                   specificity_note=('non-gating: does the committed lesson name the undocumented flag? The automatic '
                                     'offer renders behavior fields, so offered_fields_name_flag decides usefulness'),
                   basis=('a committed consolidation submission whose behavior action selects technical_evidence that '
@@ -1892,10 +1921,9 @@ def lesson_session(agent_command, work, label, task, client_path=None):
     from memento import bridge
     directory = work / label
     (directory / 'bin').mkdir(parents=True, mode=0o700)
-    log = directory / 'stockq.log'
-    log.touch(mode=0o600)
+    endpoint = directory / '.stockq.sock'
     executable = directory / 'bin' / LESSON_TOOL
-    executable.write_text(LESSON_STOCKQ % {'log': str(log), 'help': LESSON_STOCKQ_HELP})
+    executable.write_text(LESSON_STOCKQ % {'socket': str(endpoint)})
     executable.chmod(0o700)
     argv = [*agent_command, *LESSON_PI_FLAGS]
     if client_path is not None:
@@ -1905,12 +1933,14 @@ def lesson_session(agent_command, work, label, task, client_path=None):
     environment['PATH'] = str(directory / 'bin') + os.pathsep + environment.get('PATH', '')
     environment['MEMENTO_BRIDGE'] = str(Path(bridge.__file__).resolve())
     started = time.monotonic()
-    try:
-        result = subprocess.run(argv + [task], cwd=directory, env=environment, stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=900)
-        exit_code, stdout = result.returncode, result.stdout
-    except subprocess.TimeoutExpired as error:
-        exit_code, stdout = 'timeout', error.stdout or b''
+    with lesson_stockq_server(endpoint) as invocations:
+        try:
+            result = subprocess.run(argv + [task], cwd=directory, env=environment, stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=900)
+            exit_code, stdout = result.returncode, result.stdout
+        except subprocess.TimeoutExpired as error:
+            exit_code, stdout = 'timeout', error.stdout or b''
+        invocations = list(invocations)
     events = []
     for line in stdout.splitlines():
         with contextlib.suppress(ValueError):
@@ -1922,7 +1952,6 @@ def lesson_session(agent_command, work, label, task, client_path=None):
                for block in event['message'].get('content') or [] if isinstance(block, dict) and block.get('type') == 'text']
     model = next((event['message'].get('model') for event in events if event.get('type') == 'message_end'
                   and event.get('message', {}).get('role') == 'assistant'), None)
-    invocations = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
     finds = [entry for entry in invocations if entry['args'][:1] == ['find'] and entry['outcome'] != 'help']
     hits = [index for index, entry in enumerate(finds) if entry['outcome'] == 'hit']
     first = finds[0]['args'] if finds else None
@@ -1932,11 +1961,15 @@ def lesson_session(agent_command, work, label, task, client_path=None):
     # Heuristic only: did the agent try to read the fake tool instead of using it?
     inspected = [command for command in commands if isinstance(command, str) and re.search(
         r'\b(cat|less|more|head|tail|sed|awk|strings|xxd|od|python3?|grep|file)\b[^|;&]*stockq', command)]
+    repo = str(Path(__file__).resolve().parents[1])
+    harness = [command for command in commands if isinstance(command, str)
+               and any(marker in command for marker in ('memory_acceptance', '/proc/', repo))]
     return dict(label=label, extension=client_path is not None, exit=exit_code, model=model, session_id=session_id,
                 elapsed_s=round(time.monotonic() - started, 1), shell_commands=commands, stockq_invocations=invocations,
                 first_find=first, first_find_learned=learned, find_attempts=len(finds),
                 empty_finds_before_success=hits[0] if hits else len(finds), succeeded=bool(hits),
                 success_within_k=bool(hits) and hits[0] < LESSON_K, inspected_tool_source=inspected,
+                inspected_harness=harness,
                 answered_correctly=any(LESSON_SIMILAR_ANSWER in answer for answer in answers), final_answer=answers[-1:] or None,
                 cited_memory_ids=sorted(set(re.findall(r'\[memory:([0-9a-f]+)\]', '\n'.join(answers)))))
 
@@ -1968,11 +2001,15 @@ def lesson_offer_and_receipt(service, client_path, config, session, lesson_ids):
                 receipts.append(dict(id=item['id'], exposure=exposure))
     receipt_ids = {pair[0] for receipt in receipts for pair in receipt.get('exposure') or [] if isinstance(pair, list) and pair}
     flag = LESSON_TOKEN.split()[0]
-    carriers = sorted({ident for row in mine for line in (row['context'] or '').splitlines()
-                       for ident in re.findall(r'^\[memory:([0-9a-f]+)\]', line) if flag in line})
+    lines = [(ident, line) for row in mine for line in (row['context'] or '').splitlines()
+             for ident in re.findall(r'^\[memory:([0-9a-f]+)\]', line)]
+    carriers = sorted({ident for ident, line in lines if flag in line})
+    hinted = sorted({ident for ident, line in lines if 'ledger' in line.lower()})
     return dict(session=session['label'], conversation=session['session_id'], recall_rows=mine, shown=shown,
                 lesson_offered=offered, flag_via_lesson_ids=[ident for ident in carriers if ident in lesson_ids],
-                flag_via_other_ids=[ident for ident in carriers if ident not in lesson_ids], other_shown=[ident for ident in shown if ident not in lesson_ids],
+                flag_via_other_ids=[ident for ident in carriers if ident not in lesson_ids],
+                hint_via_lesson_ids=[ident for ident in hinted if ident in lesson_ids],
+                hint_via_other_ids=[ident for ident in hinted if ident not in lesson_ids], other_shown=[ident for ident in shown if ident not in lesson_ids],
                 upload=uploaded, receipts=receipts, lesson_receipted=[ident for ident in offered if ident in receipt_ids])
 
 
@@ -1990,6 +2027,7 @@ def lesson_loop(args, report, *, sleep=time.sleep):
                   frozen=dict(seed=LESSON_SEED, similar_task=LESSON_SIMILAR_TASK, stockq_help=LESSON_STOCKQ_HELP,
                               token=LESSON_TOKEN, k=LESSON_K,
                               sha256=native_sha256(json.dumps([LESSON_SEED, LESSON_SIMILAR_TASK, LESSON_STOCKQ,
+                                                               inspect.getsource(lesson_stockq_respond),
                                                                LESSON_STOCKQ_HELP, LESSON_TOKEN, LESSON_K,
                                                                LESSON_SCORE_RULE]).encode())))
     launch = {}
@@ -2021,11 +2059,11 @@ def lesson_loop(args, report, *, sleep=time.sleep):
             captured = report['captured_work'] = []
             report['processing'] = lesson_process(service, args.processor_command, args.max_ticks, captured,
                                                   dict(source=seed['source'], conversation_id=seed['conversation']))
-            stage1, stage2 = lesson_stages_processing(service, seed, captured)
-            report['stages'] = {'1_candidate_extracted': stage1, '2_lesson_promoted_grounded': stage2}
             report['stage'] = 'readiness'
             with contextlib.suppress(RuntimeError):
                 report['readiness'] = native_wait_ready(service, 300, sleep=sleep)
+            stage1, stage2 = lesson_stages_processing(service, seed, captured)
+            report['stages'] = {'1_candidate_extracted': stage1, '2_lesson_promoted_grounded': stage2}
             report['stage'] = 'behavior'
             client_path = work / 'client.json'
             config = dict(uid=os.getuid(), client_uid='lesson-client-' + nonce, mode='client', agent='pi', preset='pi',
@@ -2065,12 +2103,16 @@ def lesson_loop(args, report, *, sleep=time.sleep):
                                                                   / len(runs), 2) if runs else None,
                             mean_find_attempts=round(sum(run['find_attempts'] for run in runs) / len(runs), 2) if runs else None,
                             inspected_tool_source=sum(bool(run['inspected_tool_source']) for run in runs),
+                            inspected_harness=sum(bool(run['inspected_harness']) for run in runs),
                             models=sorted({str(run['model']) for run in runs}))
             arms = {arm: summary([session for session in sessions if session['label'].startswith(arm)])
                     for arm in ('control', 'lesson')}
             arms['lesson_flag_only_via_lesson'] = summary([
                 session for session in sessions if session['label'].startswith('lesson')
                 and by_label[session['label']]['flag_via_lesson_ids'] and not by_label[session['label']]['flag_via_other_ids']])
+            arms['lesson_hint_only_via_lesson'] = summary([
+                session for session in sessions if session['label'].startswith('lesson')
+                and by_label[session['label']]['hint_via_lesson_ids'] and not by_label[session['label']]['hint_via_other_ids']])
             report['behavior'] = dict(arms=arms, rule=LESSON_SCORE_RULE, k=LESSON_K,
                                       note=('small-sample signal, not causality; control runs without the Memento '
                                             'extension, so it also lacks capture and any other offered context'))
