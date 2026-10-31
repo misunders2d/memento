@@ -17,7 +17,9 @@ import re
 import shutil
 import socket
 import stat
+import subprocess
 import tempfile
+import threading
 from threading import Thread
 import time
 import urllib.error
@@ -1485,9 +1487,551 @@ def native_retrieval(manifest_path, report, *, service_factory=None, ready_timeo
     return report['exit_code']
 
 
+# ---------------------------------------------------------------------------
+# lesson-loop: synthetic native failure -> changed approach -> inferred lesson ->
+# automatic offer to a fresh session -> paired behavior sample. Opt-in only.
+# The harness launches and removes its own disposable native container.
+
+LESSON_SCHEMA = 'memento-lesson-loop-v1'
+LESSON_CONTAINER_PREFIX = 'memento-lesson-loop-'
+LESSON_DEFAULT_PORT = 18766
+LESSON_TOOL = 'stockq'
+# Frozen before the first run. The tool, SKUs and outputs are invented.
+LESSON_SEED = dict(
+    conversation='lesson-loop-seed-session', offset_days=2,
+    task='Find the reorder quantity for SKU KX-4471 using the stockq command.',
+    steps=[('stockq find KX-4471', '(no output)'),
+           ('stockq find KX-4471', '(no output)'),
+           ('stockq find --warehouse all KX-4471', 'KX-4471 warehouse=reno reorder_qty=240')],
+    answer=('The reorder quantity for KX-4471 is 240. `stockq find KX-4471` returned no output twice without '
+            'an error; `stockq find --warehouse all KX-4471` found it in the reno warehouse.'))
+LESSON_SIMILAR_TASK = 'Find the reorder quantity for SKU MB-2290 using the stockq command. Reply with the number.'
+LESSON_SIMILAR_ANSWER = '180'
+LESSON_STOCKQ_HELP = ('usage: stockq find [--warehouse NAME|all] SKU\n'
+                      '  --warehouse NAME|all  warehouse to search (default: local)')
+LESSON_SCORE_RULE = ('improved = the first logged `stockq find` invocation of the session already passes '
+                     '--warehouse all (help calls are not attempts); frozen before any behavior session')
+# The fake executable prints nothing (exit 0) unless every warehouse is searched.
+LESSON_STOCKQ = r'''#!/usr/bin/env python3
+import json, sys
+LOG = %(log)r
+HELP = %(help)r
+args = sys.argv[1:]
+with open(LOG, 'a') as stream:
+    stream.write(json.dumps(args) + '\n')
+if not args or args[0] in ('-h', '--help', 'help'):
+    print(HELP); sys.exit(0)
+if args[0] != 'find':
+    print(HELP, file=sys.stderr); sys.exit(2)
+warehouse, skus, rest, index = 'local', [], args[1:], 0
+while index < len(rest):
+    value = rest[index]
+    if value in ('-h', '--help'):
+        print(HELP); sys.exit(0)
+    if value == '--warehouse' and index + 1 < len(rest):
+        warehouse, index = rest[index + 1], index + 2
+        continue
+    if value.startswith('--warehouse='):
+        warehouse = value.split('=', 1)[1]
+    else:
+        skus.append(value)
+    index += 1
+for sku in skus:
+    if warehouse == 'all' and sku.upper() == 'MB-2290':
+        print('MB-2290 warehouse=tulsa reorder_qty=180')
+'''
+LESSON_PI_FLAGS = ['--print', '--mode', 'json', '--no-session', '--no-extensions', '--no-mcp', '--no-skills',
+                   '--no-prompt-templates', '--no-context-files', '--no-approve', '--no-themes', '--tools', 'bash']
+
+
+def _lesson_cmd(argv, *, timeout=600, check=True):
+    """Docker/git helper; private output stays in the caller's report."""
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if check and result.returncode:
+        raise RuntimeError(f'command_failed:{argv[0]} {argv[1] if len(argv) > 1 else ""}:{result.returncode}:'
+                           + result.stderr.strip()[-400:])
+    return result
+
+
+def lesson_asset_mounts(override_path):
+    """Read-only model assets and environment exactly as the production override names them."""
+    override = json.loads(Path(override_path).read_text())
+    service = override['services']['memory']
+    named = override.get('volumes') or {}
+    mounts, environment = [], {}
+    for volume in service.get('volumes') or []:
+        if not isinstance(volume, dict):
+            raise NativePreflightError('override_volume_shape')
+        if volume.get('target') == '/data':
+            continue  # Production data is never mounted.
+        if volume.get('read_only') is not True:
+            raise NativePreflightError('override_asset_not_read_only', volume.get('target'))
+        source = volume['source']
+        if volume.get('type') == 'volume':
+            source = (named.get(source) or {}).get('name') or source
+        elif volume.get('type') != 'bind' or not Path(source).is_dir():
+            raise NativePreflightError('override_asset_missing', volume.get('target'))
+        mounts.append(dict(type=volume['type'], source=source, destination=volume['target'], read_only=True))
+    for key, value in (service.get('environment') or {}).items():
+        if key.startswith('MEMENTO_') or key == 'OMP_NUM_THREADS':
+            environment[key] = str(value)
+    environment.pop('MEMENTO_ALLOWED_HOSTS', None)
+    if not mounts:
+        raise NativePreflightError('override_no_assets')
+    return mounts, environment
+
+
+def lesson_launch(args, nonce, report):
+    """Build/launch one fresh container on a fresh volume; refuse production first."""
+    repo = Path(__file__).resolve().parents[1]
+    port = args.port
+    if port == NATIVE_PRODUCTION_PORT or not 1024 <= port <= 65535:
+        raise NativePreflightError('production_or_invalid_port', port)
+    with socket.socket() as probe:
+        try:
+            probe.bind(('127.0.0.1', port))
+        except OSError:
+            raise NativePreflightError('port_in_use', port) from None
+    published = _lesson_cmd(['docker', 'ps', '--format', '{{.Names}}\t{{.Ports}}']).stdout
+    if any(f':{port}->' in line for line in published.splitlines()):
+        raise NativePreflightError('port_in_use', port)
+    mounts, environment = lesson_asset_mounts(args.compose_override)
+    commit = _lesson_cmd(['git', '-C', str(repo), 'rev-parse', 'HEAD']).stdout.strip()
+    dirty = bool(_lesson_cmd(['git', '-C', str(repo), 'status', '--porcelain', '--', 'crates', 'src',
+                              'Cargo.toml', 'Cargo.lock', 'packaging', 'Dockerfile.native']).stdout.strip())
+    image = args.image
+    if image is None:
+        image = f'memento-lesson-loop:{commit[:7]}'
+        built = _lesson_cmd(['docker', 'build', '-f', str(repo / 'Dockerfile.native'), '-t', image, str(repo)],
+                            timeout=7200)
+        report['build'] = dict(image=image, log_tail=built.stdout[-2000:])
+    image_id = _lesson_cmd(['docker', 'image', 'inspect', image, '--format', '{{.Id}}']).stdout.strip()
+    name = LESSON_CONTAINER_PREFIX + nonce
+    volume = name
+    url = f'http://127.0.0.1:{port}'
+    launch = dict(container_name=name, data_volume=volume, image=image, image_id=image_id, url=url, port=port,
+                  source_commit=commit, source_dirty=dirty, model_assets=mounts, environment=environment,
+                  compose_override=str(Path(args.compose_override).resolve()), container_id=None)
+    report['launch'] = launch
+    _lesson_cmd(['docker', 'volume', 'create', '--label', 'memento-lesson-loop=' + nonce, volume])
+    launch['volume_created'] = True
+    argv = ['docker', 'run', '-d', '--name', name, '--label', 'memento-lesson-loop=' + nonce,
+            '--user', '10001:10001', '--read-only', '--tmpfs', '/tmp', '--cap-drop', 'ALL',
+            '--security-opt', 'no-new-privileges:true', '--cpus', '2', '--memory', '5g', '--pids-limit', '256',
+            '-p', f'127.0.0.1:{port}:8765', '-v', f'{volume}:/data',
+            '-e', 'MEMENTO_EMBEDDINGS=1', '-e', f'MEMENTO_ALLOWED_HOSTS=127.0.0.1:{port}']
+    for key, value in environment.items():
+        argv += ['-e', f'{key}={value}']
+    for mount in mounts:
+        argv += ['-v', f'{mount["source"]}:{mount["destination"]}:ro']
+    launch['container_id'] = _lesson_cmd(argv + [image]).stdout.strip()
+    return launch
+
+
+def lesson_teardown(launch, log_path):
+    """Preserve container logs privately, then remove the container and its fresh volume."""
+    result = {}
+    if launch.get('container_id'):
+        logs = _lesson_cmd(['docker', 'logs', launch['container_name']], check=False)
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(logs.stdout + logs.stderr)
+        result['container_log'] = str(log_path)
+        result['container_removed'] = _lesson_cmd(['docker', 'rm', '-f', launch['container_name']],
+                                                  check=False).returncode == 0
+    if launch.get('volume_created'):
+        result['volume_removed'] = _lesson_cmd(['docker', 'volume', 'rm', launch['data_volume']],
+                                               check=False).returncode == 0
+    return result
+
+
+def lesson_wait_health(service, timeout=300, sleep=time.sleep):
+    started = time.monotonic()
+    while time.monotonic() - started < timeout:
+        with contextlib.suppress(Exception):
+            health = service.get('/health')
+            if health.get('status') == 'ok' and health.get('search_ready') is True:
+                return dict(elapsed_s=round(time.monotonic() - started, 1), health=health)
+        sleep(2)
+    raise RuntimeError('instance_not_ready')
+
+
+def lesson_seed_records(run_start):
+    """Pi JSONL: task, empty attempt, identical repeat, changed approach with result, answer."""
+    spec = LESSON_SEED
+    at = run_start - timedelta(days=spec['offset_days'])
+    tick = iter(range(0, 3600, 5))
+
+    def stamp():
+        return _native_time(at + timedelta(seconds=next(tick)))
+    records = [{'type': 'session', 'version': 3, 'id': spec['conversation'], 'timestamp': stamp(), 'cwd': '/tmp/inventory'},
+               {'type': 'message', 'id': 'seed-user', 'parentId': None, 'timestamp': stamp(),
+                'message': {'role': 'user', 'content': [{'type': 'text', 'text': spec['task']}]}}]
+    parent = 'seed-user'
+    for index, (command, output) in enumerate(spec['steps']):
+        call = f'seed-call-{index}'
+        records.append({'type': 'message', 'id': call, 'parentId': parent, 'timestamp': stamp(),
+                        'message': {'role': 'assistant', 'content': [
+                            {'type': 'toolCall', 'id': call, 'name': 'bash', 'arguments': {'command': command}}]}})
+        records.append({'type': 'message', 'id': f'seed-result-{index}', 'parentId': call, 'timestamp': stamp(),
+                        'message': {'role': 'toolResult', 'toolCallId': call, 'toolName': 'bash',
+                                    'content': [{'type': 'text', 'text': output}], 'isError': False}})
+        parent = f'seed-result-{index}'
+    records.append({'type': 'message', 'id': 'seed-answer', 'parentId': parent, 'timestamp': stamp(),
+                    'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': spec['answer']}]}})
+    return records
+
+
+def lesson_seed(service, work, nonce, run_start):
+    """Stage 0: replay the synthetic trace through the shipped Pi import/upload, keeping its boundary."""
+    from memento import bridge
+    config_path = work / 'seed-client.json'
+    config = dict(uid=os.getuid(), client_uid='lesson-seed-' + nonce, mode='client', agent='pi', preset='pi',
+                  timezone='UTC', url=service.base_url)
+    bridge.private_write(config_path, bridge.encode(config))
+    journal = work / 'seed-history' / 'stockq.jsonl'
+    journal.parent.mkdir(mode=0o700)
+    records = lesson_seed_records(run_start)
+    journal.write_text(''.join(json.dumps(record) + '\n' for record in records), encoding='utf-8')
+    spool = bridge.Spool(config_path, config)
+    try:
+        imported = bridge.import_history(spool, 'pi', [journal])
+        endpoints = dict(spool.db.execute("SELECT endpoint,COUNT(*) FROM outbox WHERE state='pending' GROUP BY endpoint"))
+    finally:
+        spool.close()
+    uploaded = bridge.upload(config_path, config)
+    if uploaded.get('pending') or uploaded.get('conflicts') or uploaded.get('error'):
+        raise RuntimeError('seed_upload_incomplete')
+    source = bridge.source(config, 'pi')
+    query = '/episodes/search?' + urlencode({'conversation_id': LESSON_SEED['conversation'], 'source': source,
+                                             'limit': 100})
+    episodes = []
+    for _ in range(30):
+        episodes = [item for item in service.get(query).get('episodes') or []
+                    if isinstance(item, dict) and item.get('kind') != 'native_record']
+        if len(episodes) >= 2 + 2 * len(LESSON_SEED['steps']):
+            break
+        time.sleep(1)
+    stored = [service.get('/episodes/' + urllib.parse.quote(str(item['id']), safe='')) for item in episodes]
+    stored.sort(key=lambda item: (str(item.get('occurred_at')), str(item.get('id'))))
+    roles = []
+    for item in stored:
+        text = item.get('text') or ''
+        role = ('attempt' if item.get('kind') == 'assistant' and '"toolCall"' in text else
+                'result' if item.get('kind') == 'tool' else
+                'task' if item.get('kind') == 'user' else
+                'answer' if item.get('kind') == 'assistant' else 'other')
+        roles.append(dict(id=item.get('id'), kind=item.get('kind'), role=role, occurred_at=item.get('occurred_at'),
+                          text=text, metadata=item.get('metadata')))
+    expected = ['task'] + ['attempt', 'result'] * len(LESSON_SEED['steps']) + ['answer']
+    return dict(evidence_kind='replay_native_projection', source=source, conversation=LESSON_SEED['conversation'],
+                import_records_added=imported.get('records_added'), queued_endpoints=endpoints, upload=uploaded,
+                episodes=roles, order_matches=[item['role'] for item in roles] == expected,
+                compaction_boundary_kept='/work/compaction' in endpoints)
+
+
+def lesson_process(service, processor_command, max_ticks, captured, compaction):
+    """Stage 1/2: the existing legacy runner lanes, recording claims and /work/complete bodies test-side."""
+    from memento import runner
+    config = dict(mode='server', preset='pi', agent='pi', command=list(processor_command), timezone='UTC',
+                  deadline_seconds=900, url=service.base_url)
+    original, lock = runner.Service.post, threading.Lock()
+
+    def recording(self, path, value):
+        entry = dict(path=path, at=_native_time(datetime.now(timezone.utc)))
+        if path in ('/work/complete', '/work/release'):
+            entry['request'] = value
+        try:
+            result = original(self, path, value)
+        except Exception as error:
+            entry['error'] = _native_error(error)
+            if path in ('/work/claim', '/work/complete', '/work/release'):
+                with lock:
+                    captured.append(entry)
+            raise
+        if path in ('/work/claim', '/work/complete', '/work/release'):
+            entry['response'] = result
+            with lock:
+                captured.append(entry)
+        return result
+    ticks = []
+    with patch.object(runner.Service, 'post', recording):
+        for index in range(max_ticks):
+            before = len(captured)
+            started = time.monotonic()
+            try:
+                # The first claim carries the seeded conversation's boundary, as a native compaction would.
+                code = runner.legacy_tick(config, compaction if index == 0 else None, consolidate_now=True)
+                error = None
+            except Exception as exc:  # Preserve the failed tick; later ticks may retry.
+                code, error = None, _native_error(exc)
+            claims = [entry for entry in captured[before:] if entry['path'] == '/work/claim']
+            worked = [item['kind'] for entry in claims for item in (entry.get('response') or {}).get('work') or []]
+            ticks.append(dict(tick=index + 1, exit=code, error=error, elapsed_s=round(time.monotonic() - started, 1),
+                              claimed_kinds=worked))
+            if not worked:
+                break
+    pool = {kind: service.post('/work/pool', {'kind': kind}) for kind in ('extract', 'consolidate')}
+    return dict(runner='memento.runner.legacy_tick (process_lane -> /work/complete)', processor_command=config['command'],
+                preset='pi', consolidate_now=True, ticks=ticks,
+                final_pool={kind: {key: value for key, value in result.items() if not isinstance(value, (list, dict))}
+                            for kind, result in pool.items()})
+
+
+def _lesson_kind(captured, complete):
+    ident = (complete.get('request') or {}).get('id')
+    for entry in captured:
+        for item in (entry.get('response') or {}).get('work') or [] if entry['path'] == '/work/claim' else []:
+            if item.get('id') == ident:
+                return item.get('kind')
+    return None
+
+
+def lesson_stages_processing(service, seed, captured):
+    """Separate stage verdicts from captured submissions plus current /history."""
+    seeded = {item['id']: item for item in seed['episodes']}
+    order = [item['id'] for item in seed['episodes']]
+    completes = [dict(entry, kind=_lesson_kind(captured, entry)) for entry in captured
+                 if entry['path'] == '/work/complete']
+    extraction = []
+    for entry in completes:
+        if entry['kind'] != 'extract' or 'error' in entry:
+            continue
+        for window in (entry['request'].get('output') or {}).get('windows') or []:
+            for candidate in window.get('candidates') or []:
+                extraction.append(dict(window=window.get('id'), **candidate))
+    tool_candidates = [item for item in extraction if LESSON_TOOL in json.dumps(item).lower()]
+    stage1 = dict(passed=bool(tool_candidates), committed_extractions=sum(entry['kind'] == 'extract' and 'error' not in entry
+                                                                          for entry in completes),
+                  rejected_submissions=[dict(kind=entry['kind'], error=entry['error']) for entry in completes if 'error' in entry],
+                  candidates=extraction, tool_related=len(tool_candidates),
+                  basis='candidate whose text/quote names the seeded tool, from the committed extraction submission')
+    actions = []
+    for entry in completes:
+        if entry['kind'] != 'consolidate' or 'error' in entry:
+            continue
+        for action in (entry['request'].get('output') or {}).get('actions') or []:
+            selected = action.get('technical_evidence')
+            if selected is None and not action.get('behavior'):
+                continue
+            selected = selected or []
+            roles = [seeded.get(ident, {}).get('role', 'not_seeded') for ident in selected]
+            positions = [order.index(ident) for ident in selected if ident in seeded]
+            attempts = [order.index(ident) for ident in selected if seeded.get(ident, {}).get('role') == 'attempt']
+            results = [order.index(ident) for ident in selected if seeded.get(ident, {}).get('role') == 'result']
+            changed = [ident for ident in selected if seeded.get(ident, {}).get('role') == 'attempt'
+                       and '--warehouse all' in seeded[ident]['text']]
+            useful = [ident for ident in selected if seeded.get(ident, {}).get('role') == 'result'
+                      and 'reorder_qty' in seeded[ident]['text']]
+            actions.append(dict(operation=action.get('operation'), type=action.get('type'), text=action.get('text'),
+                                behavior=action.get('behavior'), candidate_id=action.get('candidate_id'),
+                                technical_evidence=selected, technical_roles=roles,
+                                evidence_quotes=[ref.get('quote') for ref in action.get('evidence') or []],
+                                grounded=dict(all_seeded=bool(selected) and len(positions) == len(selected),
+                                              attempt_then_later_result=bool(attempts and results and max(results) > max(attempts)),
+                                              names_changed_attempt=bool(changed), names_useful_result=bool(useful))))
+    lesson_ids, histories = [], {}
+    recalled = service.get('/recall?' + urlencode({'q': LESSON_SIMILAR_TASK, 'effort': 'normal', 'limit': 10}))
+    for memory in recalled.get('memories') or []:
+        if not isinstance(memory, dict) or memory.get('tier') == 'raw' or not isinstance(memory.get('id'), str):
+            continue
+        history = service.get('/history/' + urllib.parse.quote(memory['id'], safe=''))
+        versions = [item for item in history.get('versions') or [] if isinstance(item, dict)]
+        current = max(versions, key=lambda item: item.get('version') or 0) if versions else {}
+        evidence = [ref.get('episode_id') for ref in current.get('evidence') or [] if isinstance(ref, dict)]
+        histories[memory['id']] = dict(type=current.get('type'), text=current.get('text'), state=current.get('state'),
+                                       authority=current.get('authority'), behavior=current.get('behavior'),
+                                       version=current.get('version'), evidence_episode_ids=evidence,
+                                       evidence_seeded=[ident in seeded for ident in evidence])
+        if current.get('behavior') and any(ident in seeded for ident in evidence):
+            lesson_ids.append(memory['id'])
+    grounded = [action for action in actions if action['behavior'] and all(action['grounded'].values())]
+    stage2 = dict(passed=bool(grounded and lesson_ids), lesson_ids=lesson_ids, submitted_lesson_actions=actions,
+                  committed_histories=histories,
+                  basis=('a committed consolidation submission whose behavior action selects technical_evidence that '
+                         'are all seeded episodes, include an attempt followed by a later result, and name the changed '
+                         'attempt and its useful result; plus a current /history behavior node citing seeded evidence. '
+                         'Provenance/order only: not proof the model judged causality correctly.'))
+    return stage1, stage2
+
+
+def lesson_session(agent_command, work, label, task, client_path=None):
+    """One fresh Pi print session in its own directory with the fake tool on PATH."""
+    from memento import bridge
+    directory = work / label
+    (directory / 'bin').mkdir(parents=True, mode=0o700)
+    log = directory / 'stockq.log'
+    log.touch(mode=0o600)
+    executable = directory / 'bin' / LESSON_TOOL
+    executable.write_text(LESSON_STOCKQ % {'log': str(log), 'help': LESSON_STOCKQ_HELP})
+    executable.chmod(0o700)
+    argv = [*agent_command, *LESSON_PI_FLAGS]
+    if client_path is not None:
+        entrypoint = Path(__file__).resolve().parents[1] / 'src/memento/native_pi.ts'
+        argv += ['--extension', str(entrypoint), '--memento-config', str(client_path)]
+    environment = {key: value for key, value in os.environ.items() if key not in ('MEMENTO_PROCESSING', 'MEMENTO_CONFIG')}
+    environment['PATH'] = str(directory / 'bin') + os.pathsep + environment.get('PATH', '')
+    environment['MEMENTO_BRIDGE'] = str(Path(bridge.__file__).resolve())
+    started = time.monotonic()
+    try:
+        result = subprocess.run(argv + [task], cwd=directory, env=environment, stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=900)
+        exit_code, stdout = result.returncode, result.stdout
+    except subprocess.TimeoutExpired as error:
+        exit_code, stdout = 'timeout', error.stdout or b''
+    events = []
+    for line in stdout.splitlines():
+        with contextlib.suppress(ValueError):
+            events.append(json.loads(line))
+    session_id = next((event.get('id') for event in events if event.get('type') == 'session'), None)
+    commands = [event.get('args', {}).get('command') for event in events if event.get('type') == 'tool_execution_start']
+    answers = [block.get('text', '') for event in events if event.get('type') == 'message_end'
+               and event.get('message', {}).get('role') == 'assistant'
+               for block in event['message'].get('content') or [] if isinstance(block, dict) and block.get('type') == 'text']
+    model = next((event['message'].get('model') for event in events if event.get('type') == 'message_end'
+                  and event.get('message', {}).get('role') == 'assistant'), None)
+    invocations = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    finds = [args for args in invocations if args and args[0] == 'find']
+    first = finds[0] if finds else None
+    improved = bool(first) and ('--warehouse=all' in first or any(
+        first[index] == '--warehouse' and index + 1 < len(first) and first[index + 1] == 'all'
+        for index in range(len(first))))
+    return dict(label=label, extension=client_path is not None, exit=exit_code, model=model, session_id=session_id,
+                elapsed_s=round(time.monotonic() - started, 1), shell_commands=commands, stockq_invocations=invocations,
+                first_find=first, improved_first_attempt=improved, find_attempts=len(finds),
+                answered_correctly=any(LESSON_SIMILAR_ANSWER in answer for answer in answers), final_answer=answers[-1:] or None,
+                cited_memory_ids=sorted(set(re.findall(r'\[memory:([0-9a-f]+)\]', '\n'.join(answers)))))
+
+
+def lesson_offer_and_receipt(service, client_path, config, session, lesson_ids):
+    """Stage 3/4 for one extension session: the spool's actual offer, then the uploaded exposure receipt."""
+    from memento import bridge
+    spool = bridge.Spool(client_path, config)
+    try:
+        rows = [dict(conversation=conversation, query=query, context=context, shown=json.loads(shown))
+                for conversation, query, context, shown in spool.db.execute(
+                    'SELECT conversation,query,context,shown FROM recall_cache')]
+        spool.commit()
+    finally:
+        spool.close()
+    mine = [row for row in rows if row['conversation'] == session['session_id']]
+    shown = sorted({ident for row in mine for ident in row['shown']})
+    offered = [ident for ident in lesson_ids if ident in shown]
+    uploaded = bridge.upload(client_path, config)
+    source = bridge.source(config, 'pi')
+    receipts = []
+    if session['session_id']:
+        found = service.get('/episodes/search?' + urlencode({'conversation_id': session['session_id'], 'source': source,
+                                                             'limit': 100})).get('episodes') or []
+        for item in found:
+            if isinstance(item, dict) and item.get('kind') == 'native_hook':
+                stored = service.get('/episodes/' + urllib.parse.quote(str(item['id']), safe=''))
+                exposure = (stored.get('metadata') or {}).get('exposure')
+                receipts.append(dict(id=item['id'], exposure=exposure))
+    receipt_ids = {pair[0] for receipt in receipts for pair in receipt.get('exposure') or [] if isinstance(pair, list) and pair}
+    return dict(session=session['label'], conversation=session['session_id'], recall_rows=mine, shown=shown,
+                lesson_offered=offered, other_shown=[ident for ident in shown if ident not in lesson_ids],
+                upload=uploaded, receipts=receipts, lesson_receipted=[ident for ident in offered if ident in receipt_ids])
+
+
+def lesson_loop(args, report, *, sleep=time.sleep):
+    """Return 0 (all four stages passed), 3 (a stage failed), 2 (refused before any write)."""
+    from memento import bridge
+    from memento.runner import Service
+    nonce = uuid4().hex[:10]
+    run_start = datetime.now(timezone.utc).replace(microsecond=0)
+    output = args.output.resolve()
+    repo = Path(__file__).resolve().parents[1]
+    report.update(schema=LESSON_SCHEMA, mode='lesson-loop', stage='preflight', nonce=nonce,
+                  started_at=_native_time(run_start), score_rule=LESSON_SCORE_RULE,
+                  frozen=dict(seed=LESSON_SEED, similar_task=LESSON_SIMILAR_TASK, stockq_help=LESSON_STOCKQ_HELP,
+                              sha256=native_sha256(json.dumps([LESSON_SEED, LESSON_SIMILAR_TASK, LESSON_STOCKQ,
+                                                               LESSON_STOCKQ_HELP]).encode())))
+    launch = {}
+    try:
+        try:
+            if repo == output or repo in output.parents:
+                raise NativePreflightError('report_inside_repository')
+            if args.trials < 1:
+                raise NativePreflightError('trials')
+            launch = lesson_launch(args, nonce, report)
+            service = Service(launch['url'])
+            report['stage'] = 'startup'
+            report['startup'] = lesson_wait_health(service, sleep=sleep)
+            status = service.get('/status')
+            nonzero = sorted('.'.join(path) for path in NATIVE_STATUS_ZERO if _native_dig(status, path) != 0)
+            if nonzero:
+                raise NativePreflightError('target_not_empty', nonzero)
+        except NativePreflightError as refusal:
+            report['stage'] = 'preflight_refused'
+            report['preflight_refusal'] = dict(reason=refusal.reason, **({'detail': refusal.detail} if refusal.detail else {}))
+            report['exit_code'] = 2
+            return 2
+        with tempfile.TemporaryDirectory(prefix='memento-lesson-loop-') as directory:
+            work = Path(directory)
+            os.chmod(work, 0o700)
+            report['stage'] = 'seed'
+            seed = report['seed'] = lesson_seed(service, work, nonce, run_start)
+            report['stage'] = 'processing'
+            captured = report['captured_work'] = []
+            report['processing'] = lesson_process(service, args.processor_command, args.max_ticks, captured,
+                                                  dict(source=seed['source'], conversation_id=seed['conversation']))
+            stage1, stage2 = lesson_stages_processing(service, seed, captured)
+            report['stages'] = {'1_candidate_extracted': stage1, '2_lesson_promoted_grounded': stage2}
+            report['stage'] = 'readiness'
+            with contextlib.suppress(RuntimeError):
+                report['readiness'] = native_wait_ready(service, 300, sleep=sleep)
+            report['stage'] = 'behavior'
+            client_path = work / 'client.json'
+            config = dict(uid=os.getuid(), client_uid='lesson-client-' + nonce, mode='client', agent='pi', preset='pi',
+                          timezone='UTC', url=launch['url'])
+            bridge.private_write(client_path, bridge.encode(config))
+            sessions, offers = [], []
+            # Alternate arms so time drift affects both; every session is a fresh process and directory.
+            for index in range(args.trials):
+                for arm in ('control', 'lesson'):
+                    session = lesson_session(args.agent_command, work, f'{arm}-{index + 1}', LESSON_SIMILAR_TASK,
+                                             client_path if arm == 'lesson' else None)
+                    sessions.append(session)
+                    if arm == 'lesson':
+                        offers.append(lesson_offer_and_receipt(service, client_path, config, session, stage2['lesson_ids']))
+            report['sessions'] = sessions
+            report['offers'] = offers
+            report['stages']['3_automatic_offer_fresh_session'] = dict(
+                passed=bool(offers) and all(offer['lesson_offered'] for offer in offers),
+                offered_sessions=sum(bool(offer['lesson_offered']) for offer in offers), sessions=len(offers),
+                basis='lesson id in the shipped Pi extension/bridge recall_cache offer for that fresh session',
+                contamination_note=('extension sessions are captured into this instance, so later lesson sessions can '
+                                    'also be offered raw episodes of earlier ones; see offers[].other_shown'))
+            report['stages']['4_receipt_recorded'] = dict(
+                passed=bool(offers) and all(offer['lesson_receipted'] for offer in offers if offer['lesson_offered'])
+                and any(offer['lesson_offered'] for offer in offers),
+                receipted_sessions=sum(bool(offer['lesson_receipted']) for offer in offers),
+                basis='uploaded native_hook exposure episode in the session conversation naming the lesson id')
+            arms = {}
+            for arm in ('control', 'lesson'):
+                runs = [session for session in sessions if session['label'].startswith(arm)]
+                arms[arm] = dict(n=len(runs), improved_first_attempt=sum(run['improved_first_attempt'] for run in runs),
+                                 answered_correctly=sum(run['answered_correctly'] for run in runs),
+                                 mean_find_attempts=round(sum(run['find_attempts'] for run in runs) / len(runs), 2),
+                                 models=sorted({str(run['model']) for run in runs}))
+            report['behavior'] = dict(arms=arms, rule=LESSON_SCORE_RULE,
+                                      note=('small-sample signal, not causality; control runs without the Memento '
+                                            'extension, so it also lacks capture and any other offered context'))
+            report['final_status'] = native_status_summary(service.get('/status'))
+    finally:
+        report['teardown'] = lesson_teardown(launch, output.with_suffix('.container.log'))
+    failed = sorted(name for name, stage in report['stages'].items() if not stage['passed'])
+    weakest = failed[0] if failed else None
+    report['interpretation'] = dict(failed_stages=failed, weakest_link=weakest)
+    report['stage'] = 'completed'
+    report['exit_code'] = 3 if failed else 0
+    return report['exit_code']
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['calibrate', 'learning', 'factual-scope', 'native-retrieval'])
+    parser.add_argument('mode', choices=['calibrate', 'learning', 'factual-scope', 'native-retrieval', 'lesson-loop'])
     parser.add_argument('--agent', choices=['pi', 'omp'], default='pi')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--calibrate', action='store_true', help='Reuse the isolated service model for frozen calibration first')
@@ -1496,6 +2040,16 @@ def main():
     parser.add_argument('--injection', action='store_true', help='Opt in to the fresh Pi extension injection check; no native installation')
     parser.add_argument('--instance-manifest', type=Path,
                         help='native-retrieval: private launcher manifest of one owned, isolated native service')
+    lesson = parser.add_argument_group('lesson-loop (self-launched disposable native instance)')
+    lesson.add_argument('--compose-override', type=Path,
+                        help='production compose override whose read-only model-asset mounts are reused (never /data)')
+    lesson.add_argument('--image', help='existing image built from this checkout; default builds Dockerfile.native')
+    lesson.add_argument('--port', type=int, default=LESSON_DEFAULT_PORT, help='loopback port; 8765 is refused')
+    lesson.add_argument('--processor-command', default='pi',
+                        help='single native Pi executable for the legacy runner lanes (extraction/consolidation)')
+    lesson.add_argument('--agent-command', default='pi', help='single native Pi executable for behavior sessions')
+    lesson.add_argument('--trials', type=int, default=3, help='fresh sessions per arm')
+    lesson.add_argument('--max-ticks', type=int, default=4, help='bounded runner ticks')
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit('Choose a new output file')
@@ -1505,10 +2059,15 @@ def main():
         parser.error('--instance-manifest is required by, and only valid with, native-retrieval')
     if args.mode == 'native-retrieval' and args.calibrate:
         parser.error('--calibrate does not apply to native-retrieval')
+    if (args.mode == 'lesson-loop') != (args.compose_override is not None):
+        parser.error('--compose-override is required by, and only valid with, lesson-loop')
     report = {}
     code = 0
     try:
-        if args.mode == 'native-retrieval':
+        if args.mode == 'lesson-loop':
+            args.processor_command, args.agent_command = [args.processor_command], [args.agent_command]
+            code = lesson_loop(args, report)
+        elif args.mode == 'native-retrieval':
             code = native_retrieval(args.instance_manifest, report)
         elif args.mode == 'calibrate':
             from memento.embedder import load_model
