@@ -763,6 +763,13 @@ PYTHONPATH=/path/to/matching-client/src python3 tests/memory_acceptance.py nativ
   --instance-manifest /private/native-instance.json --output /tmp/native-retrieval-result.json
 ```
 
+The opt-in `lesson-loop` mode launches its own disposable native container instead (image built from this checkout, fresh volume, non-8765 loopback port, read-only model assets taken from the named compose override), replays a synthetic Pi trace with a silent empty tool result, a repeat and a changed approach, runs the existing legacy runner lanes while recording `/work/claim` and `/work/complete` test-side, and reports candidate extraction, grounded lesson promotion, automatic offer to a fresh Pi extension session and the exposure receipt separately. It then scores paired fresh sessions with and without the extension (small-sample signal, not causality) and removes the container and volume:
+
+```sh
+PYTHONPATH=src python3 tests/memory_acceptance.py lesson-loop --compose-override /private/compose.override.yaml \
+  --processor-command /path/to/pinned-pi --output /private/lesson-loop.json
+```
+
 The frozen synthetic corpus uses supplied memories, exact original quotes and current `/history` bodies. Reports distinguish retrieval, delivered context and unrun model/native-hook stages, record exact bytes and descriptive latency, and compare two query passes. Exit 0 means the corpus gates clear, 3 means measured gate violations, 2 means preflight refusal, and 1 means a runtime/query failure. Reports are private, created without overwriting, and belong outside Git. This is an occasional test run; remove its disposable instance afterward. The existing `learning` and `calibrate` modes exercise the Python comparison path.
 
 For the explicitly selected Python comparison/development service:
