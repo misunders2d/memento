@@ -19,7 +19,7 @@ pub mod recovery;
 /// Frozen source-runtime word and casefold data, shared with retrieval.
 pub mod unicode;
 mod util;
-pub use authority::behavior_ground_truth;
+pub use authority::{assistant_ground_truth, behavior_ground_truth};
 pub use demand::{demand_extract, source_text_ranges};
 #[cfg(test)]
 mod pipeline_tests;

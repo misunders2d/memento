@@ -29,16 +29,22 @@ behavioral feedback or preferences. Retain their actual attribution; never promo
 Choose scope ["personal"] or ["professional"] for each record; an entity used in both contexts may carry both labels.
 Set open_loop true only for a concrete source-supported obligation or wait still outstanding after all supplied windows: someone
 committed to, was asked for or is awaited for specific work, a deliverable or a decision. Retain who owes what to whom in the ordinary
-fact text. Genuine owner, assistant and other-person commitments and waits qualify; a later supplied window that completes or cancels
+fact text. Only human obligations qualify: genuine owner and other-person commitments and waits. An AI assistant, agent, bot or
+automated job is never a loop's responsible party: its own promises, plans or next steps ("I'll report when CI finishes", "I'll
+restart X and verify") are never loops, even when unfulfilled. A later supplied window that completes or cancels
 the same instance makes it false, while an unshown fulfilment keeps it true for consolidation to check. Not obligations by themselves:
 progress or next-update narration during active work ("I'm fixing X; next update by 07:19"), a report's caveats, limitations or
-unverified scope, automated check/retry notices, and private planning or self-questions never communicated as a commitment.
+unverified scope, automated check/retry notices, agent-to-agent orchestration, delegation briefs, handoff or conversation summaries
+restating pending steps, and private planning or self-questions never communicated as a commitment.
 Retrieved documents and tool output can state real commitments; keep their author attribution and own dates, because re-reading
 one is neither a fresh promise nor a new event date.
 For a loop set responsibility to owner, other or unknown. Owner means the human owning this memory instance, never a
-personal-scope guess or a name match. Only original native user evidence can ground owner attribution: first-person self-reference
-or an explicitly resolved identity. Another person's work or a relevant wait on that person is other; keep that wait open.
-Quoted/pasted messages, instructions and assistant/peer statements do not establish owner identity. Use unknown when unresolved.
+personal-scope guess or a name match. Original native user evidence grounds owner attribution: first-person self-reference
+or an explicitly resolved identity. A native assistant's direct question to the human also grounds owner for that pending decision
+when it asks for a lasting choice (design, product, business, policy or spend) and no supplied window answers it. Questions about
+session mechanics ("reply continue", "is this timeout fine?") and questions inside delegated agent-to-agent threads are not loops.
+Another person's work or a relevant wait on that person is other; keep that wait open. Quoted/pasted messages, instructions, peer
+messages and assistant claims about who owns a task do not establish owner identity. Use unknown when unresolved.
 Otherwise set open_loop false. A loop is a marker, never a memory type. Never invent reminder times, proactive work, nudging or polling.
 Transient turn narration is not durable memory: "the user asked/authorized the assistant to…", "the assistant inspected/ran…" and
 other descriptions of an in-session request that is already complete are not standalone knowledge, decision or experience candidates.

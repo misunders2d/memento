@@ -141,7 +141,8 @@ pub fn grounded_sources(
         grounded_owner |= episode["source"]
             .as_str()
             .is_some_and(|source| source.starts_with("native:"))
-            && crate::behavior_ground_truth(&episode, Some(start), Some(end));
+            && (crate::behavior_ground_truth(&episode, Some(start), Some(end))
+                || crate::assistant_ground_truth(&episode, Some(start), Some(end)));
         references.push(json!({"episode_id":episode_id,"start":start,"end":end}));
         source_times.push(episode["occurred_at"].clone());
     }
@@ -1141,10 +1142,24 @@ mod responsibility_tests {
     }
 
     #[test]
+    fn native_assistant_question_to_owner_grounds_owner() {
+        let f = F::new();
+        let asked=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"asked","conversation_id":"thread","kind":"assistant","text":"Should the passport renewal use the express service?"}))).unwrap().id;
+        let tagged = f.tag(&f.owner, "owner", &asked, "Should the passport renewal use the express service?", "asked");
+        assert_eq!(tagged["responsibility"], "owner");
+        let imported=f.store.capture(parse(json!({"source":"telegram:fixture","event_id":"asked","conversation_id":"chat","kind":"assistant","text":"Should Lena sign today?"}))).unwrap().id;
+        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.other,"responsibility":"owner","evidence":[{"episode_id":imported,"quote":"Should Lena sign today?"}]})));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn owner_requires_native_user_evidence_and_forgotten_roles_are_hidden() {
         let f = F::new();
-        let assistant=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"assistant","conversation_id":"thread","kind":"assistant","text":"The passport is the owner task."}))).unwrap().id;
-        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.owner,"responsibility":"owner","evidence":[{"episode_id":assistant,"quote":"The passport is the owner task."}]})));
+        let peer=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"peer","conversation_id":"thread","kind":"assistant","text":"[AGENT MESSAGE] The passport is the owner task."}))).unwrap().id;
+        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.owner,"responsibility":"owner","evidence":[{"episode_id":peer,"quote":"The passport is the owner task."}]})));
+        assert!(result.is_err());
+        let tool=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"tool","conversation_id":"thread","kind":"tool","text":"The passport is the owner task."}))).unwrap().id;
+        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.owner,"responsibility":"owner","evidence":[{"episode_id":tool,"quote":"The passport is the owner task."}]})));
         assert!(result.is_err());
         f.tag(
             &f.owner,

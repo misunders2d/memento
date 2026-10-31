@@ -6,6 +6,16 @@ use serde_json::Value;
 use std::sync::LazyLock;
 
 pub fn behavior_ground_truth(episode: &Value, start: Option<usize>, end: Option<usize>) -> bool {
+    own_message(episode, start, end, "user")
+}
+
+/// Native assistant prose addressed to the human (owner amendment 2026-10-31: a lasting decision
+/// put to the owner can ground owner loop responsibility). Same pasted/peer/legacy guards as user truth.
+pub fn assistant_ground_truth(episode: &Value, start: Option<usize>, end: Option<usize>) -> bool {
+    own_message(episode, start, end, "assistant")
+}
+
+fn own_message(episode: &Value, start: Option<usize>, end: Option<usize>, wanted: &str) -> bool {
     let metadata = match &episode["metadata"] {
         Value::String(value) => serde_json::from_str(value).unwrap_or(Value::Null),
         other => other.clone(),
@@ -50,7 +60,7 @@ pub fn behavior_ground_truth(episode: &Value, start: Option<usize>, end: Option<
         cursor = *right;
     }
     own.push_str(&substring(text, cursor, length));
-    if kind != "user"
+    if kind != wanted
         || metadata["evidence_eligible"] == false
         || metadata
             .get("extraction_mode")
