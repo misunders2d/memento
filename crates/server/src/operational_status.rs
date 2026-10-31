@@ -77,7 +77,7 @@ fn jobs(db: &Connection, kind: &str, source: Option<&str>) -> Result<Value> {
         ),
         params![kind, source],
     )?;
-    let mut result = json!({"available":true,"pending_jobs":0,"leased_jobs":0,"completed_jobs":0,"failed_jobs":0,"retrying_jobs":0,"parked_jobs":0});
+    let mut result = json!({"available":true,"pending_jobs":0,"leased_jobs":0,"completed_jobs":0,"failed_jobs":0,"retrying_jobs":0,"parked_jobs":0,"rebatched_jobs":0});
     let mut errors = BTreeMap::<(String, String), i64>::new();
     for row in records {
         let state = row["state"]
@@ -86,6 +86,10 @@ fn jobs(db: &Connection, kind: &str, source: Option<&str>) -> Result<Value> {
         let count = row["count"].as_i64().unwrap();
         if state == "failed" && row["error"] == "historical_parked" {
             result["parked_jobs"] = json!(result["parked_jobs"].as_i64().unwrap() + count);
+            continue;
+        }
+        if state == "failed" && row["error"] == "rebatch_requested" {
+            result["rebatched_jobs"] = json!(result["rebatched_jobs"].as_i64().unwrap() + count);
             continue;
         }
         let field = match state {
@@ -112,6 +116,7 @@ fn jobs(db: &Connection, kind: &str, source: Option<&str>) -> Result<Value> {
                 "FileNotFoundError",
                 "PermissionError",
                 "TimeoutError",
+                "InterruptedError",
                 "RuntimeError",
                 "CapturedSourceUnavailable",
                 "historical_parked",

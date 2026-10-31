@@ -214,6 +214,9 @@ def test_passive_recall_is_bounded_and_never_usage(tmp_path, monkeypatch):
     # An oversized fact is omitted whole, never sliced; the complete one still fits.
     assert result['shown'] == ['abc'] and result['context'].endswith('🧠' * 100)
     assert not pending(spool, '/usage')
+    spool.usage('pi', 'session', 'answer', 'answer [memory:abc]')
+    usage = pending(spool, '/usage')[0]
+    assert (usage['query'], usage['shown'], usage['ids']) == ('query', ['abc'], ['abc'])
     spool.close()
 
 

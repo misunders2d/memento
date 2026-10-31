@@ -449,7 +449,7 @@ The existing background worker losslessly compresses remaining raw native record
 
 `memento status --agent HARNESS` separates the local capture/upload queue from service processing. It reports captured episodes and conversations, indexing units and failures, extraction backlog, consolidation candidates and jobs, media jobs and Drive state. `service` contains the harness's native-source counts; `artifacts_service` separately covers explicit file saves made without a conversation quote. Disabled or unreachable stages are reported as unavailable. Zero consolidation jobs does not mean completion: candidates can be waiting for the nightly window. The counters do not prove the native processor is online.
 
-Extraction, consolidation and media include `errors` grouped by pending/failed state and safe category, such as `invalid_output` or `cli_failed`; unfamiliar stored values become `unknown_error`. These are last recorded failure classifications, not diagnoses or proof that a retry is running. Leased and completed jobs are excluded.
+Extraction, consolidation and media include `errors` grouped by pending/failed state and safe category, such as `invalid_output` or `cli_failed`; unfamiliar stored values become `unknown_error`. Routine server rebatches are counted separately as `rebatched_jobs`. These are last recorded failure classifications, not diagnoses or proof that a retry is running. Leased and completed jobs are excluded.
 
 For a repeatable capacity measurement from a checkout, take two status snapshots and summarize them with runner receipts from the same interval:
 
@@ -531,7 +531,7 @@ Automatic attribution uses only the original evidence eligible to establish resp
 
 For a historical audit, `loop(action="close", evidence=...)` closes only when original source times establish completion newer than the pending evidence and manual choice; `loop(action="decline", evidence=...)` retracts only an untouched automatic marker whose original premises prove it was never an obligation. These grounded repairs cover memories, relations and pending candidates, preserve protected choices, and retain their exact references in history. Omitting evidence from `close` keeps the ordinary explicit manual-close behavior. An evidence-bearing repair that is protected or chronologically uncertain reports that status and leaves the loop open.
 
-To save one explicitly, tell your agent, for example: “Remember this as an open loop: I still need to send Mira the release checklist.” The agent saves the quoted statement with `remember`, then uses `loop` to open its memory ID. Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence.
+To save one explicitly, tell your agent, for example: “Remember this as an open loop: I still need to send Mira the release checklist.” The agent saves the quoted statement with `remember`, then uses `loop` to open its memory ID. Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence. After server rollout, run `memento agent update` on clients to include offered query and shown IDs with matching citations.
 
 ### Conditional behavioral suggestions
 

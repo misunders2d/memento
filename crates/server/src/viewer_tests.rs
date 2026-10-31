@@ -194,10 +194,14 @@ fn candidate_status_legacy_exclusion_parking_and_private_error_sanitization() {
     let developer=f.store.capture(parse(json!({"source":"native:fixture:codex","event_id":"developer","conversation_id":"instructions","kind":"developer","text":"Synthetic developer instruction"}))).unwrap().id;
     f.candidate("excluded", &developer);
     f.store.write(|tx|{tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts,error) VALUES('retry','retry','extract',?,'pending',0,1,'PRIVATE SOURCE MUST NOT LEAK')",[json!({"source":"native:fixture:pi"}).to_string()])?;Ok(())}).unwrap();
+    f.store.write(|tx| { tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts,error) VALUES('rebatch','rebatch','consolidate','{}','failed',0,1,'rebatch_requested')", [])?; Ok(()) }).unwrap();
     let runtime = RuntimeStatus::disabled();
     f.store
         .read(|tx| {
             let value = operational_status::operational_status(tx.sql(), None, &runtime, 0.)?;
+            assert_eq!(value["consolidation"]["rebatched_jobs"], 1);
+            assert_eq!(value["consolidation"]["failed_jobs"], 0);
+            assert_eq!(value["consolidation"]["errors"], json!([]));
             assert_eq!(value["consolidation"]["pending_candidates"], 1);
             assert_eq!(value["consolidation"]["ready_candidates"], 1);
             assert_eq!(value["consolidation"]["excluded_legacy_candidates"], 1);

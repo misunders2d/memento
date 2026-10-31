@@ -431,8 +431,15 @@ class Spool:
     def usage(self, harness, conversation, identity, text):
         ids = sorted(set(CITATION.findall(text)))
         if ids:
-            self.queue('/usage', {'event_id': digest([source(self.config, harness), conversation,
-                                                       identity, 'citations']), 'ids': ids})
+            body = {'event_id': digest([source(self.config, harness), conversation,
+                                        identity, 'citations']), 'ids': ids}
+            row = self.db.execute('SELECT query,shown FROM recall_cache WHERE conversation=? AND updated>?',
+                                  (conversation, time.time() - 300)).fetchone()
+            if row:
+                shown = json.loads(row[1])
+                if set(ids).intersection(shown):
+                    body.update(query=row[0], shown=shown)
+            self.queue('/usage', body)
 
     def record(self, harness, conversation, record, raw=None, identity=None, message_override=None):
         raw = raw if raw is not None else encode(record).decode('utf-8')
