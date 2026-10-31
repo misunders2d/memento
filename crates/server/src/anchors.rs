@@ -2,25 +2,10 @@
 use crate::records::{self, merge, one, rows};
 use memento_ann::eligibility::{ACTIVE_CANDIDATE, legacy_only, visible_sql};
 use memento_core::{Error, Result};
+use memento_domain::unicode::{name_contained as contained, name_tokens as tokens};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
-fn tokens(text: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut word = String::new();
-    for c in text.chars().chain(std::iter::once(' ')) {
-        if c != '_' && memento_domain::unicode::is_word(c) {
-            word.push(c)
-        } else if !word.is_empty() {
-            result.push(std::mem::take(&mut word).to_lowercase());
-        }
-    }
-    result
-}
-fn contained(name: &str, request: &[String]) -> bool {
-    let name = tokens(name);
-    !name.is_empty() && request.windows(name.len()).any(|part| part == name)
-}
 /// Existing tokenizer, shared by full-name anchors and grounded one-hop subject admission.
 pub fn contains_name(name: &str, text: &str) -> bool {
     contained(name, &tokens(text))
@@ -205,13 +190,47 @@ fn durable(db: &Connection, item: &Value, scope: Option<&str>) -> Result<Option<
     records::scope(&mut record)?;
     merge(&mut record, json!({"tier":"durable","confirmed":true}));
     merge(&mut record, records::details(db, id, version)?);
-    let connections=records::related(db,id,1,scope)?.into_iter().take(5).map(|row|json!({"id":row["id"],"type":row["type"],"relation":row["relation"],"direction":row["direction"],"relation_id":row["edge_id"],"basis":"edge","text":row["one_line"]})).collect();
+    // Up to two behavioral lessons claim connection slots ahead of the arbitrary
+    // eight-edge related() window; related() itself is unchanged for other callers.
+    let mut picked = lessons(db, id, scope)?;
+    for row in records::related(db, id, 1, scope)? {
+        if picked.len() == 5 {
+            break;
+        }
+        if !picked.iter().any(|lesson| lesson["id"] == row["id"]) {
+            picked.push(row);
+        }
+    }
+    let connections=picked.into_iter().map(|row|json!({"id":row["id"],"type":row["type"],"relation":row["relation"],"direction":row["direction"],"relation_id":row["edge_id"],"basis":"edge","text":row["one_line"]})).collect();
     Ok(Some(compose(
         record,
         item["text"].as_str().unwrap(),
         connections,
         item["alias"].as_str(),
     )?))
+}
+/// At most two linked behavior-bearing experience neighbors, by importance then id.
+/// Bounded: twelve keyed adjacency rows, each with one behavior lookup.
+fn lessons(db: &Connection, id: &str, scope: Option<&str>) -> Result<Vec<Value>> {
+    let sql = format!(
+        "SELECT n.id,n.version,n.type,substr(n.text,1,160) AS one_line,a.rel AS relation,a.direction,a.id AS edge_id FROM (SELECT e.id,e.dst AS target,e.rel,'out' AS direction FROM edge_versions e WHERE e.src=?2 AND e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) UNION ALL SELECT e.id,e.src AS target,e.rel,'in' AS direction FROM edge_versions e WHERE e.dst=?2 AND e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id)) a JOIN node_versions n ON n.id=a.target WHERE n.type='experience' AND n.id<>?2 AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?1 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?1)) ORDER BY coalesce((SELECT importance FROM node_stats WHERE node_id=n.id),0.5) DESC,n.id,a.id LIMIT 12",
+        visible_sql("n.id")
+    );
+    let mut result: Vec<Value> = Vec::new();
+    for row in rows(db, &sql, params![scope, id])? {
+        let lesson = row["id"].as_str().unwrap();
+        if result.iter().any(|item| item["id"] == lesson)
+            || legacy_only(db, lesson, row["version"].as_i64().unwrap())?
+            || memento_domain::behavior(db, lesson)?.is_none()
+        {
+            continue;
+        }
+        result.push(row);
+        if result.len() == 2 {
+            break;
+        }
+    }
+    Ok(result)
 }
 fn endpoint(db: &Connection, id: &str, scope: Option<&str>) -> Result<Option<Value>> {
     if let Some(mut row) = one(
@@ -697,4 +716,59 @@ pub fn add_partials(
         *output = proposed;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lesson_slot_tests {
+    use super::*;
+    use memento_core::{CommandContext, Store};
+
+    #[test]
+    fn linked_behavior_lesson_claims_a_connection_slot_on_a_hub_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        let text = "For Hubtool deploys, run the dry-run first.";
+        let source = store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"lesson","conversation_id":"lesson","kind":"user","text":text,"metadata":{}})).unwrap()).unwrap();
+        store.write(|tx| {
+            let db = tx.sql();
+            db.execute("INSERT INTO graph_commits VALUES('manual','manual','{}','{}','owner','Explicit manual relation fixture','2026-10-26T00:00:00Z')", [])?;
+            db.execute("INSERT INTO node_versions VALUES('hub',1,'manual','tool','Hubtool','active',NULL,NULL,NULL,0,'[\"professional\"]')", [])?;
+            // Ten peer edges whose ids sort before the lesson edge fill related()'s eight-edge window.
+            for i in 0..10 {
+                let peer = format!("peer{i:02}");
+                db.execute("INSERT INTO node_versions VALUES(?1,1,'manual','person',?1,'active',NULL,NULL,NULL,0,'[\"professional\"]')", [&peer])?;
+                db.execute("INSERT INTO edge_versions VALUES(?,1,'manual','hub','related_to',?,'active')", params![format!("e{i:02}"), peer])?;
+            }
+            Ok(())
+        }).unwrap();
+        // Behavior comes only from the consolidation commit that produced the version.
+        let context = CommandContext { command_id: "lesson".into(), actor: "fixture".into(), why: "Synthetic behavior provenance".into() };
+        let request = json!({"op":"consolidate","output":{"actions":[{"candidate_id":"lesson","operation":"remember","type":"experience","behavior":{"authority":"explicit_user","applicability":"Hubtool deploys","conduct":text,"exceptions":[],"rationale":"Exact fixture user instruction"}}]}});
+        store.command(&context, &request, |tx, commit| {
+            tx.touch_target("lesson-node")?;
+            tx.sql().execute("INSERT INTO node_versions VALUES('lesson-node',1,?,'experience',?,'active',NULL,NULL,NULL,0,'[\"professional\"]')", params![commit, text])?;
+            tx.sql().execute("INSERT INTO graph_evidence(target,version,episode_id,start,end,quote) VALUES('lesson-node',1,?,0,?,?)", params![source.id, text.chars().count() as i64, text])?;
+            tx.sql().execute("INSERT INTO edge_versions VALUES('z-lesson',1,?,'lesson-node','mentions','hub','active')", [commit])?;
+            Ok(json!({"results":{"lesson":{"id":"lesson-node"}}}))
+        }).unwrap();
+        store.read(|tx| {
+            let db = tx.sql();
+            assert!(memento_domain::behavior(db, "lesson-node")?.is_some());
+            // related() keeps its arbitrary first-eight-edges semantics for other callers.
+            let related = records::related(db, "hub", 1, None)?;
+            assert_eq!(related.len(), 8);
+            assert!(!related.iter().any(|row| row["id"] == "lesson-node"));
+            let found = anchors(db, "How do Hubtool deploys work?", 2, None)?;
+            let anchor = found.iter().find(|anchor| anchor["id"] == "hub").unwrap();
+            let connections = anchor["connections"].as_array().unwrap();
+            assert_eq!(connections.len(), 5);
+            assert_eq!(connections[0]["id"], "lesson-node");
+            assert_eq!(connections[0]["relation"], "mentions");
+            assert_eq!(connections[0]["direction"], "in");
+            assert_eq!(connections[0]["relation_id"], "z-lesson");
+            assert!(connections[1..].iter().all(|row| row["type"] == "person"));
+            assert!(anchor["text"].as_str().unwrap().contains("[experience; edge z-lesson] mentions this"));
+            Ok(())
+        }).unwrap();
+    }
 }

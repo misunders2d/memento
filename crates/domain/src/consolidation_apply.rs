@@ -1,3 +1,4 @@
+use super::context_builder::{LESSON_SUBJECTS, lesson_texts, named_entities};
 use super::{
     Consolidator, VERSION, continuation, ineligible, native_trace, strings, unique, word_terms,
 };
@@ -733,13 +734,14 @@ pub(super) fn apply(
         let mut closures=vec![];let mut closure_sources:HashMap<(String,String),Vec<Option<String>>>=HashMap::new();for action in &prepared.actions{let candidate_id=get_str(action,"candidate_id")?;let original=prepared.selected[candidate_id]["evidence"].as_array().unwrap().iter().map(|reference|reference["episode_id"].as_str().unwrap()).collect::<BTreeSet<_>>();let dated=|items:&Value,originals:bool|items.as_array().unwrap().iter().filter(|source|!originals||original.contains(source["episode_id"].as_str().unwrap())).map(|source|prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str().map(str::to_owned)).collect::<Vec<_>>();for target in action["closed_targets"].as_array().unwrap(){let target=target.as_str().unwrap();
             // Its own loop closes only on later lifecycle evidence; other targets on its original sources.
             let sources=if target==candidate_id{dated(&action["_closure_evidence"],false)}else{dated(&action["evidence"],true)};let(at,status)=loops::closure_time(&loop_snapshots[target],&sources)?;closures.push(json!({"candidate_id":candidate_id,"target":target,"source_occurred_at":at,"status":status}));closure_sources.insert((candidate_id.into(),target.into()),sources);}}
-        let mut results=Map::new();let mut loop_responsibilities=Map::new();let mut destinations:Map<String,Value>=Map::new();let mut resolutions=prepared.resolutions.clone();let mut actions=prepared.actions.clone();actions.sort_by_key(|action|(action["operation"]=="link",!matches!(action["operation"].as_str(),Some("remember"|"reject"|"defer"))));
+        let mut results=Map::new();let mut loop_responsibilities=Map::new();let mut destinations:Map<String,Value>=Map::new();let mut resolutions=prepared.resolutions.clone();let mut lessons=vec![];let mut actions=prepared.actions.clone();actions.sort_by_key(|action|(action["operation"]=="link",!matches!(action["operation"].as_str(),Some("remember"|"reject"|"defer"))));
         for action in &actions{let candidate_id=get_str(action,"candidate_id")?;let candidate=&prepared.selected[candidate_id];if one(tx.sql(),&format!("SELECT 1 FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"),[candidate_id])?.is_none(){continue;}let decision=one(tx.sql(),"SELECT id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1",[candidate_id])?;if decision.map(|decision|decision["id"].clone()).unwrap_or(Value::Null)!=candidate["decision_id"]{return Err(Error::Conflict("Candidate decision changed while consolidation was running"));}
             let(mut result,state)=apply_action(tx,commit,action,candidate,&resolutions,&prepared.nodes,&destinations)?;let target=result["superseded_by"].as_str().or_else(||result["merged_into"].as_str()).or_else(||result["id"].as_str()).map(str::to_owned);
             if state=="promote"{if let Some(target)=&target{let marker=loops::current(tx.sql(),candidate_id)?;if !(action["open_loop"]==false&&loops::decline_extracted(tx,commit,candidate_id)?){loops::transfer(tx,commit,candidate_id,target)?;}importance::transfer_usage(tx,candidate_id,target)?;loops::mark(tx,commit,target,action["open_loop"].as_bool(),Some(candidate_id),marker.as_ref())?;}}else if state=="review"{loops::mark(tx,commit,candidate_id,action["open_loop"].as_bool(),None,None)?;}
             let role_target=if state=="promote"{target.as_deref()}else if state=="review"{Some(candidate_id)}else{None};if let (Some(role_target),Some(value))=(role_target,action["responsibility"].as_str()){if loops::current(tx.sql(),role_target)?.is_some(){let role=loops::assign_automatic(tx,commit,role_target,value,&action["evidence"])?;if let Some(map)=role["loop_responsibilities"].as_object(){loop_responsibilities.extend(map.clone());}}}
             tx.sql().execute("INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",params![id(),candidate_id,commit,state,target,if state=="defer"{Some(timestamp()+3600.0)}else{None}])?;if ["promote","reject"].contains(&state){tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='candidate' AND target=?)",[candidate_id])?;}tx.touch_target(candidate_id)?;
             if state=="promote"{if let Some(target)=&target{resolutions.insert(candidate_id.into(),json!(target));if action["operation"]=="supersede"{if let Some(previous)=action["target"].as_str(){let previous=resolutions.get(previous).and_then(Value::as_str).unwrap_or(previous);if previous!=target{destinations.insert(previous.into(),json!(target));}}}}}
+            if state=="promote"&&matches!(action["operation"].as_str(),Some("remember"|"supersede"))&&action["type"]=="experience"&&action["behavior"].is_object(){if let Some(target)=&target{lessons.push((target.clone(),action.clone()));}}
             result["decision"]=json!(state);results.insert(candidate_id.into(),result);
         }
         let mut repair_results=Map::new();for repair in &prepared.repairs{let original=get_str(repair,"target")?;let target=follow_refinements(tx.sql(),original,&destinations)?;let evidence=&repair["evidence"];let result=match get_str(repair,"operation")?{
@@ -758,6 +760,7 @@ pub(super) fn apply(
         if !job.payload["night"].is_null(){tx.sql().execute("UPDATE consolidation_nights SET cursor=max(cursor,?) WHERE id=?",params![job.payload["next_cursor"].as_i64(),job.payload["night"].as_str()])?;}
         let mut context=context_value.clone();let redirected=apply_continuity(tx,commit,&mut context)?;let mut progressed=!redirected.is_empty();for(target,n)in &prepared.nodes{progressed|=node(tx.sql(),target)?["version"]!=n["version"];}if !progressed{for(target,frozen)in loop_snapshots{let current=one(tx.sql(),"SELECT id FROM loop_events WHERE target=? ORDER BY rowid DESC LIMIT 1",[target])?.map(|row|row["id"].clone()).unwrap_or(Value::Null);if current!=frozen["event_id"]{progressed=true;break;}}}
         continue_work(tx,commit,job,&context,&prepared.continue_with,&prepared.nodes,&destinations,progressed)?;
+        seed_lesson_links(tx,&lessons)?;
         Ok(json!({"candidate_count":results.len(),"results":results,"reported_model":model,"usage":usage,"loop_closures":closures,"repair_results":repair_results,"redirected_relations":redirected,"loop_responsibilities":loop_responsibilities}))
     })?)
 }
@@ -1133,6 +1136,36 @@ fn apply_continuity(tx: &WriteTxn, commit: &str, context: &mut Value) -> Result<
         }
     }
     Ok(changed)
+}
+/// A new or refined behavioral lesson cannot be linked in its own plan (repairs name only
+/// supplied existing nodes). When its text or conduct names an existing entity it is not
+/// yet linked to, it seeds the existing repair groups, eight lessons per group so each is a
+/// maintenance target with its named entities supplied. Repair jobs carry no candidate
+/// actions, so they never seed themselves.
+fn seed_lesson_links(tx: &WriteTxn, lessons: &[(String, Value)]) -> Result<()> {
+    let mut seeds = BTreeSet::new();
+    for (lesson, action) in lessons {
+        if seeds.contains(lesson) || !visible_link_endpoint(tx.sql(), lesson)? {
+            continue;
+        }
+        let texts = lesson_texts(&action["text"], &action["behavior"]);
+        for entity in named_entities(tx.sql(), &texts, LESSON_SUBJECTS)? {
+            if one(tx.sql(), "SELECT 1 FROM edge_versions e WHERE ((e.src=?1 AND e.dst=?2) OR (e.src=?2 AND e.dst=?1)) AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1", params![lesson, entity])?.is_none() {
+                seeds.insert(lesson.clone());
+                break;
+            }
+        }
+    }
+    let seeds = seeds.into_iter().collect::<Vec<_>>();
+    for group in seeds.chunks(8) {
+        let serialized = encode_json(&json!(group))?;
+        if one(tx.sql(), "SELECT 1 FROM repair_groups WHERE seed_ids=? AND state='pending' LIMIT 1", [&serialized])?.is_some() {
+            continue;
+        }
+        let stamp = now();
+        tx.sql().execute("INSERT INTO repair_groups(id,seed_ids,frontier,reviewed_ids,state,origin,created_at,updated_at) VALUES (?,?,?,'[]','pending','lesson-links',?,?)", params![format!("r_{}", &crate::util::id()[..24]), serialized, serialized, stamp, stamp])?;
+    }
+    Ok(())
 }
 fn continue_work(
     tx: &WriteTxn,

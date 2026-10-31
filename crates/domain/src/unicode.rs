@@ -438,3 +438,21 @@ pub fn is_word(letter: char) -> bool {
         0x2f800..=0x2fa1d | 0x30000..=0x3134a | 0x31350..=0x323af
     )
 }
+/// Lowercased literal name tokens; underscores split words.
+pub fn name_tokens(text: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut word = String::new();
+    for c in text.chars().chain(std::iter::once(' ')) {
+        if c != '_' && is_word(c) {
+            word.push(c)
+        } else if !word.is_empty() {
+            result.push(std::mem::take(&mut word).to_lowercase());
+        }
+    }
+    result
+}
+/// Exact token-window containment of a whole name; never similarity.
+pub fn name_contained(name: &str, text: &[String]) -> bool {
+    let name = name_tokens(name);
+    !name.is_empty() && text.windows(name.len()).any(|part| part == name)
+}

@@ -9,7 +9,7 @@ use std::sync::Arc;
 mod apply;
 #[path = "consolidation_context.rs"]
 mod context_builder;
-pub const VERSION: &str = "consolidate-v12";
+pub const VERSION: &str = "consolidate-v13";
 pub const ELIGIBLE: &str = "EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND g.version=1 AND NOT (CASE WHEN e.kind='developer' THEN legacy_native_context(e.source,e.kind,NULL,NULL) WHEN e.kind='user' AND e.source GLOB 'native:*:codex' THEN legacy_native_context(e.source,e.kind,e.text,e.metadata) ELSE 0 END))";
 pub const UNPARKED: &str = "NOT EXISTS (SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL)";
 pub const AWAITING: &str = "(d.next_review_at>?3 OR (d.decision='review' AND NOT EXISTS (SELECT 1 FROM review_proposals p WHERE p.id=d.target_id AND NOT EXISTS (SELECT 1 FROM review_decisions r WHERE r.proposal_id=p.id) AND ((json_extract(p.command,'$.identity.status')='exact_matches_not_supplied' AND EXISTS (SELECT 1 FROM json_each(p.base_versions) j WHERE j.value<>(SELECT max(n.version) FROM node_versions n WHERE n.id=j.key))) OR (json_extract(p.command,'$.op')='remember' AND json_extract(p.command,'$.type')='person' AND json_type(p.command,'$.identity') IS NULL)))))";

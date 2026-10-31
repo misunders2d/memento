@@ -2,6 +2,7 @@ use super::{ELIGIBLE, UNPARKED, VERSION, continuation, native_trace, strings, un
 use crate::util::*;
 use crate::{
     behavior, behavior_ground_truth, curation, exact_identities, jobs::Job, loops, recall_keywords,
+    unicode::{name_contained, name_tokens},
 };
 use memento_core::{Error, Result};
 use rusqlite::{Connection, params};
@@ -551,6 +552,44 @@ fn lexical(
     };
     Ok(rows(db,"SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?)) AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY bm25(node_fts),n.id LIMIT ?",params![query,kind,encode_json(&json!(reviewed))?,limit as i64])?.into_iter().map(|row|row["id"].as_str().unwrap().into()).collect())
 }
+/// Named entities supplied per experience lesson (candidate or maintenance target).
+pub(super) const LESSON_SUBJECTS: usize = 3;
+const ENTITY: &str = "(n.type IN ('person','organization','project','concept','place','tool') OR EXISTS(SELECT 1 FROM memory_types t WHERE t.name=n.type AND t.category='entity'))";
+/// Lesson fields that state what it is about: text, then behavior applicability/conduct.
+pub(super) fn lesson_texts<'v>(text: &'v Value, behavior: &'v Value) -> Vec<&'v str> {
+    [text, &behavior["applicability"], &behavior["conduct"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .collect()
+}
+/// Active visible entity nodes whose whole stored name is token-window contained in one
+/// field, exactly as entity anchors match a request. FTS (rarest terms first) is discovery
+/// only; same-spelled entities stay separate identities and nothing is inferred from names.
+pub(super) fn named_entities(db: &Connection, texts: &[&str], limit: usize) -> Result<Vec<String>> {
+    let fields = texts.iter().map(|text| name_tokens(text)).collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let terms = fields
+        .iter()
+        .flatten()
+        .filter(|token| seen.insert(token.as_str()))
+        .take(128)
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    let mut result = vec![];
+    if terms.is_empty() || limit == 0 {
+        return Ok(result);
+    }
+    for row in rows(db,&format!("SELECT n.id,n.text FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND {ENTITY} AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS (SELECT 1 FROM entity_merges m WHERE m.source=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {VISIBLE} ORDER BY bm25(node_fts),n.id LIMIT 128"),[terms.join(" OR ")])? {
+        let text = get_str(&row, "text")?;
+        if fields.iter().any(|tokens| name_contained(text, tokens)) {
+            result.push(get_str(&row, "id")?.to_owned());
+            if result.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(result)
+}
 fn hinted(db: &Connection, hint: Option<&Value>, kind: &str) -> Result<Vec<String>> {
     let mut result = vec![];
     for row in hint
@@ -705,6 +744,13 @@ pub(super) fn prepare(
         );
         optional.push((id.into(), unique(queue)));
     }
+    let mut mentioned: Vec<(String, Vec<String>)> = vec![];
+    for candidate in &candidates {
+        if candidate["kind"] != "relation" && candidate["type"] == "experience" {
+            let named = named_entities(db, &[get_str(candidate, "text")?], LESSON_SUBJECTS)?;
+            mentioned.push((get_str(candidate, "id")?.into(), named));
+        }
+    }
     let mut subjects = vec![];
     for target in &maintenance {
         let n = curation::canonical(db, target)?;
@@ -726,6 +772,13 @@ pub(super) fn prepare(
             &reviewed,
             false,
         )?);
+        // An experience target's named entities; listing them as subjects too keeps an
+        // unfitted one in the existing unchecked/continue_with bookkeeping.
+        if n["type"] == "experience" {
+            let named = named_entities(db, &lesson_texts(&n["text"], &builder.nodes[id]["behavior"]), LESSON_SUBJECTS)?;
+            queue.extend(named.iter().cloned());
+            mentioned.push((id.into(), named));
+        }
         subjects.push((
             id.into(),
             unique(queue)
@@ -762,6 +815,8 @@ pub(super) fn prepare(
     builder.continuity()?;
     builder.retirement()?;
     builder.allocate(&comparison, Some(6))?;
+    // After reserved comparison slots, at most LESSON_SUBJECTS per lesson.
+    builder.allocate(&mentioned, None)?;
     builder.allocate(&subjects, None)?;
     let exposures = exposures(&mut builder, &candidates)?;
     builder.allocate(&optional, None)?;
@@ -820,6 +875,17 @@ pub(super) fn prepare(
             identities.iter().find(|(id, _, _)| candidate["id"] == *id)
         {
             candidate["identity"] = json!({"exact":exact.iter().filter(|id|builder.nodes.contains_key(*id)).collect::<Vec<_>>(),"exact_total":exact.len(),"similar":similar.iter().filter(|id|builder.nodes.contains_key(*id)).collect::<Vec<_>>()});
+        }
+    }
+    for (lesson, named) in &mentioned {
+        let supplied = named.iter().filter(|id| builder.nodes.contains_key(*id)).cloned().collect::<Vec<_>>();
+        if supplied.is_empty() {
+            continue;
+        }
+        if let Some(candidate) = candidates.iter_mut().find(|candidate| candidate["id"] == *lesson) {
+            candidate["named_entities"] = json!(supplied);
+        } else if let Some(n) = builder.nodes.get_mut(lesson) {
+            n["named_entities"] = json!(supplied);
         }
     }
     let node_ids = builder.nodes.keys().cloned().collect::<Vec<_>>();
