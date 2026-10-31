@@ -369,6 +369,26 @@ fn merge_exact_plan_fences_manual_choices_and_preserves_alias_evidence() {
 }
 
 #[test]
+fn forget_cascades_to_memories_left_without_unforgotten_evidence() {
+    let f = Fixture::new();
+    f.graph.store.write(|tx|{tx.sql().execute("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES ('fixture-episode-2','contract','two','thread','user','Orion belongs to Vega.','2026-10-19T12:00:00+00:00','{}','2026-10-25T12:00:00+00:00')",[])?;Ok(())}).unwrap();
+    let a = f.remember("a", "Preserve this decision.", "Preserve this decision.");
+    let b = f.remember("b", "The launch report is pending.", "The launch report is pending.");
+    let mut restated = f.command("c", "Orion belongs to Vega.", "Orion belongs to Vega.");
+    restated["evidence"] = json!([{"episode_id":f.episode,"quote":"Orion belongs to Vega."},{"episode_id":"fixture-episode-2","quote":"Orion belongs to Vega."}]);
+    let c = f.graph.remember(parse(restated)).unwrap();
+    let (a, b, c) = (a["id"].as_str().unwrap(), b["id"].as_str().unwrap(), c["id"].as_str().unwrap());
+    let preview = f.graph.forget_preview(a).unwrap();
+    assert_eq!(preview["dependents"], json!([b]));
+    f.graph.forget(parse(json!({"command_id":"forget-a","actor":"owner","why":"Explicit active-memory exclusion","target":a,"token":preview["token"]}))).unwrap();
+    assert_eq!(f.history(a).last().unwrap()["state"], "forgotten");
+    assert_eq!(f.history(b).last().unwrap()["state"], "forgotten");
+    assert_eq!(f.history(c).last().unwrap()["state"], "active");
+    assert!(f.graph.recall_keywords("launch", 20, None).unwrap().is_empty());
+    assert!(!f.graph.recall_keywords("Orion", 20, None).unwrap().is_empty());
+}
+
+#[test]
 fn forget_retains_raw_and_history_fences_evidence_and_enqueues_vector_removal() {
     let f = Fixture::new();
     let n = f.remember("fact", "Preserve this decision.", "Preserve this decision.");

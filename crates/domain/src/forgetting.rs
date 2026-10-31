@@ -5,6 +5,19 @@ use memento_core::{Error, Result, WriteTxn};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
+/// Active nodes/edges outside `?1` that cite a source event of `?1` and whose whole
+/// current evidence lies in that event set or in already forgotten source events.
+const ORPHANED: &str = "WITH t(id) AS (SELECT value FROM json_each(?1)),
+fresh(source,event_id) AS (SELECT DISTINCT e.source,e.event_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target IN (SELECT id FROM t)),
+gone(source,event_id) AS (SELECT source,event_id FROM fresh UNION SELECT source,event_id FROM forgotten_sources),
+touched(id) AS (SELECT DISTINCT g.target FROM fresh JOIN episodes e ON e.source=fresh.source AND e.event_id=fresh.event_id JOIN graph_evidence g ON g.episode_id=e.id WHERE g.target NOT IN (SELECT id FROM t)),
+cur(id,version,kind) AS (SELECT n.id,n.version,'node' FROM node_versions n JOIN touched ON touched.id=n.id WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
+ UNION ALL SELECT e.id,e.version,'edge' FROM edge_versions e JOIN touched ON touched.id=e.id WHERE e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id))
+SELECT c.id,c.version,c.kind FROM cur c WHERE EXISTS (SELECT 1 FROM graph_evidence g WHERE g.target=c.id AND g.version=c.version)
+ AND NOT EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND g.version=c.version AND NOT EXISTS (SELECT 1 FROM gone WHERE gone.source=e.source AND gone.event_id=e.event_id))
+ ORDER BY c.id";
+const INCIDENT: &str = "SELECT e.id,e.version FROM edge_versions e WHERE (e.src IN (SELECT value FROM json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id";
+
 pub fn preview(db: &Connection, target: &str) -> Result<Value> {
     let existing = one(
         db,
@@ -23,7 +36,7 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
         [target],
     )?;
     let candidate = one(db, "SELECT * FROM candidates WHERE id=?", [target])?;
-    let (kind, label, nodes, edges, targets) = if let Some(n) = n {
+    let (kind, label, mut nodes, mut edges, mut targets) = if let Some(n) = n {
         if n["state"] != "active" && !existing {
             return Err(Error::Validation(
                 "Choose the active memory identifier; this node is no longer active",
@@ -83,12 +96,40 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
     } else {
         return Err(Error::Validation("Unknown active-memory identifier"));
     };
+    // Owner decision 2026-10-31: forgetting a source event also forgets other active
+    // memories whose entire current evidence lies in forgotten source events.
+    let mut dependents = vec![];
+    while !existing {
+        let found = rows(db, ORPHANED, [encode_json(&json!(targets))?])?;
+        if found.is_empty() {
+            break;
+        }
+        let mut orphan_nodes = vec![];
+        for row in found {
+            let id = get_str(&row, "id")?.to_owned();
+            if row["kind"] == "node" {
+                nodes[&id] = row["version"].clone();
+                orphan_nodes.push(id.clone());
+            } else {
+                edges[&id] = row["version"].clone();
+            }
+            dependents.push(id.clone());
+            targets.push(id);
+        }
+        for row in rows(db, INCIDENT, [encode_json(&json!(orphan_nodes))?])? {
+            let id = get_str(&row, "id")?.to_owned();
+            if edges.get(&id).is_none() {
+                edges[&id] = row["version"].clone();
+                targets.push(id);
+            }
+        }
+    }
     let sources = rows(
         db,
         "SELECT DISTINCT e.source,e.event_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target IN (SELECT value FROM json_each(?)) ORDER BY e.source,e.event_id",
         [encode_json(&json!(targets))?],
     )?;
-    let mut record = json!({"target":target,"kind":kind,"label":label,"nodes":nodes,"edges":edges,"targets":targets,"sources":sources,"already_forgotten":existing,"policy":"active_memory_only","raw_history":"retained","backups":"retained"});
+    let mut record = json!({"target":target,"kind":kind,"label":label,"nodes":nodes,"edges":edges,"targets":targets,"dependents":dependents,"sources":sources,"already_forgotten":existing,"policy":"active_memory_only","raw_history":"retained","backups":"retained"});
     record["token"] = json!(hash_json(&record)?);
     Ok(record)
 }

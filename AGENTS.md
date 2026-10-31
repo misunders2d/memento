@@ -254,7 +254,7 @@ No automatic database backup or remote forget journals. Request a manual verifie
 ```sh
 docker compose exec memory /usr/local/bin/memento-admin --data-dir /data backup
 ```
-Run review `list|approve|reject` and `forget ID --why REASON` as service owner/root, never the agent; decisions require human terminal confirmation. Forget removes active memory and suppresses re-extraction but retains raw history/artifacts/backups; old backups can restore forgotten content.
+Run review `list|approve|reject` and `forget ID --why REASON` as service owner/root, never the agent; decisions require human terminal confirmation. Forget removes active memory and suppresses re-extraction but retains raw history/artifacts/backups; old backups can restore forgotten content. It also forgets other active memories whose entire current evidence lies in forgotten source messages (owner decision 2026-10-31); the preview lists them as `dependents`.
 
 Duplicate-entity repair uses the same owner socket: read-only `inventory` reports suspected same-type clusters (case/whitespace spelling only; members may be distinct), and `merge CLUSTER --why REASON [--into ID] [--exclude ID ...] [--include ID ...]` previews an exact version/evidence/loop-bound plan (`--include` adds an owner-chosen active same-type spelling variant; nothing is grouped semantically), then applies the existing reviewed merge per member after typed confirmation. Any change after the preview refuses the plan. The survivor gains a new version carrying the union of evidence and scopes, duplicate relations fold, and candidates of pending reviews made stale by the merge are requeued rather than rejected. Agents never run these commands.
 
