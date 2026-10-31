@@ -2,10 +2,10 @@
 use crate::query_rows::{self, ACTIVE_CANDIDATE, one, rows};
 use memento_core::{Error, Result};
 use memento_domain::loops;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, functions::FunctionFlags, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 pub const MAX_NODES: usize = 50_000;
 pub const CSP: &str = "default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 pub const STATIC_FILES: &[&str] = &[
@@ -16,10 +16,14 @@ pub const STATIC_FILES: &[&str] = &[
     "vendor/sigma.min.js",
     "vendor/forceatlas2.min.js",
 ];
-const CURRENT_NODE: &str = "n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id)";
-const CURRENT_EDGE: &str = "e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=e.id)";
-const OPEN_LOOP: &str =
+pub(crate) const CURRENT_NODE: &str = "n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id)";
+pub(crate) const CURRENT_EDGE: &str = "e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=e.id)";
+pub(crate) const OPEN_LOOP: &str =
     "l.rowid=(SELECT max(x.rowid) FROM loop_events x WHERE x.target=l.target) AND l.state='open'";
+/// The node set the viewer shows: current versions together with their commit.
+const NODES: &str = "node_versions n JOIN graph_commits c ON c.id=n.commit_id";
+const IN_SCOPE: &str = "(?1 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?1))";
+const IN_IDS: &str = "n.id IN (SELECT value FROM json_each(?2))";
 fn default_view() -> String {
     "memories".into()
 }
@@ -86,7 +90,7 @@ pub struct CandidatesQuery {
     #[serde(default = "fifty")]
     pub limit: u32,
 }
-fn scope(value: Option<&str>) -> Result<()> {
+pub(crate) fn scope(value: Option<&str>) -> Result<()> {
     if value.is_some_and(|s| !["personal", "professional"].contains(&s)) {
         return Err(Error::Validation("Invalid viewer scope"));
     }
@@ -101,7 +105,7 @@ fn page(offset: u64, limit: u32, max: u32) -> Result<()> {
 fn whitespace(c: char) -> bool {
     c.is_whitespace() || ('\u{001c}'..='\u{001f}').contains(&c)
 }
-fn label(text: &str) -> String {
+pub(crate) fn label(text: &str) -> String {
     text.split(whitespace)
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -110,24 +114,24 @@ fn label(text: &str) -> String {
         .take(80)
         .collect()
 }
-fn within(item: &Value, scope: Option<&str>) -> bool {
+pub(crate) fn within(item: &Value, scope: Option<&str>) -> bool {
     scope.is_none_or(|scope| {
         item["scope"]
             .as_array()
             .is_some_and(|s| s.iter().any(|v| v == scope))
     })
 }
-fn loop_value(row: &Value, now: &str) -> Value {
+pub(crate) fn loop_value(row: &Value, now: &str) -> Value {
     json!({"due_at":row["due_at"],"deferred":row["deferred_until"].as_str().is_some_and(|v|!v.is_empty()&&v>now),"overdue":row["due_at"].as_str().is_some_and(|v|!v.is_empty()&&v<now),"responsibility":row["responsibility"].as_str().unwrap_or("unknown")})
 }
-fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String, Value>> {
+pub(crate) fn behavior_map(db: &Connection, targets: &[String]) -> Result<HashMap<String, Value>> {
     // A behavior comes from the content commit (creation or same-ID
     // revision) that produced the current version, as in domain::behavior;
     // recovered legacy content resolves through the replacement it came from.
     let owners = rows(
         db,
-        "WITH cur AS (SELECT c.id,c.version FROM node_versions c WHERE c.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=c.id) AND c.type='experience' AND (?1 IS NULL OR c.id=?1)), own AS (SELECT cur.id,coalesce(r.source_id,cur.id) AS source,coalesce(r.source_version,cur.version) AS at FROM cur LEFT JOIN node_revisions r ON r.id=cur.id AND r.version=(SELECT max(y.version) FROM node_revisions y WHERE y.id=cur.id AND y.version<=cur.version)) SELECT own.id,own.source,d.version,d.commit_id FROM own JOIN node_versions d ON d.id=own.source AND d.version=coalesce((SELECT max(r.version) FROM node_revisions r WHERE r.id=own.source AND r.version<=own.at),1)",
-        [target],
+        "WITH cur AS (SELECT c.id,c.version FROM node_versions c WHERE c.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=c.id) AND c.type='experience' AND c.id IN (SELECT value FROM json_each(?1))), own AS (SELECT cur.id,coalesce(r.source_id,cur.id) AS source,coalesce(r.source_version,cur.version) AS at FROM cur LEFT JOIN node_revisions r ON r.id=cur.id AND r.version=(SELECT max(y.version) FROM node_revisions y WHERE y.id=cur.id AND y.version<=cur.version)) SELECT own.id,own.source,d.version,d.commit_id FROM own JOIN node_versions d ON d.id=own.source AND d.version=coalesce((SELECT max(r.version) FROM node_revisions r WHERE r.id=own.source AND r.version<=own.at),1)",
+        [serde_json::to_string(targets)?],
     )?;
     let ids = owners
         .iter()
@@ -225,7 +229,47 @@ fn behavior_map(db: &Connection, target: Option<&str>) -> Result<HashMap<String,
     }
     Ok(result)
 }
+/// Rank with exactly the rounded weight the viewer returns.
+fn weight(pinned: i64, raw: f64) -> Result<f64> {
+    if pinned != 0 {
+        return Ok(1.0);
+    }
+    if !raw.is_finite() {
+        return Err(Error::Unavailable("Invalid viewer weight"));
+    }
+    format!("{raw:.4}")
+        .parse::<f64>()
+        .map_err(|_| Error::Unavailable("Invalid viewer weight"))
+}
+fn select_ids<P: rusqlite::Params>(db: &Connection, sql: &str, params: P) -> Result<Vec<String>> {
+    Ok(rows(db, sql, params)?
+        .into_iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect())
+}
+/// Current viewer nodes among `targets`, each mapped to whether it is inside the scope.
+fn current(db: &Connection, scope: Option<&str>, targets: &[String]) -> Result<HashMap<String, bool>> {
+    Ok(rows(
+        db,
+        &format!("SELECT n.id,{IN_SCOPE} AS inside FROM {NODES} WHERE {IN_IDS} AND {CURRENT_NODE}"),
+        params![scope, serde_json::to_string(targets)?],
+    )?
+    .into_iter()
+    .map(|r| (r["id"].as_str().unwrap().to_owned(), r["inside"] == 1))
+    .collect())
+}
+fn role<'a>(roles: &'a HashMap<String, Value>, target: &str) -> &'a str {
+    roles
+        .get(target)
+        .and_then(|value| value["responsibility"].as_str())
+        .unwrap_or("unknown")
+}
 pub fn graph(db: &Connection, q: &GraphQuery, now: &str) -> Result<Value> {
+    graph_capped(db, q, now, MAX_NODES)
+}
+/// Each view selects its nodes in SQL; labels, behaviors and loop roles are
+/// resolved only for what is returned. Header counts stay whole-graph.
+pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Result<Value> {
     scope(q.scope.as_deref())?;
     if q.responsibility.as_deref().is_some_and(|value|!loops::valid_responsibility(value)) {
         return Err(Error::Validation("Invalid loop responsibility"));
@@ -233,182 +277,191 @@ pub fn graph(db: &Connection, q: &GraphQuery, now: &str) -> Result<Value> {
     if !["memories", "behaviors", "loops", "around"].contains(&q.view.as_str()) {
         return Err(Error::Validation("Invalid graph view"));
     }
-    let mut nodes = HashMap::new();
-    let mut order = Vec::new();
-    for row in rows(
-        db,
-        &format!(
-            "SELECT n.id,n.type,substr(n.text,1,240) AS text,n.scope,n.pinned,c.recorded_at,coalesce(s.importance,0.5)*coalesce(s.decay,1) AS weight FROM node_versions n JOIN graph_commits c ON c.id=n.commit_id LEFT JOIN node_stats s ON s.node_id=n.id WHERE {CURRENT_NODE}"
-        ),
-        [],
-    )? {
-        let id = row["id"].as_str().unwrap().to_owned();
-        let weight = if row["pinned"].as_i64().unwrap_or(0) != 0 {
-            1.0
-        } else {
-            format!(
-                "{:.4}",
-                row["weight"]
-                    .as_f64()
-                    .ok_or(Error::Unavailable("Invalid viewer weight"))?
-            )
-            .parse::<f64>()
-            .map_err(|_| Error::Unavailable("Invalid viewer weight"))?
-        };
-        nodes.insert(id.clone(),json!({"id":id,"type":row["type"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"weight":weight,"at":row["recorded_at"],"behavior":null,"loop":null}));
-        order.push(id);
-    }
-    let mut edges = rows(
-        db,
-        &format!("SELECT e.id,e.src,e.rel,e.dst FROM edge_versions e WHERE {CURRENT_EDGE}"),
-        [],
-    )?
-    .into_iter()
-    .filter(|r| {
-        nodes.contains_key(r["src"].as_str().unwrap())
-            && nodes.contains_key(r["dst"].as_str().unwrap())
-    })
-    .collect::<Vec<_>>();
-    for edge in &mut edges {
-        edge["loop"] = Value::Null;
-    }
-    for (id, behavior) in behavior_map(db, None)? {
-        if let Some(node) = nodes.get_mut(&id) {
-            node["behavior"] = behavior["authority"].clone();
-        }
-    }
-    let markers = rows(db,&format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),[])?;
-    let roles = loops::responsibilities(db,&markers.iter().map(|row|row["target"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?;
-    for mut row in markers {
-        let target = row["target"].as_str().unwrap().to_owned();
-        let role=roles.get(&target).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown");
-        if q.responsibility.as_deref().is_some_and(|wanted|wanted!=role) { continue; }
-        row["responsibility"]=json!(role);
-        if let Some(node) = nodes.get_mut(&target) {
-            node["loop"] = loop_value(&row, now);
-        } else if let Some(edge) = edges.iter_mut().find(|e| e["id"] == target) {
-            edge["loop"] = loop_value(&row, now);
-        }
-    }
-    let candidates=loops::visible_loop_targets(db,rows(db,&format!("SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?)?.into_iter().map(|mut row|{row["responsibility"]=json!(roles.get(row["id"].as_str().unwrap()).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown"));Ok(json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"loop":loop_value(&row,now)}))}).collect::<Result<Vec<_>>>()?.into_iter().filter(|r|within(r,q.scope.as_deref())&&q.responsibility.as_deref().is_none_or(|wanted|r["loop"]["responsibility"]==wanted)).collect::<Vec<_>>();
-    let mut looped = nodes
-        .values()
-        .filter(|n| within(n, q.scope.as_deref()) && !n["loop"].is_null())
-        .map(|n| n["loop"].clone())
+    let inside = q.scope.as_deref();
+    let wanted = q.responsibility.as_deref();
+    let keep = |roles: &HashMap<String, Value>, target: &str| wanted.is_none_or(|w| w == role(roles, target));
+    let total_nodes: usize = db.query_row(
+        &format!("SELECT count(*) FROM {NODES} WHERE {CURRENT_NODE} AND {IN_SCOPE}"),
+        [inside],
+        |r| r.get(0),
+    )?;
+    let total_edges: usize = db.query_row(
+        &format!("SELECT count(*) FROM edge_versions e WHERE {CURRENT_EDGE} AND EXISTS(SELECT 1 FROM {NODES} WHERE n.id=e.src AND {CURRENT_NODE} AND {IN_SCOPE}) AND EXISTS(SELECT 1 FROM {NODES} WHERE n.id=e.dst AND {CURRENT_NODE} AND {IN_SCOPE})"),
+        [inside],
+        |r| r.get(0),
+    )?;
+    let markers = rows(db,&format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),[])?
+        .into_iter()
+        .map(|row| (row["target"].as_str().unwrap().to_owned(), row))
+        .collect::<HashMap<_, _>>();
+    let targets = markers.keys().cloned().collect::<Vec<_>>();
+    // A responsibility filter needs every open loop's role; otherwise only returned loops need one.
+    let mut roles = if wanted.is_some() { loops::responsibilities(db, &targets)? } else { HashMap::new() };
+    let loop_nodes = current(db, inside, &targets)?;
+    let loop_edges = rows(db, &format!("SELECT e.id,e.src,e.dst FROM edge_versions e WHERE e.id IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE}"), [serde_json::to_string(&targets)?])?
+        .into_iter()
+        .filter(|e| !loop_nodes.contains_key(e["id"].as_str().unwrap()))
+        .collect::<Vec<_>>();
+    let ends = current(db, inside, &loop_edges.iter().flat_map(|e| [e["src"].as_str().unwrap().to_owned(), e["dst"].as_str().unwrap().to_owned()]).collect::<Vec<_>>())?;
+    let loop_edges = loop_edges
+        .into_iter()
+        .filter(|e| ends.contains_key(e["src"].as_str().unwrap()) && ends.contains_key(e["dst"].as_str().unwrap()) && keep(&roles, e["id"].as_str().unwrap()))
+        .collect::<Vec<_>>();
+    let deferred = |target: &str| loop_value(&markers[target], now)["deferred"] == true;
+    let mut looped = loop_nodes
+        .iter()
+        .filter(|(id, scoped)| **scoped && keep(&roles, id))
+        .map(|(id, _)| deferred(id))
         .collect::<Vec<_>>();
     looped.extend(
-        edges
+        loop_edges
             .iter()
-            .filter(|e| {
-                !e["loop"].is_null()
-                    && (within(&nodes[e["src"].as_str().unwrap()], q.scope.as_deref())
-                        || within(&nodes[e["dst"].as_str().unwrap()], q.scope.as_deref()))
-            })
-            .map(|e| e["loop"].clone()),
+            .filter(|e| ends[e["src"].as_str().unwrap()] || ends[e["dst"].as_str().unwrap()])
+            .map(|e| deferred(e["id"].as_str().unwrap())),
     );
-    looped.extend(candidates.iter().map(|c| c["loop"].clone()));
+    let mut candidates = Vec::new();
+    for row in loops::visible_loop_targets(db,rows(db,&format!("SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?)? {
+        let item = json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"])?,"loop":null});
+        if within(&item, inside) && keep(&roles, row["id"].as_str().unwrap()) {
+            looped.push(loop_value(&row, now)["deferred"] == true);
+            candidates.push((row, item));
+        }
+    }
     let full_candidate_loops = q.all && q.view == "loops";
-    let candidate_overflow = full_candidate_loops && candidates.len() > MAX_NODES;
+    let candidate_overflow = full_candidate_loops && candidates.len() > cap;
     let candidate_limit = if candidate_overflow {
         0
     } else if full_candidate_loops {
-        MAX_NODES
+        cap
     } else {
         100
     };
-    let loops = json!({"open":looped.iter().filter(|l|l["deferred"]!=true).count(),"deferred":looped.iter().filter(|l|l["deferred"]==true).count(),"candidates":{"total":candidates.len(),"items":candidates.iter().take(candidate_limit).cloned().collect::<Vec<_>>()}});
-    nodes.retain(|_, n| within(n, q.scope.as_deref()));
-    order.retain(|id| nodes.contains_key(id));
+    let candidate_total = candidates.len();
+    candidates.truncate(candidate_limit);
+    if wanted.is_none() && !candidates.is_empty() {
+        roles.extend(loops::responsibilities(db, &candidates.iter().map(|(row, _)| row["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?);
+    }
+    let items = candidates
+        .into_iter()
+        .map(|(mut row, mut item)| {
+            row["responsibility"] = json!(role(&roles, row["id"].as_str().unwrap()));
+            item["loop"] = loop_value(&row, now);
+            item
+        })
+        .collect::<Vec<_>>();
+    let loop_counts = json!({"open":looped.iter().filter(|d|!**d).count(),"deferred":looped.iter().filter(|d|**d).count(),"candidates":{"total":candidate_total,"items":items}});
+    let mut result = json!({"view":q.view,"total_nodes":total_nodes,"total_edges":total_edges,"loops":loop_counts,"too_large":false,"nodes":[],"edges":[]});
     let mut focus = HashSet::new();
+    if q.view == "around" {
+        let id = q.id.clone().unwrap_or_default();
+        if current(db, inside, std::slice::from_ref(&id))?.get(&id) != Some(&true) {
+            return Err(Error::NotFound("Memory not found in this scope"));
+        }
+        focus.insert(id);
+    }
+    let all = q.all && !(q.view == "loops" && q.responsibility.is_some());
+    // "Show all" is refused from the count alone, before any node is read.
+    if (all && total_nodes > cap) || candidate_overflow {
+        result["too_large"] = json!(true);
+        return Ok(result);
+    }
+    let mut behaviors = None;
     match q.view.as_str() {
-        "behaviors" => focus.extend(
-            nodes
-                .iter()
-                .filter(|(_, n)| !n["behavior"].is_null())
-                .map(|(id, _)| id.clone()),
-        ),
+        "behaviors" => {
+            let experiences = select_ids(db, &format!("SELECT n.id FROM {NODES} WHERE n.type='experience' AND {CURRENT_NODE} AND {IN_SCOPE}"), [inside])?;
+            let map = behavior_map(db, &experiences)?;
+            focus.extend(map.iter().filter(|(_, b)| !b["authority"].is_null()).map(|(id, _)| id.clone()));
+            behaviors = Some(map);
+        }
         "loops" => {
-            focus.extend(
-                nodes
-                    .iter()
-                    .filter(|(_, n)| !n["loop"].is_null())
-                    .map(|(id, _)| id.clone()),
-            );
-            for edge in &edges {
-                if !edge["loop"].is_null() {
-                    for endpoint in ["src", "dst"] {
-                        let id = edge[endpoint].as_str().unwrap();
-                        if nodes.contains_key(id) {
-                            focus.insert(id.to_owned());
-                        }
+            focus.extend(loop_nodes.iter().filter(|(id, scoped)| **scoped && keep(&roles, id)).map(|(id, _)| id.clone()));
+            for edge in &loop_edges {
+                for endpoint in ["src", "dst"] {
+                    let id = edge[endpoint].as_str().unwrap();
+                    if ends[id] {
+                        focus.insert(id.to_owned());
                     }
                 }
             }
         }
-        "around" => {
-            let id =
-                q.id.as_ref()
-                    .filter(|id| nodes.contains_key(*id))
-                    .ok_or(Error::NotFound("Memory not found in this scope"))?;
-            focus.insert(id.clone());
-        }
         _ => (),
     }
-    let chosen = if q.all && !(q.view == "loops" && q.responsibility.is_some()) {
-        nodes.keys().cloned().collect::<HashSet<_>>()
+    let chosen = if all {
+        None
     } else if q.view == "memories" {
-        let mut ranked = order.clone();
-        ranked.sort_by(|a, b| {
-            nodes[b]["weight"]
-                .as_f64()
-                .unwrap()
-                .total_cmp(&nodes[a]["weight"].as_f64().unwrap())
-                .then(a.cmp(b))
-        });
-        let mut recent = order;
-        recent.sort_by(|a, b| nodes[b]["at"].as_str().cmp(&nodes[a]["at"].as_str()));
-        ranked
-            .into_iter()
-            .take(200)
-            .chain(recent.into_iter().take(100))
-            .collect()
+        db.create_scalar_function("viewer_weight", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+            weight(ctx.get(0)?, ctx.get(1)?).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))
+        })?;
+        Some(select_ids(db, &format!("SELECT id FROM (SELECT n.id FROM {NODES} LEFT JOIN node_stats s ON s.node_id=n.id WHERE {CURRENT_NODE} AND {IN_SCOPE} ORDER BY viewer_weight(n.pinned,coalesce(s.importance,0.5)*coalesce(s.decay,1)) DESC,n.id LIMIT 200) UNION SELECT id FROM (SELECT n.id FROM {NODES} WHERE {CURRENT_NODE} AND {IN_SCOPE} ORDER BY c.recorded_at DESC,n.rowid LIMIT 100)"), [inside])?)
     } else {
-        let mut chosen = focus.clone();
-        for edge in &edges {
-            let a = edge["src"].as_str().unwrap();
-            let b = edge["dst"].as_str().unwrap();
-            if focus.contains(a) && nodes.contains_key(b) {
-                chosen.insert(b.into());
-            }
-            if focus.contains(b) && nodes.contains_key(a) {
-                chosen.insert(a.into());
-            }
-        }
-        chosen
+        let others = select_ids(db, &format!("SELECT e.dst AS id FROM edge_versions e WHERE e.src IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE} UNION SELECT e.src FROM edge_versions e WHERE e.dst IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE}"), [serde_json::to_string(&focus)?])?;
+        let mut chosen = focus.iter().cloned().collect::<Vec<_>>();
+        chosen.extend(current(db, inside, &others)?.into_iter().filter(|(id, scoped)| *scoped && !focus.contains(id)).map(|(id, _)| id));
+        Some(chosen)
     };
-    let too_large = chosen.len() > MAX_NODES || candidate_overflow;
-    let mut result = json!({"view":q.view,"total_nodes":nodes.len(),"total_edges":edges.iter().filter(|e|nodes.contains_key(e["src"].as_str().unwrap())&&nodes.contains_key(e["dst"].as_str().unwrap())).count(),"loops":loops,"too_large":too_large,"nodes":[],"edges":[]});
-    if too_large {
+    if chosen.as_ref().is_some_and(|c| c.len() > cap) {
+        result["too_large"] = json!(true);
         return Ok(result);
     }
-    let sorted = chosen.iter().cloned().collect::<BTreeSet<_>>();
-    result["nodes"] = json!(
-        sorted
+    let select = format!("SELECT n.id,n.type,substr(n.text,1,240) AS text,n.scope,n.pinned,c.recorded_at,coalesce(s.importance,0.5)*coalesce(s.decay,1) AS weight FROM {NODES} LEFT JOIN node_stats s ON s.node_id=n.id WHERE {CURRENT_NODE} AND {IN_SCOPE}");
+    let found = match &chosen {
+        None => rows(db, &select, [inside])?,
+        Some(chosen) => rows(db, &format!("{select} AND {IN_IDS}"), params![inside, serde_json::to_string(chosen)?])?,
+    };
+    let mut nodes = Vec::new();
+    for row in found {
+        let weight = weight(
+            row["pinned"].as_i64().unwrap_or(0),
+            row["weight"].as_f64().ok_or(Error::Unavailable("Invalid viewer weight"))?,
+        )?;
+        nodes.push(json!({"id":row["id"],"type":row["type"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"weight":weight,"at":row["recorded_at"],"behavior":null,"loop":null}));
+    }
+    nodes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let returned = nodes.iter().map(|n| n["id"].as_str().unwrap().to_owned()).collect::<HashSet<_>>();
+    let mut edges = match chosen {
+        None => rows(db, &format!("SELECT e.id,e.src,e.rel,e.dst FROM edge_versions e WHERE {CURRENT_EDGE} ORDER BY e.rowid"), [])?
             .into_iter()
-            .map(|id| {
-                let mut node = nodes.remove(&id).unwrap();
-                node["focus"] = json!(focus.contains(&id));
-                node
-            })
-            .collect::<Vec<_>>()
-    );
-    result["edges"] = json!(
-        edges
-            .into_iter()
-            .filter(|e| chosen.contains(e["src"].as_str().unwrap())
-                && chosen.contains(e["dst"].as_str().unwrap()))
-            .collect::<Vec<_>>()
-    );
+            .filter(|e| returned.contains(e["src"].as_str().unwrap()) && returned.contains(e["dst"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        Some(_) => rows(db, &format!("SELECT e.id,e.src,e.rel,e.dst FROM edge_versions e WHERE e.src IN (SELECT value FROM json_each(?1)) AND e.dst IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE} ORDER BY e.rowid"), [serde_json::to_string(&returned)?])?,
+    };
+    let behaviors = match behaviors {
+        Some(map) => map,
+        None => behavior_map(db, &nodes.iter().filter(|n| n["type"] == "experience").map(|n| n["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?,
+    };
+    let marked = nodes
+        .iter()
+        .chain(&edges)
+        .map(|item| item["id"].as_str().unwrap().to_owned())
+        .filter(|id| markers.contains_key(id))
+        .collect::<Vec<_>>();
+    if wanted.is_none() && !marked.is_empty() {
+        roles.extend(loops::responsibilities(db, &marked)?);
+    }
+    let loop_of = |id: &str| {
+        markers.get(id).filter(|_| keep(&roles, id)).map(|row| {
+            let mut row = row.clone();
+            row["responsibility"] = json!(role(&roles, id));
+            loop_value(&row, now)
+        })
+    };
+    for node in &mut nodes {
+        let id = node["id"].as_str().unwrap().to_owned();
+        if let Some(behavior) = behaviors.get(&id) {
+            node["behavior"] = behavior["authority"].clone();
+        }
+        if let Some(value) = loop_of(&id) {
+            node["loop"] = value;
+        }
+        node["focus"] = json!(focus.contains(&id));
+    }
+    for edge in &mut edges {
+        let id = edge["id"].as_str().unwrap().to_owned();
+        // A loop on an ID that is also a current node belongs to the node.
+        edge["loop"] = loop_of(&id).filter(|_| !loop_nodes.contains_key(&id)).unwrap_or(Value::Null);
+    }
+    result["nodes"] = json!(nodes);
+    result["edges"] = json!(edges);
     Ok(result)
 }
 pub fn node(db: &Connection, id: &str, now: &str) -> Result<Value> {
@@ -436,7 +489,7 @@ pub fn node(db: &Connection, id: &str, now: &str) -> Result<Value> {
         [id],
     )?;
     let behavior = if row["type"] == "experience" {
-        behavior_map(db, Some(id))?.remove(id)
+        behavior_map(db, &[id.to_owned()])?.remove(id)
     } else {
         None
     };

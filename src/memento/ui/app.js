@@ -11,6 +11,7 @@ const state = {view: 'memories', scope: '', responsibility: '', all: false, data
   conv: 0, cand: 0, candQuery: '', sideCollapsed: false, returnFocus: null};
 const worker = new Worker('static/layout-worker.js');
 let layoutRun = 0;
+let graphFetch = null;
 
 function el(tag, props, ...children) {
   const node = document.createElement(tag);
@@ -34,12 +35,12 @@ function row(onActivate, ...children) {
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 const motion = duration => reducedMotion.matches ? 0 : duration;
 
-async function api(path, params) {
+async function api(path, params, signal) {
   const url = new URL(path, location.href);
   for (const [key, value] of Object.entries(params || {})) {
     if (value !== '' && value !== null && value !== undefined && value !== false) url.searchParams.set(key, value);
   }
-  const response = await fetch(url, {headers: {Accept: 'application/json'}});
+  const response = await fetch(url, {headers: {Accept: 'application/json'}, signal});
   if (!response.ok) throw new Error(`${response.status} ${(await response.json().catch(() => ({}))).detail || response.statusText}`);
   return response.json();
 }
@@ -218,12 +219,21 @@ function summary(data) {
   return `${shown} · ${data.loops.open.toLocaleString()} open loops${data.loops.deferred ? `, ${data.loops.deferred.toLocaleString()} deferred` : ''}`;
 }
 
+// A newer view or filter replaces any graph request still in flight.
+function abortGraph() {
+  if (graphFetch) graphFetch.abort();
+  graphFetch = null;
+}
+
 async function loadGraph() {
+  abortGraph();
+  const request = graphFetch = new AbortController();
   status('Loading…');
   select(null);
   try {
     const data = await api('api/graph', {view: state.view, scope: state.scope, all: state.all,
-      responsibility: state.view === 'loops' ? state.responsibility : ''});
+      responsibility: state.view === 'loops' ? state.responsibility : ''}, request.signal);
+    if (request.signal.aborted) return;
     state.data = data;
     if (data.too_large) {
       if (state.renderer) state.renderer.kill();
@@ -241,6 +251,7 @@ async function loadGraph() {
     legend();
     sidelist();
   } catch (error) {
+    if (request.signal.aborted) return;
     status(`Could not load: ${error.message}`);
   }
 }
@@ -447,6 +458,7 @@ function setView(view) {
   if (tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = Math.max(0, active.offsetLeft - (tabs.clientWidth - active.offsetWidth) / 2);
   const unprocessed = view === 'unprocessed';
   if (unprocessed) {
+    abortGraph();
     worker.postMessage({stop: true}); layoutRun++;
     if (state.renderer) state.renderer.kill();
     state.renderer = state.graph = null;

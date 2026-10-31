@@ -53,7 +53,7 @@ fn canceled_status_keeps_admission_without_starving_health_or_recall() {
         let (entered, started) = tokio::sync::oneshot::channel();
         let held = gate.clone();
         let counter = began.clone();
-        let first = tokio::spawn(status_blocking(state.status_admission.clone(), move || {
+        let first = tokio::spawn(admitted_blocking(state.status_admission.clone(), move || {
             counter.fetch_add(1, Ordering::SeqCst);
             let _ = entered.send(());
             held.wait();
@@ -67,7 +67,7 @@ fn canceled_status_keeps_admission_without_starving_health_or_recall() {
         for _ in 0..40 {
             let held = gate.clone();
             let counter = began.clone();
-            waiting.push(tokio::spawn(status_blocking(state.status_admission.clone(), move || {
+            waiting.push(tokio::spawn(admitted_blocking(state.status_admission.clone(), move || {
                 counter.fetch_add(1, Ordering::SeqCst);
                 held.wait();
                 Ok(())
@@ -103,11 +103,53 @@ fn canceled_status_keeps_admission_without_starving_health_or_recall() {
 #[tokio::test]
 async fn status_admission_returns_after_sql_error_or_worker_panic() {
     let admission = Arc::new(Semaphore::new(1));
-    assert!(status_blocking::<()>(admission.clone(), || Err(Error::Unavailable("Fixture SQL error"))).await.is_err());
+    assert!(admitted_blocking::<()>(admission.clone(), || Err(Error::Unavailable("Fixture SQL error"))).await.is_err());
     assert_eq!(admission.available_permits(), 1);
-    assert!(status_blocking::<()>(admission.clone(), || panic!("Fixture worker panic")).await.is_err());
+    assert!(admitted_blocking::<()>(admission.clone(), || panic!("Fixture worker panic")).await.is_err());
     assert_eq!(admission.available_permits(), 1);
-    let result = status_blocking(admission.clone(), || Ok(42)).await.unwrap_or_else(|_| panic!("admission must remain usable"));
+    let result = admitted_blocking(admission.clone(), || Ok(42)).await.unwrap_or_else(|_| panic!("admission must remain usable"));
     assert_eq!(result, 42);
     assert_eq!(admission.available_permits(), 1);
+}
+
+#[test]
+fn busy_viewer_reads_queue_without_starving_recall() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2).max_blocking_threads(3).enable_all().build().unwrap();
+    runtime.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memento_core::Store::open(dir.path().join("data")).unwrap();
+        let mut state = AppState::new(store).unwrap();
+        state.recall = Some(Arc::new(StubRecall));
+        let gate = Gate::new();
+        let _release_on_failure = ReleaseOnDrop(gate.clone());
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let wait = gate.clone();
+            held.push(tokio::spawn(admitted_blocking(state.viewer_admission.clone(), move || {
+                let _ = entered.send(());
+                wait.wait();
+                Ok(())
+            })));
+            tokio::time::timeout(Duration::from_secs(2), started).await.unwrap().unwrap();
+        }
+        // Two viewer reads hold both permits; further UI requests wait without a worker.
+        let mut graphs = (0..8).map(|_| tokio::spawn(request(state.clone(), "/ui/api/graph"))).collect::<Vec<_>>();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(graphs.iter().all(|task| !task.is_finished()));
+        let (health, recall) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(request(state.clone(), "/health"), request(state.clone(), "/recall?q=fixture"))
+        }).await.expect("queued viewer reads must leave the third blocking worker free");
+        assert_eq!(health.0, StatusCode::OK);
+        assert_eq!(recall.0, StatusCode::OK);
+        // Stale client requests are dropped before they ever reach SQL.
+        for task in graphs.drain(1..) { task.abort(); }
+        gate.release();
+        for task in held { assert!(task.await.unwrap().is_ok()); }
+        let graph = tokio::time::timeout(Duration::from_secs(2), graphs.remove(0)).await.unwrap().unwrap();
+        assert_eq!(graph.0, StatusCode::OK);
+        assert!(graph.1["nodes"].is_array());
+        assert_eq!(state.viewer_admission.available_permits(), 2);
+    });
 }
