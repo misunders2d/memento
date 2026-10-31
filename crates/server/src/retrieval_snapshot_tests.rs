@@ -23,10 +23,10 @@ fn owned_hot_paused_scorer_allows_capture_query_and_keeps_old_current_and_forget
             };
             let deadline=Instant::now()+Duration::from_secs(20);
             projection.snapshot_hot_until(true,deadline,
-                |_,view|Retrieval::hot_preview(view,&request,&vector,true,None),
+                |_,view|Retrieval::hot_preview(view,&request,&vector,true,None,&RecallTimings::default()),
                 |tx,hot,cold| {
                     let cut=tx.source_cut().clone();
-                    let rows=Retrieval::current_owned_scored(tx,hot,|n,pool|cold.search(&vector,n,"episode",pool,None,None),&request,&vector,true,deadline,Some(&score))?.0;
+                    let rows=Retrieval::current_owned_scored(tx,hot,|n,pool|cold.search(&vector,n,"episode",pool,None,None),&request,&vector,true,deadline,Some(&score),&RecallTimings::default())?.0;
                     assert_eq!(tx.source_cut(),&cut);
                     assert_eq!(tx.sql().query_row("SELECT max(version) FROM node_versions WHERE id=?",[&old_changed],|r|r.get::<_,i64>(0))?,1);
                     assert_eq!(tx.sql().query_row("SELECT count(*) FROM forgotten_targets WHERE target=?",[&old_forgotten],|r|r.get::<_,i64>(0))?,0);
@@ -73,10 +73,10 @@ fn optional_parked_preview_error_is_only_observed_when_pool_is_used() {
     f.store.read(|tx| {
         let scoped=RecallRequest{query:"unrelated probe".into(),scope:Some("personal".into()),..Default::default()};
         let deadline=Instant::now()+std::time::Duration::from_secs(5);
-        let value=Retrieval::current_owned_scored(tx,preview(),|_,_|panic!("Scoped request must not use Cold"),&scoped,&vector,true,deadline,None)?;
+        let value=Retrieval::current_owned_scored(tx,preview(),|_,_|panic!("Scoped request must not use Cold"),&scoped,&vector,true,deadline,None,&RecallTimings::default())?;
         assert!(value.0.is_empty());
         let automatic=RecallRequest{query:"unrelated probe".into(),automatic:true,..Default::default()};
-        assert!(matches!(Retrieval::current_owned_scored(tx,preview(),|_,_|Ok(Vec::new()),&automatic,&vector,true,deadline,None),Err(Error::Unavailable("optional preview sentinel"))));
+        assert!(matches!(Retrieval::current_owned_scored(tx,preview(),|_,_|Ok(Vec::new()),&automatic,&vector,true,deadline,None,&RecallTimings::default()),Err(Error::Unavailable("optional preview sentinel"))));
         Ok(())
     }).unwrap();
 }

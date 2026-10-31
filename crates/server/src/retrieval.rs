@@ -2,12 +2,13 @@
 use crate::{
     Recall, RecallRequest, anchors,
     period::{self, Eligible, Period},
+    recall_timings::{Count, RecallTimings, Stage},
     records,
     text_reranker::{MAX_CANDIDATES, TextReranker},
 };
 use chrono::{DateTime, Utc};
 use memento_ann::{
-    Pool, Projection, SearchHit, SearchView,
+    Pool, Projection, SearchHit, SearchView, SnapshotTiming,
     eligibility::{self, ACTIVE_CANDIDATE, HISTORICAL, RAW_FALLBACK, visible_sql},
 };
 use memento_core::{Error, F32Blob, ReadTxn, Result, Store, Tier, raw};
@@ -18,7 +19,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 const TEXT_FLOOR: f64 = 0.685;
 const AUTO_FLOOR: f64 = 0.66;
@@ -246,33 +247,67 @@ impl Retrieval {
         request: &RecallRequest,
         vector: &[f32; 768],
         deadline: Instant,
+        timings: &RecallTimings,
     ) -> Result<Vec<Value>> {
         let query = effective_query(request);
-        let score =
-            |documents: &[&str], until: Instant| self.text_reranker.score(&query, documents, until);
+        let score = |documents: &[&str], until: Instant| {
+            let mut waited = Duration::ZERO;
+            let logits = self.text_reranker.score(&query, documents, until, &mut waited);
+            timings.add(Stage::ScorerLockWait, waited);
+            logits
+        };
+        Self::passes(&self.projection, request, vector, deadline, &score, timings)
+    }
+    fn passes(
+        projection: &Projection,
+        request: &RecallRequest,
+        vector: &[f32; 768],
+        deadline: Instant,
+        scorer: &TextScore<'_>,
+        timings: &RecallTimings,
+    ) -> Result<Vec<Value>> {
+        // Every passage-scoring batch on either cut.
+        let score = |documents: &[&str], until: Instant| {
+            let at = Instant::now();
+            let logits = scorer(documents, until);
+            timings.lap(Stage::Scorer, at);
+            timings.count(Count::ScorerCalls, 1);
+            timings.count(Count::ScoredPassages, documents.len());
+            logits
+        };
         // A stored-memory period never reads raw history, so it needs no Cold cut.
         let deep = request.effort == "deep"
             && !request.automatic
             && request.scope.is_none()
             && Period::of(request)?.is_none();
-        let (mut results, need_archive) =
-            self.projection
-                .snapshot_hot_until(deep, deadline,
-                    |tx, view| Self::hot_preview(view, request, vector, deep, Self::period(tx, request)?),
+        let cut = |archive: bool| {
+            let (at, mut wait) = (Instant::now(), SnapshotTiming::default());
+            let value = projection
+                .snapshot_hot_timed(archive, deadline, &mut wait,
+                    |tx, view| {
+                        let at = Instant::now();
+                        let period = Self::period(tx, request);
+                        timings.lap(Stage::Period, at);
+                        Self::hot_preview(view, request, vector, archive, period?, timings)
+                    },
                     |tx, hot, cold| Self::current_owned_scored(tx, hot,
                         |n, pool| cold.search(vector, n, "episode", pool, None, None),
-                        request, vector, deep, deadline, Some(&score)))?;
+                        request, vector, archive, deadline, Some(&score), timings));
+            timings.index(&wait);
+            timings.count(Count::Passes, 1);
+            (value, at)
+        };
+        let (value, at) = cut(deep);
+        timings.lap(Stage::FirstPass, at);
+        timings.pass(if deep { "archive" } else { "hot" });
+        let (mut results, need_archive) = value?;
         if need_archive && !deep {
             // A new cut, acquired cold->hot, prevents mixing a future index with an old snapshot.
             // Hot answers never wait for archive construction unless the existing raw fallback is required.
-            let value = self
-                .projection
-                .snapshot_hot_until(true, deadline,
-                    |tx, view| Self::hot_preview(view, request, vector, true, Self::period(tx, request)?),
-                    |tx, hot, cold| Self::current_owned_scored(tx, hot,
-                        |n, pool| cold.search(vector, n, "episode", pool, None, None),
-                        request, vector, true, deadline, Some(&score)))?;
-            results = value.0;
+            let (value, at) = cut(true);
+            timings.lap(Stage::ArchivePass, at);
+            timings.pass("archive");
+            results = value?.0;
         }
         Ok(results)
     }
@@ -292,7 +327,7 @@ impl Retrieval {
             .map(|p| Ok((p, period::eligible(tx, &p, request.scope.as_deref())?)))
             .transpose()
     }
-    fn hot_preview(view: &SearchView<'_>, request: &RecallRequest, vector: &[f32; 768], archive: bool, period: Option<(Period, Eligible)>) -> Result<HotPreview> {
+    fn hot_preview(view: &SearchView<'_>, request: &RecallRequest, vector: &[f32; 768], archive: bool, period: Option<(Period, Eligible)>, timings: &RecallTimings) -> Result<HotPreview> {
         let at = Utc::now();
         let limit = if request.automatic { request.limit.min(6) } else { request.limit };
         let n = if request.automatic { (limit * 20).clamp(24, 120) } else { (limit * 20).min(1000) };
@@ -300,17 +335,23 @@ impl Retrieval {
         // Eligibility precedes the top-n cut: out-of-period neighbours never take slots.
         let points = period.as_ref().map(|(_, eligible)| eligible.points.as_slice());
         let mut curated = Vec::new();
-        for kind in ["node", "candidate", "segment"] {
+        for (kind, stage) in [("node", Stage::SearchNode), ("candidate", Stage::SearchCandidate), ("segment", Stage::SearchSegment)] {
+            let started = Instant::now();
             curated.extend(view.search_within(Tier::Hot, vector, n, kind, pool, request.scope.as_deref(), None, points)?);
+            timings.lap(stage, started);
         }
+        timings.count(Count::AnnHits, curated.len());
+        let started = Instant::now();
         let deep_raw = if request.effort == "deep" && !request.automatic && request.scope.is_none() && period.is_none() {
             view.search(Tier::Hot, vector, n, "episode", Pool::Ordinary, None, None)?
         } else { Vec::new() };
+        let started = timings.lap(Stage::SearchDeepRaw, started);
         // A bounded preview may be unused if the archive cut has enough curated
         // results. Preserve its error until this optional pool is actually used.
         let parked = if archive && request.automatic && request.scope.is_none() && limit > 0 {
             Some(view.search(Tier::Hot, vector, 4, "candidate", Pool::ParkedCandidate, None, None))
         } else { None };
+        timings.lap(Stage::SearchParked, started);
         Ok(HotPreview { at, curated, deep_raw, parked, period })
     }
     #[cfg(test)]
@@ -323,10 +364,11 @@ impl Retrieval {
         deadline: Instant,
         score: Option<&TextScore<'_>>,
     ) -> Result<(Vec<Value>, bool)> {
-        let hot = Self::hot_preview(view, request, vector, archive, Self::period(tx, request)?)?;
+        let timings = RecallTimings::default();
+        let hot = Self::hot_preview(view, request, vector, archive, Self::period(tx, request)?, &timings)?;
         Self::current_owned_scored(tx, hot,
             |n, pool| view.search(Tier::Cold, vector, n, "episode", pool, None, None),
-            request, vector, archive, deadline, score)
+            request, vector, archive, deadline, score, &timings)
     }
     fn current_owned_scored(
         tx: &ReadTxn<'_>,
@@ -337,6 +379,7 @@ impl Retrieval {
         archive: bool,
         deadline: Instant,
         score: Option<&TextScore<'_>>,
+        timings: &RecallTimings,
     ) -> Result<(Vec<Value>, bool)> {
         let db = tx.sql();
         let scope = request.scope.as_deref();
@@ -348,11 +391,14 @@ impl Retrieval {
             request.limit
         };
         // Entity anchors/connections are recall context, not period-ranked memories.
+        let mut clock = Instant::now();
         let named = if period.is_some() {
             Vec::new()
         } else {
             anchors::anchors(db, &request.query, limit, scope)?
         };
+        timings.count(Count::Named, named.len());
+        clock = timings.lap(Stage::NameAnchors, clock);
         let mut matches = BTreeMap::<String, Value>::new();
         let mut keyword_targets = HashSet::new();
         let n = if request.automatic {
@@ -420,12 +466,16 @@ impl Retrieval {
                 }
             }
         }
+        timings.count(Count::LexicalHits, and_targets.len());
+        timings.count(Count::Discovered, discoveries.len());
+        clock = timings.lap(Stage::Lexical, clock);
         hits.extend(discoveries);
         hits.sort_by(|a, b| {
             b.cosine
                 .total_cmp(&a.cosine)
                 .then_with(|| a.target.cmp(&b.target))
         });
+        timings.count(Count::Hydrated, hits.len());
         for hit in hits {
             check(deadline)?;
             let Some(mut record) = hydrate(tx, &hit, false)? else {
@@ -452,7 +502,10 @@ impl Retrieval {
                 matches.insert(id, record);
             }
         }
+        timings.count(Count::Admitted, matches.len());
+        clock = timings.lap(Stage::Hydration, clock);
         validate_text_passages(db, &mut matches, limit, deadline, score, &or_only, request.explain)?;
+        timings.count(Count::Validated, matches.len());
         let meaningful = matches.values().try_fold(false, |yes, v| {
             Ok::<_, Error>(yes || records::meaningful(db, v)?)
         })?;
@@ -461,10 +514,14 @@ impl Retrieval {
             && !meaningful
             && (request.effort != "deep" || request.automatic)
             && matches.len() + named.len() < limit;
+        clock = timings.lap(Stage::Validation, clock);
         if request.effort == "deep" && !request.automatic && scope.is_none() && period.is_none() {
             let mut raw_matches = BTreeMap::new();
             let mut raw_hits = deep_raw;
-            raw_hits.extend(cold_search(n, Pool::Ordinary)?);
+            let cold = cold_search(n, Pool::Ordinary)?;
+            timings.count(Count::ColdHits, cold.len());
+            clock = timings.lap(Stage::SearchCold, clock);
+            raw_hits.extend(cold);
             for hit in raw_hits {
                 if hit.cosine as f64 >= TEXT_FLOOR {
                     if let Some(mut row) = hydrate(tx, &hit, false)? {
@@ -503,6 +560,8 @@ impl Retrieval {
         } else if need_archive && archive {
             let fallback_limit = if request.automatic { 1 } else { limit };
             let fallback_hits = cold_search((fallback_limit * 4).max(8), Pool::RawFallback)?;
+            timings.count(Count::ColdHits, fallback_hits.len());
+            clock = timings.lap(Stage::SearchCold, clock);
             let mut fallback = Self::raw_fallback_scored(
                 tx, fallback_hits, &request.query, fallback_limit,
                 !request.automatic, at, deadline, score, request.explain,
@@ -552,6 +611,7 @@ impl Retrieval {
         } else {
             drop(cold_search);
         }
+        clock = timings.lap(Stage::Fallback, clock);
         let mut records = Vec::new();
         for (_, mut row) in matches {
             if !records::media_sources(db, &mut row)? {
@@ -594,6 +654,8 @@ impl Retrieval {
             records.push(row);
         }
         records.sort_by(order);
+        timings.count(Count::Finished, records.len());
+        clock = timings.lap(Stage::Finish, clock);
         let mut facts = Vec::new();
         // Exact full-name/alias T1 anchors keep their existing priority and budget.
         let mut emitted_ids = named
@@ -838,7 +900,9 @@ impl Retrieval {
                 }
             }
         }
+        clock = timings.lap(Stage::Rows, clock);
         if period.is_none() {
+            let before = output.len();
             anchors::add_partials(
                 db,
                 &request.query,
@@ -849,7 +913,9 @@ impl Retrieval {
                 &mut output,
                 limit,
             )?;
+            timings.count(Count::PartialAnchors, output.len().saturating_sub(before));
         }
+        timings.lap(Stage::PartialAnchors, clock);
         if request.explain {
             for row in output.iter_mut().filter(|r| r.get("explain").is_none()) {
                 let route = match row["match"].as_str() {
@@ -1082,9 +1148,20 @@ impl Retrieval {
 }
 impl Recall for Retrieval {
     fn recall(&self, request: &RecallRequest, deadline: Instant) -> Result<Vec<Value>> {
-        let vector = self.encode(request)?;
+        self.recall_timed(request, deadline, &RecallTimings::default())
+    }
+    fn recall_timed(
+        &self,
+        request: &RecallRequest,
+        deadline: Instant,
+        timings: &RecallTimings,
+    ) -> Result<Vec<Value>> {
+        let at = Instant::now();
+        let vector = self.encode(request);
+        timings.lap(Stage::Embedding, at);
+        let vector = vector?;
         check(deadline)?;
-        self.recall_vector(request, &vector, deadline)
+        self.recall_vector(request, &vector, deadline, timings)
     }
     fn ready(&self) -> bool {
         self.projection.ready(Tier::Hot)
@@ -1282,6 +1359,7 @@ mod tests {
     include!("period_tests.rs");
     include!("full_text_tests.rs");
     include!("explain_tests.rs");
+    include!("recall_timing_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,

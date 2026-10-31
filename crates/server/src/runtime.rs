@@ -1,5 +1,5 @@
 //! One native service owner. Capture/health remain independent of model/index startup.
-use crate::{AppState, Recall, RecallRequest, indexing::Indexer, retrieval::Retrieval};
+use crate::{AppState, Recall, RecallRequest, indexing::Indexer, recall_timings::RecallTimings, retrieval::Retrieval};
 use memento_ann::{Projection, discovery::Discovery};
 use memento_core::{Error, ModelSignature, Result, Store, Tier};
 use memento_domain::{
@@ -40,15 +40,26 @@ pub struct Config {
     pub cold_max_importance: f64,
 }
 struct DeferredRecall(RwLock<Option<Arc<Retrieval>>>);
-impl Recall for DeferredRecall {
-    fn recall(&self, request: &RecallRequest, deadline: Instant) -> Result<Vec<Value>> {
-        let value = self
-            .0
+impl DeferredRecall {
+    fn current(&self) -> Result<Arc<Retrieval>> {
+        self.0
             .read()
             .map_err(|_| Error::Unavailable("Native retrieval is unavailable"))?
             .clone()
-            .ok_or(Error::Unavailable("Native model and index are not ready"))?;
-        value.recall(request, deadline)
+            .ok_or(Error::Unavailable("Native model and index are not ready"))
+    }
+}
+impl Recall for DeferredRecall {
+    fn recall(&self, request: &RecallRequest, deadline: Instant) -> Result<Vec<Value>> {
+        self.current()?.recall(request, deadline)
+    }
+    fn recall_timed(
+        &self,
+        request: &RecallRequest,
+        deadline: Instant,
+        timings: &RecallTimings,
+    ) -> Result<Vec<Value>> {
+        self.current()?.recall_timed(request, deadline, timings)
     }
     fn ready(&self) -> bool {
         self.0

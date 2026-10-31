@@ -146,6 +146,19 @@ pub struct SearchView<'a> {
     cold: Option<&'a EdgeShard>,
     deadline: Instant,
 }
+/// Where a snapshot spent its time before the caller's first search. Diagnostics only.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SnapshotTiming {
+    pub cold_lock: Duration,
+    pub hot_lock: Duration,
+    /// SQLite read-cut open.
+    pub open: Duration,
+    /// Checkpoint validation plus any foreground catch-up and its writer acknowledgment.
+    pub cold_sync: Duration,
+    pub hot_sync: Duration,
+    /// A foreground catch-up advanced an index cursor.
+    pub caught_up: bool,
+}
 /// Single-use Cold query from the same pinned authority cut as owned Hot hits.
 /// The guard is released before the owned result reaches hydration/scoring.
 pub struct ColdQuery<'a> {
@@ -715,15 +728,45 @@ impl Projection {
         collect_hot: impl FnOnce(&ReadTxn<'_>, &SearchView<'_>) -> Result<H>,
         finish: impl FnOnce(&ReadTxn<'_>, H, ColdQuery<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.snapshot_hot_timed(cold, deadline, &mut SnapshotTiming::default(), collect_hot, finish)
+    }
+    /// `snapshot_hot_until` that also records lock, open and sync wall time, even on error.
+    pub fn snapshot_hot_timed<H, T>(
+        &self,
+        cold: bool,
+        deadline: Instant,
+        timing: &mut SnapshotTiming,
+        collect_hot: impl FnOnce(&ReadTxn<'_>, &SearchView<'_>) -> Result<H>,
+        finish: impl FnOnce(&ReadTxn<'_>, H, ColdQuery<'_>) -> Result<T>,
+    ) -> Result<T> {
         check(Some(deadline))?;
         // Preserve cold->hot order; waiting for a Cold build never holds Hot.
-        let mut cold_guard = if cold { Some(lock_ready_until(&self.cold, deadline)?) } else { None };
-        let mut hot_guard = lock_until(&self.hot.state, deadline)?;
+        let at = Instant::now();
+        let cold_guard = cold.then(|| lock_ready_until(&self.cold, deadline)).transpose();
+        timing.cold_lock = at.elapsed();
+        let mut cold_guard = cold_guard?;
+        let at = Instant::now();
+        let hot_guard = lock_until(&self.hot.state, deadline);
+        timing.hot_lock = at.elapsed();
+        let mut hot_guard = hot_guard?;
+        fn cursor(state: &State) -> Option<i64> {
+            state.checkpoint.as_ref().map(|c| c.cursor.id)
+        }
+        let at = Instant::now();
         self.store.read(|tx| {
+            timing.open = at.elapsed();
             if let Some(state) = cold_guard.as_mut() {
-                self.sync_snapshot(tx, Tier::Cold, state, deadline)?;
+                let (at, before) = (Instant::now(), cursor(state));
+                let synced = self.sync_snapshot(tx, Tier::Cold, state, deadline);
+                timing.cold_sync = at.elapsed();
+                timing.caught_up |= cursor(state) != before;
+                synced?;
             }
-            self.sync_snapshot(tx, Tier::Hot, &mut hot_guard, deadline)?;
+            let (at, before) = (Instant::now(), cursor(&hot_guard));
+            let synced = self.sync_snapshot(tx, Tier::Hot, &mut hot_guard, deadline);
+            timing.hot_sync = at.elapsed();
+            timing.caught_up |= cursor(&hot_guard) != before;
+            synced?;
             let owned_hot = {
                 let hot_view = SearchView {
                     hot: hot_guard.shard.as_deref(), cold: None, deadline,

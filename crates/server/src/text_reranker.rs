@@ -171,12 +171,22 @@ impl TextReranker {
     /// or media handling. Caller owns typed routing and the remaining budget.
     /// Checks surround tokenization; ORT inference is terminated at the deadline.
     /// Expiry/failure discards every partial score. A later call gets fresh options.
-    pub fn score(&self, query: &str, documents: &[&str], deadline: Instant) -> Result<Vec<f32>> {
+    /// `lock_wait` receives the time spent waiting for the shared session.
+    pub fn score(
+        &self,
+        query: &str,
+        documents: &[&str],
+        deadline: Instant,
+        lock_wait: &mut Duration,
+    ) -> Result<Vec<f32>> {
         validate(query, documents, deadline)?;
         if documents.is_empty() {
             return Ok(Vec::new());
         }
+        let waiting = Instant::now();
         let mut session = loop {
+            // Kept current so an expiry while waiting still reports the wait.
+            *lock_wait = waiting.elapsed();
             check(deadline)?;
             match self.session.try_lock() {
                 Ok(session) => break session,
@@ -282,7 +292,7 @@ mod tests {
             "New York City is famous for the Metropolitan Museum of Art.",
         ];
         let before = scorer
-            .score(query, &documents, Instant::now() + Duration::from_secs(30))
+            .score(query, &documents, Instant::now() + Duration::from_secs(30), &mut Duration::default())
             .unwrap();
         assert_eq!(before.len(), 2);
         assert!(before[0] > before[1]);
@@ -314,9 +324,9 @@ mod tests {
                     .is_err()
             );
         }
-        assert!(scorer.score(query, &documents, Instant::now()).is_err());
+        assert!(scorer.score(query, &documents, Instant::now(), &mut Duration::default()).is_err());
         let after = scorer
-            .score(query, &documents, Instant::now() + Duration::from_secs(30))
+            .score(query, &documents, Instant::now() + Duration::from_secs(30), &mut Duration::default())
             .unwrap();
         assert_eq!(before, after);
     }

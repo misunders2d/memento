@@ -12,6 +12,7 @@ pub mod operational_status;
 mod period;
 mod query_api;
 mod query_rows;
+pub mod recall_timings;
 mod records;
 pub mod retrieval;
 pub mod runtime;
@@ -33,6 +34,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use memento_core::{Error, Result, Store, capture::EpisodeInput};
+use recall_timings::RecallTimings;
 use memento_domain::{
     Graph, dto,
     processing::{self, Processing},
@@ -145,6 +147,15 @@ fn twenty() -> usize {
 /// Implemented by the native retrieval coordinator. Absence fails semantic requests closed.
 pub trait Recall: Send + Sync {
     fn recall(&self, request: &RecallRequest, deadline: Instant) -> Result<Vec<Value>>;
+    /// Same recall, also recording `/recall` stage timings; stubs keep the plain path.
+    fn recall_timed(
+        &self,
+        request: &RecallRequest,
+        deadline: Instant,
+        _timings: &RecallTimings,
+    ) -> Result<Vec<Value>> {
+        self.recall(request, deadline)
+    }
     fn ready(&self) -> bool;
 }
 #[derive(Clone)]
@@ -275,6 +286,14 @@ impl AppState {
         request: &RecallRequest,
         deadline: Instant,
     ) -> Result<Vec<Value>> {
+        self.recall_memories_timed(request, deadline, &RecallTimings::default())
+    }
+    pub fn recall_memories_timed(
+        &self,
+        request: &RecallRequest,
+        deadline: Instant,
+        timings: &RecallTimings,
+    ) -> Result<Vec<Value>> {
         if !["cheap", "normal", "deep"].contains(&request.effort.as_str())
             || !(1..=100).contains(&request.limit)
             || request
@@ -319,14 +338,14 @@ impl AppState {
                 .recall
                 .as_ref()
                 .ok_or(Error::Unavailable("Native embedding runtime is disabled"))?
-                .recall(request, deadline);
+                .recall_timed(request, deadline, timings);
         }
         if !request.query.trim().is_empty() && request.since.is_none() && request.source.is_none() {
             let result = self
                 .recall
                 .as_ref()
                 .ok_or(Error::Unavailable("Native embedding runtime is disabled"))?
-                .recall(request, deadline)?;
+                .recall_timed(request, deadline, timings)?;
             let _ = self.seed_recall_repairs(&result, request.scope.clone());
             return Ok(result);
         }
@@ -646,23 +665,34 @@ async fn recall(
 ) -> std::result::Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError(Error::Validation("Invalid recall query")))?;
     let revision = state.assets.revision.clone();
+    let started = Instant::now();
     let deadline =
-        Instant::now() + std::time::Duration::from_secs(if query.automatic { 15 } else { 30 });
-    let memories = blocking(move || {
-        let mut rows = state.recall_memories(&query, deadline)?;
-        if query.explain {
-            // Period listings and literal raw evidence never enter semantic ranking.
-            for row in rows.iter_mut().filter(|r| r.get("explain").is_none()) {
-                let route = if row["match"] == "period" { "period_list" } else { "literal_raw" };
-                row["explain"] = json!({"route":route,"ordering":"route_specific","sort_key":null,"passage_validation":{"status":"not_run","reason":"route_exempt"}});
+        started + std::time::Duration::from_secs(if query.automatic { 15 } else { 30 });
+    let (memories, timings) = blocking(move || {
+        let timings = RecallTimings::default();
+        timings.lap(recall_timings::Stage::Queue, started);
+        let memories = state.recall_memories_timed(&query, deadline, &timings).map(|mut rows| {
+            if query.explain {
+                // Period listings and literal raw evidence never enter semantic ranking.
+                for row in rows.iter_mut().filter(|r| r.get("explain").is_none()) {
+                    let route = if row["match"] == "period" { "period_list" } else { "literal_raw" };
+                    row["explain"] = json!({"route":route,"ordering":"route_specific","sort_key":null,"passage_validation":{"status":"not_run","reason":"route_exempt"}});
+                }
             }
-        }
-        Ok(rows)
+            rows
+        });
+        timings.count(recall_timings::Count::Returned, memories.as_ref().map_or(0, Vec::len));
+        // Also on error: an expired deadline is when the stage split matters most.
+        let value = timings.json(&query, started.elapsed());
+        recall_timings::log(&value, memories.is_ok());
+        Ok((memories, query.explain.then_some(value)))
     })
     .await?;
-    Ok(Json(
-        json!({"client_revision":revision,"memories":memories}),
-    ))
+    let mut body = json!({"client_revision":revision,"memories":memories.map_err(ApiError)?});
+    if let Some(timings) = timings {
+        body["timings"] = timings;
+    }
+    Ok(Json(body))
 }
 struct ChannelReader {
     receiver: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>,
