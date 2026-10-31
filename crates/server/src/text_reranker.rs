@@ -107,14 +107,18 @@ fn logits(shape: &[i64], values: &[f32]) -> Result<f32> {
     }
 }
 
-/// One CPU session; scores serialize independently of EmbeddingGemma lanes.
+/// One CPU session (1..=8 intra-op threads, default 1); scores serialize
+/// independently of EmbeddingGemma lanes.
 pub struct TextReranker {
     tokenizer: Tokenizer,
     session: Mutex<Session>,
 }
 impl TextReranker {
     /// Load only pinned local FP32 assets. Performs no network/authority access.
-    pub fn load(root: &Path, runtime_library: &Path) -> Result<Self> {
+    pub fn load(root: &Path, runtime_library: &Path, threads: usize) -> Result<Self> {
+        if !(1..=8).contains(&threads) {
+            return Err(Error::Validation("MEMENTO_TEXT_SCORER_THREADS must be 1..8"));
+        }
         for asset in ASSETS {
             if !bootstrap::verify(&root.join(asset.path), asset)? {
                 return Err(Error::Unavailable(
@@ -139,7 +143,7 @@ impl TextReranker {
         }
         let session = Session::builder()
             .map_err(|_| unavailable())?
-            .with_intra_threads(1)
+            .with_intra_threads(threads)
             .map_err(|_| unavailable())?
             .with_inter_threads(1)
             .map_err(|_| unavailable())?
@@ -276,7 +280,13 @@ mod tests {
     #[test]
     fn incomplete_explicit_cache_fails_without_preparing_or_writing_assets() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(TextReranker::load(dir.path(), Path::new("missing-runtime")).is_err());
+        assert!(TextReranker::load(dir.path(), Path::new("missing-runtime"), 1).is_err());
+        for threads in [0, 9] {
+            assert!(matches!(
+                TextReranker::load(dir.path(), Path::new("missing-runtime"), threads),
+                Err(Error::Validation(_))
+            ));
+        }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
     #[test]
@@ -285,7 +295,7 @@ mod tests {
         let root =
             std::env::var_os("MEMENTO_TEXT_RERANKER_TEST_ASSETS").expect("explicit test assets");
         let runtime = std::env::var_os("MEMENTO_ORT_LIBRARY").expect("explicit pinned runtime");
-        let scorer = TextReranker::load(Path::new(&root), Path::new(&runtime)).unwrap();
+        let scorer = TextReranker::load(Path::new(&root), Path::new(&runtime), 1).unwrap();
         let query = "How many people live in Berlin?";
         let documents = [
             "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
@@ -329,5 +339,40 @@ mod tests {
             .score(query, &documents, Instant::now() + Duration::from_secs(30), &mut Duration::default())
             .unwrap();
         assert_eq!(before, after);
+    }
+    #[test]
+    #[ignore = "requires explicitly supplied pinned local model assets and ORT; no download"]
+    fn pinned_model_threads_keep_scores() {
+        let root =
+            std::env::var_os("MEMENTO_TEXT_RERANKER_TEST_ASSETS").expect("explicit test assets");
+        let runtime = std::env::var_os("MEMENTO_ORT_LIBRARY").expect("explicit pinned runtime");
+        let long = "Memento keeps raw history and consolidates durable facts overnight. ".repeat(60);
+        let queries = ["How many people live in Berlin?", "which loops does the owner still need to close", long.as_str()];
+        let documents: Vec<String> = (0..10)
+            .map(|i| format!("Passage {i}: {}", "Berlin population registry and open loop evidence notes. ".repeat(1 + i * 4)))
+            .collect();
+        let documents: Vec<&str> = documents.iter().map(String::as_str).collect();
+        let deadline = || Instant::now() + Duration::from_secs(120);
+        let one = TextReranker::load(Path::new(&root), Path::new(&runtime), 1).unwrap();
+        for threads in [2, 4] {
+            let many = TextReranker::load(Path::new(&root), Path::new(&runtime), threads).unwrap();
+            for query in queries {
+                let started = Instant::now();
+                let a = one.score(query, &documents, deadline(), &mut Duration::default()).unwrap();
+                let single = started.elapsed();
+                let started = Instant::now();
+                let b = many.score(query, &documents, deadline(), &mut Duration::default()).unwrap();
+                let parallel = started.elapsed();
+                let diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                let order = |v: &[f32]| {
+                    let mut i: Vec<usize> = (0..v.len()).collect();
+                    i.sort_by(|x, y| v[*y].total_cmp(&v[*x]));
+                    i
+                };
+                eprintln!("threads={threads} query_chars={} max_diff={diff:e} one={single:?} many={parallel:?}", query.len());
+                assert!(diff < 1e-4);
+                assert_eq!(order(&a), order(&b));
+            }
+        }
     }
 }

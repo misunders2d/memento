@@ -135,6 +135,17 @@ fn run() -> Result<()> {
         model,
         bootstrap_assets: std::env::var_os("MEMENTO_MODEL_DIR").is_none(),
         text_reranker_dir: std::env::var_os("MEMENTO_TEXT_RERANKER_DIR").map(PathBuf::from),
+        // Foreground recall scorer; default 1 keeps the two-CPU budget.
+        text_scorer_threads: std::env::var("MEMENTO_TEXT_SCORER_THREADS")
+            .ok()
+            .map(|s| {
+                s.parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=8).contains(n))
+                    .ok_or(Error::Validation("MEMENTO_TEXT_SCORER_THREADS must be 1..8"))
+            })
+            .transpose()?
+            .unwrap_or(1),
         pdfium,
         allowed_hosts: std::env::var("MEMENTO_ALLOWED_HOSTS")
             .unwrap_or_default()

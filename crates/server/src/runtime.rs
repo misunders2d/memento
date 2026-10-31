@@ -33,6 +33,7 @@ pub struct Config {
     pub model: Option<ModelConfig>,
     pub bootstrap_assets: bool,
     pub text_reranker_dir: Option<PathBuf>,
+    pub text_scorer_threads: usize,
     pub pdfium: Option<PathBuf>,
     pub allowed_hosts: Vec<String>,
     pub compact_executable: PathBuf,
@@ -322,6 +323,7 @@ impl Application {
                         let text_reranker = Arc::new(crate::text_reranker::TextReranker::load(
                             &text_reranker_root,
                             &runtime_library,
+                            config.text_scorer_threads,
                         )?);
                         if background_services.stop.load(Ordering::Acquire) {
                             return Ok(());
