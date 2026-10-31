@@ -214,8 +214,10 @@ impl AppState {
     }
     fn seed_recall_repairs(&self, rows: &[Value], scope: Option<String>) -> Option<std::thread::JoinHandle<()>> {
         let clusters: Vec<Vec<String>> = rows.iter().filter_map(|row| {
-            let others = row["same_name_ids"].as_array()?;
-            let mut ids: Vec<String> = others.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+            // Same-spelled anchors and identical-text rows collapsed by automatic recall.
+            let others = row["same_name_ids"].as_array().into_iter().flatten();
+            let copies = (row["type"] != "media").then(|| row["duplicate_ids"].as_array()).flatten().into_iter().flatten();
+            let mut ids: Vec<String> = others.chain(copies).filter_map(Value::as_str).map(str::to_owned).collect();
             ids.push(row["id"].as_str()?.to_owned());
             ids.sort();
             ids.dedup();
@@ -253,7 +255,7 @@ impl AppState {
                     let command = processing::Maintenance {
                         command_id: format!("recall-duplicates-{digest}"),
                         actor: "memento-recall".into(),
-                        why: "Review same-spelled entities found by recall".into(),
+                        why: "Review same-spelled entities or identical memories found by recall".into(),
                         target_ids: group.clone(),
                         origin: Some("recall".into()),
                     };

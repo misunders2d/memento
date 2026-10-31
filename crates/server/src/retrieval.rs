@@ -2318,6 +2318,20 @@ mod tests {
         assert_eq!(rows, before);
     }
     #[test]
+    fn recall_duplicate_repair_seeds_identical_text_memories() {
+        let mut f = Fixture::new();
+        let one = f.add("Orion launches on Friday.", "knowledge", "2020-01-01T00:00:00Z", 0.5, 0.9, "personal");
+        let two = f.add("orion launches on friday", "knowledge", "2020-01-01T00:00:00Z", 0.5, 0.89, "personal");
+        let rows = f.recall("When does Orion launch?", 6, true, Some("personal"));
+        assert!(rows.iter().any(|row| row["duplicate_ids"].as_array().is_some_and(|ids| !ids.is_empty())));
+        let state = crate::AppState::new(f.store.clone()).unwrap();
+        state.seed_recall_repairs(&rows, Some("personal".into())).unwrap().join().unwrap();
+        let seeds: Vec<String> = f.store.read(|tx| Ok(tx.sql().query_row("SELECT seed_ids FROM repair_groups WHERE state='pending'", [], |r| r.get::<_, String>(0))?)).map(|s| serde_json::from_str(&s).unwrap()).unwrap();
+        let mut expected = vec![one, two];
+        expected.sort();
+        assert_eq!(seeds, expected);
+    }
+    #[test]
     fn recall_duplicate_repair_excludes_pending_candidate() {
         let mut f = Fixture::new();
         let seed = f.add("Alex North", "person", "2020-01-01T00:00:00Z", 0.5, 0.8, "personal");
