@@ -2281,6 +2281,60 @@ mod tests {
             })
             .unwrap();
     }
+    struct RepairFixtureRecall(Vec<Value>);
+    impl crate::Recall for RepairFixtureRecall {
+        fn recall(&self, _: &crate::RecallRequest, _: Instant) -> Result<Vec<Value>> { Ok(self.0.clone()) }
+        fn ready(&self) -> bool { true }
+    }
+    #[test]
+    fn recall_duplicate_repair_seeds_only_durable_nodes_once() {
+        let mut f = Fixture::new();
+        let one = f.add("Alex North", "person", "2020-01-01T00:00:00Z", 0.5, 0.82, "personal");
+        let two = f.add("Alex North", "person", "2020-01-01T00:00:00Z", 0.5, 0.81, "personal");
+        let rows = f.recall("Alex North", 6, true, Some("personal"));
+        let before = rows.clone();
+        let mut state = crate::AppState::new(f.store.clone()).unwrap();
+        state.recall = Some(Arc::new(RepairFixtureRecall(rows.clone())));
+        let request = RecallRequest { query: "Alex North".into(), scope: Some("personal".into()), automatic: true, ..Default::default() };
+        assert_eq!(state.recall_memories(&request, Instant::now() + std::time::Duration::from_secs(5)).unwrap(), before);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while f.store.read(|tx| Ok(tx.sql().query_row("SELECT count(*) FROM repair_groups", [], |r| r.get::<_, i64>(0))?)).unwrap() == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let counts = || f.store.read(|tx| {
+            let groups: i64 = tx.sql().query_row("SELECT count(*) FROM repair_groups WHERE state='pending'", [], |r| r.get(0))?;
+            let commits: i64 = tx.sql().query_row("SELECT count(*) FROM graph_commits WHERE actor='memento-recall'", [], |r| r.get(0))?;
+            let seeds: String = tx.sql().query_row("SELECT seed_ids FROM repair_groups WHERE state='pending'", [], |r| r.get(0))?;
+            Ok((groups, commits, seeds))
+        }).unwrap();
+        let first = counts();
+        let mut expected = vec![one, two]; expected.sort();
+        assert_eq!((first.0, first.1), (1, 1));
+        assert_eq!(serde_json::from_str::<Vec<String>>(&first.2).unwrap(), expected);
+        assert_eq!(state.recall_memories(&request, Instant::now() + std::time::Duration::from_secs(5)).unwrap(), before);
+        state.seed_recall_repairs(&rows, Some("personal".into())).unwrap().join().unwrap();
+        assert_eq!(counts(), first);
+        assert_eq!(rows, before);
+    }
+    #[test]
+    fn recall_duplicate_repair_excludes_pending_candidate() {
+        let mut f = Fixture::new();
+        let seed = f.add("Alex North", "person", "2020-01-01T00:00:00Z", 0.5, 0.8, "personal");
+        let episode=f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"pending-alex","conversation_id":"pending-alex","kind":"user","text":"Alex North","metadata":{}})).unwrap()).unwrap();
+        f.store.write(|tx| {
+            tx.sql().execute("INSERT INTO extraction_runs SELECT 'pending-run',commit_id,?2,'test','test','[]','{}','2026-10-25' FROM node_versions WHERE id=?1 AND version=1",params![seed,episode.id])?;
+            tx.sql().execute("INSERT INTO candidates VALUES('pending-alex','pending-run','entity','person','Alex North','Exact source',NULL,NULL,1,NULL,NULL,'[\"personal\"]')",[])?;
+            tx.sql().execute("INSERT INTO graph_evidence VALUES('pending-alex',1,?1,0,10,'Alex North')",[&episode.id])?;
+            Ok(())
+        }).unwrap();
+        let rows = f.recall("Alex North", 6, true, Some("personal"));
+        assert!(rows.iter().any(|row| row["same_name_count"] == 2));
+        let state = crate::AppState::new(f.store.clone()).unwrap();
+        state.seed_recall_repairs(&rows, Some("personal".into())).unwrap().join().unwrap();
+        let count: i64 = f.store.read(|tx| Ok(tx.sql().query_row("SELECT count(*) FROM repair_groups", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(count, 0);
+    }
     #[test]
     fn t3_partial_same_spelling_reports_ambiguity_without_merging() {
         let mut f = Fixture::new();

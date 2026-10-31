@@ -158,6 +158,7 @@ pub struct AppState {
     pub media_enabled: bool,
     pub services: Option<Arc<runtime::Services>>,
     status_admission: Arc<tokio::sync::Semaphore>,
+    recall_repairs: Arc<std::sync::Mutex<std::collections::HashSet<Vec<String>>>>,
 }
 impl AppState {
     pub fn new(store: Arc<Store>) -> Result<Self> {
@@ -172,6 +173,7 @@ impl AppState {
             media_enabled: false,
             services: None,
             status_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            recall_repairs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
     /// Hydrate cold opaque runs outside the SQL snapshot and retain leases while
@@ -209,6 +211,59 @@ impl AppState {
             return Err(Error::NotFound("Source blob not found"));
         }
         self.processing.queue.submit_media(&command)
+    }
+    fn seed_recall_repairs(&self, rows: &[Value], scope: Option<String>) -> Option<std::thread::JoinHandle<()>> {
+        let clusters: Vec<Vec<String>> = rows.iter().filter_map(|row| {
+            let others = row["same_name_ids"].as_array()?;
+            let mut ids: Vec<String> = others.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+            ids.push(row["id"].as_str()?.to_owned());
+            ids.sort();
+            ids.dedup();
+            (ids.len() >= 2).then_some(ids)
+        }).collect();
+        if clusters.is_empty() { return None; }
+        let state = self.clone();
+        std::thread::Builder::new().name("recall-repair".into()).spawn(move || {
+            use sha2::{Digest, Sha256};
+            for cluster in clusters {
+                let targets = state.store.read(|tx| {
+                    let db = tx.sql();
+                    let mut targets = Vec::new();
+                    for id in &cluster {
+                        let sql = format!("SELECT n.version FROM node_versions n WHERE n.id=?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND NOT EXISTS(SELECT 1 FROM entity_merges m WHERE m.source=n.id) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)) AND {}", memento_ann::eligibility::visible_sql("n.id"));
+                        use rusqlite::OptionalExtension;
+                        let version: Option<i64> = db.query_row(&sql, rusqlite::params![id, scope], |r| r.get(0)).optional()?;
+                        if let Some(version) = version {
+                            if !memento_ann::eligibility::legacy_only(db, id, version)? { targets.push(id.clone()); }
+                        }
+                    }
+                    Ok(targets)
+                });
+                let Ok(targets) = targets else { eprintln!("recall repair: eligibility check failed"); continue };
+                if targets.len() < 2 { continue; }
+                for chunk in targets.chunks(48) {
+                    let mut group = chunk.to_vec();
+                    if group.len() == 1 { group.insert(0, targets[targets.len() - 2].clone()); }
+                    if let Ok(mut seen) = state.recall_repairs.lock() {
+                        if seen.contains(&group) { continue; }
+                        if seen.len() >= 1024 { seen.clear(); }
+                        seen.insert(group.clone());
+                    } else { continue; }
+                    let digest = Sha256::digest(serde_json::to_vec(&group).unwrap_or_default()).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+                    let command = processing::Maintenance {
+                        command_id: format!("recall-duplicates-{digest}"),
+                        actor: "memento-recall".into(),
+                        why: "Review same-spelled entities found by recall".into(),
+                        target_ids: group.clone(),
+                        origin: Some("recall".into()),
+                    };
+                    if state.processing.maintain(command).is_err() {
+                        eprintln!("recall repair: maintenance failed");
+                        if let Ok(mut seen) = state.recall_repairs.lock() { seen.remove(&group); }
+                    }
+                }
+            }
+        }).ok()
     }
     pub fn recall_memories(
         &self,
@@ -262,11 +317,13 @@ impl AppState {
                 .recall(request, deadline);
         }
         if !request.query.trim().is_empty() && request.since.is_none() && request.source.is_none() {
-            return self
+            let result = self
                 .recall
                 .as_ref()
                 .ok_or(Error::Unavailable("Native embedding runtime is disabled"))?
-                .recall(request, deadline);
+                .recall(request, deadline)?;
+            let _ = self.seed_recall_repairs(&result, request.scope.clone());
+            return Ok(result);
         }
         if request.scope.is_some() {
             return Ok(Vec::new());
