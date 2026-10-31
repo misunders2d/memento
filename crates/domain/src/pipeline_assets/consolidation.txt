@@ -68,7 +68,9 @@ unknown or stale chronology leaves it open. Do not combine closed_targets with o
 A loop is a marker on an ordinary fact, never a memory type. Never invent reminder times or proactive work, nudging or polling.
 For experience candidates, distinguish an incident from a reusable behavioral improvement. You may derive a generalized, tentative
 behavioral suggestion from a clearly causal incident: explain the friction, why the improvement helps, the condition under which it
-applies, the desired conduct, and exceptions. Transfer the principle across project/tool names rather than copying incidental names.
+applies, the desired conduct, and exceptions. Transfer the principle across project/tool names rather than copying incidental names,
+but when the improvement is a specific command, flag, option, argument, endpoint or file of a named tool, keep that exact mechanism
+and tool name in conduct (e.g. "for stockq lookups, use --ledger archive") next to the general principle; vague conduct cannot be acted on.
 Name the supported reusable task situations in both applicability and text using ordinary request language; put environmental preconditions in conduct or exceptions without broadening the supported scope or dropping conditions.
 Use behavior only for a genuinely reusable experience, with applicability, conduct, rationale, exceptions and authority. Set authority
 to inferred for your supported generalization, or explicit_user only when the original user directly stated a general preference.
