@@ -49,10 +49,8 @@ fn new_lesson_sees_named_tools_then_links_through_seeded_maintenance() {
     let work = f.consolidate_work();
     let candidate = &work["input"]["candidates"][0];
     assert_eq!(candidate["type"], "experience");
-    let named = ids(&candidate["named_entities"]);
-    assert_eq!(named.iter().cloned().collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from([stockq.clone(), namesake.clone()]));
-    assert!(named.iter().all(|id| supplied(&work).contains(id)));
-    assert!(!named.contains(&distractor), "a partial name is never a match");
+    // A new lesson cannot link in its own plan, so it spends no ceiling on named entities.
+    assert!(candidate.get("named_entities").is_none());
     // The validator offers a new candidate no link to an existing entity: one remember.
     let lesson = remember_lesson(&f, &work, "For stockq lookups, use --ledger archive.");
     let groups = f.graph.store.read(|tx| rows(tx.sql(), "SELECT seed_ids,frontier,origin,state FROM repair_groups", [])).unwrap();
@@ -67,8 +65,10 @@ fn new_lesson_sees_named_tools_then_links_through_seeded_maintenance() {
     let nodes = work["input"]["existing_nodes"].as_array().unwrap();
     let target = nodes.iter().find(|n| n["id"] == lesson.as_str()).unwrap();
     assert_eq!(target["behavior"]["authority"], "explicit_user");
+    // Same spelling, separate identities: both are supplied, neither is merged.
     let named = ids(&target["named_entities"]);
-    assert!(named.contains(&stockq) && named.contains(&namesake));
+    assert_eq!(named.iter().cloned().collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from([stockq.clone(), namesake.clone()]));
+    assert!(!named.contains(&distractor), "a partial name is never a match");
     assert!(named.iter().all(|id| supplied(&work).contains(id)));
     let repair = json!({"operation":"link","target":lesson,"dst":stockq,"relation":"mentions","evidence":[{"episode_id":episode,"quote":LESSON,"occurrence":null},{"episode_id":tool_episode,"quote":"Stockq","occurrence":null}],"why":"The lesson's conduct is about the stockq inventory CLI"});
     let result = f.complete(&work, json!({"actions":[],"repairs":[repair]})).unwrap();
@@ -99,7 +99,7 @@ fn lesson_maintenance_target_matches_conduct_within_the_context_ceiling() {
     f.capture("lesson", "thread", text, "user", "contract", json!({}), "2026-10-18T12:00:00Z");
     f.extract("contract", "thread", text, "experience", false);
     let work = f.consolidate_work();
-    // A candidate matches on its own text only; this one names no tool.
+    // New candidates get no named entities; only maintenance targets do.
     assert!(work["input"]["candidates"][0].get("named_entities").is_none());
     assert!(supplied(&work).len() <= 48);
     let lesson = remember_lesson(&f, &work, &format!("For {} lookups, use --ledger archive.", names.join(", ")));

@@ -744,13 +744,9 @@ pub(super) fn prepare(
         );
         optional.push((id.into(), unique(queue)));
     }
+    // Only existing lessons (maintenance targets) get named entities: a new lesson cannot
+    // link in its own plan, so supplying them for candidates would only spend the ceiling.
     let mut mentioned: Vec<(String, Vec<String>)> = vec![];
-    for candidate in &candidates {
-        if candidate["kind"] != "relation" && candidate["type"] == "experience" {
-            let named = named_entities(db, &[get_str(candidate, "text")?], LESSON_SUBJECTS)?;
-            mentioned.push((get_str(candidate, "id")?.into(), named));
-        }
-    }
     let mut subjects = vec![];
     for target in &maintenance {
         let n = curation::canonical(db, target)?;
@@ -882,9 +878,7 @@ pub(super) fn prepare(
         if supplied.is_empty() {
             continue;
         }
-        if let Some(candidate) = candidates.iter_mut().find(|candidate| candidate["id"] == *lesson) {
-            candidate["named_entities"] = json!(supplied);
-        } else if let Some(n) = builder.nodes.get_mut(lesson) {
+        if let Some(n) = builder.nodes.get_mut(lesson) {
             n["named_entities"] = json!(supplied);
         }
     }

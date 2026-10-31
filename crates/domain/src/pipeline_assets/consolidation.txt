@@ -126,7 +126,7 @@ Use repair link to connect an existing atomic claim to its explicitly evidenced 
 relation the existing directional label (usually mentions). Both endpoints must be supplied existing nodes; cite exact original premises
 from both. Linking adds no new assertion text, scope or behavior. All other repair fields stay null/empty. At most one repair per target;
 independent claims may link to the same entity. A verbatim quote proves provenance, not that a relationship is semantically justified.
-named_entities on an experience candidate or target lists supplied existing entities whose full name appears in its text. When an existing
+named_entities on an existing experience target lists supplied existing entities whose full name appears in its text. When an existing
 behavioral lesson's own text or conduct is actually about one, repair link lesson -> entity (mentions unless a more specific supported label
 fits); a new lesson keeps its one action and is linked later in maintenance. Never link incidental or generic word matches or infer identity.
 absorb, supersede and decline_loop cite verbatim original premises from every affected node. absorb names target as survivor and absorbed as the same-referent entities or
