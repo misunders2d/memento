@@ -528,8 +528,16 @@ fn push_unique(values: &mut Value, value: Value) {
 fn neighbors(db: &Connection, target: &str, limit: usize) -> Result<Vec<String>> {
     Ok(rows(db,"SELECT n.id FROM edge_versions e JOIN node_versions n ON n.id=CASE WHEN e.src=?1 THEN e.dst ELSE e.src END WHERE (e.src=?1 OR e.dst=?1) AND e.rel<>'supersedes' AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY n.id LIMIT ?2",params![target,limit as i64])?.into_iter().map(|row|row["id"].as_str().unwrap().into()).collect())
 }
+/// Typed BM25 hints. Each FTS row sits at its identity's `node_fts_documents.seq` and
+/// holds that identity's current version (schema trigger), so ids resolve through the
+/// small mapping instead of reading every match's stored columns.
+const LEXICAL: &str = "SELECT n.id FROM node_fts CROSS JOIN node_fts_documents d ON d.seq=node_fts.rowid CROSS JOIN node_versions n ON n.id=d.id AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=d.id) WHERE node_fts MATCH ?1 AND n.type=?2 AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?3)) ORDER BY bm25(node_fts),n.id LIMIT ?4";
+/// Identical lookups within one prepared batch share its read snapshot; answer them once.
+type LexicalCache = HashMap<String, Vec<String>>;
+#[allow(clippy::too_many_arguments)]
 fn lexical(
     db: &Connection,
+    cache: &mut LexicalCache,
     text: &str,
     kind: &str,
     minimum: usize,
@@ -550,7 +558,17 @@ fn lexical(
             .collect::<Vec<_>>()
             .join(" OR ")
     };
-    Ok(rows(db,"SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?)) AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY bm25(node_fts),n.id LIMIT ?",params![query,kind,encode_json(&json!(reviewed))?,limit as i64])?.into_iter().map(|row|row["id"].as_str().unwrap().into()).collect())
+    let reviewed = encode_json(&json!(reviewed))?;
+    let key = format!("{query}\0{kind}\0{limit}\0{reviewed}");
+    if let Some(found) = cache.get(&key) {
+        return Ok(found.clone());
+    }
+    let found: Vec<String> = rows(db, LEXICAL, params![query, kind, reviewed, limit as i64])?
+        .into_iter()
+        .map(|row| row["id"].as_str().unwrap().into())
+        .collect();
+    cache.insert(key, found.clone());
+    Ok(found)
 }
 /// Named entities supplied per experience lesson (candidate or maintenance target).
 pub(super) const LESSON_SUBJECTS: usize = 3;
@@ -675,6 +693,7 @@ pub(super) fn prepare(
     let mut relevant: Vec<(String, Vec<String>)> = vec![];
     let mut optional: Vec<(String, Vec<String>)> = vec![];
     let mut sub = std::time::Instant::now();
+    let mut lexical_cache = LexicalCache::new();
     for candidate in &candidates {
         let id = get_str(candidate, "id")?;
         let mut queue = vec![];
@@ -703,6 +722,7 @@ pub(super) fn prepare(
             crate::work_timing::lap("targets_exact", &mut sub);
             let lex = lexical(
                 db,
+                &mut lexical_cache,
                 get_str(candidate, "text")?,
                 get_str(candidate, "type")?,
                 3,
@@ -713,6 +733,7 @@ pub(super) fn prepare(
             crate::work_timing::lap("targets_lexical", &mut sub);
             let heads = lexical(
                 db,
+                &mut lexical_cache,
                 get_str(candidate, "text")?,
                 get_str(candidate, "type")?,
                 3,
@@ -770,6 +791,7 @@ pub(super) fn prepare(
         queue.extend(neighbors(db, id, 96)?);
         queue.extend(lexical(
             db,
+            &mut lexical_cache,
             get_str(&n, "text")?,
             get_str(&n, "type")?,
             2,
@@ -1052,6 +1074,39 @@ mod overlap_tests {
         let ids = store.read(|tx| Builder::new(tx.sql(), dir.path()).evidence("n1", 1, false)).unwrap()
             .iter().map(|reference| reference["episode_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
         assert_eq!(ids, ["e5", "e0", "e1", "e2", "e4", "e6", "e7", "e8"]);
+    }
+
+    #[test]
+    fn lexical_matches_the_stored_column_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memento_core::Store::open(dir.path()).unwrap();
+        let texts = ["Launch plan for Memento", "Memento launch moved", "Plan the garden", "Launch launch launch", "Old memento plan", "Memento"];
+        store.write(|tx| {
+            for (index, text) in texts.iter().enumerate() {
+                let (kind, state) = if index == 2 { ("person", "active") } else if index == 4 { ("fact", "merged") } else { ("fact", "active") };
+                for version in 1..=(index as i64 % 3 + 1) {
+                    // Earlier versions say something else; only the current text is indexed.
+                    let body = if version == index as i64 % 3 + 1 { text.to_string() } else { format!("stale garden {version}") };
+                    tx.sql().execute("INSERT INTO node_versions VALUES (?,?,'c',?,?,?,NULL,NULL,NULL,0,'[\"personal\"]')", params![format!("n{index}"), version, kind, body, state])?;
+                }
+            }
+            Ok(())
+        }).unwrap();
+        let old = "SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?)) AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY bm25(node_fts),n.id LIMIT ?";
+        store.read(|tx| {
+            let mut cache = LexicalCache::new();
+            for (text, kind, reviewed, head) in [("launch plan memento", "fact", vec![], false), ("memento", "fact", vec!["n1".to_owned()], false), ("garden plan", "person", vec![], false), ("garden plan", "fact", vec![], true), ("launch", "fact", vec![], true)] {
+                let terms = word_terms(text, 3, 32);
+                let query = if head { format!("\"{}\"", terms[0]) } else { terms.iter().map(|term| format!("\"{term}\"")).collect::<Vec<_>>().join(" OR ") };
+                let expected = rows(tx.sql(), old, params![query, kind, encode_json(&json!(reviewed))?, 8])?.into_iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+                assert_eq!(lexical(tx.sql(), &mut cache, text, kind, 3, 8, &reviewed, head)?, expected);
+                // A repeated lookup is answered from the batch cache with the same result.
+                assert_eq!(lexical(tx.sql(), &mut cache, text, kind, 3, 8, &reviewed, head)?, expected);
+            }
+            // Superseded text is not indexed; the only "garden" match is the person.
+            assert!(lexical(tx.sql(), &mut cache, "stale garden", "fact", 3, 8, &[], false)?.is_empty());
+            Ok(())
+        }).unwrap();
     }
 }
 
