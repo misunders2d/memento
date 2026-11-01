@@ -532,12 +532,29 @@ fn neighbors(db: &Connection, target: &str, limit: usize) -> Result<Vec<String>>
 /// holds that identity's current version (schema trigger), so ids resolve through the
 /// small mapping instead of reading every match's stored columns.
 const LEXICAL: &str = "SELECT n.id FROM node_fts CROSS JOIN node_fts_documents d ON d.seq=node_fts.rowid CROSS JOIN node_versions n ON n.id=d.id AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=d.id) WHERE node_fts MATCH ?1 AND n.type=?2 AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?3)) ORDER BY bm25(node_fts),n.id LIMIT ?4";
-/// Identical lookups within one prepared batch share its read snapshot; answer them once.
-type LexicalCache = HashMap<String, Vec<String>>;
+/// Discovery lookups for one claim, including its narrowed re-preparations, share one
+/// read snapshot; each distinct lookup is answered once.
+type DiscoveryCache = HashMap<String, Vec<String>>;
+fn cached(cache: &mut DiscoveryCache, key: String, lookup: impl FnOnce() -> Result<Vec<String>>) -> Result<Vec<String>> {
+    if let Some(found) = cache.get(&key) {
+        return Ok(found.clone());
+    }
+    let found = lookup()?;
+    cache.insert(key, found.clone());
+    Ok(found)
+}
+fn exact_ids(db: &Connection, cache: &mut DiscoveryCache, kind: &str, text: &str) -> Result<Vec<String>> {
+    cached(cache, format!("exact\0{kind}\0{text}"), || {
+        Ok(exact_identities(db, kind, text)?.into_iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect())
+    })
+}
+fn neighbor_ids(db: &Connection, cache: &mut DiscoveryCache, target: &str, limit: usize) -> Result<Vec<String>> {
+    cached(cache, format!("neighbors\0{target}\0{limit}"), || neighbors(db, target, limit))
+}
 #[allow(clippy::too_many_arguments)]
 fn lexical(
     db: &Connection,
-    cache: &mut LexicalCache,
+    cache: &mut DiscoveryCache,
     text: &str,
     kind: &str,
     minimum: usize,
@@ -559,16 +576,12 @@ fn lexical(
             .join(" OR ")
     };
     let reviewed = encode_json(&json!(reviewed))?;
-    let key = format!("{query}\0{kind}\0{limit}\0{reviewed}");
-    if let Some(found) = cache.get(&key) {
-        return Ok(found.clone());
-    }
-    let found: Vec<String> = rows(db, LEXICAL, params![query, kind, reviewed, limit as i64])?
-        .into_iter()
-        .map(|row| row["id"].as_str().unwrap().into())
-        .collect();
-    cache.insert(key, found.clone());
-    Ok(found)
+    cached(cache, format!("lexical\0{query}\0{kind}\0{limit}\0{reviewed}"), || {
+        Ok(rows(db, LEXICAL, params![query, kind, reviewed, limit as i64])?
+            .into_iter()
+            .map(|row| row["id"].as_str().unwrap().into())
+            .collect())
+    })
 }
 /// Named entities supplied per experience lesson (candidate or maintenance target).
 pub(super) const LESSON_SUBJECTS: usize = 3;
@@ -626,6 +639,16 @@ pub(super) fn prepare(
     job: &Job,
     discovery: Option<&Value>,
     configured: bool,
+) -> Result<Value> {
+    prepare_cached(db, dir, job, discovery, configured, &mut DiscoveryCache::new())
+}
+fn prepare_cached(
+    db: &Connection,
+    dir: &Path,
+    job: &Job,
+    discovery: Option<&Value>,
+    configured: bool,
+    discovery_cache: &mut DiscoveryCache,
 ) -> Result<Value> {
     let mut lap = std::time::Instant::now();
     let ids = strings(&job.payload["candidate_ids"])?;
@@ -693,7 +716,6 @@ pub(super) fn prepare(
     let mut relevant: Vec<(String, Vec<String>)> = vec![];
     let mut optional: Vec<(String, Vec<String>)> = vec![];
     let mut sub = std::time::Instant::now();
-    let mut lexical_cache = LexicalCache::new();
     for candidate in &candidates {
         let id = get_str(candidate, "id")?;
         let mut queue = vec![];
@@ -714,15 +736,11 @@ pub(super) fn prepare(
             });
         crate::work_timing::lap("targets_hint", &mut sub);
         if candidate["kind"] != "relation" {
-            let exact =
-                exact_identities(db, get_str(candidate, "type")?, get_str(candidate, "text")?)?
-                    .into_iter()
-                    .map(|row| row["id"].as_str().unwrap().to_owned())
-                    .collect::<Vec<_>>();
+            let exact = exact_ids(db, discovery_cache, get_str(candidate, "type")?, get_str(candidate, "text")?)?;
             crate::work_timing::lap("targets_exact", &mut sub);
             let lex = lexical(
                 db,
-                &mut lexical_cache,
+                discovery_cache,
                 get_str(candidate, "text")?,
                 get_str(candidate, "type")?,
                 3,
@@ -733,7 +751,7 @@ pub(super) fn prepare(
             crate::work_timing::lap("targets_lexical", &mut sub);
             let heads = lexical(
                 db,
-                &mut lexical_cache,
+                discovery_cache,
                 get_str(candidate, "text")?,
                 get_str(candidate, "type")?,
                 3,
@@ -766,11 +784,10 @@ pub(super) fn prepare(
         }
         queue.extend(hinted(db, hint, "broad")?);
         crate::work_timing::lap("targets_hinted", &mut sub);
-        queue.extend(
-            recall_keywords(db, &excerpt(get_str(candidate, "text")?, 512), 8, None)?
-                .into_iter()
-                .map(|row| row["id"].as_str().unwrap().to_owned()),
-        );
+        let words = excerpt(get_str(candidate, "text")?, 512);
+        queue.extend(cached(discovery_cache, format!("keywords\0{words}"), || {
+            Ok(recall_keywords(db, &words, 8, None)?.into_iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect())
+        })?);
         optional.push((id.into(), unique(queue)));
         crate::work_timing::lap("targets_keywords", &mut sub);
     }
@@ -784,14 +801,11 @@ pub(super) fn prepare(
         if !builder.nodes.contains_key(id) {
             continue;
         }
-        let exact = exact_identities(db, get_str(&n, "type")?, get_str(&n, "text")?)?
-            .into_iter()
-            .map(|row| row["id"].as_str().unwrap().to_owned());
-        let mut queue = exact.collect::<Vec<_>>();
-        queue.extend(neighbors(db, id, 96)?);
+        let mut queue = exact_ids(db, discovery_cache, get_str(&n, "type")?, get_str(&n, "text")?)?;
+        queue.extend(neighbor_ids(db, discovery_cache, id, 96)?);
         queue.extend(lexical(
             db,
-            &mut lexical_cache,
+            discovery_cache,
             get_str(&n, "text")?,
             get_str(&n, "type")?,
             2,
@@ -819,7 +833,7 @@ pub(super) fn prepare(
     for (key, exact, similar) in &identities {
         let mut queue = unique(exact.iter().chain(similar).cloned());
         for target in queue.clone().iter().take(8) {
-            queue.extend(neighbors(db, target, 8)?);
+            queue.extend(neighbor_ids(db, discovery_cache, target, 8)?);
         }
         let queue = unique(queue);
         let original = optional.iter_mut().find(|(id, _)| id == key).unwrap();
@@ -897,7 +911,7 @@ pub(super) fn prepare(
             if let [only] = entities {
                 narrowed.payload["_priority"] = json!(relevant.iter().find(|(id, _)| only["id"] == *id).map(|(_, targets)| targets.clone()).unwrap_or_default());
             }
-            let mut context = prepare(db, dir, &narrowed, discovery, configured)?;
+            let mut context = prepare_cached(db, dir, &narrowed, discovery, configured, discovery_cache)?;
             let rest = batch.into_iter().filter(|id| !kept.contains(id));
             context["_deferred"] = json!(unique(strings(&context["_deferred"])?.into_iter().chain(rest)));
             return Ok(context);
@@ -1095,7 +1109,7 @@ mod overlap_tests {
         }).unwrap();
         let old = "SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?)) AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY bm25(node_fts),n.id LIMIT ?";
         store.read(|tx| {
-            let mut cache = LexicalCache::new();
+            let mut cache = DiscoveryCache::new();
             for (text, kind, reviewed, head) in [("launch plan memento", "fact", vec![], false), ("memento", "fact", vec!["n1".to_owned()], false), ("garden plan", "person", vec![], false), ("garden plan", "fact", vec![], true), ("launch", "fact", vec![], true)] {
                 let terms = word_terms(text, 3, 32);
                 let query = if head { format!("\"{}\"", terms[0]) } else { terms.iter().map(|term| format!("\"{term}\"")).collect::<Vec<_>>().join(" OR ") };
