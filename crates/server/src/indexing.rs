@@ -23,15 +23,17 @@ fn candidate_source() -> String {
 /// Tool output, tool-call turns, hooks and instructions stay literal-search raw
 /// history. Text matches `episodes_status_indexable_v2`, so checks stay index-only.
 macro_rules! message {
-    () => {
-        "e.kind IN ('user','assistant') AND CAST(coalesce(json_extract(e.metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip' AND coalesce(json_extract(e.metadata,'$.evidence_eligible'),1)<>0"
+    ($alias:literal) => {
+        concat!($alias,".kind IN ('user','assistant') AND CAST(coalesce(json_extract(",$alias,".metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip' AND coalesce(json_extract(",$alias,".metadata,'$.evidence_eligible'),1)<>0")
     };
 }
-const MESSAGE: &str = message!();
-const EPISODE: &str = concat!("SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,x.episode_id,x.start,x.end,x.rowid AS position FROM episode_chunks x JOIN episodes e INDEXED BY episodes_status_indexable_v2 ON e.id=x.episode_id WHERE ",message!()," AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)");
+/// Newest message episode in `(?1, ?2]` that still needs chunks or a vector. Episodes
+/// are scanned by seq; membership uses the message index, so no body is read.
+const WALK: &str = concat!("SELECT e.id,e.seq,EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) AS chunked FROM episodes e WHERE e.seq>?1 AND e.seq<=?2 AND EXISTS(SELECT 1 FROM episodes m INDEXED BY episodes_status_indexable_v2 WHERE m.id=e.id AND ",message!("m"),") AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND (NOT EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) OR EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=x.id AND i.kind='episode' AND i.version=1) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=x.id AND f.version=1 AND f.resolved=0))) ORDER BY e.seq DESC LIMIT 1");
+const EPISODE: &str = concat!("SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,x.episode_id,x.start,x.end,x.rowid AS position FROM episode_chunks x JOIN episodes e INDEXED BY episodes_status_indexable_v2 ON e.id=x.episode_id WHERE ",message!("e")," AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)");
 /// Excluded raw chunks whose vectors predate the message-only rule. Chunk rows are
 /// immutable references and stay; only their embeddings are removed.
-const RETIRED: &str = concat!("SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target WHERE i.kind='episode' AND i.seq BETWEEN ?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM episodes e INDEXED BY episodes_status_indexable_v2 WHERE e.id=x.episode_id AND ",message!(),")");
+const RETIRED: &str = concat!("SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target WHERE i.kind='episode' AND i.seq BETWEEN ?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM episodes e INDEXED BY episodes_status_indexable_v2 WHERE e.id=x.episode_id AND ",message!("e"),")");
 const RETIRE_BATCH: i64 = 512;
 pub(crate) fn sources() -> [(String, &'static str); 3] {
     [
@@ -44,7 +46,11 @@ pub struct Indexer {
     store: Arc<Store>,
     projection: Arc<Projection>,
     model: EmbeddingModel,
-    cursors: Mutex<([i64; 3], i64)>,
+    /// Ascending cursors for nodes and candidates, which are served before episodes.
+    cursors: Mutex<[i64; 2]>,
+    /// Newest-first walk over message episodes: chunking happens when the walk
+    /// reaches an episode, so new chunks never land behind the cursor.
+    episodes: Mutex<Frontier>,
     /// Retirement cursor over episode vector seqs; `None` once the pass is done.
     retired: Mutex<Option<i64>>,
     pub stop: Arc<AtomicBool>,
@@ -60,25 +66,18 @@ impl Indexer {
             store,
             projection,
             model,
-            cursors: Mutex::new(([0; 3], 0)),
+            cursors: Mutex::new([0; 2]),
+            episodes: Mutex::new(Frontier::default()),
             retired: Mutex::new(Some(i64::MIN)),
             stop,
         })
     }
-    fn prepare_episode(&self) -> Result<bool> {
-        let mut cursor = self
-            .cursors
-            .lock()
-            .map_err(|_| Error::Unavailable("Index cursor is unavailable"))?;
-        let (through,episode)=self.store.read(|tx|{let through=tx.sql().query_row("SELECT coalesce(max(seq),0) FROM episodes",[],|r|r.get::<_,i64>(0))?;let row=records::one(tx.sql(),&format!("SELECT e.id,e.seq,e.source,e.event_id,e.text FROM episodes e WHERE e.seq>? AND e.seq<=? AND {MESSAGE} AND NOT EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) ORDER BY e.seq LIMIT 1"),params![cursor.1,through])?;Ok((through,row))})?;
-        let Some(row) = episode else {
-            cursor.1 = through;
-            return Ok(false);
-        };
+    /// Chunks one message episode; a concurrent chunking or forgetting wins.
+    fn prepare(&self, id: &str) -> Result<()> {
         // Full original hydration and tokenization happen outside the writer transaction.
         let text = self
             .store
-            .read(|tx| tx.original_text(row["id"].as_str().unwrap()))?
+            .read(|tx| tx.original_text(id))?
             .ok_or(Error::Unavailable("Index source is unavailable"))?;
         let mut spans = Vec::new();
         for (left, right) in domain::source_text_ranges(&text) {
@@ -98,9 +97,35 @@ impl Indexer {
         if spans.is_empty() {
             spans.push((0, 0));
         }
-        self.store.write(|tx|{let exists:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks WHERE episode_id=?1) OR EXISTS(SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=?1)",[row["id"].as_str()],|r|r.get(0))?;if !exists{for(start,end)in &spans{let id=format!("e_{}",&raw::sha256(format!("{}:{start}:{end}",row["id"].as_str().unwrap()).as_bytes())[..32]);tx.sql().execute("INSERT INTO episode_chunks VALUES(?,?,?,?)",params![id,row["id"].as_str(),start,end])?;}}Ok(())})?;
-        cursor.1 = row["seq"].as_i64().unwrap();
-        Ok(true)
+        self.store.write(|tx|{let exists:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks WHERE episode_id=?1) OR EXISTS(SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=?1)",[id],|r|r.get(0))?;if !exists{for(start,end)in &spans{let chunk=format!("e_{}",&raw::sha256(format!("{id}:{start}:{end}").as_bytes())[..32]);tx.sql().execute("INSERT INTO episode_chunks VALUES(?,?,?,?)",params![chunk,id,start,end])?;}}Ok(())})?;
+        Ok(())
+    }
+    /// Next raw chunk, newest message episode first.
+    fn episode_unit(&self) -> Result<Option<Value>> {
+        let mut frontier = self
+            .episodes
+            .lock()
+            .map_err(|_| Error::Unavailable("Index cursor is unavailable"))?;
+        loop {
+            let Some((id, seq, chunked)) =
+                self.store.read(|tx| next_episode(tx.sql(), &mut frontier))?
+            else {
+                return Ok(None);
+            };
+            if !chunked {
+                self.prepare(&id)?;
+            }
+            let chunk = self.store.read(|tx| {
+                records::one(tx.sql(), &format!("SELECT a.* FROM ({EPISODE}) a WHERE a.episode_id=? AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND f.version=a.version AND f.resolved=0) ORDER BY a.start LIMIT 1"), [&id])
+            })?;
+            if chunk.is_some() {
+                return Ok(chunk);
+            }
+            // Forgotten meanwhile, or every chunk awaits its failure retry.
+            if let Some(range) = frontier.ranges.last_mut() {
+                range.1 = range.1.min(seq - 1);
+            }
+        }
     }
     fn retire_excluded(&self) -> Result<bool> {
         let mut cursor = self
@@ -119,11 +144,16 @@ impl Indexer {
             .cursors
             .lock()
             .map_err(|_| Error::Unavailable("Index cursor is unavailable"))?;
-        self.store.read(|tx|{
+        let ordered = self.store.read(|tx|{
             for(source,_)in sources(){if let Some(row)=records::one(tx.sql(),&format!("SELECT a.* FROM ({source}) a JOIN index_failures f ON f.target=a.id AND f.version=a.version WHERE f.resolved=0 AND f.next_attempt<=? AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version) ORDER BY f.next_attempt LIMIT 1"),[timestamp()])?{return Ok(Some(row));}}
-            for(index,(source,table))in sources().iter().enumerate(){let row=records::one(tx.sql(),&format!("SELECT a.* FROM ({source}) a WHERE a.position>? AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND f.version=a.version AND f.resolved=0) ORDER BY a.position LIMIT 1"),[cursors.0[index]])?;if let Some(row)=row{return Ok(Some(row));}cursors.0[index]=tx.sql().query_row(&format!("SELECT coalesce(max(rowid),0) FROM {table}"),[],|r|r.get(0))?;}
+            for(index,(source,table))in sources().iter().take(2).enumerate(){let row=records::one(tx.sql(),&format!("SELECT a.* FROM ({source}) a WHERE a.position>? AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND f.version=a.version AND f.resolved=0) ORDER BY a.position LIMIT 1"),[cursors[index]])?;if let Some(row)=row{return Ok(Some(row));}cursors[index]=tx.sql().query_row(&format!("SELECT coalesce(max(rowid),0) FROM {table}"),[],|r|r.get(0))?;}
             Ok(None)
-        })
+        })?;
+        drop(cursors);
+        match ordered {
+            Some(row) => Ok(Some(row)),
+            None => self.episode_unit(),
+        }
     }
     pub fn run_once(&self) -> Result<bool> {
         if self.stop.load(Ordering::Acquire) || !self.projection.ready(Tier::Hot) {
@@ -131,9 +161,8 @@ impl Indexer {
         }
         resolve_due_failures(&self.store)?;
         let retired = self.retire_excluded()?;
-        let prepared = self.prepare_episode()? || retired;
         let Some(mut row) = self.pending()? else {
-            return Ok(prepared);
+            return Ok(retired);
         };
         if row["kind"] == "episode" {
             let original = self
@@ -149,7 +178,7 @@ impl Indexer {
             );
         }
         if self.stop.load(Ordering::Acquire) {
-            return Ok(prepared);
+            return Ok(true);
         }
         let vector = self
             .model
@@ -179,14 +208,13 @@ impl Indexer {
         if let Some(index) = match row["kind"].as_str() {
             Some("node") => Some(0),
             Some("candidate") => Some(1),
-            Some("episode") => Some(2),
             _ => None,
         } {
             let mut cursor = self
                 .cursors
                 .lock()
                 .map_err(|_| Error::Unavailable("Index cursor is unavailable"))?;
-            cursor.0[index] = cursor.0[index].max(row["position"].as_i64().unwrap_or(0));
+            cursor[index] = cursor[index].max(row["position"].as_i64().unwrap_or(0));
         }
         Ok(true)
     }
@@ -211,6 +239,40 @@ impl Indexer {
     fn commit(&self, row: &Value, vector: &[f32; 768], hints: &[Value]) -> Result<()> {
         commit_index(&self.store, row, vector, hints)
     }
+}
+/// Newest-first ranges over episode seq, `(exclusive low, inclusive cursor)`.
+/// Episodes captured above the newest range open a range that is served first;
+/// the older range resumes where it stopped.
+#[derive(Default)]
+struct Frontier {
+    top: Option<i64>,
+    ranges: Vec<(i64, i64)>,
+}
+fn next_episode(db: &Connection, frontier: &mut Frontier) -> Result<Option<(String, i64, bool)>> {
+    let high: i64 = db.query_row("SELECT coalesce(max(seq),0) FROM episodes", [], |r| r.get(0))?;
+    let low = frontier.top.unwrap_or(i64::MIN);
+    if high > low {
+        frontier.ranges.push((low, high));
+        frontier.top = Some(high);
+    }
+    while let Some(&(low, cursor)) = frontier.ranges.last() {
+        let found = db
+            .query_row(WALK, params![low, cursor], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?))
+            })
+            .optional()?;
+        match found {
+            // Inclusive: sibling chunks of this episode are served next.
+            Some(found) => {
+                frontier.ranges.last_mut().unwrap().1 = found.1;
+                return Ok(Some(found));
+            }
+            None => {
+                frontier.ranges.pop();
+            }
+        }
+    }
+    Ok(None)
 }
 /// One bounded batch from `from`: remove pre-rule vectors of excluded raw chunks.
 /// The projection drops touched points whose rows are gone; chunk rows remain.
@@ -388,12 +450,12 @@ pub fn status(
     let (episode_index, episode_filter) = if source.is_some() {
         (
             "episodes_status_cover_v1",
-            concat!("e.source=?1 AND ",message!()," AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)"),
+            concat!("e.source=?1 AND ",message!("e")," AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)"),
         )
     } else {
         (
             "episodes_status_indexable_v2",
-            concat!("?1 IS NULL AND ",message!()," AND NOT EXISTS(SELECT 1 FROM forgotten_episode_ids f WHERE f.id=e.id)"),
+            concat!("?1 IS NULL AND ",message!("e")," AND NOT EXISTS(SELECT 1 FROM forgotten_episode_ids f WHERE f.id=e.id)"),
         )
     };
     // All three joined keys are unique. A no-chunk episode contributes only to
@@ -447,6 +509,65 @@ mod status_tests {
                 Ok(())
             })
             .unwrap();
+    }
+    #[test]
+    fn episode_walk_serves_newest_first_and_arrivals_before_the_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        let capture = |event: &str, kind: &str, metadata: Value| {
+            store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":event,"conversation_id":"thread","kind":kind,"text":format!("Text {event}"),"metadata":metadata})).unwrap()).unwrap().id
+        };
+        let old = capture("old", "user", json!({}));
+        let mid = capture("mid", "assistant", json!({}));
+        capture("tool", "tool", json!({"extraction_mode":"tool_output"}));
+        let new = capture("new", "user", json!({}));
+        let chunk = |episode: &str| {
+            store.write(|tx| {
+                tx.sql().execute("INSERT INTO episode_chunks VALUES(?,?,0,4)", params![format!("chunk-{episode}"), episode])?;
+                Ok(())
+            }).unwrap()
+        };
+        let embed = |episode: &str| {
+            let mut vector = [0f32; 768];
+            vector[0] = 1.;
+            store.write(|tx| {
+                let seq: i64 = tx.sql().query_row("SELECT coalesce(max(seq),0)+1 FROM vector_items", [], |r| r.get(0))?;
+                tx.put_vector(&VectorWrite{seq,target:format!("chunk-{episode}"),kind:VectorKind::Episode,version:1,current:true,tier:Tier::Cold,embedding:F32Blob::from_values(&vector)?})?;
+                Ok(())
+            }).unwrap()
+        };
+        let mut frontier = Frontier::default();
+        let mut next = || store.read(|tx| next_episode(tx.sql(), &mut frontier)).unwrap().map(|(id, _, chunked)| (id, chunked));
+        chunk(&old);
+        chunk(&mid);
+        // The newest message episode comes first, even before it has chunks.
+        assert_eq!(next(), Some((new.clone(), false)));
+        chunk(&new);
+        assert_eq!(next(), Some((new.clone(), true)));
+        embed(&new);
+        assert_eq!(next(), Some((mid.clone(), true)));
+        // A message captured meanwhile is served before the backlog resumes.
+        let arrival = capture("arrival", "user", json!({}));
+        assert_eq!(next(), Some((arrival.clone(), false)));
+        chunk(&arrival);
+        embed(&arrival);
+        assert_eq!(next(), Some((mid.clone(), true)));
+        // A chunk awaiting its failure retry does not hold the walk.
+        store.write(|tx| {
+            tx.sql().execute("INSERT INTO index_failures VALUES(?,1,1,'Fixture',0,0)", [format!("chunk-{mid}")])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(next(), Some((old.clone(), true)));
+        embed(&old);
+        assert_eq!(next(), None);
+        // Episodes are walked by seq with index-only membership, never a full sort.
+        store.read(|tx| {
+            let mut query = tx.sql().prepare(&format!("EXPLAIN QUERY PLAN {WALK}"))?;
+            let plan = query.query_map(params![0, 100], |r| r.get::<_, String>(3))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            assert!(plan.iter().any(|step| step.starts_with("SEARCH e USING INTEGER PRIMARY KEY")), "{plan:?}");
+            assert!(plan.iter().all(|step| !step.contains("TEMP B-TREE")), "{plan:?}");
+            Ok(())
+        }).unwrap();
     }
     #[test]
     fn only_messages_are_raw_index_units_and_older_excluded_vectors_retire() {
