@@ -825,11 +825,10 @@ impl Retrieval {
                     ));
                 }
                 // Additive complete rendering for current-fact rows only; legacy `text` keeps
-                // its summary for old bridges. Long bodies stay withheld until the owner
-                // chooses broader automatic disclosure; sensitive types are also withheld.
+                // its summary for old bridges. Long bodies travel whole when the rendering
+                // fits one reminder (owner decision 2026-11-02); sensitive types stay withheld.
                 if let Some(full) = full {
                     if row["category"] == "memory"
-                        && row["text_truncated"] != true
                         && row["type"] != "media"
                         && row["behavior"].is_null()
                         && full.len() <= FULL_TEXT_BYTES

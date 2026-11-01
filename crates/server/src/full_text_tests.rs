@@ -1,5 +1,5 @@
-// Coverage-first automatic recall: complete short facts travel beside the unchanged
-// summary; long bodies are explicitly withheld under the default disclosure policy.
+// Coverage-first automatic recall: complete facts travel beside the unchanged summary
+// when their rendering fits one reminder; longer bodies and sensitive types are withheld.
 const SYNTHETIC_CREDENTIAL: &str = "MEMENTO_SYNTHETIC_CREDENTIAL_Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7Q7";
 fn long_body(lead: &str, tail: &str) -> String {
     let mut body = format!("{lead} ");
@@ -26,7 +26,7 @@ fn row<'a>(rows: &'a [Value], id: &str) -> &'a Value {
     rows.iter().find(|r| r["id"] == id).unwrap_or_else(|| panic!("{id} missing from {rows:?}"))
 }
 #[test]
-fn automatic_full_text_withholds_long_facts_and_keeps_short_facts_complete() {
+fn automatic_full_text_keeps_long_and_short_facts_complete() {
     let mut f = Fixture::new();
     let body = long_body("Synthetic quartz deployment rule.", "Only when the owner approves in writing.");
     let long = f.add(&body, "knowledge", "2026-10-20T00:00:00Z", 0.5, 0.9, "personal");
@@ -45,7 +45,8 @@ fn automatic_full_text_withholds_long_facts_and_keeps_short_facts_complete() {
     assert!(text.starts_with(&format!("Source 2026-10-20: {}", summary(&body))));
     assert!(text.contains(" (Connected: Mark Petrov [person; related_to "), "{text}");
     assert_eq!(fact["text_truncated"], true);
-    assert!(fact.get("full_text").is_none());
+    let full = fact["full_text"].as_str().unwrap();
+    assert!(full.starts_with(&format!("Source 2026-10-20: {body} (Connected: Mark Petrov [person; related_to ")), "{full}");
     let short = row(&automatic, &brief);
     assert_eq!(short["text_truncated"], false);
     assert_eq!(short["full_text"], short["text"]);
@@ -53,7 +54,7 @@ fn automatic_full_text_withholds_long_facts_and_keeps_short_facts_complete() {
 }
 
 #[test]
-fn automatic_full_text_withholds_long_bodies_even_when_framing_fits() {
+fn automatic_full_text_keeps_long_bodies_only_when_framing_fits() {
     let mut f = Fixture::new();
     // "Source 2026-10-20: " is 19 bytes, so 1481 body bytes render to exactly 1500.
     let fits = format!("Quartz boundary fact. {}", "x".repeat(1481 - 22));
@@ -62,7 +63,7 @@ fn automatic_full_text_withholds_long_bodies_even_when_framing_fits() {
     let over_id = f.add(&over, "knowledge", "2026-10-20T00:00:00Z", 0.5, 0.89, "personal");
     let automatic = f.recall("quartz", 6, true, Some("personal"));
     assert_eq!(row(&automatic, &fits_id)["text_truncated"], true);
-    assert!(row(&automatic, &fits_id).get("full_text").is_none());
+    assert_eq!(row(&automatic, &fits_id)["full_text"], format!("Source 2026-10-20: {fits}"));
     let withheld = row(&automatic, &over_id);
     assert_eq!(withheld["text_truncated"], true);
     assert!(withheld.get("full_text").is_none());
@@ -95,15 +96,14 @@ fn synthetic_credential_tail_stays_behind_existing_guards() {
     // Scope exclusion is unchanged: neither rendering reaches another scope.
     let other = f.recall("quartz", 6, true, Some("professional"));
     assert!(!serde_json::to_string(&other).unwrap().contains(SYNTHETIC_CREDENTIAL));
-    // Ordinary types do not bypass the default tail policy either. This does not
-    // claim to detect secrets in content; it preserves the existing disclosure bound.
+    // Ordinary types now travel whole (owner decision 2026-11-02); no content-based
+    // secret detection is claimed, so the ordinary tail is visible in its own scope.
     let rows = f.recall("quartz", 6, true, Some("personal"));
-    assert!(row(&rows, &personal).get("full_text").is_none());
-    assert!(!serde_json::to_string(&rows).unwrap().contains(SYNTHETIC_CREDENTIAL));
+    assert!(row(&rows, &personal)["full_text"].as_str().unwrap().contains(SYNTHETIC_CREDENTIAL));
 }
 
 #[test]
-fn parked_candidate_full_text_withholds_the_long_body_and_keeps_unverified_framing() {
+fn parked_candidate_full_text_keeps_the_long_body_and_unverified_framing() {
     let f = Fixture::new();
     let body = long_body("Synthetic quartz historical candidate.", "Only for the archived staging fixture.");
     let episode = f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"parked","conversation_id":"parked","kind":"user","text":body,"occurred_at":"2026-10-20T00:00:00Z","metadata":{}})).unwrap()).unwrap();
@@ -129,7 +129,7 @@ fn parked_candidate_full_text_withholds_the_long_body_and_keeps_unverified_frami
     let parked = row(&rows, id);
     assert!(parked["text"].as_str().unwrap().contains("Unverified historical candidate (source 2026-10-20): "));
     assert_eq!(parked["text_truncated"], true);
-    assert!(parked.get("full_text").is_none());
+    assert!(parked["full_text"].as_str().unwrap().ends_with(&format!("Unverified historical candidate (source 2026-10-20): {body}")));
     assert!(parked.get("_full_render").is_none());
 }
 
