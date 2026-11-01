@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod loops;
 pub mod pipeline_schema;
 pub mod processing;
+pub mod work_timing;
 mod reconciliation;
 pub mod recovery;
 /// Frozen source-runtime word and casefold data, shared with retrieval.

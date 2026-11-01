@@ -668,6 +668,7 @@ pub(super) fn apply(
             Error::Conflict("Consolidation loop policy changed; derive a fresh plan").into(),
         );
     }
+    let mut lap = std::time::Instant::now();
     let ids = context_value["candidates"]
         .as_array()
         .ok_or(Error::Validation("Invalid prepared context"))?
@@ -684,10 +685,12 @@ pub(super) fn apply(
             Error::Conflict("Consolidation eligibility changed; derive a fresh plan").into(),
         );
     }
+    crate::work_timing::lap("apply_eligibility", &mut lap);
     let prepared = consolidator
         .graph
         .store
         .read(|tx| Ok(validate(tx.sql(), tx.data_dir(), context_value, output)))??;
+    crate::work_timing::lap("apply_validate", &mut lap);
     for repair in &prepared.repairs {
         if repair["operation"] == "retire"
             && context_value["_retirement"]["ready"]
@@ -727,7 +730,7 @@ pub(super) fn apply(
         format!("consolidator/{agent}"),
         why,
     );
-    Ok(consolidator.graph.store.command(&ctx,&request,|tx,commit|{
+    let committed = consolidator.graph.store.command(&ctx,&request,|tx,commit|{
         job.check_in(tx.sql())?;check_continuity(tx.sql(),context_value)?;for repair in &prepared.repairs{if repair["operation"]=="retire"{check_retirement(tx.sql(),context_value,get_str(repair,"target")?)?;}if repair["operation"]=="link"{for key in ["target","dst"]{if !visible_link_endpoint(tx.sql(),get_str(repair,key)?)?{return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan"));}}}}
         if !ineligible(tx.sql(),&ids)?.is_empty(){return Err(Error::Conflict("Consolidation eligibility changed; derive a fresh plan"));}for(target,frozen)in &prepared.nodes{if node(tx.sql(),target)?["version"]!=frozen["version"]{return Err(Error::Conflict("Consolidation graph context changed; derive a fresh plan"));}}for(target,frozen)in &prepared.edges{if one(tx.sql(),"SELECT version FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1",[target])?.is_none_or(|current|current["version"]!=frozen["version"]){return Err(Error::Conflict("Consolidation relation context changed; derive a fresh plan"));}}
         let loop_snapshots=context_value["loop_snapshots"].as_object().unwrap();let frozen_version=|target:&str|prepared.nodes.get(target).or_else(||prepared.edges.get(target)).and_then(|value|value["version"].as_i64()).unwrap_or(1);if !prepared.repairs.is_empty()||prepared.actions.iter().any(|action|!action["closed_targets"].as_array().unwrap().is_empty()){for(target,frozen)in loop_snapshots{if loops::snapshot(tx.sql(),target,frozen_version(target))?!=*frozen{return Err(Error::Conflict("Consolidation loop state changed; derive a fresh plan"));}}}
@@ -762,7 +765,9 @@ pub(super) fn apply(
         continue_work(tx,commit,job,&context,&prepared.continue_with,&prepared.nodes,&destinations,progressed)?;
         seed_lesson_links(tx,&lessons)?;
         Ok(json!({"candidate_count":results.len(),"results":results,"reported_model":model,"usage":usage,"loop_closures":closures,"repair_results":repair_results,"redirected_relations":redirected,"loop_responsibilities":loop_responsibilities}))
-    })?)
+    });
+    crate::work_timing::lap("apply_commit", &mut lap);
+    Ok(committed?)
 }
 
 fn resolve(

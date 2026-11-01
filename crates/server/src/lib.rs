@@ -642,7 +642,30 @@ command!(loop_command, dto::Loop, graph, loop_command);
 command!(usage, dto::Citation, graph, cite);
 command!(claim, processing::Claim, processing, claim);
 command!(pool, processing::Pool, processing, pool);
-command!(work, processing::Work, processing, work);
+async fn work(
+    State(state): State<AppState>,
+    request: Request,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let command: processing::Work = json_body(request).await?;
+    Ok(Json(
+        blocking(move || {
+            let action = command.action.clone();
+            let started = Instant::now();
+            memento_domain::work_timing::take();
+            let result = state.processing.work(command);
+            // One stderr line per request: action, stage names and microseconds only.
+            let stages: serde_json::Map<String, Value> = memento_domain::work_timing::take()
+                .into_iter()
+                .map(|(name, us)| (name.to_owned(), json!(us as u64)))
+                .collect();
+            if matches!(action.as_str(), "claim" | "submit" | "complete" | "pool") {
+                eprintln!("{}", json!({"event":"work_timing","action":action,"ok":result.is_ok(),"total_us":started.elapsed().as_micros() as u64,"stages_us":stages}));
+            }
+            result
+        })
+        .await?,
+    ))
+}
 command!(compact, processing::Compaction, processing, compact);
 command!(renew, processing::Lease, processing, renew);
 command!(complete, processing::Complete, processing, complete);

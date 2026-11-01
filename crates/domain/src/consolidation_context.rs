@@ -609,6 +609,7 @@ pub(super) fn prepare(
     discovery: Option<&Value>,
     configured: bool,
 ) -> Result<Value> {
+    let mut lap = std::time::Instant::now();
     let ids = strings(&job.payload["candidate_ids"])?;
     let maintenance = job
         .payload
@@ -669,6 +670,7 @@ pub(super) fn prepare(
     }
     builder.continuity()?;
     builder.retirement()?;
+    crate::work_timing::lap("prepare_load", &mut lap);
     let mut identities: Vec<(String, Vec<String>, Vec<String>)> = vec![];
     let mut relevant: Vec<(String, Vec<String>)> = vec![];
     let mut optional: Vec<(String, Vec<String>)> = vec![];
@@ -809,6 +811,7 @@ pub(super) fn prepare(
     }
     builder.allocate(&comparison, Some(2))?;
     builder.continuity()?;
+    crate::work_timing::lap("prepare_discover_targets", &mut lap);
     builder.retirement()?;
     builder.allocate(&comparison, Some(6))?;
     // After reserved comparison slots, at most LESSON_SUBJECTS per lesson.
@@ -818,6 +821,7 @@ pub(super) fn prepare(
     builder.allocate(&optional, None)?;
     builder.continuity()?;
     builder.retirement()?;
+    crate::work_timing::lap("prepare_allocate", &mut lap);
     // Bounded continuation: in cursor-free admission, a candidate whose top exact,
     // lexical or semantic target did not fit the ceiling stays pending for a later batch
     // instead of being decided without them. At least one candidate always proceeds.
@@ -882,6 +886,7 @@ pub(super) fn prepare(
             n["named_entities"] = json!(supplied);
         }
     }
+    crate::work_timing::lap("prepare_defer", &mut lap);
     let node_ids = builder.nodes.keys().cloned().collect::<Vec<_>>();
     if !node_ids.is_empty() {
         for mut edge in rows(
@@ -907,8 +912,11 @@ pub(super) fn prepare(
             loops::snapshot(db, id, item["version"].as_i64().unwrap_or(1))?,
         );
     }
+    crate::work_timing::lap("prepare_relations_loops", &mut lap);
     builder.technical_context(&candidates)?;
+    crate::work_timing::lap("prepare_technical", &mut lap);
     let later = builder.later_context(&candidates)?;
+    crate::work_timing::lap("prepare_later", &mut lap);
     let mut unchecked: Map<String, Value> = Map::new();
     for (key, queue) in &subjects {
         let missing = queue
