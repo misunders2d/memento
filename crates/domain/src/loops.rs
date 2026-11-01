@@ -473,6 +473,7 @@ fn closed_at(db: &Connection, target: &str) -> Result<Option<String>> {
     }
     latest(boundaries.iter().map(String::as_str))
 }
+/// `due` is the automatic due date of a marker this call creates.
 pub fn mark(
     tx: &WriteTxn,
     commit: &str,
@@ -480,12 +481,13 @@ pub fn mark(
     open_loop: Option<bool>,
     evidence_target: Option<&str>,
     evidence_loop: Option<&Value>,
+    due: Option<&str>,
 ) -> Result<()> {
     if open_loop != Some(true) {
         return Ok(());
     }
     let Some(previous) = current(tx.sql(), target)? else {
-        append(tx, commit, target, "open", None, None)?;
+        append(tx, commit, target, "open", due, None)?;
         return Ok(());
     };
     if previous["state"] != "closed"
@@ -505,9 +507,13 @@ pub fn mark(
     )?;
     for row in sources {
         if parse_time(get_str(&row, "occurred_at")?)? > boundary {
-            let due = evidence_loop
-                .and_then(|value| value["due_at"].as_str())
-                .or_else(|| previous["due_at"].as_str());
+            let incoming = evidence_loop.and_then(|value| value["due_at"].as_str());
+            // A manual reminder survives reopening by automatically dated evidence.
+            let due = if manual_due(tx.sql(), target)? && !manual_due(tx.sql(), evidence_target.unwrap())? {
+                previous["due_at"].as_str().or(incoming)
+            } else {
+                incoming.or_else(|| previous["due_at"].as_str())
+            };
             append(
                 tx,
                 commit,
@@ -521,14 +527,67 @@ pub fn mark(
     }
     Ok(())
 }
+/// Whether a manual `remind` set a due date anywhere in `target`'s lineage. Only
+/// `remind` sets a due date manually; other manual actions carry it forward.
+pub fn manual_due(db: &Connection, target: &str) -> Result<bool> {
+    for branch in lineage(db, target)? {
+        if one(
+            db,
+            "SELECT 1 FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? AND json_extract(c.request,'$.command.op')='loop' AND json_extract(c.request,'$.command.action')='remind' LIMIT 1",
+            [&branch],
+        )?
+        .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+/// Sets an automatic due date, resolved from an explicit date in `sources`, on
+/// `target`'s open loop. A manual reminder in its lineage (or `origin`'s) and a
+/// live deferral always win. Unless `fresh` (the marker comes from these same
+/// sources), the sources must be newer than the pending evidence at `version`
+/// and any manual choice, as for closure.
+#[allow(clippy::too_many_arguments)]
+pub fn automatic_due(
+    tx: &WriteTxn,
+    commit: &str,
+    target: &str,
+    version: i64,
+    due: &str,
+    sources: &[Option<String>],
+    fresh: bool,
+    origin: Option<&str>,
+) -> Result<&'static str> {
+    let Some(marker) = current(tx.sql(), target)? else {
+        return Ok("not_open");
+    };
+    if marker["state"] != "open" {
+        return Ok("not_open");
+    }
+    if marker["due_at"].as_str() == Some(due) {
+        return Ok("unchanged");
+    }
+    if manual_due(tx.sql(), target)?
+        || origin.map(|origin| manual_due(tx.sql(), origin)).transpose()? == Some(true)
+        || marker["deferred_until"].as_str().is_some_and(|until| until > now().as_str())
+    {
+        return Ok("protected_loop_choice");
+    }
+    if !fresh {
+        if let (_, Some(status)) = closure_time(&snapshot(tx.sql(), target, version)?, sources)? {
+            return Ok(status);
+        }
+    }
+    append(tx, commit, target, "open", Some(due), marker["deferred_until"].as_str())?;
+    Ok("updated")
+}
 pub fn decline_extracted(tx: &WriteTxn, commit: &str, target: &str) -> Result<bool> {
     let Some(marker) = current(tx.sql(), target)? else {
         return Ok(false);
     };
-    if marker["state"] != "open"
-        || !marker["due_at"].is_null()
-        || !marker["deferred_until"].is_null()
-    {
+    // Every event below is from extraction, so a due date here is automatic.
+    if marker["state"] != "open" || !marker["deferred_until"].is_null() {
         return Ok(false);
     }
     let records = rows(
@@ -582,13 +641,12 @@ pub fn decline_automatic(
         ));
     }
     let marker = current(tx.sql(), target)?;
+    // A manual reminder is a manual choice; an automatic due date does not protect.
     if (n["state"] != "active" && n["tier"] != "candidate")
         || protected(tx.sql(), &n)?
         || !live["manual_choice_at"].is_null()
         || marker.as_ref().is_none_or(|value| {
-            value["state"] != "open"
-                || !value["due_at"].is_null()
-                || !value["deferred_until"].is_null()
+            value["state"] != "open" || !value["deferred_until"].is_null()
         })
     {
         return Ok(json!({"id":target,"status":"protected_loop_choice"}));
@@ -1216,7 +1274,7 @@ mod responsibility_tests {
                     },
                     &json!({"op":"extract"}),
                     |tx, commit| {
-                        mark(tx, commit, &target, Some(true), None, None)?;
+                        mark(tx, commit, &target, Some(true), None, None, None)?;
                         Ok(json!({}))
                     },
                 )
@@ -1246,7 +1304,7 @@ mod responsibility_tests {
                     },
                     &json!({"op":"consolidate"}),
                     |tx, commit| {
-                        mark(tx, commit, &target, Some(true), Some(&fresh), None)?;
+                        mark(tx, commit, &target, Some(true), Some(&fresh), None, None)?;
                         Ok(json!({}))
                     },
                 )

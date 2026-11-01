@@ -11,6 +11,7 @@ pub mod extraction;
 pub mod forgetting;
 pub mod importance;
 pub mod jobs;
+pub mod loop_due;
 pub mod loops;
 pub mod pipeline_schema;
 pub mod processing;

@@ -69,6 +69,17 @@
           ],
           "title": "Dst"
         },
+        "due": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Due"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "evidence": {
           "items": {
             "$ref": "#/$defs/Source"
@@ -344,6 +355,35 @@
         "authority"
       ],
       "title": "Behavior",
+      "type": "object"
+    },
+    "Due": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "At",
+          "type": "string"
+        },
+        "overdue": {
+          "title": "Overdue",
+          "type": "boolean"
+        },
+        "quote": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Quote",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "quote",
+        "overdue"
+      ],
+      "title": "Due",
       "type": "object"
     },
     "Repair": {

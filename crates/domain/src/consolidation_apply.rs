@@ -8,7 +8,7 @@ use crate::{
     extraction::source_span,
     importance,
     jobs::{Job, timestamp},
-    loops,
+    loop_due, loops,
     pipeline_schema::{self, WorkResult, reject},
 };
 use memento_core::{Error, Result, WriteTxn};
@@ -364,6 +364,35 @@ fn validate(
                     None,
                 ));
             }
+        }
+        if !action["due"].is_null() {
+            // The date expression must be in an original premise quote and resolves
+            // against that source's time; later_context never dates a pending loop.
+            let cited = action["evidence"].as_array().unwrap().iter().find(|source| {
+                original.contains(source["episode_id"].as_str().unwrap())
+                    && action["due"]["quote"]
+                        .as_str()
+                        .is_some_and(|expression| source["quote"].as_str().unwrap().contains(expression))
+            });
+            let resolved = match cited {
+                _ if action["open_loop"] != true => Err(loop_due::Invalid::Format),
+                None => Err(loop_due::Invalid::Quote),
+                Some(source) => loop_due::resolve(
+                    &action["due"],
+                    source["quote"].as_str().unwrap(),
+                    episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str(),
+                    context["timezone"].as_str(),
+                ),
+            };
+            let at = resolved.map_err(|invalid| {
+                let code = match invalid {
+                    loop_due::Invalid::Format => "consolidation_due_invalid",
+                    loop_due::Invalid::Quote => "consolidation_due_quote_invalid",
+                    loop_due::Invalid::BeforeSource => "consolidation_due_before_source",
+                };
+                reject_item(code, action, None)
+            })?;
+            action["_due_at"] = json!(at);
         }
         validate_behavior(action, candidate, &episodes, &traces).map_err(|error| match error {
             Error::Validation(code) => reject_item(code, action, None),
@@ -740,7 +769,10 @@ pub(super) fn apply(
         let mut results=Map::new();let mut loop_responsibilities=Map::new();let mut destinations:Map<String,Value>=Map::new();let mut resolutions=prepared.resolutions.clone();let mut lessons=vec![];let mut actions=prepared.actions.clone();actions.sort_by_key(|action|(action["operation"]=="link",!matches!(action["operation"].as_str(),Some("remember"|"reject"|"defer"))));
         for action in &actions{let candidate_id=get_str(action,"candidate_id")?;let candidate=&prepared.selected[candidate_id];if one(tx.sql(),&format!("SELECT 1 FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"),[candidate_id])?.is_none(){continue;}let decision=one(tx.sql(),"SELECT id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1",[candidate_id])?;if decision.map(|decision|decision["id"].clone()).unwrap_or(Value::Null)!=candidate["decision_id"]{return Err(Error::Conflict("Candidate decision changed while consolidation was running"));}
             let(mut result,state)=apply_action(tx,commit,action,candidate,&resolutions,&prepared.nodes,&destinations)?;let target=result["superseded_by"].as_str().or_else(||result["merged_into"].as_str()).or_else(||result["id"].as_str()).map(str::to_owned);
-            if state=="promote"{if let Some(target)=&target{let marker=loops::current(tx.sql(),candidate_id)?;if !(action["open_loop"]==false&&loops::decline_extracted(tx,commit,candidate_id)?){loops::transfer(tx,commit,candidate_id,target)?;}importance::transfer_usage(tx,candidate_id,target)?;loops::mark(tx,commit,target,action["open_loop"].as_bool(),Some(candidate_id),marker.as_ref())?;}}else if state=="review"{loops::mark(tx,commit,candidate_id,action["open_loop"].as_bool(),None,None)?;}
+            if state=="promote"{if let Some(target)=&target{let marker=loops::current(tx.sql(),candidate_id)?;let fresh=loops::current(tx.sql(),target)?.is_none();if !(action["open_loop"]==false&&loops::decline_extracted(tx,commit,candidate_id)?){loops::transfer(tx,commit,candidate_id,target)?;}importance::transfer_usage(tx,candidate_id,target)?;loops::mark(tx,commit,target,action["open_loop"].as_bool(),Some(candidate_id),marker.as_ref(),None)?;
+                // This plan's explicit due date, else the candidate's own one for a reaffirmed existing loop.
+                let due=action["_due_at"].as_str().or_else(||marker.as_ref().filter(|marker|!fresh&&action["open_loop"]==true&&marker["state"]=="open").and_then(|marker|marker["due_at"].as_str()));if let Some(due)=due{let sources=candidate["evidence"].as_array().unwrap().iter().map(|source|source["occurred_at"].as_str().map(str::to_owned)).collect::<Vec<_>>();loops::automatic_due(tx,commit,target,frozen_version(target.as_str()),due,&sources,fresh,Some(candidate_id))?;}}}
+            else if state=="review"{loops::mark(tx,commit,candidate_id,action["open_loop"].as_bool(),None,None,action["_due_at"].as_str())?;if let Some(due)=action["_due_at"].as_str(){loops::automatic_due(tx,commit,candidate_id,1,due,&[],true,None)?;}}
             let role_target=if state=="promote"{target.as_deref()}else if state=="review"{Some(candidate_id)}else{None};if let (Some(role_target),Some(value))=(role_target,action["responsibility"].as_str()){if loops::current(tx.sql(),role_target)?.is_some(){let role=loops::assign_automatic(tx,commit,role_target,value,&action["evidence"])?;if let Some(map)=role["loop_responsibilities"].as_object(){loop_responsibilities.extend(map.clone());}}}
             tx.sql().execute("INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",params![id(),candidate_id,commit,state,target,if state=="defer"{Some(timestamp()+3600.0)}else{None}])?;if ["promote","reject"].contains(&state){tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='candidate' AND target=?)",[candidate_id])?;}tx.touch_target(candidate_id)?;
             if state=="promote"{if let Some(target)=&target{resolutions.insert(candidate_id.into(),json!(target));if action["operation"]=="supersede"{if let Some(previous)=action["target"].as_str(){let previous=resolutions.get(previous).and_then(Value::as_str).unwrap_or(previous);if previous!=target{destinations.insert(previous.into(),json!(target));}}}}}
