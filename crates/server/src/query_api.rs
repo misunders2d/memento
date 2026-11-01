@@ -187,23 +187,25 @@ pub async fn status(
                             .map(str::to_owned),
                     };
                 }
+                let indexing_started = std::time::Instant::now();
+                if state.recall.is_some() {
+                    // Global latest count; an exact recount runs in the background.
+                    let projection = state.services.as_ref().and_then(|s| s.projection());
+                    let failed = state
+                        .services
+                        .as_ref()
+                        .is_some_and(|s| s.index_error.load(Ordering::Acquire));
+                    let now = memento_domain::jobs::timestamp();
+                    runtime.indexing = crate::index_counts::view(
+                        state.index_counts.current(&state.store, now),
+                        failed,
+                        projection.as_ref().is_some_and(|p| p.ready(Tier::Hot)),
+                        projection.as_ref().is_some_and(|p| p.ready(Tier::Cold)),
+                        now,
+                    );
+                }
+                stages.push(("indexing", indexing_started.elapsed().as_micros()));
                 let result = state.store.read(|tx| {
-                    let indexing_started = std::time::Instant::now();
-                    if state.recall.is_some() {
-                        let projection = state.services.as_ref().and_then(|s| s.projection());
-                        let failed = state
-                            .services
-                            .as_ref()
-                            .is_some_and(|s| s.index_error.load(Ordering::Acquire));
-                        runtime.indexing = crate::indexing::status(
-                            tx.sql(),
-                            query.source.as_deref(),
-                            failed,
-                            projection.as_ref().is_some_and(|p| p.ready(Tier::Hot)),
-                            projection.as_ref().is_some_and(|p| p.ready(Tier::Cold)),
-                        )?;
-                    }
-                    stages.push(("indexing", indexing_started.elapsed().as_micros()));
                     operational_status::operational_status_timed(
                         tx.sql(),
                         query.source.as_deref(),

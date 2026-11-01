@@ -342,11 +342,12 @@ pub fn status(
     );
     let mut result = records::one(db, &sql, [source])?
         .ok_or(Error::Unavailable("Index counts are unavailable"))?;
-    records::merge(
-        &mut result,
-        json!({"available":true,"error":if error {Some("NativeIndexingError")}else{None},"search":{"engine":"qdrant-edge","ready":hot_ready,"cold_ready":cold_ready,"error":if hot_ready {None}else{Some("not_ready")}}}),
-    );
+    records::merge(&mut result, live_fields(error, hot_ready, cold_ready));
     Ok(result)
+}
+/// Live worker/search readiness, independent of the unit counts.
+pub fn live_fields(error: bool, hot_ready: bool, cold_ready: bool) -> Value {
+    json!({"available":true,"error":if error {Some("NativeIndexingError")}else{None},"search":{"engine":"qdrant-edge","ready":hot_ready,"cold_ready":cold_ready,"error":if hot_ready {None}else{Some("not_ready")}}})
 }
 #[cfg(test)]
 mod status_tests {

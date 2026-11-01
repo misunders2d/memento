@@ -3,6 +3,7 @@ mod anchors;
 pub mod assets;
 pub mod bootstrap;
 mod connect_guide;
+mod index_counts;
 mod drive_api;
 pub mod indexing;
 mod legacy_text;
@@ -169,6 +170,7 @@ pub struct AppState {
     pub media_enabled: bool,
     pub services: Option<Arc<runtime::Services>>,
     status_admission: Arc<tokio::sync::Semaphore>,
+    index_counts: Arc<index_counts::IndexCounts>,
     /// Viewer reads share two blocking workers so browsing cannot crowd out recall.
     viewer_admission: Arc<tokio::sync::Semaphore>,
     recall_repairs: Arc<std::sync::Mutex<std::collections::HashSet<Vec<String>>>>,
@@ -186,6 +188,7 @@ impl AppState {
             media_enabled: false,
             services: None,
             status_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            index_counts: Arc::new(index_counts::IndexCounts::default()),
             viewer_admission: Arc::new(tokio::sync::Semaphore::new(2)),
             recall_repairs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
