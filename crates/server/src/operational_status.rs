@@ -9,7 +9,7 @@ use memento_domain::{
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct StatusQuery {
@@ -166,6 +166,21 @@ pub fn operational_status(
     runtime: &RuntimeStatus,
     now: f64,
 ) -> Result<Value> {
+    operational_status_timed(db, source, runtime, now, &mut Vec::new())
+}
+/// Same counts; appends per-section elapsed microseconds for the timing log.
+pub fn operational_status_timed(
+    db: &Connection,
+    source: Option<&str>,
+    runtime: &RuntimeStatus,
+    now: f64,
+    stages: &mut Vec<(&'static str, u128)>,
+) -> Result<Value> {
+    let mut last = Instant::now();
+    let mut lap = |name: &'static str| {
+        stages.push((name, last.elapsed().as_micros()));
+        last = Instant::now();
+    };
     if !runtime.indexing.is_object() || !runtime.indexing["available"].is_boolean() {
         return Err(Error::Unavailable("Live indexing status is unavailable"));
     }
@@ -184,13 +199,16 @@ pub fn operational_status(
         rusqlite::params_from_iter(source),
         |r| r.get(0),
     )?;
+    lap("episodes");
     let captured = json!({"episodes":episodes,"conversations":conversation_count(db,source)?});
+    lap("conversations");
     let raw_index = if source.is_some() {
         "episodes_status_cover_v1"
     } else {
         "episodes_status_raw_v1"
     };
     let mut raw=one(db,&format!("SELECT coalesce(sum(text_runs IS NULL),0) AS inline_raw_episodes,coalesce(sum(CASE (text_runs IS NULL) WHEN 1 THEN length(CAST(text AS BLOB)) ELSE 0 END),0) AS inline_raw_bytes,coalesce(sum(NOT(text_runs IS NULL)),0) AS offloaded_raw_episodes FROM episodes INDEXED BY {raw_index} WHERE kind IN ('native_record','native_live_record','native_hook') AND CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS TEXT)='skip'{source_and}"),rusqlite::params_from_iter(source))?.unwrap();
+    lap("raw_inline");
     let compressed=one(db,&format!("SELECT coalesce(sum(record_count),0) AS records,coalesce(sum(raw_size),0) AS original,coalesce(sum(length(data)),0) AS stored FROM raw_frames INDEXED BY raw_frames_status_cover_v1{source_where}"),rusqlite::params_from_iter(source))?.unwrap();
     raw["inline_raw_episodes"] = json!(
         raw["inline_raw_episodes"].as_i64().unwrap() - compressed["records"].as_i64().unwrap()
@@ -200,13 +218,17 @@ pub fn operational_status(
     raw["compressed_raw_bytes"] = compressed["stored"].clone();
     let objects=one(db,"SELECT count(*) AS objects,coalesce(sum(size),0) AS bytes,coalesce(sum(remote_id IS NULL),0) AS local_objects,coalesce(sum(CASE WHEN remote_id IS NULL THEN size ELSE 0 END),0) AS local_bytes,coalesce(sum(remote_id IS NOT NULL),0) AS remote_objects,coalesce(sum(CASE WHEN remote_id IS NOT NULL THEN size ELSE 0 END),0) AS remote_bytes FROM blobs",[])?.unwrap();
     let artifacts = json!({"scope":"global","registered":{"objects":objects["objects"],"bytes":objects["bytes"]},"local_only":{"objects":objects["local_objects"],"bytes":objects["local_bytes"]},"verified_remote":{"objects":objects["remote_objects"],"bytes":objects["remote_bytes"]}});
+    lap("raw_frames_and_artifacts");
     let mut extraction = jobs(db, "extract", source)?;
+    lap("extraction_jobs");
     extraction["pending_conversations"] = json!(pending_conversations(db, source)?);
+    lap("pending_conversations");
     extraction["parked_conversations"] = json!(db.query_row(
         "SELECT count(*) FROM historical_parking WHERE (?1 IS NULL OR source=?1)",
         [source],
         |r| r.get::<_, i64>(0)
     )?);
+    lap("parked_conversations");
     let mut progress = rows(
         db,
         "SELECT p.source,p.conversation_id,p.seq AS cursor,p.offset,p.compact_through,p.latest_seq,h.parked_through,h.live_seq AS live_cursor,h.live_offset FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND h.conversation_id=p.conversation_id WHERE (?1 IS NULL OR p.source=?1) ORDER BY p.source,p.conversation_id",
@@ -221,9 +243,12 @@ pub fn operational_status(
         }
     }
     extraction["progress"] = json!(progress);
+    lap("extraction_progress");
     let mut consolidation = jobs(db, "consolidate", source)?;
+    lap("consolidation_jobs");
     let awaiting = AWAITING.replace("?3", "?1");
     let pending=one(db,&format!("WITH candidate_status AS MATERIALIZED (SELECT ({ELIGIBLE}) AS eligible,NOT EXISTS(SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {awaiting}) AS ready,EXISTS(SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL) AS parked FROM candidates c WHERE {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND e.source=?2))) SELECT coalesce(sum(eligible AND NOT parked),0) AS pending_candidates,coalesce(sum(eligible AND ready AND NOT parked),0) AS ready_candidates,coalesce(sum(NOT eligible),0) AS excluded_legacy_candidates,coalesce(sum(eligible AND parked),0) AS parked_candidates FROM candidate_status"),params![now,source])?.unwrap();
+    lap("candidates");
     consolidation
         .as_object_mut()
         .unwrap()
@@ -231,10 +256,14 @@ pub fn operational_status(
     let mut repair=one(db,"SELECT coalesce(sum(state='pending'),0) AS pending,coalesce(sum(state='done'),0) AS done FROM repair_groups",[])?.unwrap();
     repair["scope"] = json!("global");
     consolidation["repair_groups"] = repair;
+    lap("repair_groups");
     let mut historical = historical_status(db)?;
+    lap("historical");
     historical["scope"] = json!("global");
     let mut media = jobs(db, "media", source)?;
+    lap("media_jobs");
     media["captured_attachments"] = captured_media_status(db, source)?;
+    lap("captured_media");
     Ok(
         json!({"source":source,"captured":captured,"raw_storage":raw,"artifact_storage":artifacts,"indexing":runtime.indexing,"extraction":extraction,"consolidation":consolidation,"historical":historical,"media":media,"drive":runtime.drive}),
     )

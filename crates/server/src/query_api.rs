@@ -169,9 +169,12 @@ pub async fn status(
     Ok(protect(
         Json(
             admitted_blocking(state.status_admission.clone(), move || {
+                let started = std::time::Instant::now();
+                let mut stages: Vec<(&'static str, u128)> = Vec::new();
                 let mut runtime = RuntimeStatus::disabled();
                 if let Some(services) = &state.services {
                     let cold = services.cold_status()?;
+                    stages.push(("drive", started.elapsed().as_micros()));
                     runtime.drive = DriveStatus {
                         connected: services.cold().is_some(),
                         reauthorization_required: services.reauthorization.load(Ordering::Acquire),
@@ -184,7 +187,8 @@ pub async fn status(
                             .map(str::to_owned),
                     };
                 }
-                state.store.read(|tx| {
+                let result = state.store.read(|tx| {
+                    let indexing_started = std::time::Instant::now();
                     if state.recall.is_some() {
                         let projection = state.services.as_ref().and_then(|s| s.projection());
                         let failed = state
@@ -199,13 +203,23 @@ pub async fn status(
                             projection.as_ref().is_some_and(|p| p.ready(Tier::Cold)),
                         )?;
                     }
-                    operational_status::operational_status(
+                    stages.push(("indexing", indexing_started.elapsed().as_micros()));
+                    operational_status::operational_status_timed(
                         tx.sql(),
                         query.source.as_deref(),
                         &runtime,
                         memento_domain::jobs::timestamp(),
+                        &mut stages,
                     )
-                })
+                });
+                // One stderr line per request: section names and microseconds only.
+                let stages_us: serde_json::Map<String, Value> =
+                    stages.into_iter().map(|(k, v)| (k.to_owned(), json!(v as u64))).collect();
+                eprintln!(
+                    "{}",
+                    json!({"event":"status_timing","ok":result.is_ok(),"source_filtered":query.source.is_some(),"total_us":started.elapsed().as_micros() as u64,"stages_us":stages_us})
+                );
+                result
             })
             .await?,
         )
