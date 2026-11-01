@@ -168,6 +168,12 @@ impl Store {
             tx.execute_batch(include_str!("status_indexes.sql"))?;
             tx.commit()?;
         }
+        // Admits deletion of excluded episodes' vectorless, uncited chunk rows only;
+        // DDL-only, after the message index it uses. Older header5 images never delete chunks.
+        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name='episode_chunks_no_DELETE_v2')",[],|r|r.get::<_,bool>(0))?{
+            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("chunk_retirement.sql"))?;tx.commit()?;
+        }
         let relation_indexes: i64 = db.query_row(
             "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('search_candidate_relation_src_v1','search_candidate_relation_dst_v1')",
             [],

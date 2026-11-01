@@ -650,7 +650,7 @@ Ordinary people and their relationships consolidate automatically from source ev
 
 There is **no automatic database backup**. The backup command requests and verifies a manual Drive snapshot.
 
-To reclaim database space after background compression, the service owner runs:
+To reclaim database space after background compression, or after the startup cleanup that removes old vectors and chunk rows of raw episodes that are no longer indexed (tool output, tool-call turns, hooks and instructions; cited chunks are kept), the service owner runs:
 
 ```sh
 docker compose exec memory /usr/local/bin/memento-admin --data-dir /data compact

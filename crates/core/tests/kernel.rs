@@ -577,3 +577,31 @@ fn loop_lineage_index_upgrade_preserves_header_evidence_and_healthy_schema() {
         after
     );
 }
+
+#[test]
+fn open_replaces_the_chunk_delete_guard_once_and_keeps_other_deletes_refused() {
+    let (_dir, store) = store();
+    let path = store.data_dir().to_owned();
+    drop(store);
+    // A database created before chunk retirement carries the unconditional guard.
+    let db = Connection::open(path.join("memory.sqlite")).unwrap();
+    db.execute_batch("DROP TRIGGER episode_chunks_no_DELETE_v2; CREATE TRIGGER episode_chunks_no_DELETE BEFORE DELETE ON episode_chunks BEGIN SELECT RAISE(ABORT,'graph history is immutable'); END;").unwrap();
+    drop(db);
+    let store = Store::open(&path).unwrap();
+    let triggers = store
+        .read(|tx| {
+            let mut query = tx.sql().prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name='episode_chunks' ORDER BY name")?;
+            Ok(query.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(triggers, ["episode_chunks_no_DELETE_v2", "episode_chunks_no_UPDATE", "episode_chunks_no_replace"]);
+    store
+        .write(|tx| {
+            tx.sql().execute_batch("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(1,'message','fixture','m','chat','user','Human text',NULL,'{}','2026-11-01T00:00:00+00:00'),(2,'output','fixture','o','chat','tool','Tool text',NULL,'{\"extraction_mode\":\"tool_output\"}','2026-11-01T00:00:00+00:00'); INSERT INTO episode_chunks VALUES('chunk-message','message',0,5),('chunk-output','output',0,4);")?;
+            Ok(())
+        })
+        .unwrap();
+    let delete = |id: &str| store.write(|tx| Ok(tx.sql().execute("DELETE FROM episode_chunks WHERE id=?", [id])?));
+    assert!(format!("{:?}", delete("chunk-message").unwrap_err()).contains("graph history is immutable"));
+    assert_eq!(delete("chunk-output").unwrap(), 1);
+}
