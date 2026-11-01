@@ -1078,7 +1078,8 @@ mod overlap_tests {
 
     #[test]
     fn lexical_matches_the_stored_column_join() {
-        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
         let store = memento_core::Store::open(dir.path()).unwrap();
         let texts = ["Launch plan for Memento", "Memento launch moved", "Plan the garden", "Launch launch launch", "Old memento plan", "Memento"];
         store.write(|tx| {
