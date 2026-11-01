@@ -48,7 +48,7 @@ async function api(path, params, signal) {
 const typeColor = type => TYPE_COLORS[TYPES.indexOf(type)] || css('--muted');
 const when = value => value ? new Date(value).toLocaleString() : '';
 const loopColor = loop => loop.deferred ? css('--deferred') : loop.overdue ? css('--overdue') : loop.due_at ? css('--due') : css('--open');
-const roleText = role => ({owner: 'For owner', other: 'Other person', unknown: 'Unspecified'}[role] || 'Unspecified');
+const roleText = role => ({owner: 'For owner', other: 'Other person', unknown: 'Unresolved, no assignee'}[role] || 'Unresolved, no assignee');
 const loopText = loop => `${roleText(loop.responsibility)} · ${loop.deferred ? 'deferred' : loop.overdue ? `overdue since ${when(loop.due_at)}` : loop.due_at ? `due ${when(loop.due_at)}` : 'open, no date'}`;
 const harness = source => source.split(':').pop();
 
@@ -216,7 +216,8 @@ function status(text) {
 
 function summary(data) {
   const shown = state.graph ? `${state.graph.order.toLocaleString()} of ${data.total_nodes.toLocaleString()} memories, ${state.graph.size.toLocaleString()} links` : '';
-  return `${shown} · ${data.loops.open.toLocaleString()} open loops${data.loops.deferred ? `, ${data.loops.deferred.toLocaleString()} deferred` : ''}`;
+  const unresolved = state.view === 'loops' && state.responsibility === 'unknown' ? 'unresolved, no assignee' : 'open loops';
+  return `${shown} · ${data.loops.open.toLocaleString()} ${unresolved}${data.loops.deferred ? `, ${data.loops.deferred.toLocaleString()} deferred` : ''}${state.responsibility === '' && data.loops.unresolved ? ` · ${data.loops.unresolved.toLocaleString()} unresolved` : ''}`;
 }
 
 // A newer view or filter replaces any graph request still in flight.

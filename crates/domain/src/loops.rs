@@ -867,10 +867,13 @@ pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
             let selected=visible_loop_targets(db,rows(db,&sql,params![now,cutoff,command.scope])?)?;
             let ids=selected.iter().map(|row|row["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
             let roles=responsibilities(db,&ids)?;
-            let matches=selected.iter().filter(|row|command.responsibility.as_deref().is_none_or(|wanted|roles.get(row["id"].as_str().unwrap()).and_then(|role|role["responsibility"].as_str()).unwrap_or("unknown")==wanted)).collect::<Vec<_>>();
+            let role=|row:&Value|roles.get(row["id"].as_str().unwrap()).and_then(|role|role["responsibility"].as_str()).unwrap_or("unknown");
+            // Without a filter, list only assigned loops; unknown ones are unresolved, not obligations.
+            let matches=selected.iter().filter(|row|match command.responsibility.as_deref() {None=>role(row)!="unknown",Some(wanted)=>role(row)==wanted}).collect::<Vec<_>>();
+            let unresolved=selected.iter().filter(|row|role(row)=="unknown").count();
             let total=json!(matches.len());let mut values=vec![];
             for row in matches.into_iter().take(command.limit) {if let Some(mut value)=target(db,get_str(row,"id")?)? {for key in ["id","state","due_at","deferred_until"] {value[key]=row[key].clone();}value["responsibility"]=json!(roles.get(row["id"].as_str().unwrap()).and_then(|role|role["responsibility"].as_str()).unwrap_or("unknown"));values.push(value);}}
-            Ok(json!({"loops":values,"total":total}))
+            Ok(json!({"loops":values,"total":total,"unresolved":unresolved}))
         });
     }
     let target_id = command

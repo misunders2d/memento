@@ -279,7 +279,11 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
     }
     let inside = q.scope.as_deref();
     let wanted = q.responsibility.as_deref();
-    let keep = |roles: &HashMap<String, Value>, target: &str| wanted.is_none_or(|w| w == role(roles, target));
+    // Unfiltered views show assigned loops; unresolved (unknown) ones only on request.
+    let keep = |roles: &HashMap<String, Value>, target: &str| match wanted {
+        None => role(roles, target) != "unknown",
+        Some(w) => w == role(roles, target),
+    };
     let total_nodes: usize = db.query_row(
         &format!("SELECT count(*) FROM {NODES} WHERE {CURRENT_NODE} AND {IN_SCOPE}"),
         [inside],
@@ -295,8 +299,7 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
         .map(|row| (row["target"].as_str().unwrap().to_owned(), row))
         .collect::<HashMap<_, _>>();
     let targets = markers.keys().cloned().collect::<Vec<_>>();
-    // A responsibility filter needs every open loop's role; otherwise only returned loops need one.
-    let mut roles = if wanted.is_some() { loops::responsibilities(db, &targets)? } else { HashMap::new() };
+    let roles = loops::responsibilities(db, &targets)?;
     let loop_nodes = current(db, inside, &targets)?;
     let loop_edges = rows(db, &format!("SELECT e.id,e.src,e.dst FROM edge_versions e WHERE e.id IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE}"), [serde_json::to_string(&targets)?])?
         .into_iter()
@@ -305,8 +308,15 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
     let ends = current(db, inside, &loop_edges.iter().flat_map(|e| [e["src"].as_str().unwrap().to_owned(), e["dst"].as_str().unwrap().to_owned()]).collect::<Vec<_>>())?;
     let loop_edges = loop_edges
         .into_iter()
-        .filter(|e| ends.contains_key(e["src"].as_str().unwrap()) && ends.contains_key(e["dst"].as_str().unwrap()) && keep(&roles, e["id"].as_str().unwrap()))
+        .filter(|e| ends.contains_key(e["src"].as_str().unwrap()) && ends.contains_key(e["dst"].as_str().unwrap()))
         .collect::<Vec<_>>();
+    let unknown = |id: &str| role(&roles, id) == "unknown";
+    let mut unresolved = loop_nodes.iter().filter(|(id, scoped)| **scoped && unknown(id)).count()
+        + loop_edges
+            .iter()
+            .filter(|e| (ends[e["src"].as_str().unwrap()] || ends[e["dst"].as_str().unwrap()]) && unknown(e["id"].as_str().unwrap()))
+            .count();
+    let loop_edges = loop_edges.into_iter().filter(|e| keep(&roles, e["id"].as_str().unwrap())).collect::<Vec<_>>();
     let deferred = |target: &str| loop_value(&markers[target], now)["deferred"] == true;
     let mut looped = loop_nodes
         .iter()
@@ -322,6 +332,9 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
     let mut candidates = Vec::new();
     for row in loops::visible_loop_targets(db,rows(db,&format!("SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?)? {
         let item = json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"])?,"loop":null});
+        if within(&item, inside) && unknown(row["id"].as_str().unwrap()) {
+            unresolved += 1;
+        }
         if within(&item, inside) && keep(&roles, row["id"].as_str().unwrap()) {
             looped.push(loop_value(&row, now)["deferred"] == true);
             candidates.push((row, item));
@@ -338,9 +351,6 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
     };
     let candidate_total = candidates.len();
     candidates.truncate(candidate_limit);
-    if wanted.is_none() && !candidates.is_empty() {
-        roles.extend(loops::responsibilities(db, &candidates.iter().map(|(row, _)| row["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?);
-    }
     let items = candidates
         .into_iter()
         .map(|(mut row, mut item)| {
@@ -349,7 +359,7 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
             item
         })
         .collect::<Vec<_>>();
-    let loop_counts = json!({"open":looped.iter().filter(|d|!**d).count(),"deferred":looped.iter().filter(|d|**d).count(),"candidates":{"total":candidate_total,"items":items}});
+    let loop_counts = json!({"open":looped.iter().filter(|d|!**d).count(),"deferred":looped.iter().filter(|d|**d).count(),"unresolved":unresolved,"candidates":{"total":candidate_total,"items":items}});
     let mut result = json!({"view":q.view,"total_nodes":total_nodes,"total_edges":total_edges,"loops":loop_counts,"too_large":false,"nodes":[],"edges":[]});
     let mut focus = HashSet::new();
     if q.view == "around" {
@@ -429,15 +439,6 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
         Some(map) => map,
         None => behavior_map(db, &nodes.iter().filter(|n| n["type"] == "experience").map(|n| n["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?,
     };
-    let marked = nodes
-        .iter()
-        .chain(&edges)
-        .map(|item| item["id"].as_str().unwrap().to_owned())
-        .filter(|id| markers.contains_key(id))
-        .collect::<Vec<_>>();
-    if wanted.is_none() && !marked.is_empty() {
-        roles.extend(loops::responsibilities(db, &marked)?);
-    }
     let loop_of = |id: &str| {
         markers.get(id).filter(|_| keep(&roles, id)).map(|row| {
             let mut row = row.clone();

@@ -935,7 +935,7 @@
   {
     "name": "loop",
     "title": "Loop",
-    "description": "List/filter loops or adjust markers. assign labels responsibility; decline retracts an automatic false marker. Evidence-bearing close checks original chronology; only remind sets a reminder.",
+    "description": "List/filter loops or adjust markers. list returns assigned (owner/other) loops by default; responsibility unknown lists unresolved ones, which are not obligations. assign labels responsibility; decline retracts an automatic false marker. Evidence-bearing close checks original chronology; only remind sets a reminder.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

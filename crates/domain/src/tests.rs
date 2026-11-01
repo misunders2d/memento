@@ -257,17 +257,25 @@ fn loop_deadline_strict_cutoff_and_manual_chronology_protect_retirement() {
     let listed = f
         .graph
         .loop_command(parse(
-            json!({"action":"list","due_before":"2035-01-02T00:00:00Z"}),
+            json!({"action":"list","due_before":"2035-01-02T00:00:00Z","responsibility":"unknown"}),
         ))
         .unwrap();
     assert_eq!(listed["total"], 0);
     let listed = f
         .graph
         .loop_command(parse(
-            json!({"action":"list","due_before":"2035-01-02T00:00:00.000001Z"}),
+            json!({"action":"list","due_before":"2035-01-02T00:00:00.000001Z","responsibility":"unknown"}),
         ))
         .unwrap();
     assert_eq!(listed["total"], 1);
+    // An unassigned loop is unresolved: counted, but not listed as an obligation by default.
+    let listed = f
+        .graph
+        .loop_command(parse(
+            json!({"action":"list","due_before":"2035-01-02T00:00:00.000001Z"}),
+        ))
+        .unwrap();
+    assert_eq!((listed["total"].clone(), listed["unresolved"].clone()), (json!(0), json!(1)));
     assert_eq!(f.history(target).len(), snapshot.len());
     let expected = f
         .graph

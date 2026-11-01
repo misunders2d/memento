@@ -86,8 +86,10 @@ fn graph_scope_views_loop_counts_xss_and_forgotten_boundaries() {
             let all = graph(tx.sql(), &GraphQuery::default(), NOW)?;
             assert_eq!(all["total_nodes"], 3);
             assert_eq!(all["total_edges"], 1);
-            assert_eq!(all["loops"]["open"], 1);
-            assert_eq!(all["loops"]["deferred"], 1);
+            // Unassigned loops are unresolved: counted apart, not as open obligations.
+            assert_eq!((all["loops"]["open"].clone(), all["loops"]["deferred"].clone(), all["loops"]["unresolved"].clone()), (json!(0), json!(0), json!(2)));
+            let unresolved = graph(tx.sql(), &parse(json!({"responsibility":"unknown"})), NOW)?;
+            assert_eq!((unresolved["loops"]["open"].clone(), unresolved["loops"]["deferred"].clone()), (json!(1), json!(1)));
             assert!(
                 all["nodes"]
                     .as_array()
@@ -137,18 +139,19 @@ fn complete_loop_view_includes_candidates_beyond_default_cap_with_scope_and_forg
         Ok(())
     }).unwrap();
     f.store.read(|tx| {
-        let bounded = graph(tx.sql(), &parse(json!({"view":"loops"})), NOW)?;
+        assert_eq!(graph(tx.sql(), &parse(json!({"view":"loops"})), NOW)?["loops"]["candidates"]["total"], 0);
+        let bounded = graph(tx.sql(), &parse(json!({"view":"loops","responsibility":"unknown"})), NOW)?;
         assert_eq!(bounded["loops"]["candidates"]["total"], 102);
         assert_eq!(bounded["loops"]["candidates"]["items"].as_array().unwrap().len(), 100);
-        let complete = graph(tx.sql(), &parse(json!({"view":"loops","all":true})), NOW)?;
+        let complete = graph(tx.sql(), &parse(json!({"view":"loops","all":true,"responsibility":"unknown"})), NOW)?;
         assert_eq!(complete["too_large"], false);
         assert_eq!(complete["loops"]["open"], 102);
         assert_eq!(complete["loops"]["candidates"]["items"].as_array().unwrap().len(), 102);
-        let personal = graph(tx.sql(), &parse(json!({"view":"loops","all":true,"scope":"personal"})), NOW)?;
+        let personal = graph(tx.sql(), &parse(json!({"view":"loops","all":true,"scope":"personal","responsibility":"unknown"})), NOW)?;
         assert_eq!(personal["loops"]["candidates"]["total"], 101);
         assert_eq!(personal["loops"]["candidates"]["items"].as_array().unwrap().len(), 101);
         assert!(personal["loops"]["candidates"]["items"].as_array().unwrap().iter().all(|item|item["id"]!="loop-candidate-101" && item["id"]!="loop-candidate-102"));
-        assert_eq!(graph(tx.sql(), &parse(json!({"all":true})), NOW)?["loops"]["candidates"]["items"].as_array().unwrap().len(), 100);
+        assert_eq!(graph(tx.sql(), &parse(json!({"all":true,"responsibility":"unknown"})), NOW)?["loops"]["candidates"]["items"].as_array().unwrap().len(), 100);
         Ok(())
     }).unwrap();
 }
@@ -415,10 +418,13 @@ fn legacy_graph(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Resul
     }
     let markers = rows(db,&format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),[])?;
     let roles = loops::responsibilities(db,&markers.iter().map(|row|row["target"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?;
+    let keep = |role: &str| q.responsibility.as_deref().map_or(role != "unknown", |wanted| wanted == role);
+    let mut unknown = HashSet::new();
     for mut row in markers {
         let target = row["target"].as_str().unwrap().to_owned();
         let role=roles.get(&target).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown");
-        if q.responsibility.as_deref().is_some_and(|wanted|wanted!=role) { continue; }
+        if role == "unknown" { unknown.insert(target.clone()); }
+        if !keep(role) { continue; }
         row["responsibility"]=json!(role);
         if let Some(node) = nodes.get_mut(&target) {
             node["loop"] = loop_value(&row, now);
@@ -426,7 +432,15 @@ fn legacy_graph(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Resul
             edge["loop"] = loop_value(&row, now);
         }
     }
-    let candidates=loops::visible_loop_targets(db,rows(db,&format!("SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?)?.into_iter().map(|mut row|{row["responsibility"]=json!(roles.get(row["id"].as_str().unwrap()).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown"));Ok(json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"loop":loop_value(&row,now)}))}).collect::<Result<Vec<_>>>()?.into_iter().filter(|r|within(r,q.scope.as_deref())&&q.responsibility.as_deref().is_none_or(|wanted|r["loop"]["responsibility"]==wanted)).collect::<Vec<_>>();
+    let candidates=loops::visible_loop_targets(db,rows(db,&format!("SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?)?.into_iter().map(|mut row|{row["responsibility"]=json!(roles.get(row["id"].as_str().unwrap()).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown"));Ok(json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"loop":loop_value(&row,now)}))}).collect::<Result<Vec<_>>>()?.into_iter().filter(|r|within(r,q.scope.as_deref())).collect::<Vec<_>>();
+    let unresolved = nodes.iter().filter(|(id, n)| unknown.contains(*id) && within(n, q.scope.as_deref())).count()
+        + edges.iter().filter(|e| {
+            let id = e["id"].as_str().unwrap();
+            unknown.contains(id) && !nodes.contains_key(id)
+                && (within(&nodes[e["src"].as_str().unwrap()], q.scope.as_deref()) || within(&nodes[e["dst"].as_str().unwrap()], q.scope.as_deref()))
+        }).count()
+        + candidates.iter().filter(|c| c["loop"]["responsibility"] == "unknown").count();
+    let candidates = candidates.into_iter().filter(|c| keep(c["loop"]["responsibility"].as_str().unwrap())).collect::<Vec<_>>();
     let mut looped = nodes
         .values()
         .filter(|n| within(n, q.scope.as_deref()) && !n["loop"].is_null())
@@ -452,7 +466,7 @@ fn legacy_graph(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Resul
     } else {
         100
     };
-    let loops = json!({"open":looped.iter().filter(|l|l["deferred"]!=true).count(),"deferred":looped.iter().filter(|l|l["deferred"]==true).count(),"candidates":{"total":candidates.len(),"items":candidates.iter().take(candidate_limit).cloned().collect::<Vec<_>>()}});
+    let loops = json!({"open":looped.iter().filter(|l|l["deferred"]!=true).count(),"deferred":looped.iter().filter(|l|l["deferred"]==true).count(),"unresolved":unresolved,"candidates":{"total":candidates.len(),"items":candidates.iter().take(candidate_limit).cloned().collect::<Vec<_>>()}});
     nodes.retain(|_, n| within(n, q.scope.as_deref()));
     order.retain(|id| nodes.contains_key(id));
     let mut focus = HashSet::new();
