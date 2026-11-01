@@ -1,13 +1,13 @@
 //! Source-validated tentative candidate batches; no model client/credentials.
 use crate::pipeline_schema::{self, WorkResult, reject};
 use crate::util::*;
-use crate::{Graph, context, jobs::Job, loops};
+use crate::{Graph, context, jobs::Job, loop_due, loops};
 use memento_core::{Error, Result};
 use rusqlite::params;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
-pub const VERSION: &str = "extract-v2";
+pub const VERSION: &str = "extract-v3";
 #[derive(Clone)]
 pub struct Extractor {
     pub graph: Graph,
@@ -20,12 +20,14 @@ impl Extractor {
         self.graph.store.read(|tx|{let mut windows=vec![];for item in job.payload["windows"].as_array().ok_or(Error::Validation("Invalid extraction windows"))?{let id=get_str(item,"episode_id")?;let row=one(tx.sql(),"SELECT * FROM episodes WHERE id=?",[id])?.ok_or(Error::Validation("extraction_source_missing"))?;let text=tx.original_text(id)?.ok_or(Error::Validation("extraction_source_missing"))?;let metadata=decode_json(get_str(&row,"metadata")?)?;let kind=get_str(&row,"kind")?;let source=get_str(&row,"source")?;
         if metadata["extraction_mode"]=="skip"||one(tx.sql(),"SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1",params![source,row["event_id"].as_str()])?.is_some()||memento_core::raw::legacy_native_context(source,kind,Some(&text),Some(&metadata)){continue;}
         let start=item["start"].as_u64().ok_or(Error::Validation("Invalid extraction window"))? as usize;let end=item["end"].as_u64().ok_or(Error::Validation("Invalid extraction window"))? as usize;let end=if metadata["extraction_mode"]=="tool_output"||kind=="tool"{end.min(start+2000)}else{end};
-        windows.push(json!({"id":item["id"],"episode_id":id,"source":source,"kind":kind,"start":start,"end":end,"text":substring(&text,start,end)}));
-    }Ok(json!({"windows":windows,"window_view":"handles-v1"}))})
+        windows.push(json!({"id":item["id"],"episode_id":id,"source":source,"kind":kind,"start":start,"end":end,"text":substring(&text,start,end),"occurred_at":row["occurred_at"]}));
+    }Ok(json!({"windows":windows,"window_view":"handles-v1","policy_version":VERSION}))})
     }
     pub fn model_input(context: &Value) -> Value {
-        let windows=context["windows"].as_array().into_iter().flatten().enumerate().map(|(index,item)|json!({"id":format!("w{index}"),"kind":item["kind"],"text":item["text"]})).collect::<Vec<_>>();
-        let mut view = json!({"windows":windows});
+        // local_time (with weekday) resolves an explicit relative due date only.
+        let zone = context["timezone"].as_str();
+        let windows=context["windows"].as_array().into_iter().flatten().enumerate().map(|(index,item)|json!({"id":format!("w{index}"),"kind":item["kind"],"local_time":loop_due::local_time(item["occurred_at"].as_str(),zone),"text":item["text"]})).collect::<Vec<_>>();
+        let mut view = json!({"timezone":zone,"windows":windows});
         if let Some(rejection) = context.get("previous_rejection") {
             view["previous_rejection"] = rejection.clone();
         }
@@ -40,6 +42,9 @@ impl Extractor {
         model: Option<&str>,
         usage: Option<&Value>,
     ) -> WorkResult<Value> {
+        if leased["policy_version"] != VERSION {
+            return Err(Error::Conflict("Extraction policy changed; derive a fresh plan").into());
+        }
         if !pipeline_schema::validate(&pipeline_schema::EXTRACTION, output) {
             return Err(reject("candidate_schema_invalid", vec![]));
         }
@@ -67,6 +72,30 @@ impl Extractor {
         if batches.len() != windows.len() || supplied != expected {
             return Err(reject("candidate_window_coverage_invalid", vec![]));
         }
+        // An explicit due date resolves against its window's original time; keyed by (window, key).
+        let mut dues = HashMap::new();
+        for batch in batches {
+            let handle = batch["id"].as_str().unwrap();
+            for draft in batch["candidates"].as_array().unwrap() {
+                if draft["due"].is_null() {
+                    continue;
+                }
+                let resolved = if draft["open_loop"] == true {
+                    loop_due::resolve(&draft["due"], draft["quote"].as_str().unwrap(), windows[handle]["occurred_at"].as_str(), leased["timezone"].as_str())
+                } else {
+                    Err(loop_due::Invalid::Format)
+                };
+                let at = resolved.map_err(|invalid| {
+                    let code = match invalid {
+                        loop_due::Invalid::Format => "candidate_due_invalid",
+                        loop_due::Invalid::Quote => "candidate_due_quote_invalid",
+                        loop_due::Invalid::BeforeSource => "candidate_due_before_source",
+                    };
+                    reject(code, vec![json!({"window_id":handle,"key":draft["key"],"quote":draft["due"]["quote"]})])
+                })?;
+                dues.insert((handle.to_owned(), draft["key"].as_str().unwrap().to_owned()), at);
+            }
+        }
         let prepared=self.graph.store.read(|tx|{let mut prepared=Vec::new();for batch in batches{let handle=get_str(batch,"id")?;let window=&windows[handle];let episode_id=get_str(window,"episode_id")?;let episode=one(tx.sql(),"SELECT * FROM episodes WHERE id=?",[episode_id])?.ok_or(Error::Validation("extraction_source_missing"))?;let text=tx.original_text(episode_id)?.ok_or(Error::Validation("extraction_source_missing"))?;let metadata=decode_json(get_str(&episode,"metadata")?)?;
             if memento_core::raw::legacy_native_context(get_str(&episode,"source")?,get_str(&episode,"kind")?,Some(&text),Some(&metadata)){prepared.push((handle.to_owned(),vec![]));continue;}
             let begin=window["start"].as_u64().unwrap() as usize;let raw=substring(&text,begin,window["end"].as_u64().unwrap() as usize);let mut keys=HashMap::new();let mut local=vec![];
@@ -76,7 +105,7 @@ impl Extractor {
                 // Store reference details separately on quote rejection; no model
                 // output or source text is placed in HTTP diagnostics.
                 let quote=get_str(draft,"quote")?;let occurrence=draft["occurrence"].as_u64().map(|value|value as usize);let (start,end)=source_span(&raw,quote,occurrence)?;let from=time(draft["valid_from"].as_str())?;let to=time(draft["valid_to"].as_str())?;if let (Some(left),Some(right))=(&from,&to){if parse_time(left)?>=parse_time(right)?{return Err(Error::Validation("candidate_world_interval_invalid"));}}
-                let labels=draft["scope"].as_array().unwrap().iter().map(|value|value.as_str().unwrap().to_owned()).collect::<Vec<_>>();let labels=scope(tx.sql(),typ,&labels)?;let mut item=json!({"kind":kind,"type":typ,"text":draft["text"],"why":draft["why"],"scope":labels,"open_loop":draft["open_loop"],"responsibility":draft["responsibility"],"start":begin+start,"end":begin+end,"quote":quote,"confidence":draft["confidence"],"valid_from":from,"valid_to":to});
+                let labels=draft["scope"].as_array().unwrap().iter().map(|value|value.as_str().unwrap().to_owned()).collect::<Vec<_>>();let labels=scope(tx.sql(),typ,&labels)?;let mut item=json!({"kind":kind,"type":typ,"text":draft["text"],"why":draft["why"],"scope":labels,"open_loop":draft["open_loop"],"responsibility":draft["responsibility"],"start":begin+start,"end":begin+end,"quote":quote,"confidence":draft["confidence"],"valid_from":from,"valid_to":to,"due_at":dues.get(&(handle.to_owned(),key.to_owned()))});
                 let fingerprint=json!({"episode_id":episode_id,"kind":item["kind"],"type":item["type"],"text":item["text"],"start":item["start"],"end":item["end"],"valid_from":item["valid_from"],"valid_to":item["valid_to"]});item["id"]=json!(format!("c_{}",&hash_json(&fingerprint)?[..32]));keys.insert(key.to_owned(),local.len());local.push((draft.clone(),item));
             }
             for index in 0..local.len(){let draft=&local[index].0;let (src,dst)=if draft["kind"]=="relation"{let a=keys.get(draft["src_key"].as_str().unwrap());let b=keys.get(draft["dst_key"].as_str().unwrap());let (Some(&a),Some(&b))=(a,b)else{return Err(Error::Validation("candidate_relation_endpoint_missing"));};if !matches!(local[a].1["kind"].as_str(),Some("entity"|"memory"))||!matches!(local[b].1["kind"].as_str(),Some("entity"|"memory")){return Err(Error::Validation("candidate_relation_endpoint_missing"));}let src=get_str(&local[a].1,"id")?.to_owned();let dst=get_str(&local[b].1,"id")?.to_owned();let material=format!("{}|{src}|{dst}",get_str(&local[index].1,"id")?);local[index].1["id"]=json!(format!("c_{}",&memento_core::raw::sha256(material.as_bytes())[..32]));(Some(src),Some(dst))}else{(None,None)};local[index].1["src"]=json!(src);local[index].1["dst"]=json!(dst);}
@@ -93,7 +122,7 @@ impl Extractor {
         );
         Ok(self.graph.store.command(&ctx,&request,|tx,commit|{job.check_in(tx.sql())?;let mut count=0;let mut loop_responsibilities=serde_json::Map::new();for (handle,items)in &prepared{let window=&windows[handle];let episode_id=get_str(window,"episode_id")?;let episode=one(tx.sql(),"SELECT * FROM episodes WHERE id=?",[episode_id])?.ok_or(Error::Validation("extraction_source_missing"))?;let text=tx.original_text(episode_id)?.ok_or(Error::Validation("extraction_source_missing"))?;let metadata=decode_json(get_str(&episode,"metadata")?)?;if one(tx.sql(),"SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? LIMIT 1",params![episode["source"].as_str(),episode["event_id"].as_str()])?.is_some()||memento_core::raw::legacy_native_context(get_str(&episode,"source")?,get_str(&episode,"kind")?,Some(&text),Some(&metadata)){continue;}
             let run=format!("{}/{}",job.id,get_str(window,"id")?);tx.sql().execute("INSERT INTO extraction_runs VALUES (?,?,?,?,?,?,?,?)",params![run,commit,episode_id,VERSION,"connected-harness-default",encode_json(&json!(model.filter(|value|!value.is_empty()).into_iter().collect::<Vec<_>>()))?,encode_json(&usage.cloned().unwrap_or(Value::Null))?,now()])?;
-            for item in items{let inserted=tx.sql().execute("INSERT INTO candidates(id,run_id,kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM candidates WHERE id=?)",params![item["id"].as_str(),run,item["kind"].as_str(),item["type"].as_str(),item["text"].as_str(),item["why"].as_str(),item["src"].as_str(),item["dst"].as_str(),item["confidence"].as_f64(),item["valid_from"].as_str(),item["valid_to"].as_str(),encode_json(&item["scope"])?,item["id"].as_str()])?;if inserted>0{let target=get_str(item,"id")?;tx.sql().execute("INSERT INTO graph_evidence VALUES (?,?,?,?,?,?)",params![target,1,episode_id,item["start"].as_i64(),item["end"].as_i64(),item["quote"].as_str()])?;loops::mark(tx,commit,target,item["open_loop"].as_bool(),None,None)?;if item["open_loop"]==true{if let Some(value)=item["responsibility"].as_str(){let role=loops::assign_automatic(tx,commit,target,value,&json!([{"episode_id":episode_id,"quote":item["quote"],"start":item["start"],"end":item["end"]}]))?;if let Some(map)=role["loop_responsibilities"].as_object(){loop_responsibilities.extend(map.clone());}}}tx.touch_target(target)?;count+=1;}}
+            for item in items{let inserted=tx.sql().execute("INSERT INTO candidates(id,run_id,kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope) SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM candidates WHERE id=?)",params![item["id"].as_str(),run,item["kind"].as_str(),item["type"].as_str(),item["text"].as_str(),item["why"].as_str(),item["src"].as_str(),item["dst"].as_str(),item["confidence"].as_f64(),item["valid_from"].as_str(),item["valid_to"].as_str(),encode_json(&item["scope"])?,item["id"].as_str()])?;if inserted>0{let target=get_str(item,"id")?;tx.sql().execute("INSERT INTO graph_evidence VALUES (?,?,?,?,?,?)",params![target,1,episode_id,item["start"].as_i64(),item["end"].as_i64(),item["quote"].as_str()])?;loops::mark(tx,commit,target,item["open_loop"].as_bool(),None,None,item["due_at"].as_str())?;if item["open_loop"]==true{if let Some(value)=item["responsibility"].as_str(){let role=loops::assign_automatic(tx,commit,target,value,&json!([{"episode_id":episode_id,"quote":item["quote"],"start":item["start"],"end":item["end"]}]))?;if let Some(map)=role["loop_responsibilities"].as_object(){loop_responsibilities.extend(map.clone());}}}tx.touch_target(target)?;count+=1;}}
             tx.touch_run(&run)?;
         }
         if job.payload["mode"]=="demand"{}else if job.payload["cursor"]=="live"{tx.sql().execute("UPDATE historical_parking SET live_seq=?,live_offset=? WHERE source=? AND conversation_id=?",params![job.payload["next_seq"].as_i64(),job.payload["next_offset"].as_i64(),job.payload["source"].as_str(),job.payload["conversation_id"].as_str()])?;}else{tx.sql().execute("UPDATE processing_progress SET seq=?,offset=? WHERE source=? AND conversation_id=?",params![job.payload["next_seq"].as_i64(),job.payload["next_offset"].as_i64(),job.payload["source"].as_str(),job.payload["conversation_id"].as_str()])?;}

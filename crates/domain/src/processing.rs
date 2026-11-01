@@ -419,6 +419,8 @@ impl Processing {
                         self.consolidator.prepare(&job, discovery.as_ref())?
                     };
                     crate::work_timing::lap("claim_prepare", &mut lap);
+                    // Explicit due dates resolve in this claim's timezone.
+                    prepared["timezone"] = json!(command.timezone_name);
                     if let Some(rejection) = rejection {
                         prepared["previous_rejection"] = rejection;
                     }

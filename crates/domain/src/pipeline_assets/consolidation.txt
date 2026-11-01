@@ -44,6 +44,11 @@ commitment, a hypothetical, an unrelated task, or work already completed or canc
 or tool output can state a real commitment, but re-reading one is neither a fresh promise nor a new event date.
 Use null for uncertainty. Age or inactivity alone never proves completion. False declines only an untouched extraction flag;
 it does not close an existing target or override an explicit open, close, deferred or reminder choice.
+due follows extraction's rule: set it only with open_loop true when an original premise quote explicitly states the obligation's
+date or deadline. due.quote is that exact date expression inside the cited premise quote; resolve relative expressions against
+that evidence's local_time in the supplied timezone (YYYY-MM-DD for a date-only deadline, an aware ISO timestamp for a stated time;
+overdue only when the text says the deadline had already passed). A candidate's loop.due_at is its automatic due date; null keeps it.
+Vague timing gives null, later_context never dates a loop, and a manual reminder or deferral always wins.
 Windows marked later_context are the first communicated user/assistant messages after a loop-flagged candidate's source in the same
 conversation (private reasoning, tool calls and tool output excluded). They are lifecycle data, never premises: cite one only to close
 a real obligation it unambiguously fulfils or cancels. For the candidate's own loop, list its own candidate_id in closed_targets with
@@ -142,7 +147,7 @@ Only targets listed in retirement_ready have complete incident-edge fences; requ
 Use decline_loop only when exact original evidence proves an automatic marker never represented a concrete outstanding obligation,
 such as an assistant's or agent's own promise or next step, agent-to-agent orchestration, a standing policy, hypothetical, completed
 turn narration, progress or next-update narration, a report's caveat or unverified scope, an automated notice or uncommunicated private
-planning. It retracts a mistaken marker, not a later completion. Retain uncertain real human commitments and waits. Explicit manual loop choices, pinned nodes, due dates and deferrals remain protected. No new reminders.
+planning. It retracts a mistaken marker, not a later completion. Retain uncertain real human commitments and waits. Explicit manual loop choices (including reminders), pinned nodes and deferrals remain protected; an automatic due date does not. No new reminders.
 Check supplied subject loops on every pass. Use close_loop for a real existing obligation only when exact supplied original evidence
 unambiguously completes or cancels that SAME instance, with known original source time newer than pending evidence and any manual choice.
 For close_loop cite ONLY that later completion/cancellation evidence. The pending premise is already supplied for comparison;

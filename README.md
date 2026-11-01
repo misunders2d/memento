@@ -84,7 +84,7 @@ Extraction starts after native compaction or conversation inactivity. Candidates
 
 Relevant facts, eligible behavioral suggestions and at most one matching media reference can appear automatically in later prompts, within a small shared context budget. They are labeled distinctly, and the result can legitimately be empty. A file match points to the original; it does not imply that facts or lessons were extracted from the image or recording. The seven memory tools (`recall`, `remember`, `link`, `supersede`, `reconcile`, `history`, `loop`) let an agent explicitly recall, save, connect, correct or inspect memories and manage loop markers.
 
-History retains exact source quotes, dates and changes. **Old conversations keep their original dates:** age affects recall ranking, without deleting memories or making imported history appear new. Age alone never closes a task. Reminder dates can be stored and listed; there is no proactive reminder delivery.
+History retains exact source quotes, dates and changes. **Old conversations keep their original dates:** age affects recall ranking, without deleting memories or making imported history appear new. Age alone never closes a task. Due dates can be stored and listed, set manually or taken from an explicit date in the source; there is no proactive reminder delivery.
 
 ## Bring your history, keep your data
 
@@ -507,7 +507,7 @@ The seven ordinary memory tools are:
 | `supersede` | Correct, refine or record a world-time change as the same memory's next version |
 | `reconcile` | Combine evidenced duplicates into one identity on explicit request |
 | `history` | Inspect versions, differences, reasons and evidence |
-| `loop` | List, assign responsibility, open, close, decline false markers, defer or set an explicit reminder time |
+| `loop` | List (including by due date), assign responsibility, open, close, decline false markers, defer or set an explicit reminder time |
 
 `recall(query, effort="normal", scope=...)` performs semantic retrieval; effort can be `cheap`, `normal` or `deep`. Omit the query for recent raw activity; use aware ISO `since` or `source` for literal raw evidence filtering. Raw history has no inferred personal/professional scope.
 
@@ -531,7 +531,11 @@ Automatic attribution uses only the original evidence eligible to establish resp
 
 For a historical audit, `loop(action="close", evidence=...)` closes only when original source times establish completion newer than the pending evidence and manual choice; `loop(action="decline", evidence=...)` retracts only an untouched automatic marker whose original premises prove it was never an obligation. These grounded repairs cover memories, relations and pending candidates, preserve protected choices, and retain their exact references in history. Omitting evidence from `close` keeps the ordinary explicit manual-close behavior. An evidence-bearing repair that is protected or chronologically uncertain reports that status and leaves the loop open.
 
-To save one explicitly, tell your agent, for example: “Remember this as an open loop: I still need to send Mira the release checklist.” The agent saves the quoted statement with `remember`, then uses `loop` to open its memory ID. Only explicit `loop` action `remind` sets a reminder time. There is **no proactive reminder scheduler**. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence. After server rollout, run `memento agent update` on clients to include offered query and shown IDs with matching citations.
+To save one explicitly, tell your agent, for example: “Remember this as an open loop: I still need to send Mira the release checklist.” The agent saves the quoted statement with `remember`, then uses `loop` to open its memory ID. Explicit `loop` action `remind` sets a manual due date. There is **no proactive reminder scheduler** and no notification.
+
+**Automatic due dates** (native service only; the Python comparison service does not set them). When the source explicitly states when an open loop is due ("tomorrow", "by Friday", "on Nov 3", "next week Monday", "end of month"), processing stores that date as the loop's `due_at`. The model resolves it against the source message's original time, shown as `local_time` in the processing timezone, never the processing date; the date expression must appear verbatim in the cited quote. Vague timing ("soon", "later", "at some point") gives no date. A date-only deadline means the **end of that local day** (23:59:59 in the processing timezone; the later instant if that time repeats); a stated time of day keeps that time. Stored values are UTC-normalized aware timestamps, like manual reminders. The service rejects malformed or naive values, dates on non-loops, expressions absent from the quote, and dates before the source's time unless the text says the deadline had already passed. A manual `remind` anywhere in the loop's history, or a live `later` deferral, always wins; otherwise newer evidence with a newer explicit date may replace an automatic one under the same chronology rule as closure. Promotion and identity transfers keep the date. An automatic due date does not protect a mistaken marker from being declined. Existing loops are not backfilled.
+
+Ask for "open loops due today or overdue" with `loop(action="list", due_before=<next local midnight>)`; `due_before=<now>` lists overdue ones. `list` orders loops by due date (undated last), and without a `responsibility` filter shows only assigned (owner/other) loops. The viewer marks loops overdue from the same stored `due_at`. Promotion, correction and reviewed merges preserve committed citation usage and query feedback without rewriting original evidence. After server rollout, run `memento agent update` on clients to include offered query and shown IDs with matching citations.
 
 ### Conditional behavioral suggestions
 

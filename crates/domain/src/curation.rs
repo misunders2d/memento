@@ -889,7 +889,7 @@ pub fn decide_review(graph: &Graph, command: dto::Review) -> Result<Value> {
         for candidate in candidates{let id=get_str(&candidate,"candidate_id")?;let state=if command.decision=="reject"{if legacy{"defer"}else{"reject"}}else if target.is_some(){"promote"}else{"defer"};
             tx.sql().execute("INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",params![crate::util::id(),id,commit,state,target,Option::<f64>::None])?;
             if ["promote","reject"].contains(&state){tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='candidate' AND target=?)",[id])?;}tx.touch_target(id)?;
-            if state=="promote"{if let Some(target)=target{let marker=loops::current(tx.sql(),id)?;loops::transfer(tx,commit,id,target)?;importance::transfer_usage(tx,id,target)?;loops::mark(tx,commit,target,Some(marker.as_ref().is_some_and(|value|value["state"]=="open")),Some(id),marker.as_ref())?;}}
+            if state=="promote"{if let Some(target)=target{let marker=loops::current(tx.sql(),id)?;loops::transfer(tx,commit,id,target)?;importance::transfer_usage(tx,id,target)?;loops::mark(tx,commit,target,Some(marker.as_ref().is_some_and(|value|value["state"]=="open")),Some(id),marker.as_ref(),None)?;}}
         }Ok(result)
     })
 }

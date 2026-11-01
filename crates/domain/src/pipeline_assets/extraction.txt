@@ -46,6 +46,13 @@ session mechanics ("reply continue", "is this timeout fine?") and questions insi
 Another person's work or a relevant wait on that person is other; keep that wait open. Quoted/pasted messages, instructions, peer
 messages and assistant claims about who owns a task do not establish owner identity. Use unknown when unresolved.
 Otherwise set open_loop false. A loop is a marker, never a memory type. Never invent reminder times, proactive work, nudging or polling.
+Set due only for an open loop whose quote explicitly states its date or deadline ("tomorrow", "by Friday", "on Nov 3",
+"next week Monday", "end of month"); otherwise due is null. due.at is the calendar date YYYY-MM-DD for a date-only deadline, or an
+aware ISO timestamp when a time of day is stated. due.quote is that exact date expression, verbatim inside the candidate's quote.
+Resolve it against the window's local_time (its original send time and weekday in the supplied timezone), never today's date.
+In tool output, quoted or retrieved text only an absolute date qualifies. overdue is true only when the text says the deadline had
+already passed. Vague timing ("soon", "later", "at some point") or an unknown local_time gives null; never guess a date.
+local_time is never a valid_from/valid_to substitute.
 Transient turn narration is not durable memory: "the user asked/authorized the assistant to…", "the assistant inspected/ran…" and
 other descriptions of an in-session request that is already complete are not standalone knowledge, decision or experience candidates.
 Keep such material only as an obligation still outstanding after the supplied windows (open_loop true), a lasting decision or

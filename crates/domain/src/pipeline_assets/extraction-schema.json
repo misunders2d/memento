@@ -1,5 +1,34 @@
 {
   "$defs": {
+    "Due": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "At",
+          "type": "string"
+        },
+        "overdue": {
+          "title": "Overdue",
+          "type": "boolean"
+        },
+        "quote": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Quote",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "quote",
+        "overdue"
+      ],
+      "title": "Due",
+      "type": "object"
+    },
     "EntityDraft": {
       "additionalProperties": false,
       "properties": {
@@ -19,6 +48,17 @@
             }
           ],
           "title": "Dst Key"
+        },
+        "due": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Due"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "key": {
           "maxLength": 64,
@@ -172,6 +212,17 @@
             }
           ],
           "title": "Dst Key"
+        },
+        "due": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Due"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "key": {
           "maxLength": 64,
