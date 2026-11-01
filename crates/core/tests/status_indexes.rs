@@ -2,8 +2,8 @@ use memento_core::{CommandContext, Error, F32Blob, Store, Tier, VectorKind, Vect
 use rusqlite::Connection;
 use serde_json::json;
 
-const DROP: &str = "DROP INDEX vector_blobs_status_current_v1;DROP INDEX episodes_status_indexable_v1;DROP INDEX episodes_status_raw_v1;";
-const COUNT: &str = "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('vector_blobs_status_current_v1','episodes_status_indexable_v1','episodes_status_raw_v1')";
+const DROP: &str = "DROP INDEX vector_blobs_status_current_v1;DROP INDEX episodes_status_indexable_v2;DROP INDEX episodes_status_raw_v1;";
+const COUNT: &str = "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('vector_blobs_status_current_v1','episodes_status_indexable_v2','episodes_status_raw_v1')";
 
 #[test]
 fn additive_status_indexes_preserve_authority_and_respect_writer_and_reopen_fences() {

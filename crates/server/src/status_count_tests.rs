@@ -141,11 +141,12 @@ fn exact_unit_counts_preserve_sources_missing_vectors_failures_versions_and_snap
         .read(|tx| {
             // Index-unit counts preserve all active candidates independently of the
             // consolidation classifier; no-evidence candidates have no source membership.
-            assert_eq!(counts(tx.sql(), None), vec![15, 3, 11, 1, 1]);
+            // A developer instruction is not a message, so it is never an unprepared unit.
+            assert_eq!(counts(tx.sql(), None), vec![15, 3, 11, 1, 0]);
             assert_eq!(counts(tx.sql(), Some("synthetic:a")), vec![8, 1, 6, 1, 0]);
             assert_eq!(
                 counts(tx.sql(), Some("native:fixture:codex")),
-                vec![2, 0, 2, 0, 1]
+                vec![2, 0, 2, 0, 0]
             );
             Ok(())
         })
@@ -165,7 +166,7 @@ fn exact_unit_counts_preserve_sources_missing_vectors_failures_versions_and_snap
         .unwrap();
     store
         .read(|tx| {
-            assert_eq!(counts(tx.sql(), None), vec![14, 3, 10, 1, 1]);
+            assert_eq!(counts(tx.sql(), None), vec![14, 3, 10, 1, 0]);
             Ok(())
         })
         .unwrap();

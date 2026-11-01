@@ -162,7 +162,7 @@ impl Store {
         // Ordinary derived indexes also serve earlier private header5 archives.
         // The unknown-header check and exclusive writer lease precede all DDL;
         // a healthy reopen leaves schema_version and authority untouched.
-        let status_indexes:i64=db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('vector_blobs_status_current_v1','episodes_status_indexable_v1','episodes_status_raw_v1')",[],|r|r.get(0))?;
+        let status_indexes:i64=db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('vector_blobs_status_current_v1','episodes_status_indexable_v2','episodes_status_raw_v1')",[],|r|r.get(0))?;
         if status_indexes != 3 {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(include_str!("status_indexes.sql"))?;
