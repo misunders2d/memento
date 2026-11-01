@@ -59,12 +59,14 @@ fn conversation_count(db: &Connection, source: Option<&str>) -> Result<i64> {
         db.query_row(&sql, [], |r| r.get(0))?
     })
 }
+// Source filters probe from each job/file's own rows; CROSS JOIN pins that
+// order so the planner never scans every episode of the source per row.
+const CONSOLIDATE_ORIGIN: &str = "EXISTS(SELECT 1 FROM json_each(j.payload,'$.candidate_ids') c CROSS JOIN graph_evidence g CROSS JOIN episodes e WHERE g.target=c.value AND e.id=g.episode_id AND e.source=?2)";
+const CAPTURED_MEDIA: &str = "SELECT cm.state,j.state AS job_state,count(*) AS count FROM captured_media cm LEFT JOIN jobs j ON j.id=cm.job_id WHERE (?1 IS NULL OR EXISTS(SELECT 1 FROM captured_media_refs r CROSS JOIN episodes e WHERE r.sha256=cm.sha256 AND e.id=r.episode_id AND e.source=?1)) GROUP BY cm.state,j.state";
 fn jobs(db: &Connection, kind: &str, source: Option<&str>) -> Result<Value> {
     let origin = match kind {
         "extract" => "json_extract(j.payload,'$.source')=?2",
-        "consolidate" => {
-            "EXISTS(SELECT 1 FROM json_each(j.payload,'$.candidate_ids') c JOIN graph_evidence g ON g.target=c.value JOIN episodes e ON e.id=g.episode_id WHERE e.source=?2)"
-        }
+        "consolidate" => CONSOLIDATE_ORIGIN,
         "media" => {
             "EXISTS(SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=j.id AND e.source=?2)"
         }
@@ -136,7 +138,7 @@ fn jobs(db: &Connection, kind: &str, source: Option<&str>) -> Result<Value> {
 fn captured_media_status(db: &Connection, source: Option<&str>) -> Result<Value> {
     let records = rows(
         db,
-        "SELECT cm.state,j.state AS job_state,count(*) AS count FROM captured_media cm LEFT JOIN jobs j ON j.id=cm.job_id WHERE (?1 IS NULL OR EXISTS(SELECT 1 FROM captured_media_refs r JOIN episodes e ON e.id=r.episode_id WHERE r.sha256=cm.sha256 AND e.source=?1)) GROUP BY cm.state,j.state",
+        CAPTURED_MEDIA,
         [source],
     )?;
     let mut counts = json!({"waiting":0,"ready":0,"queued":0,"indexed":0,"failed":0,"unsupported":0,"forgotten":0});
@@ -275,4 +277,30 @@ pub fn status(
     now: f64,
 ) -> Result<Value> {
     store.read(|tx| operational_status(tx.sql(), query.source.as_deref(), runtime, now))
+}
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    // Source-filtered counts must probe each job/file's own rows, never range
+    // over every episode of the source once per row.
+    #[test]
+    fn source_filters_probe_rows_not_source_episodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        store
+            .read(|tx| {
+                let consolidate = format!("SELECT state,error,count(*) AS count FROM jobs j WHERE kind=?1 AND (?2 IS NULL OR {CONSOLIDATE_ORIGIN}) GROUP BY state,error");
+                for (sql, params) in [(consolidate.as_str(), 2), (CAPTURED_MEDIA, 1)] {
+                    let mut plan = tx.sql().prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let values: Vec<Option<&str>> = vec![Some("consolidate"), Some("source")];
+                    let details = plan
+                        .query_map(rusqlite::params_from_iter(&values[2 - params..]), |r| r.get::<_, String>(3))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    assert!(details.iter().any(|d| d.contains("episodes") && d.contains("(id=?)")), "{details:?}");
+                    assert!(!details.iter().any(|d| d.contains("(source=?)")), "{details:?}");
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
 }
