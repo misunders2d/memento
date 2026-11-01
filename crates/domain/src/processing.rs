@@ -347,6 +347,7 @@ impl Processing {
                 )
             })
         };
+        crate::work_timing::count("claim_batch_size", command.batch_size as u64);
         let mut lap = std::time::Instant::now();
         let night_due = schedule()?;
         crate::work_timing::lap("claim_schedule", &mut lap);

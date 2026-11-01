@@ -577,6 +577,7 @@ fn lexical(
     };
     let reviewed = encode_json(&json!(reviewed))?;
     cached(cache, format!("lexical\0{query}\0{kind}\0{limit}\0{reviewed}"), || {
+        crate::work_timing::count(if head { "lexical_head_queries" } else { "lexical_queries" }, 1);
         Ok(rows(db, LEXICAL, params![query, kind, reviewed, limit as i64])?
             .into_iter()
             .map(|row| row["id"].as_str().unwrap().into())
@@ -640,7 +641,11 @@ pub(super) fn prepare(
     discovery: Option<&Value>,
     configured: bool,
 ) -> Result<Value> {
-    prepare_cached(db, dir, job, discovery, configured, &mut DiscoveryCache::new())
+    let context = prepare_cached(db, dir, job, discovery, configured, &mut DiscoveryCache::new())?;
+    for (name, list) in [("prepare_admitted", &job.payload["candidate_ids"]), ("prepare_kept", &context["candidates"]), ("prepare_deferred", &context["_deferred"])] {
+        crate::work_timing::count(name, list.as_array().map_or(0, Vec::len) as u64);
+    }
+    Ok(context)
 }
 fn prepare_cached(
     db: &Connection,
@@ -650,6 +655,7 @@ fn prepare_cached(
     configured: bool,
     discovery_cache: &mut DiscoveryCache,
 ) -> Result<Value> {
+    crate::work_timing::count("prepare_levels", 1);
     let mut lap = std::time::Instant::now();
     let ids = strings(&job.payload["candidate_ids"])?;
     let maintenance = job

@@ -652,14 +652,19 @@ async fn work(
             let action = command.action.clone();
             let started = Instant::now();
             memento_domain::work_timing::take();
+            memento_domain::work_timing::take_counts();
             let result = state.processing.work(command);
-            // One stderr line per request: action, stage names and microseconds only.
+            // One stderr line per request: action, stage microseconds and cheap counts only.
             let stages: serde_json::Map<String, Value> = memento_domain::work_timing::take()
                 .into_iter()
                 .map(|(name, us)| (name.to_owned(), json!(us as u64)))
                 .collect();
+            let counts: serde_json::Map<String, Value> = memento_domain::work_timing::take_counts()
+                .into_iter()
+                .map(|(name, n)| (name.to_owned(), json!(n)))
+                .collect();
             if matches!(action.as_str(), "claim" | "submit" | "complete" | "pool") {
-                eprintln!("{}", json!({"event":"work_timing","action":action,"ok":result.is_ok(),"total_us":started.elapsed().as_micros() as u64,"stages_us":stages}));
+                eprintln!("{}", json!({"event":"work_timing","action":action,"ok":result.is_ok(),"total_us":started.elapsed().as_micros() as u64,"stages_us":stages,"counts":counts}));
             }
             result
         })
