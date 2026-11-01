@@ -440,6 +440,7 @@ CREATE TRIGGER backup_gaps_no_replace BEFORE INSERT ON backup_gaps WHEN EXISTS(S
 
 CREATE TRIGGER episode_chunks_no_UPDATE BEFORE UPDATE ON episode_chunks BEGIN SELECT RAISE(ABORT,'graph history is immutable'); END;
 
+-- Replaced at open by chunk_retirement.sql (episode_chunks_no_DELETE_v2).
 CREATE TRIGGER episode_chunks_no_DELETE BEFORE DELETE ON episode_chunks BEGIN SELECT RAISE(ABORT,'graph history is immutable'); END;
 
 CREATE TRIGGER episode_chunks_no_replace BEFORE INSERT ON episode_chunks WHEN EXISTS(SELECT 1 FROM episode_chunks WHERE id=NEW.id OR (episode_id=NEW.episode_id AND start=NEW.start AND end=NEW.end)) BEGIN SELECT RAISE(ABORT,'graph history is immutable'); END;
