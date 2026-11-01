@@ -569,10 +569,6 @@ fn lexical(
     let query = if head {
         format!("\"{}\"", terms[0])
     } else {
-        let terms = informative(db, cache, terms)?;
-        if terms.is_empty() {
-            return Ok(vec![]);
-        }
         terms
             .iter()
             .map(|term| format!("\"{term}\""))
@@ -587,30 +583,6 @@ fn lexical(
             .map(|row| row["id"].as_str().unwrap().into())
             .collect())
     })
-}
-/// FTS5 BM25 clamps the IDF of a word found in at least half of all indexed memories to
-/// 1e-6 (fts5_aux.c), so such a word barely affects ranking yet makes an OR query match
-/// most memories. OR hints drop it once it also appears in `COMMON_FLOOR` memories; a
-/// small store keeps every word, where the query is cheap and each match matters.
-const COMMON_FLOOR: i64 = 1024;
-fn informative(db: &Connection, cache: &mut DiscoveryCache, terms: Vec<String>) -> Result<Vec<String>> {
-    let rows = cached(cache, "fts_rows".into(), || {
-        Ok(vec![db.query_row("SELECT count(*) FROM node_fts_documents", [], |row| row.get::<_, i64>(0))?.to_string()])
-    })?[0]
-        .parse::<i64>()
-        .unwrap_or(0);
-    let common = ((rows + 1) / 2).max(COMMON_FLOOR);
-    if rows < common {
-        return Ok(terms);
-    }
-    let mut kept = vec![];
-    for term in terms {
-        kept.extend(cached(cache, format!("informative\0{term}"), || {
-            let hits = db.query_row("SELECT count(*) FROM (SELECT 1 FROM node_fts WHERE node_fts MATCH ?1 LIMIT ?2)", params![format!("\"{term}\""), common], |row| row.get::<_, i64>(0))?;
-            Ok(if hits < common { vec![term.clone()] } else { vec![] })
-        })?);
-    }
-    Ok(kept)
 }
 /// Named entities supplied per experience lesson (candidate or maintenance target).
 pub(super) const LESSON_SUBJECTS: usize = 3;
@@ -1144,7 +1116,6 @@ mod overlap_tests {
         let old = "SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?)) AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY bm25(node_fts),n.id LIMIT ?";
         store.read(|tx| {
             let mut cache = DiscoveryCache::new();
-            // A small store keeps every word, including ones in most of its memories.
             for (text, kind, reviewed, head) in [("launch plan memento", "fact", vec![], false), ("memento", "fact", vec!["n1".to_owned()], false), ("garden plan", "person", vec![], false), ("garden plan", "fact", vec![], true), ("launch", "fact", vec![], true)] {
                 let terms = word_terms(text, 3, 32);
                 let query = if head { format!("\"{}\"", terms[0]) } else { terms.iter().map(|term| format!("\"{term}\"")).collect::<Vec<_>>().join(" OR ") };
@@ -1155,21 +1126,6 @@ mod overlap_tests {
             }
             // Superseded text is not indexed; the only "garden" match is the person.
             assert!(lexical(tx.sql(), &mut cache, "stale garden", "fact", 3, 8, &[], false)?.is_empty());
-            Ok(())
-        }).unwrap();
-        // Past the floor, words in half of all memories carry no OR hint; heads keep theirs.
-        store.write(|tx| {
-            for index in 0..2 * COMMON_FLOOR {
-                tx.sql().execute("INSERT INTO node_versions VALUES (?,1,'c','fact',?,'active',NULL,NULL,NULL,0,'[\"personal\"]')", params![format!("f{index}"), format!("Filler note {index}")])?;
-            }
-            Ok(())
-        }).unwrap();
-        store.read(|tx| {
-            let mut cache = DiscoveryCache::new();
-            let expected = rows(tx.sql(), old, params!["\"launch\" OR \"memento\"", "fact", "[]", 8])?.into_iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
-            assert_eq!(lexical(tx.sql(), &mut cache, "launch filler note memento", "fact", 3, 8, &[], false)?, expected);
-            assert!(lexical(tx.sql(), &mut cache, "filler note", "fact", 3, 8, &[], false)?.is_empty());
-            assert_eq!(lexical(tx.sql(), &mut cache, "note", "fact", 3, 8, &[], true)?.len(), 8);
             Ok(())
         }).unwrap();
     }
