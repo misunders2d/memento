@@ -374,8 +374,30 @@ impl Application {
                         let maintain_store = store.clone();
                         let captured = memento_media::captured::CapturedMedia::new(queue.clone());
                         let status = Arc::downgrade(&background_services);
+                        // One pass per process; completion now clears new contexts.
+                        let contexts = Mutex::new(Some(i64::MIN));
                         let maintain = Arc::new(move || {
                             let raw = maintain_store.compress_raw_step();
+                            let cleared = match contexts.lock() {
+                                Ok(mut cursor) => match *cursor {
+                                    Some(from) => {
+                                        let step = memento_domain::jobs::clear_done_contexts(
+                                            &maintain_store,
+                                            from,
+                                        );
+                                        *cursor = step.as_ref().ok().and_then(|(_, next)| *next);
+                                        step.map(|(scanned, _)| scanned > 0)
+                                    }
+                                    None => Ok(false),
+                                },
+                                Err(_) => Ok(false),
+                            };
+                            if let Err(error) = &cleared {
+                                eprintln!(
+                                    "Job context cleanup failed ({}); data retained",
+                                    memento_domain::jobs::error_category(error)
+                                );
+                            }
                             let indexed = indexer.run_once();
                             let attachments = captured.step();
                             if let Err(error) = &attachments {
@@ -395,7 +417,10 @@ impl Application {
                                     memento_domain::jobs::error_category(error)
                                 );
                             }
-                            Ok(indexed? || raw.unwrap_or(false) || attachments.unwrap_or(false))
+                            Ok(indexed?
+                                || raw.unwrap_or(false)
+                                || attachments.unwrap_or(false)
+                                || cleared.unwrap_or(false))
                         });
                         let mut worker = Worker::new(queue, handlers, Some(maintain));
                         worker.start()?;

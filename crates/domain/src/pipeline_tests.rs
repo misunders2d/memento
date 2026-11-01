@@ -301,6 +301,8 @@ fn lone_candidate_keeps_its_old_target_when_endpoints_fill_the_ceiling() {
     let promoted = first["input"]["candidates"].as_array().unwrap().clone();
     assert_eq!(promoted.len(), 47);
     f.complete(&first, json!({"actions":promoted.iter().map(|candidate| action(candidate, "remember")).collect::<Vec<_>>()})).unwrap();
+    // Completion keeps the result and drops the leased input packet.
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM jobs WHERE state='done' AND (context IS NOT NULL OR result IS NULL)"), 0);
     let task = claim(48);
     let context: Value = serde_json::from_str(&f.stored::<String>(&format!("SELECT context FROM jobs WHERE id='{}'", task["id"].as_str().unwrap()))).unwrap();
     let supplied = context["existing_nodes"].as_array().unwrap().iter().map(|node| node["id"].as_str().unwrap().to_owned()).collect::<std::collections::BTreeSet<_>>();

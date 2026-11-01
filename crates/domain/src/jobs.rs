@@ -167,7 +167,7 @@ impl Queue {
         self.graph.store.write(|tx|Ok(tx.sql().execute("UPDATE jobs SET lease_until=? WHERE id=? AND state='leased' AND owner=? AND lease_until>?",params![now+self.lease_seconds as f64,job.id,job.owner,now])?==1))
     }
     pub fn complete(&self, job: &Job, result: &Value) -> Result<()> {
-        self.graph.store.write(|tx|{job.check_in(tx.sql())?;tx.sql().execute("UPDATE jobs SET state='done',result=?,error=NULL,owner=NULL,lease_until=NULL WHERE id=? AND owner=?",params![encode_json(result)?,job.id,job.owner])?;Ok(())})
+        self.graph.store.write(|tx|{job.check_in(tx.sql())?;tx.sql().execute("UPDATE jobs SET state='done',result=?,error=NULL,owner=NULL,lease_until=NULL,context=NULL WHERE id=? AND owner=?",params![encode_json(result)?,job.id,job.owner])?;Ok(())})
     }
     /// Returns a lease its client never received: no failure, backoff or attempt.
     pub fn unclaim(&self, job: &Job) -> Result<()> {
@@ -181,6 +181,33 @@ impl Queue {
         });
         self.graph.store.write(|tx|{let retryable=if failure.category=="CapturedSourceUnavailable"&&job.kind=="media"&&job.payload["captured"]==true{active_captured_source(tx.sql(),get_str(&job.payload,"sha256")?)?}else{failure.retryable};tx.sql().execute("UPDATE jobs SET state=?,available_at=?,error=?,owner=NULL,lease_until=NULL WHERE id=? AND state='leased' AND owner=?",params![if retryable{"pending"}else{"failed"},timestamp()+delay.as_secs_f64(),failure.category,job.id,job.owner])?;Ok(())})
     }
+}
+/// One bounded batch from `from`: drop leased inputs that completed jobs kept
+/// before completion cleared them. Nothing reads a done job's context; results stay.
+/// Returns the scanned count and the next rowid cursor, `None` once the pass is done.
+pub fn clear_done_contexts(store: &memento_core::Store, from: i64) -> Result<(i64, Option<i64>)> {
+    const BATCH: i64 = 256;
+    let (scanned, last, stale) = store.read(|tx| {
+        Ok(tx.sql().query_row(
+            "SELECT count(*),max(rowid),coalesce(sum(state='done' AND context IS NOT NULL),0) FROM (SELECT rowid,state,context FROM jobs WHERE rowid>=?1 ORDER BY rowid LIMIT ?2)",
+            params![from, BATCH],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, i64>(2)?)),
+        )?)
+    })?;
+    let Some(last) = last else {
+        return Ok((0, None));
+    };
+    if stale > 0 {
+        store.write(|tx| {
+            tx.sql().execute(
+                "UPDATE jobs SET context=NULL WHERE rowid BETWEEN ?1 AND ?2 AND state='done' AND context IS NOT NULL",
+                params![from, last],
+            )?;
+            Ok(())
+        })?;
+    }
+    let next = if scanned < BATCH { None } else { last.checked_add(1) };
+    Ok((scanned, next))
 }
 pub fn active_captured_source(db: &Connection, sha: &str) -> Result<bool> {
     Ok(one(db,"SELECT 1 FROM captured_media_refs r JOIN episodes e ON e.id=r.episode_id WHERE r.sha256=? AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=r.sha256) LIMIT 1",[sha])?.is_some())
@@ -379,4 +406,30 @@ fn run_once(
     let _ = pulse.join();
     completed?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    #[test]
+    fn cleanup_drops_only_done_job_contexts_and_keeps_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memento_core::Store::open(dir.path().join("data")).unwrap();
+        store.write(|tx| {
+            for (id, state) in [("done", "done"), ("failed", "failed"), ("pending", "pending"), ("leased", "leased")] {
+                tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts,result,context) VALUES(?1,?1,'consolidate','{}',?2,0,0,'{\"kept\":true}','{\"input\":true}')", params![id, state])?;
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(clear_done_contexts(&store, i64::MIN).unwrap(), (4, None));
+        store.read(|tx| {
+            let mut query = tx.sql().prepare("SELECT id FROM jobs WHERE context IS NOT NULL ORDER BY id")?;
+            let kept = query.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            // Retries still need their previous rejection; live leases their packet.
+            assert_eq!(kept, ["failed", "leased", "pending"]);
+            assert_eq!(tx.sql().query_row("SELECT result FROM jobs WHERE id='done'", [], |r| r.get::<_, String>(0))?, "{\"kept\":true}");
+            Ok(())
+        }).unwrap();
+        assert_eq!(clear_done_contexts(&store, i64::MAX).unwrap(), (0, None));
+    }
 }
