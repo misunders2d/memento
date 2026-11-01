@@ -674,6 +674,7 @@ pub(super) fn prepare(
     let mut identities: Vec<(String, Vec<String>, Vec<String>)> = vec![];
     let mut relevant: Vec<(String, Vec<String>)> = vec![];
     let mut optional: Vec<(String, Vec<String>)> = vec![];
+    let mut sub = std::time::Instant::now();
     for candidate in &candidates {
         let id = get_str(candidate, "id")?;
         let mut queue = vec![];
@@ -692,12 +693,14 @@ pub(super) fn prepare(
                         .as_ref()
                         .is_some_and(|vector| hint["vector"] == memento_core::raw::sha256(vector))
             });
+        crate::work_timing::lap("targets_hint", &mut sub);
         if candidate["kind"] != "relation" {
             let exact =
                 exact_identities(db, get_str(candidate, "type")?, get_str(candidate, "text")?)?
                     .into_iter()
                     .map(|row| row["id"].as_str().unwrap().to_owned())
                     .collect::<Vec<_>>();
+            crate::work_timing::lap("targets_exact", &mut sub);
             let lex = lexical(
                 db,
                 get_str(candidate, "text")?,
@@ -707,6 +710,7 @@ pub(super) fn prepare(
                 &[],
                 false,
             )?;
+            crate::work_timing::lap("targets_lexical", &mut sub);
             let heads = lexical(
                 db,
                 get_str(candidate, "text")?,
@@ -716,6 +720,7 @@ pub(super) fn prepare(
                 &[],
                 true,
             )?;
+            crate::work_timing::lap("targets_heads", &mut sub);
             let semantic = hinted(db, hint, "typed")?;
             relevant.push((
                 id.into(),
@@ -739,12 +744,14 @@ pub(super) fn prepare(
             identities.push((id.into(), exact, similar));
         }
         queue.extend(hinted(db, hint, "broad")?);
+        crate::work_timing::lap("targets_hinted", &mut sub);
         queue.extend(
             recall_keywords(db, &excerpt(get_str(candidate, "text")?, 512), 8, None)?
                 .into_iter()
                 .map(|row| row["id"].as_str().unwrap().to_owned()),
         );
         optional.push((id.into(), unique(queue)));
+        crate::work_timing::lap("targets_keywords", &mut sub);
     }
     // Only existing lessons (maintenance targets) get named entities: a new lesson cannot
     // link in its own plan, so supplying them for candidates would only spend the ceiling.
@@ -785,6 +792,7 @@ pub(super) fn prepare(
                 .collect(),
         ));
     }
+    crate::work_timing::lap("targets_maintenance", &mut sub);
     let mut comparison: Vec<(String, Vec<String>)> = vec![];
     for (key, exact, similar) in &identities {
         let mut queue = unique(exact.iter().chain(similar).cloned());
@@ -809,8 +817,11 @@ pub(super) fn prepare(
             comparison.push((subject, queue));
         }
     }
+    crate::work_timing::lap("targets_neighbors", &mut sub);
     builder.allocate(&comparison, Some(2))?;
+    crate::work_timing::lap("targets_allocate", &mut sub);
     builder.continuity()?;
+    crate::work_timing::lap("targets_continuity", &mut sub);
     crate::work_timing::lap("prepare_discover_targets", &mut lap);
     builder.retirement()?;
     builder.allocate(&comparison, Some(6))?;
