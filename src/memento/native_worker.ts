@@ -8,6 +8,9 @@ const url = process.env.MEMENTO_WORKER_URL;
 if (!url || !options.agent || !options.timezone) throw new Error("Missing worker configuration");
 // RPC reserves stdout; host consumes only these framed metadata records on stderr.
 const emit = (value: object) => console.error(JSON.stringify(value));
+// Durable commits per native session. Completed work already leaves the model context
+// after each commit; rotation only bounds the retained native session.
+const ROTATE_AFTER = 16;
 
 export default function worker(pi: any) {
   pi.registerTool({
@@ -48,7 +51,7 @@ export default function worker(pi: any) {
     if (emptyKinds.has(command.kinds[0])) throw new Error("That work kind is empty; try the other kind or finish");
     const now = Date.now();
     for (const [id, until] of cooling) if (until <= now) cooling.delete(id);
-    return { ...options, kinds: command.kinds, batch_size: command.batch_size ?? 64,
+    return { ...options, kinds: command.kinds, batch_size: command.batch_size ?? 16,
       continuous: true, exclude: [...cooling.keys()] };
   }
   function completion(command: any) {
@@ -86,8 +89,8 @@ export default function worker(pi: any) {
       else if (input.action === "submit") {
         const next = input.command.next;
         input.command = { complete: completion(input.command.complete) };
-        // One safe session boundary after eight durable commits. No next lease.
-        if (next && completed < 7 && !emptyKinds.has(next.kinds?.[0])) {
+        // One safe session boundary after ROTATE_AFTER durable commits. No next lease.
+        if (next && completed < ROTATE_AFTER - 1 && !emptyKinds.has(next.kinds?.[0])) {
           const saved = current; current = [];
           try { input.command.next = claim(next); } finally { current = saved; }
         }
@@ -164,10 +167,10 @@ export default function worker(pi: any) {
       kind: action === "claim" ? event.input.command.kinds?.[0] : event.input.command.next?.kinds?.[0],
       empty_kinds: [...emptyKinds],
       completed: completedId, released: action === "release" && value.released ? event.input.command.id : null,
-      boundary: completed >= 8 && !current.length, empty: !!offered && !current.length });
+      boundary: completed >= ROTATE_AFTER && !current.length, empty: !!offered && !current.length });
     return { content: [{ type: "text", text: JSON.stringify({ current_work: current.map(item => ({ id: item.id, kind: item.kind })), receipt: last,
       empty_kinds: [...emptyKinds],
-      session_boundary: completed >= 8 && !current.length }) }], structuredContent: undefined };
+      session_boundary: completed >= ROTATE_AFTER && !current.length }) }], structuredContent: undefined };
   });
   pi.on("context", (event: any = { messages: [] }) => {
     // Keep native reasoning/tool history within a unit. Dropping it after every
