@@ -31,28 +31,41 @@ fn own_message(episode: &Value, start: Option<usize>, end: Option<usize>, wanted
     static PEER: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)\[\s*(?:HERDR\s+)?AGENT MESSAGE\s*\]|Message Type:\s*(?:NEW_TASK|MESSAGE|FINAL_ANSWER)|<(?:system-reminder|collaboration[^>]*|tool_result)\b").unwrap()
     });
+    // Chat front doors wrap other people's messages, often mid-line, as data.
+    static UNTRUSTED: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\[(BEGIN|END) UNTRUSTED [^\]]*\]").unwrap());
     static FENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*(?:```|~~~)").unwrap());
+    let length = text.chars().count();
     let mut ranges = vec![];
-    let mut depth = 0usize;
-    let mut opened = 0;
-    for tag in PASTED.captures_iter(text) {
-        let full = tag.get(0).unwrap();
-        if tag.get(1).unwrap().as_str().is_empty() {
-            if depth == 0 {
-                opened = text[..full.start()].chars().count();
-            }
-            depth += 1;
-        } else if depth > 0 {
-            depth -= 1;
-            if depth == 0 {
-                ranges.push((opened, text[..full.end()].chars().count()));
+    for (tags, opens) in [(&*PASTED, ""), (&*UNTRUSTED, "BEGIN")] {
+        let mut depth = 0usize;
+        let mut opened = 0;
+        for tag in tags.captures_iter(text) {
+            let full = tag.get(0).unwrap();
+            if tag.get(1).unwrap().as_str() == opens {
+                if depth == 0 {
+                    opened = text[..full.start()].chars().count();
+                }
+                depth += 1;
+            } else if depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    ranges.push((opened, text[..full.end()].chars().count()));
+                }
             }
         }
+        if depth > 0 {
+            ranges.push((opened, length));
+        }
     }
-    let length = text.chars().count();
-    if depth > 0 {
-        ranges.push((opened, length));
-    }
+    ranges.sort_unstable();
+    ranges.dedup_by(|next, kept| {
+        let overlaps = next.0 <= kept.1;
+        if overlaps {
+            kept.1 = kept.1.max(next.1);
+        }
+        overlaps
+    });
     let mut own = String::new();
     let mut cursor = 0;
     for (left, right) in &ranges {

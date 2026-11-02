@@ -59,6 +59,8 @@ keys!(Count, COUNTS,
     ScorerCalls = "scorer_calls",
     ScoredPassages = "scored_passages",
     Returned = "returned",
+    QueryChars = "query_chars",
+    ContextChars = "context_chars",
 );
 /// One request's clocks; single-threaded, shared by `&` across the pipeline's closures.
 pub struct RecallTimings {

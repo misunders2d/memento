@@ -702,6 +702,8 @@ async fn recall(
     let (memories, timings) = blocking(move || {
         let timings = RecallTimings::default();
         timings.lap(recall_timings::Stage::Queue, started);
+        timings.count(recall_timings::Count::QueryChars, query.query.chars().count());
+        timings.count(recall_timings::Count::ContextChars, query.context.chars().count());
         let memories = state.recall_memories_timed(&query, deadline, &timings).map(|mut rows| {
             if query.explain {
                 // Period listings and literal raw evidence never enter semantic ranking.

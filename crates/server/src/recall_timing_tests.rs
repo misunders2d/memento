@@ -52,6 +52,7 @@ fn explain_reports_stage_timings_and_the_log_line_has_no_request_text() {
     assert_eq!(timings["pass"], "hot");
     let counts = &timings["counts"];
     assert_eq!(counts["passes"], 1);
+    assert_eq!((&counts["query_chars"], &counts["context_chars"]), (&json!(query.len()), &json!(context.len())));
     assert_eq!(counts["returned"], body["memories"].as_array().unwrap().len());
     assert_eq!(stripped(body["memories"].as_array().unwrap()), stripped(plain["memories"].as_array().unwrap()));
     assert!(counts["ann_hits"].as_u64().unwrap() >= 1 && counts["returned"].as_u64().unwrap() >= 1);
