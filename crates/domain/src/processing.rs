@@ -999,10 +999,17 @@ fn enqueue_night(
     let key = if force {
         format!("consolidate/manual/{}", id())
     } else {
-        format!(
+        let key = format!(
             "consolidate/{}",
             memento_core::raw::sha256(ascii_json(&payload)?.as_bytes())
-        )
+        );
+        // Still-ready candidates can rebuild a batch whose job already ended (rebatched,
+        // failed preparation, re-derived review). Reusing that key admits nothing forever.
+        if one(tx.sql(), "SELECT 1 FROM jobs WHERE job_key=?", [&key])?.is_some() {
+            format!("{key}/{}", id())
+        } else {
+            key
+        }
     };
     Queue::insert(tx, &key, "consolidate", &payload)?;
     Ok(true)

@@ -724,6 +724,36 @@ fn failed_consolidation_preparation_never_leaves_a_blocking_lease() {
 }
 
 #[test]
+fn scheduled_continuous_claim_rebuilds_a_batch_whose_job_already_ended() {
+    let f = Fixture::new();
+    f.seed();
+    f.extract("contract", "thread", FACT, "knowledge", false);
+    use chrono::Timelike;
+    let hour = chrono::Utc::now().hour();
+    // Scheduled (not forced) continuous admission inside an open window.
+    let claim = || f.processing.claim(Claim { agent: "fixture".into(), timezone_name: "UTC".into(), compaction: None,
+        exclude: vec![], consolidate_now: false, kinds: Some(vec!["consolidate".into()]),
+        consolidation_start: Some(format!("{hour:02}:00")), consolidation_end: Some(format!("{:02}:00", (hour + 2) % 24)),
+        continuous: true, batch_size: 16 });
+    let quotes: Vec<(i64, String)> = f.graph.store.read(|tx| {
+        let mut statement = tx.sql().prepare("SELECT rowid,quote FROM graph_evidence WHERE target IN (SELECT id FROM candidates)")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }).unwrap();
+    // Test-only corruption so the first preparation ends its job as failed.
+    f.graph.store.write(|tx| { tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE target IN (SELECT id FROM candidates)")?; Ok(()) }).unwrap();
+    assert!(matches!(claim(), Err(Error::Conflict(_))));
+    let failed: String = f.stored("SELECT id FROM jobs WHERE kind='consolidate' AND state='failed'");
+    f.graph.store.write(|tx| { for (rowid, quote) in &quotes { tx.sql().execute("UPDATE graph_evidence SET quote=? WHERE rowid=?", params![quote, rowid])?; } Ok(()) }).unwrap();
+    // The same still-ready candidates rebuild the identical batch; the ended job must not absorb it.
+    let work = claim().unwrap()["work"][0].clone();
+    assert_eq!(work["kind"], "consolidate");
+    assert_ne!(work["id"], failed);
+    assert_eq!(work["input"]["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(f.stored::<String>(&format!("SELECT state FROM jobs WHERE id='{failed}'")), "failed");
+}
+
+#[test]
 fn failed_mixed_claim_returns_every_withheld_lease() {
     let f = Fixture::new();
     f.seed();
