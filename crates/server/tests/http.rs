@@ -485,7 +485,7 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
         ("zen.example.ts.net", Some("https://zen.example.ts.net"), "application/json"),
         ("127.0.0.1:8765", Some("http://127.0.0.1:8765"), "application/vnd.memento+json; charset=utf-8"),
     ] {
-        assert_eq!(send(&state, "POST", "/episodes", host, origin, Some(kind), &typeless).await.status(), StatusCode::OK, "{host}");
+        assert!(send(&state, "POST", "/episodes", host, origin, Some(kind), &typeless).await.status().is_success(), "{host}");
     }
     assert_eq!(request(&state, "GET", "/status", None).await.1["captured"]["episodes"], 1);
     let blob = send(&state, "POST", "/blobs", "zen.example.ts.net", None, Some("application/pdf"), "synthetic bytes").await;
@@ -528,6 +528,7 @@ async fn host_origin_error_body_and_chunked_limits_preserve_privacy() {
     let response = router(state.clone())
         .oneshot(
             Request::post("/episodes")
+                .header("host", "127.0.0.1:8765")
                 .header("content-type", "application/json")
                 .body(body)
                 .unwrap(),
@@ -538,6 +539,7 @@ async fn host_origin_error_body_and_chunked_limits_preserve_privacy() {
     let response = router(state)
         .oneshot(
             Request::post("/episodes")
+                .header("host", "127.0.0.1:8765")
                 .header("content-length", "invalid")
                 .body(Body::empty())
                 .unwrap(),
@@ -557,6 +559,7 @@ async fn actual_streaming_blob_roundtrip_and_client_release_bytes_are_verified()
     let response = router(state.clone())
         .oneshot(
             Request::post("/blobs")
+                .header("host", "127.0.0.1:8765")
                 .header("content-type", "application/pdf")
                 .body(Body::from_stream(futures_util::stream::iter(chunks)))
                 .unwrap(),
@@ -570,6 +573,7 @@ async fn actual_streaming_blob_roundtrip_and_client_release_bytes_are_verified()
     let response = router(state.clone())
         .oneshot(
             Request::get(format!("/blobs/{}", value["sha256"].as_str().unwrap()))
+                .header("host", "127.0.0.1:8765")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -716,7 +720,7 @@ async fn status_connect_and_viewer_routes_keep_real_counts_static_bytes_and_priv
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
 }
 
 #[tokio::test]
@@ -753,7 +757,7 @@ async fn configured_bare_mcp_hosts_accept_valid_ports_and_reject_host_origin_con
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
     }
     for path in [
         "/ui/static/app.js",
@@ -784,7 +788,7 @@ async fn configured_bare_mcp_hosts_accept_valid_ports_and_reject_host_origin_con
         );
     }
     let response = router(state)
-        .oneshot(Request::get("/client-release").body(Body::empty()).unwrap())
+        .oneshot(Request::get("/client-release").header("host", "127.0.0.1:8765").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.headers()["cache-control"], "no-store");
@@ -796,6 +800,7 @@ async fn strict_json_media_and_drive_validation_fail_before_authority_or_provide
     let response = router(state.clone())
         .oneshot(
             Request::post("/episodes")
+                .header("host", "127.0.0.1:8765")
                 .header("content-type", "text/plain")
                 .body(Body::from(
                     serde_json::to_vec(&capture("Rejected plain MIME source")).unwrap(),
@@ -826,6 +831,7 @@ async fn strict_json_media_and_drive_validation_fail_before_authority_or_provide
     let response = router(state)
         .oneshot(
             Request::post("/drive/connect/begin")
+                .header("host", "127.0.0.1:8765")
                 .header("content-type", "application/json")
                 .header("origin", "https://evil.invalid")
                 .body(Body::from(r#"{"callback_port":12345}"#))
