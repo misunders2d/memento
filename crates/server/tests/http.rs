@@ -490,6 +490,40 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
     assert_eq!(request(&state, "GET", "/status", None).await.1["captured"]["episodes"], 1);
     let blob = send(&state, "POST", "/blobs", "zen.example.ts.net", None, Some("application/pdf"), "synthetic bytes").await;
     assert_eq!(blob.status(), StatusCode::CREATED);
+    // A duplicated Origin header cannot hide a foreign value behind a trusted first one.
+    let response = router(state.clone())
+        .oneshot(
+            Request::get("/health")
+                .header("host", "127.0.0.1:8765")
+                .header("origin", "http://127.0.0.1:8765")
+                .header("origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // MCP keeps its stricter rule: with a configured allowlist, loopback is not an MCP host.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#;
+    for (host, origin, expected) in [
+        ("zen.example.ts.net", None, StatusCode::OK),
+        ("127.0.0.1:8765", None, StatusCode::MISDIRECTED_REQUEST),
+        ("zen.example.ts.net", Some("http://127.0.0.1:8765"), StatusCode::FORBIDDEN),
+    ] {
+        let mut builder = Request::post("/mcp/")
+            .header("host", host)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        let response = router(state.clone()).oneshot(builder.body(Body::from(initialize)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected, "{host} {origin:?}");
+    }
+    // Drive's runner-only route still refuses even a trusted browser Origin.
+    let response = send(&state, "POST", "/drive/connect/begin", "127.0.0.1:8765", Some("http://127.0.0.1:8765"), Some("application/json"), r#"{"callback_port":12345}"#).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["cache-control"], "no-store");
 }
 #[tokio::test]
 async fn host_origin_error_body_and_chunked_limits_preserve_privacy() {

@@ -489,15 +489,16 @@ async fn admission(State(state): State<AppState>, request: Request, next: Next) 
     {
         return deny(StatusCode::MISDIRECTED_REQUEST);
     }
-    if let Some(origin) = headers.get("origin") {
-        let trusted = origin
+    // Every Origin value must be trusted, so a duplicated header cannot hide a foreign one.
+    let untrusted = headers.get_all("origin").iter().any(|origin| {
+        !origin
             .to_str()
             .ok()
             .and_then(|o| o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")))
-            .is_some_and(|host| trusted_host(&state.allowed_hosts, host));
-        if !trusted {
-            return deny(StatusCode::FORBIDDEN);
-        }
+            .is_some_and(|host| trusted_host(&state.allowed_hosts, host))
+    });
+    if untrusted {
+        return deny(StatusCode::FORBIDDEN);
     }
     next.run(request).await
 }
