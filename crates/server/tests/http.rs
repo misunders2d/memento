@@ -520,6 +520,24 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
         let response = router(state.clone()).oneshot(builder.body(Body::from(initialize)).unwrap()).await.unwrap();
         assert_eq!(response.status(), expected, "{host} {origin:?}");
     }
+    // A repeated Host header is never trusted, even when every value is trusted.
+    for (path, extra) in [("/health", "evil.example"), ("/mcp/", "evil.example"), ("/health", "127.0.0.1:8765")] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(if path == "/mcp/" { "POST" } else { "GET" })
+                    .uri(path)
+                    .header("host", if path == "/mcp/" { "zen.example.ts.net" } else { "127.0.0.1:8765" })
+                    .header("host", extra)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(initialize))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST, "{path} {extra}");
+    }
     // A trusted first Origin cannot carry a loopback Origin past MCP's stricter rule.
     let response = router(state.clone())
         .oneshot(

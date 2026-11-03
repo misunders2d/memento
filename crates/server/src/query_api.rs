@@ -34,10 +34,7 @@ fn protect(mut response: Response, cache: &'static str) -> Response {
     response
 }
 fn host(state: &AppState, headers: &HeaderMap) -> Result<()> {
-    if !headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .is_some_and(|h| viewer::host_allowed(h, &state.allowed_hosts))
+    if !crate::single_host(headers).is_some_and(|h| viewer::host_allowed(h, &state.allowed_hosts))
     {
         return Err(Error::Validation("Viewer host is not allowed"));
     }

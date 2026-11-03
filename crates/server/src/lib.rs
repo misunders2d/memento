@@ -28,7 +28,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
     extract::{Path, Query, Request, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -101,6 +101,12 @@ pub(crate) fn allowed_host(allowed: &[String], name: &str, port: Option<u16>) ->
     })
 }
 /// Router-wide trust: loopback always (container health check, local clients), plus configured hosts.
+/// The Host value only when exactly one is present: a repeated Host header is never trusted.
+pub(crate) fn single_host(headers: &HeaderMap) -> Option<&str> {
+    let mut hosts = headers.get_all("host").iter();
+    let host = hosts.next()?;
+    hosts.next().is_none().then(|| host.to_str().ok()).flatten()
+}
 pub(crate) fn trusted_host(allowed: &[String], host: &str) -> bool {
     host_parts(host).is_some_and(|(name, port)| {
         LOOPBACK.contains(&name.as_str()) || allowed_host(allowed, &name, port)
@@ -482,11 +488,7 @@ async fn limits(request: Request, next: Next) -> Response {
 async fn admission(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let headers = request.headers();
     let deny = |status: StatusCode| (status, [("cache-control", "no-store")]).into_response();
-    if !headers
-        .get("host")
-        .and_then(|host| host.to_str().ok())
-        .is_some_and(|host| trusted_host(&state.allowed_hosts, host))
-    {
+    if !single_host(headers).is_some_and(|host| trusted_host(&state.allowed_hosts, host)) {
         return deny(StatusCode::MISDIRECTED_REQUEST);
     }
     // Every Origin value must be trusted, so a duplicated header cannot hide a foreign one.

@@ -50,10 +50,7 @@ pub fn admit(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if !headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|host| trusted_host(state, host))
+    if !crate::single_host(headers).is_some_and(|host| trusted_host(state, host))
     {
         return Err(StatusCode::MISDIRECTED_REQUEST);
     }
