@@ -7,7 +7,10 @@ use crate::{
     hash_file,
 };
 use memento_core::{Error, Result, raw};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{
+    Connection, OpenFlags,
+    backup::{Backup, StepResult},
+};
 use serde::{
     Deserialize, Serialize,
     de::{self, MapAccess, SeqAccess, Visitor},
@@ -276,7 +279,15 @@ pub(crate) fn snapshot(data: &Path, target: &Path) -> Result<i64> {
     let source = open_read(&data.join("memory.sqlite"))?;
     let value = header(&source)?;
     drop(fs_safe::create(target)?);
-    source.backup("main", target, None)?;
+    {
+        let mut copy = Connection::open(target)?;
+        // One step copies every page under one read transaction. A stepped backup
+        // restarts from page 0 whenever another connection writes between steps, so
+        // a busy live database never finishes. In WAL mode the read blocks no writer.
+        if Backup::new(&source, &mut copy)?.step(-1)? != StepResult::Done {
+            return Err(Error::Unavailable("Database snapshot could not read the live database"));
+        }
+    }
     let db = Connection::open(target)?;
     db.execute_batch("PRAGMA journal_mode=DELETE")?;
     drop(db);

@@ -341,3 +341,62 @@ fn restore_rejects_trigger_that_changes_authority_during_permitted_rebase() {
         })
         .unwrap();
 }
+#[test]
+fn snapshot_finishes_while_another_connection_keeps_writing() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    use std::time::Duration;
+    let parent = private();
+    let data = parent.path().join("source");
+    let _store = fixture(&data);
+    let path = data.join("memory.sqlite");
+    // Enough pages that a 100-page stepped copy needs thousands of steps.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE filler(x BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<8000)
+             INSERT INTO filler SELECT randomblob(4000) FROM n;",
+        )
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writes = Arc::new(AtomicU64::new(0));
+    let writer = {
+        let (stop, writes, path) = (stop.clone(), writes.clone(), path.clone());
+        std::thread::spawn(move || {
+            let db = Connection::open(path).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            db.execute_batch("PRAGMA synchronous=OFF").unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                db.execute("INSERT INTO filler VALUES (randomblob(64))", []).unwrap();
+                writes.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+    while writes.load(Ordering::Relaxed) < 10 {
+        std::thread::yield_now();
+    }
+    let before = writes.load(Ordering::Relaxed);
+    let target = parent.path().join("copy.sqlite");
+    let (done, finished) = std::sync::mpsc::channel();
+    {
+        let (data, target) = (data.clone(), target.clone());
+        std::thread::spawn(move || {
+            let _ = done.send(snapshot(&data, &target).map_err(|error| error.to_string()));
+        });
+    }
+    let result = finished.recv_timeout(Duration::from_secs(60));
+    let after = writes.load(Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    result.expect("snapshot must finish while another connection writes").unwrap();
+    assert!(after > before, "the writer kept committing during the snapshot");
+    let copy = Connection::open(&target).unwrap();
+    assert_eq!(copy.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+    assert_eq!(
+        copy.query_row("SELECT count(*) FROM filler WHERE length(x)=4000", [], |r| r.get::<_, i64>(0)).unwrap(),
+        8000
+    );
+}
