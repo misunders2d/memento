@@ -484,7 +484,9 @@ function registerTools(api: NativeAPI, T: typeof SchemaType, harness: string,
     })]) }, { additionalProperties: false })],
     ["link", "Add an evidence-backed directional relation with an exact current-conversation quote; episode IDs are optional. Native provenance, command identity and actor are supplied automatically.", T.Object({ command: command({
       a: T.String({ minLength: 1, maxLength: 64 }), b: T.String({ minLength: 1, maxLength: 64 }),
-      rel: T.Union(["belongs_to", "follows_up_on", "works_in", "decided_by", "mentions", "part_of", "caused_by", "owned_by", "related_to"].map((value) => T.Literal(value))),
+      // Open predicate set, as on the service (which refuses supersedes). No lookahead: some model APIs reject it.
+      rel: T.String({ pattern: "^[a-z][a-z0-9_]{0,63}$",
+        description: "Most specific evidence-backed directional predicate in lowercase snake_case, for example belongs_to, follows_up_on, works_in, decided_by, mentions, part_of, caused_by, owned_by or related_to. supersedes is reserved for supersede." }),
     }) }, { additionalProperties: false })],
     ["supersede", "Atomically correct, change, or refine a belief using an exact current-conversation quote; episode IDs are optional. Refinement keeps the old assertion true but less complete. Native provenance, command identity and actor are supplied automatically.", T.Object({ command: command({
       old: T.String({ minLength: 1, maxLength: 64 }),
@@ -496,12 +498,17 @@ function registerTools(api: NativeAPI, T: typeof SchemaType, harness: string,
       absorbed: T.Array(T.String({ minLength: 1, maxLength: 64 }), { minItems: 1, maxItems: 8, uniqueItems: true }),
       expected_versions: T.Record(T.String({ minLength: 1, maxLength: 64 }), T.Integer({ minimum: 1 }), { minProperties: 2, maxProperties: 9 }),
     }) }, { additionalProperties: false })],
-    ["loop", "When asked, list or adjust a follow-up marker on an existing memory. Later hides only the marker from loop lists, not the fact from recall. Only an explicit remind action sets a reminder time. Native mutation identity and actor are supplied automatically.", T.Object({
-      action: T.Union(["list", "open", "close", "later", "remind"].map((value) => T.Literal(value))),
+    ["loop", "When asked, list or adjust a follow-up marker on an existing memory. list returns assigned (owner/other) loops; responsibility unknown lists unresolved ones, which are not obligations. assign sets responsibility; decline retracts an automatic false marker; close with evidence checks original chronology. Later hides only the marker from loop lists, not the fact from recall. remind sets a manual due date; processing may set one automatically only from an explicit source date. Evidence quotes need the episode_id from history. Native mutation identity and actor are supplied automatically.", T.Object({
+      action: T.Union(["list", "open", "close", "later", "remind", "assign", "decline"].map((value) => T.Literal(value))),
       limit: T.Optional(T.Integer({ minimum: 1, maximum: 100, default: 20 })),
       id: optionalString(T.String({ minLength: 1, maxLength: 64 })),
       days: T.Optional(T.Number({ exclusiveMinimum: 0, default: 7 })),
       due_at: date, due_before: date, scope: optionalString(scopeLabel), why: optionalString(string()),
+      responsibility: optionalString(T.Union(["owner", "other", "unknown"].map((value) => T.Literal(value)))),
+      evidence: T.Optional(T.Array(T.Object({
+        episode_id: T.String({ minLength: 1, maxLength: 64 }), quote: string(),
+        occurrence: T.Optional(T.Integer({ minimum: 0 })),
+      }, { additionalProperties: false }), { minItems: 1, maxItems: 8 })),
     }, { additionalProperties: false })],
   ];
   for (const [verb, description, parameters] of definitions) {
