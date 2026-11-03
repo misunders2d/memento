@@ -124,7 +124,9 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                     for ident in lost:
                         status = api.Service(config['url']).post('/work', {'action':'status','command':{'id':ident}})
                         if status.get('state') != 'done':
-                            raise api.RunnerError('worker lease lost before completion')
+                            if leases.lost_reason(ident) == 'rejected':
+                                raise api.RunnerError('worker lease rejected by service before completion')
+                            raise api.RunnerError('worker lease renewal unreachable before completion')
                         leases.remove(ident)
                         if ident not in done:
                             done.add(ident)
@@ -134,7 +136,7 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                         # abort that response; the refreshed unit deadline bounds a stall.
                         deadline = time.monotonic() + config['deadline_seconds']
                     if time.monotonic() > deadline:
-                        raise api.RunnerError('worker unit deadline or lease lost')
+                        raise api.RunnerError('worker unit deadline exceeded')
                     if process.poll() is not None:
                         raise api.RunnerError('persistent native worker exited')
                     events = selector.select(.2)

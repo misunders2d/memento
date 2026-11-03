@@ -314,6 +314,10 @@ impl Worker {
         )?);
         Ok(())
     }
+    /// The dispatch thread ended without close(): a panic escaped a callback outside job containment.
+    pub fn stopped(&self) -> bool {
+        !self.stop.load(Ordering::Acquire) && self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+    }
     pub fn close(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.wake.1.notify_all();

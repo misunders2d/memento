@@ -114,6 +114,22 @@ impl Services {
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
+    /// A registered background thread or the job worker ended before shutdown, usually by panic.
+    /// Health stays unhealthy until restart; nothing clears it.
+    pub fn stopped_thread(&self) -> bool {
+        if self.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let thread = self
+            .threads
+            .lock()
+            .map_or(true, |threads| threads.iter().any(JoinHandle::is_finished));
+        let worker = self
+            .worker
+            .lock()
+            .map_or(true, |worker| worker.as_ref().is_some_and(Worker::stopped));
+        thread || worker
+    }
     pub fn close(&self) {
         self.request_stop();
         if let Ok(auth) = self.drive_authorization.read() {

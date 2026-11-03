@@ -85,7 +85,9 @@ def native(tmp_path,monkeypatch):
                 return dict(worker_protocol=1,lease_seconds=.12,policies=dict(extract={},consolidate={}),
                             pending_extract_conversations=0,ready_candidates=2,jobs=[],pending_maintenance_groups=0,
                             eligible_extract_conversations=int(os.environ.get('ELIGIBLE','0')))
-            if path=='/work/renew':return {'renewed':command['id'] not in os.environ.get('RENEW_FALSE','').split(',')}
+            if path=='/work/renew':
+                if command['id'] in os.environ.get('RENEW_UNREACHABLE','').split(','):raise runner.RunnerError('service_unavailable')
+                return {'renewed':command['id'] not in os.environ.get('RENEW_FALSE','').split(',')}
             if path=='/work' and command['action']=='status':
                 return dict(id=command['command']['id'],kind='consolidate',state=os.environ.get('STATUS_STATE','done'))
             if path=='/work/release':return {'released':True}
@@ -220,7 +222,18 @@ def test_failed_renewal_of_unfinished_work_still_stops_and_releases(native,monke
     monkeypatch.setenv('RENEW_FALSE','first')
     monkeypatch.setenv('STATUS_STATE','leased')
     monkeypatch.setenv('SUBMIT_DELAY','.4')  # loss is observed while the unit is still in progress
-    with pytest.raises(runner.RunnerError,match='lease lost before completion'):
+    with pytest.raises(runner.RunnerError,match='lease rejected by service before completion'):
+        worker.tick(runner,config,consolidate_now=True)
+    assert [command for path,command in calls if path=='/work/release']==[dict(id='first',owner='lease-a',error='cli_failed')]
+
+
+def test_unreachable_renewal_is_reported_apart_from_rejection(native,monkeypatch):
+    config,trace,calls=native
+    monkeypatch.setenv('RENEW_UNREACHABLE','first')
+    monkeypatch.setenv('STATUS_STATE','leased')
+    monkeypatch.setenv('SUBMIT_DELAY','.4')
+    # Message split only: an unanswered renewal still stops and releases the unit.
+    with pytest.raises(runner.RunnerError,match='lease renewal unreachable before completion'):
         worker.tick(runner,config,consolidate_now=True)
     assert [command for path,command in calls if path=='/work/release']==[dict(id='first',owner='lease-a',error='cli_failed')]
 

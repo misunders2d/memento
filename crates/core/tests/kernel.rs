@@ -605,3 +605,20 @@ fn open_replaces_the_chunk_delete_guard_once_and_keeps_other_deletes_refused() {
     assert!(format!("{:?}", delete("chunk-message").unwrap_err()).contains("graph history is immutable"));
     assert_eq!(delete("chunk-output").unwrap(), 1);
 }
+#[test]
+fn poisoned_writer_keeps_health_unavailable() {
+    let (_temp, store) = store();
+    store.health().unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.write(|_| -> Result<()> { panic!("synthetic writer panic") });
+    }));
+    assert!(panicked.is_err());
+    // Health reports the poisoned writer, and nothing clears it.
+    for _ in 0..2 {
+        assert!(matches!(
+            store.health(),
+            Err(Error::Unavailable("Evidence writer requires recovery"))
+        ));
+    }
+    assert!(store.write(|_| Ok(())).is_err());
+}

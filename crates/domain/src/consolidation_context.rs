@@ -835,9 +835,17 @@ fn prepare_cached(
         ));
     }
     crate::work_timing::lap("targets_maintenance", &mut sub);
-    let mut comparison: Vec<(String, Vec<String>)> = vec![];
+    // Per subject: required top exact/lexical/semantic targets of every member candidate,
+    // then the rest. Reserved comparison slots reach the tops before weak first-word
+    // matches, so a candidate is not deferred only because head hints filled them.
+    let mut subjects_queue: Vec<(String, Vec<String>, Vec<String>)> = vec![];
     for (key, exact, similar) in &identities {
-        let mut queue = unique(exact.iter().chain(similar).cloned());
+        let tops = relevant
+            .iter()
+            .find(|(id, _)| id == key)
+            .map(|(_, tops)| tops.clone())
+            .unwrap_or_default();
+        let mut queue = unique(tops.iter().chain(exact).chain(similar).cloned());
         for target in queue.clone().iter().take(8) {
             queue.extend(neighbor_ids(db, discovery_cache, target, 8)?);
         }
@@ -853,12 +861,17 @@ fn prepare_cached(
             .next()
             .unwrap_or_else(|| candidate["text"].as_str().unwrap().into());
         let subject = format!("{}\0{head}", get_str(candidate, "type")?);
-        if let Some((_, prior)) = comparison.iter_mut().find(|(key, _)| key == &subject) {
-            *prior = unique(prior.iter().chain(&queue).cloned());
+        if let Some((_, prior_tops, prior)) = subjects_queue.iter_mut().find(|(key, _, _)| key == &subject) {
+            prior_tops.extend(tops);
+            prior.extend(queue);
         } else {
-            comparison.push((subject, queue));
+            subjects_queue.push((subject, tops, queue));
         }
     }
+    let comparison: Vec<(String, Vec<String>)> = subjects_queue
+        .into_iter()
+        .map(|(subject, tops, rest)| (subject, unique(tops.into_iter().chain(rest))))
+        .collect();
     crate::work_timing::lap("targets_neighbors", &mut sub);
     builder.allocate(&comparison, Some(2))?;
     crate::work_timing::lap("targets_allocate", &mut sub);

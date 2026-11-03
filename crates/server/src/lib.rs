@@ -581,6 +581,9 @@ async fn health(State(state): State<AppState>) -> std::result::Result<Json<Value
         if let Some(message) = services.startup_error.lock().ok().and_then(|e| *e) {
             return Err(Error::Unavailable(message).into());
         }
+        if services.stopped_thread() {
+            return Err(Error::Unavailable("Background service stopped; restart required").into());
+        }
         if services
             .cold_status()?
             .is_some_and(|s| !s["last_error"].is_null())
