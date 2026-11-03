@@ -36,20 +36,6 @@ pub fn admit(
     headers: &HeaderMap,
     post: bool,
 ) -> std::result::Result<(), StatusCode> {
-    if post
-        && !headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("application/json")
-            })
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
     if !crate::single_host(headers).is_some_and(|host| trusted_host(state, host))
     {
         return Err(StatusCode::MISDIRECTED_REQUEST);
@@ -65,17 +51,40 @@ pub fn admit(
             return Err(StatusCode::FORBIDDEN);
         }
     }
+    // Host and Origin first, so a refused caller learns nothing from body validation.
+    if post
+        && !headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("application/json")
+            })
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     Ok(())
 }
+/// Host/Origin refusals are never cached, like router-wide admission.
+fn refuse(status: StatusCode) -> Response {
+    if matches!(status, StatusCode::MISDIRECTED_REQUEST | StatusCode::FORBIDDEN) {
+        (status, [("cache-control", "no-store")]).into_response()
+    } else {
+        status.into_response()
+    }
+}
 pub async fn unsupported(State(state): State<AppState>, request: Request) -> Response {
-    match admit(&state,request.headers(),false){Err(status)=>status.into_response(),Ok(())=>(StatusCode::METHOD_NOT_ALLOWED,Json(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Method not allowed"}}))).into_response()}
+    match admit(&state,request.headers(),false){Err(status)=>refuse(status),Ok(())=>(StatusCode::METHOD_NOT_ALLOWED,Json(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Method not allowed"}}))).into_response()}
 }
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
 pub async fn request(State(state): State<AppState>, request: Request) -> Response {
     if let Err(status) = admit(&state, request.headers(), true) {
-        return status.into_response();
+        return refuse(status);
     }
     let accept = request
         .headers()

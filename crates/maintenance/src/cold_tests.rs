@@ -28,6 +28,7 @@ pub(super) struct Directory {
     binding: PublicBinding,
     pub(super) names: Mutex<BTreeMap<String, RemoteBackup>>,
     interrupt: AtomicBool,
+    pub(super) panic: AtomicBool,
     block: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl Directory {
@@ -43,6 +44,7 @@ impl Directory {
             },
             names: Mutex::new(BTreeMap::new()),
             interrupt: AtomicBool::new(false),
+            panic: AtomicBool::new(false),
             block: Mutex::new(None),
         })
     }
@@ -59,6 +61,7 @@ impl ColdStore for Directory {
         _checkpoint: &Value,
         save: &mut dyn FnMut(Value) -> Result<()>,
     ) -> Result<ColdObject> {
+        assert!(!self.panic.load(Ordering::Acquire), "synthetic cold upload panic");
         let (sha, md5, size) = drive::hashes(path)?;
         let target = self.root.join(&sha);
         if !target.exists() {
@@ -364,6 +367,24 @@ fn runtime_drains_bounded_batches_stops_and_never_creates_backup() {
             Ok(())
         })
         .unwrap();
+}
+#[test]
+fn runtime_reports_a_worker_thread_ended_by_an_escaping_panic() {
+    let temp = private();
+    let (store, manager, backend) = setup(temp.path());
+    blob(&store, b"panics during upload", "image/png");
+    backend.panic.store(true, Ordering::Release);
+    let runtime = ColdRuntime::new(manager, ColdPolicy::default()).unwrap();
+    assert!(!runtime.stopped());
+    runtime.start().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !runtime.stopped() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(runtime.stopped());
+    // Closing is an explicit stop, never a stopped-thread report.
+    assert!(runtime.close().is_err());
+    assert!(!runtime.stopped());
 }
 #[test]
 fn pending_derived_media_stage_retains_its_registered_artifact_until_job_finishes() {

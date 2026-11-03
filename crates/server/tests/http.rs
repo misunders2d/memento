@@ -519,7 +519,14 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
         }
         let response = router(state.clone()).oneshot(builder.body(Body::from(initialize)).unwrap()).await.unwrap();
         assert_eq!(response.status(), expected, "{host} {origin:?}");
+        if expected != StatusCode::OK {
+            assert_eq!(response.headers()["cache-control"], "no-store", "{host} {origin:?}");
+        }
     }
+    // MCP refuses the loopback Host before judging the body: typeless loopback POST is 421, not 400.
+    let response = send(&state, "POST", "/mcp/", "127.0.0.1:8765", None, None, initialize).await;
+    assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(response.headers()["cache-control"], "no-store");
     // A repeated Host header is never trusted, even when every value is trusted.
     for (path, extra) in [("/health", "evil.example"), ("/mcp/", "evil.example"), ("/health", "127.0.0.1:8765")] {
         let response = router(state.clone())

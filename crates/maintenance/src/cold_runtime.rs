@@ -164,6 +164,14 @@ impl ColdRuntime {
         );
         Ok(())
     }
+    /// The worker thread ended before close, usually by an escaping panic.
+    pub fn stopped(&self) -> bool {
+        !self.stopping.load(Ordering::Acquire)
+            && self
+                .thread
+                .lock()
+                .map_or(true, |thread| thread.as_ref().is_some_and(JoinHandle::is_finished))
+    }
     pub fn close(&self) -> Result<()> {
         self.stopping.store(true, Ordering::Release);
         self.wake.1.notify_all();

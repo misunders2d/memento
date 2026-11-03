@@ -222,6 +222,9 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                                             if set(item) != {'id','owner','kind'} or item['kind'] not in api.KINDS:
                                                 raise api.RunnerError('invalid worker claim')
                                             leases.active[item['id']] = item['owner']
+                                            # A fresh claim never inherits a renewal loss recorded
+                                            # for an earlier lease of the same job.
+                                            leases.lost.pop(item['id'], None)
                                             job_kinds[item['id']] = item['kind']
                                     empty.clear()
                                 if event.get('empty') and event.get('kind') in api.KINDS:

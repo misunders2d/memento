@@ -238,6 +238,13 @@ def test_unreachable_renewal_is_reported_apart_from_rejection(native,monkeypatch
     assert [command for path,command in calls if path=='/work/release']==[dict(id='first',owner='lease-a',error='cli_failed')]
 
 
+def test_removed_lease_forgets_its_renewal_loss():
+    leases=runner.Leases(None,[dict(id='job',owner='lease-a')],60)
+    leases.lost['job']='rejected'
+    leases.remove('job')
+    assert leases.lost_reason('job') is None and not leases.is_lost('job')
+
+
 def test_reconciled_submit_that_never_settles_is_bounded_by_unit_deadline(native,monkeypatch):
     config,trace,calls=native
     config['deadline_seconds']=.3

@@ -128,7 +128,11 @@ impl Services {
             .worker
             .lock()
             .map_or(true, |worker| worker.as_ref().is_some_and(Worker::stopped));
-        thread || worker
+        let cold = self
+            .cold_runtime
+            .lock()
+            .map_or(true, |cold| cold.as_ref().is_some_and(|cold| cold.stopped()));
+        thread || worker || cold
     }
     pub fn close(&self) {
         self.request_stop();

@@ -585,6 +585,7 @@ class Leases:
     def remove(self, ident):
         with self.lock:
             self.active.pop(ident, None)
+            self.lost.pop(ident, None)
 
 
 KINDS = ('extract', 'consolidate')
