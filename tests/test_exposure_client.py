@@ -107,7 +107,7 @@ def test_cached_peer_and_failed_output_do_not_create_or_relabel_receipts(spool, 
         raise OSError('synthetic outage')
     monkeypatch.setattr(bridge, 'http', offline)
     cached = bridge.passive(spool, 'conversation', 'Connect another agent.', harness='pi')
-    assert cached == {**first, 'error': 'recall_unavailable'}
+    assert cached == {**first, 'context': 'Memento recall is unavailable; cached context from the same request 0 min ago, not refreshed:\n' + first['context'], 'error': 'recall_unavailable'}
     assert bridge.passive(spool, 'other', 'No cache.', harness='pi')['context'] == ''
     assert [bridge.encode(row) for row in receipts(spool)] == [original]
     monkeypatch.setattr(bridge, 'http', lambda *_args, **_kwargs: {'memories': [lesson(version=2)]})

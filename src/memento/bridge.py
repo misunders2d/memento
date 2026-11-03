@@ -948,11 +948,17 @@ def recall_offer(spool, conversation, query, result, *, budget, notice_in_contex
     return {'context': context, 'shown': shown, **({'update_notice': notice} if notice else {})}
 
 
-def recall_cached(spool, conversation, query, budget, *, peer=False):
-    row = spool.db.execute('''SELECT query,context,shown FROM recall_cache
+def recall_cached(spool, conversation, query, budget, *, peer=False, outage=False):
+    row = spool.db.execute('''SELECT query,context,shown,updated FROM recall_cache
         WHERE conversation=? AND updated>?''', (conversation, time.time() - 300)).fetchone()
-    return ({'context': row[1], 'shown': json.loads(row[2])}
-            if row and (peer or row[0] == query) and len(row[1].encode('utf-8')) <= budget
+    context = row[1] if row else ''
+    if context and outage:
+        # During an outage the model must not mistake an earlier result for fresh recall.
+        minutes = max(0, int((time.time() - row[3]) // 60))
+        context = ('Memento recall is unavailable; cached context from the same request '
+                   f'{minutes} min ago, not refreshed:\n' + context)
+    return ({'context': context, 'shown': json.loads(row[2])}
+            if row and (peer or row[0] == query) and len(context.encode('utf-8')) <= budget
             else {'context': '', 'shown': []})
 
 
@@ -969,7 +975,7 @@ def passive(spool, conversation, query, cwd=None, *, budget=CONTEXT_BYTES, notic
         return recall_offer(spool, conversation, query, result, budget=budget,
                             notice_in_context=notice_in_context, harness=harness)
     except (OSError, ValueError, TypeError, _http_exception()):
-        return {**recall_cached(spool, conversation, query, budget), 'error': 'recall_unavailable'}
+        return {**recall_cached(spool, conversation, query, budget, outage=True), 'error': 'recall_unavailable'}
 
 
 def recall_state(spool, conversation):
@@ -1167,7 +1173,7 @@ def _automatic(spool, conversation, query, cwd=None, *, budget, notice_in_contex
     if offered is not None:
         return dict(offered, query=query)
     if launch_failed:
-        return {**recall_cached(spool, conversation, query, budget), 'error': 'recall_unavailable', 'query': query,
+        return {**recall_cached(spool, conversation, query, budget, outage=True), 'error': 'recall_unavailable', 'query': query,
                 **({'warning': True} if warning else {})}
     # This is a bounded local completion wait, not another HTTP request or an
     # idle poller. Detached work survives hook/process-group cancellation.
@@ -1192,7 +1198,7 @@ def _automatic(spool, conversation, query, cwd=None, *, budget, notice_in_contex
                             delayed=selected is delayed, **options) if not selected.get('error') else None)
                 spool.commit()
                 return (dict(offered, query=selected_query) if offered is not None else
-                        {**recall_cached(spool, conversation, query, budget), 'error': 'recall_unavailable', 'query': query,
+                        {**recall_cached(spool, conversation, query, budget, outage=True), 'error': 'recall_unavailable', 'query': query,
                          **({'warning': True} if warning else {})})
             spool.commit()
         time.sleep(min(.05, max(0, until - time.monotonic())))
@@ -1205,7 +1211,7 @@ def _automatic(spool, conversation, query, cwd=None, *, budget, notice_in_contex
             return dict(offered, query=delayed['query'], pending=True)
         spool.commit()
     if failed or ready and ready.get('error'):
-        return {**recall_cached(spool, conversation, query, budget), 'error': 'recall_unavailable', 'query': query,
+        return {**recall_cached(spool, conversation, query, budget, outage=True), 'error': 'recall_unavailable', 'query': query,
                 'pending': True, **({'warning': True} if warning else {})}
     return {**recall_cached(spool, conversation, query, budget), 'pending': True, 'query': query}
 
@@ -1238,7 +1244,7 @@ def recall_ready(spool, conversation, turn, *, token=None, budget=CONTEXT_BYTES,
         result = (recall_offer(spool, conversation, ready['query'], ready,
                     budget=max(0, min(CONTEXT_BYTES, budget)), notice_in_context=notice_in_context,
                     harness=harness, delayed=True) if not ready.get('error') else
-                  {**recall_cached(spool, conversation, ready['query'], budget),
+                  {**recall_cached(spool, conversation, ready['query'], budget, outage=True),
                    'error': 'recall_unavailable', **({'warning': True} if warning else {})})
         if expired():
             spool.db.rollback()
@@ -1256,7 +1262,7 @@ def recall_ready(spool, conversation, turn, *, token=None, budget=CONTEXT_BYTES,
             return {'pending': True}
         spool.commit()
         query = state['latest']['query']
-        return {**recall_cached(spool, conversation, query, budget), 'query': query,
+        return {**recall_cached(spool, conversation, query, budget, outage=True), 'query': query,
                 'error': 'recall_unavailable', **({'warning': True} if warning else {})}
     spool.commit()
     return {'pending': pending}

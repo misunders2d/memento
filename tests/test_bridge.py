@@ -12,6 +12,9 @@ import pytest
 
 from memento import bridge
 
+# Cached context offered during an outage carries this label (fixture ages are under a minute).
+OUTAGE = 'Memento recall is unavailable; cached context from the same request 0 min ago, not refreshed:\n'
+
 
 def spool_at(tmp_path, **overrides):
     config = {'uid': 1000, 'client_uid': 'test-device', 'url': 'http://127.0.0.1:1', 'preset': 'claude',
@@ -258,7 +261,7 @@ def test_passive_slow_healthy_response_and_stalled_request_budget(tmp_path):
         healthy = bridge.passive(spool, 'session', 'synthetic query')
         assert 'error' not in healthy and healthy['shown'] == ['slow-fact']
         started = time.monotonic()
-        assert bridge.passive(spool, 'session', 'synthetic query') == {**healthy, 'error': 'recall_unavailable'}
+        assert bridge.passive(spool, 'session', 'synthetic query') == {**healthy, 'context': OUTAGE + healthy['context'], 'error': 'recall_unavailable'}
         assert 2.5 <= time.monotonic() - started < 4.5
         assert len(calls) == 2  # No retry after the stalled request.
     finally:
@@ -335,7 +338,7 @@ def test_failed_recall_does_not_consume_or_replay_update_notice(tmp_path, monkey
         raise OSError('unavailable')
     monkeypatch.setattr(bridge, 'http', outage)
     cached = bridge.passive(spool, 's', 'ordinary request')
-    assert cached == {'context': success['context'], 'shown': ['fact'], 'error': 'recall_unavailable'}
+    assert cached == {'context': OUTAGE + success['context'], 'shown': ['fact'], 'error': 'recall_unavailable'}
     spool.close()
 
 
@@ -393,7 +396,7 @@ def test_offline_cache_does_not_leak_previous_request(tmp_path, monkeypatch):
         raise OSError('offline')
 
     monkeypatch.setattr(bridge, 'http', offline)
-    assert bridge.passive(spool, 'session', 'original query') == {**first, 'error': 'recall_unavailable'}
+    assert bridge.passive(spool, 'session', 'original query') == {**first, 'context': OUTAGE + first['context'], 'error': 'recall_unavailable'}
     assert bridge.passive(spool, 'session', 'different query') == {
         'context': '', 'shown': [], 'error': 'recall_unavailable'}
     spool.close()
