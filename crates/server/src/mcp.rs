@@ -26,15 +26,9 @@ fn trusted_host(state: &AppState, host: &str) -> bool {
         return false;
     };
     if state.allowed_hosts.is_empty() {
-        return ["127.0.0.1", "localhost", "::1"].contains(&name.as_str());
+        return crate::LOOPBACK.contains(&name.as_str());
     }
-    state.allowed_hosts.iter().any(|allowed| {
-        let wildcard = allowed.ends_with(":*");
-        let allowed = allowed.strip_suffix(":*").unwrap_or(allowed);
-        crate::host_parts(allowed).is_some_and(|(candidate, expected)| {
-            candidate == name && (wildcard || expected.is_none() || expected == port)
-        })
-    })
+    crate::allowed_host(&state.allowed_hosts, &name, port)
 }
 
 pub fn admit(

@@ -89,6 +89,23 @@ pub(crate) fn host_parts(host: &str) -> Option<(String, Option<u16>)> {
         port.map(str::parse::<u16>).transpose().ok()?,
     ))
 }
+pub(crate) const LOOPBACK: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+/// `MEMENTO_ALLOWED_HOSTS` entry match: a bare name allows any port, `name:port` that port, `name:*` any port.
+pub(crate) fn allowed_host(allowed: &[String], name: &str, port: Option<u16>) -> bool {
+    allowed.iter().any(|allowed| {
+        let wildcard = allowed.ends_with(":*");
+        let allowed = allowed.strip_suffix(":*").unwrap_or(allowed);
+        host_parts(allowed).is_some_and(|(candidate, expected)| {
+            candidate == name && (wildcard || expected.is_none() || expected == port)
+        })
+    })
+}
+/// Router-wide trust: loopback always (container health check, local clients), plus configured hosts.
+pub(crate) fn trusted_host(allowed: &[String], host: &str) -> bool {
+    host_parts(host).is_some_and(|(name, port)| {
+        LOOPBACK.contains(&name.as_str()) || allowed_host(allowed, &name, port)
+    })
+}
 pub const CAPTURE_BYTES: usize = 1024 * 1024;
 pub const BLOB_BYTES: usize = 1024 * 1024 * 1024;
 #[derive(Clone, Debug, Deserialize)]
@@ -408,18 +425,18 @@ pub(crate) fn parse<T: DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|_| Error::Validation("Invalid request fields"))
 }
 async fn json_body<T: DeserializeOwned>(request: Request) -> std::result::Result<T, ApiError> {
-    if let Some(kind) = request.headers().get("content-type") {
-        let valid = kind
-            .to_str()
-            .ok()
-            .and_then(|s| s.split(';').next())
-            .is_some_and(|s| {
-                let s = s.trim().to_ascii_lowercase();
-                s == "application/json" || (s.starts_with("application/") && s.ends_with("+json"))
-            });
-        if !valid {
-            return Err(ApiError(Error::Validation("Invalid request fields")));
-        }
+    // A JSON media type is required: browsers can send a typeless or text/plain body cross-site without preflight.
+    let valid = request
+        .headers()
+        .get("content-type")
+        .and_then(|kind| kind.to_str().ok())
+        .and_then(|s| s.split(';').next())
+        .is_some_and(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            s == "application/json" || (s.starts_with("application/") && s.ends_with("+json"))
+        });
+    if !valid {
+        return Err(ApiError(Error::Validation("Invalid request fields")));
     }
     let bytes = to_bytes(request.into_body(), CAPTURE_BYTES)
         .await
@@ -457,6 +474,29 @@ async fn limits(request: Request, next: Next) -> Response {
         };
         if length > maximum as u64 {
             return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+    }
+    next.run(request).await
+}
+/// Every route, including `/blobs`, rejects an untrusted Host (DNS rebinding) or a present untrusted Origin.
+async fn admission(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let deny = |status: StatusCode| (status, [("cache-control", "no-store")]).into_response();
+    if !headers
+        .get("host")
+        .and_then(|host| host.to_str().ok())
+        .is_some_and(|host| trusted_host(&state.allowed_hosts, host))
+    {
+        return deny(StatusCode::MISDIRECTED_REQUEST);
+    }
+    if let Some(origin) = headers.get("origin") {
+        let trusted = origin
+            .to_str()
+            .ok()
+            .and_then(|o| o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")))
+            .is_some_and(|host| trusted_host(&state.allowed_hosts, host));
+        if !trusted {
+            return deny(StatusCode::FORBIDDEN);
         }
     }
     next.run(request).await
@@ -518,6 +558,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(mcp::unsupported),
         )
         .layer(middleware::from_fn(limits))
+        .layer(middleware::from_fn_with_state(state.clone(), admission))
         .with_state(state)
 }
 async fn health(State(state): State<AppState>) -> std::result::Result<Json<Value>, ApiError> {

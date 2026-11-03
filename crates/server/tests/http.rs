@@ -416,6 +416,81 @@ async fn actual_mcp_scoped_recall_validates_since_before_dispatch() {
         }
     }
 }
+async fn send(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    host: &str,
+    origin: Option<&str>,
+    kind: Option<&str>,
+    body: &str,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(path).header("host", host);
+    if let Some(origin) = origin {
+        builder = builder.header("origin", origin);
+    }
+    if let Some(kind) = kind {
+        builder = builder.header("content-type", kind);
+    }
+    router(state.clone())
+        .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() {
+    let (_dir, mut state) = fixture();
+    // A tailnet-only allowlist must keep loopback trusted: the container health check uses it.
+    state.allowed_hosts = std::sync::Arc::new(vec!["zen.example.ts.net".into()]);
+    for host in ["127.0.0.1:8765", "localhost:8765", "[::1]:8765", "zen.example.ts.net"] {
+        assert_eq!(send(&state, "GET", "/health", host, None, None, "").await.status(), StatusCode::OK, "{host}");
+    }
+    let routes: [(&str, &str, Option<&str>, &str); 14] = [
+        ("GET", "/health", None, ""),
+        ("GET", "/status", None, ""),
+        ("GET", "/recall?q=Atlas", None, ""),
+        ("GET", "/episodes/search?q=Atlas", None, ""),
+        ("GET", "/history/unknown", None, ""),
+        ("GET", "/runner", None, ""),
+        ("GET", "/connect", None, ""),
+        ("GET", "/ui/api/graph", None, ""),
+        ("POST", "/episodes", Some("application/json"), "{}"),
+        ("POST", "/remember", Some("application/json"), "{}"),
+        ("POST", "/work", Some("application/json"), "{}"),
+        ("POST", "/blobs", Some("application/pdf"), "bytes"),
+        ("POST", "/mcp/", Some("application/json"), "{}"),
+        ("POST", "/drive/connect/begin", Some("application/json"), "{}"),
+    ];
+    for (method, path, kind, body) in routes {
+        for host in ["evil.example", "zen.example.ts.net.evil.example", "evil.example@127.0.0.1"] {
+            let response = send(&state, method, path, host, None, kind, body).await;
+            assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST, "{method} {path} {host}");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+        for origin in ["https://evil.example", "null", "file://", "https://zen.example.ts.net.evil.example"] {
+            let response = send(&state, method, path, "127.0.0.1:8765", Some(origin), kind, body).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path} {origin}");
+        }
+    }
+    for path in ["/episodes", "/remember", "/work", "/work/claim", "/usage", "/drive/connect/begin"] {
+        for kind in [None, Some("text/plain"), Some("application/x-www-form-urlencoded")] {
+            let response = send(&state, "POST", path, "127.0.0.1:8765", None, kind, "{}").await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path} {kind:?}");
+        }
+    }
+    let typeless = serde_json::to_string(&capture("Typeless capture is refused")).unwrap();
+    assert_eq!(send(&state, "POST", "/episodes", "127.0.0.1:8765", None, None, &typeless).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(request(&state, "GET", "/status", None).await.1["captured"]["episodes"], 0);
+    for (host, origin, kind) in [
+        ("zen.example.ts.net", Some("https://zen.example.ts.net"), "application/json"),
+        ("127.0.0.1:8765", Some("http://127.0.0.1:8765"), "application/vnd.memento+json; charset=utf-8"),
+    ] {
+        assert_eq!(send(&state, "POST", "/episodes", host, origin, Some(kind), &typeless).await.status(), StatusCode::OK, "{host}");
+    }
+    assert_eq!(request(&state, "GET", "/status", None).await.1["captured"]["episodes"], 1);
+    let blob = send(&state, "POST", "/blobs", "zen.example.ts.net", None, Some("application/pdf"), "synthetic bytes").await;
+    assert_eq!(blob.status(), StatusCode::CREATED);
+}
 #[tokio::test]
 async fn host_origin_error_body_and_chunked_limits_preserve_privacy() {
     let (_dir, state) = fixture();

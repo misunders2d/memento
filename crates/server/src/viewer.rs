@@ -600,11 +600,5 @@ pub fn candidates(db: &Connection, q: &CandidatesQuery) -> Result<Value> {
     Ok(json!({"total":total,"items":items}))
 }
 pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
-    let Some((hostname, _)) = crate::host_parts(host) else {
-        return false;
-    };
-    ["localhost", "127.0.0.1", "::1"].contains(&hostname.as_str())
-        || allowed
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case(host) || a.eq_ignore_ascii_case(&hostname))
+    crate::trusted_host(allowed, host)
 }

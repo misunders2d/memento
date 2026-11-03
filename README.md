@@ -343,7 +343,7 @@ docker compose up -d
 tailscale serve --bg 8765
 ```
 
-Tailnet HTTPS must be enabled and ACLs must restrict access to your devices. The API's published listener remains loopback-only. MCP host protection stays enabled; the endpoint is `/mcp/`.
+Tailnet HTTPS must be enabled and ACLs must restrict access to your devices. The API's published listener remains loopback-only. Every route answers only loopback names or hosts listed in `MEMENTO_ALLOWED_HOSTS`, refuses a browser `Origin` outside that set, and JSON POSTs require a JSON `Content-Type` (`/blobs` keeps its file MIME). MCP keeps its stricter host check; the endpoint is `/mcp/`.
 
 Clients use the canonical `/mcp/` URL. Existing `/mcp` URLs receive a relative HTTP 307 redirect, preserving the request method, query string and private HTTPS origin without trusting forwarded headers.
 
