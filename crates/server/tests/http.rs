@@ -520,6 +520,21 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
         let response = router(state.clone()).oneshot(builder.body(Body::from(initialize)).unwrap()).await.unwrap();
         assert_eq!(response.status(), expected, "{host} {origin:?}");
     }
+    // A trusted first Origin cannot carry a loopback Origin past MCP's stricter rule.
+    let response = router(state.clone())
+        .oneshot(
+            Request::post("/mcp/")
+                .header("host", "zen.example.ts.net")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("origin", "https://zen.example.ts.net")
+                .header("origin", "http://127.0.0.1:8765")
+                .body(Body::from(initialize))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     // Drive's runner-only route still refuses even a trusted browser Origin.
     let response = send(&state, "POST", "/drive/connect/begin", "127.0.0.1:8765", Some("http://127.0.0.1:8765"), Some("application/json"), r#"{"callback_port":12345}"#).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);

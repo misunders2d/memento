@@ -57,7 +57,8 @@ pub fn admit(
     {
         return Err(StatusCode::MISDIRECTED_REQUEST);
     }
-    if let Some(origin) = headers.get("origin") {
+    // Every Origin value must pass MCP's stricter rule, not only the first one.
+    for origin in headers.get_all("origin") {
         let origin = origin.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
         let host = origin
             .strip_prefix("https://")
