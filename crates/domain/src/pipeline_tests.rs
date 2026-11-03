@@ -2012,3 +2012,20 @@ fn same_plan_decline_keeps_protections_and_concurrent_loop_fence() {
     assert_eq!(declined["status"], "declined_not_obligation");
     assert_eq!(g.graph.history(&target).unwrap()[0]["loop"]["state"], "closed");
 }
+#[test]
+fn worker_reports_a_dispatch_thread_stopped_by_an_escaping_panic() {
+    use std::{collections::HashMap, time::{Duration, Instant}};
+    let f = Fixture::new();
+    let queue = jobs::Queue::new(f.graph.clone());
+    let maintenance: jobs::Maintenance = Arc::new(|| panic!("synthetic maintenance panic"));
+    let mut worker = jobs::Worker::new(queue, HashMap::new(), Some(maintenance));
+    assert!(!worker.stopped());
+    worker.start().unwrap();
+    let began = Instant::now();
+    while !worker.stopped() {
+        assert!(began.elapsed() < Duration::from_secs(5), "dead worker not reported");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    worker.close();
+    assert!(!worker.stopped(), "an intentional close is not a failure");
+}

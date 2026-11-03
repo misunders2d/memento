@@ -211,6 +211,10 @@ impl Store {
             .map_err(|_| Error::Unavailable("Evidence writer requires recovery"))?;
         apply()
     }
+    /// A panic while writing poisons the writer; every later write fails closed until restart.
+    pub(crate) fn writer_poisoned(&self) -> bool {
+        self.writer.is_poisoned()
+    }
     pub fn blobs(&self) -> &Arc<crate::blobs::BlobStore> {
         &self.blobs
     }

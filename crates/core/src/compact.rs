@@ -51,6 +51,10 @@ impl Store {
         })
     }
     pub fn health(&self) -> Result<()> {
+        // The probe uses its own connection, so it cannot see the in-process writer mutex.
+        if self.writer_poisoned() {
+            return Err(Error::Unavailable("Evidence writer requires recovery"));
+        }
         let probe = Connection::open_with_flags(
             self.data_dir().join("memory.sqlite"),
             OpenFlags::SQLITE_OPEN_READ_WRITE,
