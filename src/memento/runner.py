@@ -555,7 +555,8 @@ class Leases:
     def __init__(self, service, work, seconds):
         self.service, self.seconds = service, seconds
         self.active = {item['id']: item['owner'] for item in work}
-        self.lost = set()
+        # ident -> 'rejected' (service answered renewed=false) or 'unreachable' (no answer).
+        self.lost = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -566,16 +567,20 @@ class Leases:
                 items = list(self.active.items())
             for ident, owner in items:
                 try:
-                    renewed = self.service.post('/work/renew', {'id': ident, 'owner': owner}).get('renewed') is True
+                    reason = None if self.service.post('/work/renew', {'id': ident, 'owner': owner}).get('renewed') is True else 'rejected'
                 except RunnerError:
-                    renewed = False
-                if not renewed:
+                    reason = 'unreachable'
+                if reason:
                     with self.lock:
-                        self.lost.add(ident)
+                        self.lost.setdefault(ident, reason)
 
     def is_lost(self, ident):
         with self.lock:
             return ident in self.lost
+
+    def lost_reason(self, ident):
+        with self.lock:
+            return self.lost.get(ident)
 
     def remove(self, ident):
         with self.lock:
