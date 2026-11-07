@@ -4,7 +4,7 @@ use crate::query_rows::{ACTIVE_CANDIDATE, one, rows};
 use memento_core::{Error, Result, Store};
 use memento_domain::{
     consolidation::{AWAITING, ELIGIBLE},
-    processing::{historical_status, pending_conversations},
+    processing::{EXTRACTION_INPUT, admissible_through, historical_status, pending_conversations},
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -162,6 +162,27 @@ fn captured_media_status(db: &Connection, source: Option<&str>) -> Result<Value>
         json!({"scope":"global","through_seq":progress["seq"],"latest_seq":progress["latest_seq"]});
     Ok(counts)
 }
+fn parked_conversations(db: &Connection, source: Option<&str>) -> Result<i64> {
+    Ok(db.query_row(
+        "SELECT count(*) FROM historical_parking WHERE (?1 IS NULL OR source=?1)",
+        [source],
+        |r| r.get(0),
+    )?)
+}
+fn candidate_counts(
+    db: &Connection,
+    source: Option<&str>,
+    now: f64,
+) -> Result<serde_json::Map<String, Value>> {
+    let awaiting = AWAITING.replace("?3", "?1");
+    let pending=one(db,&format!("WITH candidate_status AS MATERIALIZED (SELECT ({ELIGIBLE}) AS eligible,NOT EXISTS(SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {awaiting}) AS ready,EXISTS(SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL) AS parked FROM candidates c WHERE {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND e.source=?2))) SELECT coalesce(sum(eligible AND NOT parked),0) AS pending_candidates,coalesce(sum(eligible AND ready AND NOT parked),0) AS ready_candidates,coalesce(sum(NOT eligible),0) AS excluded_legacy_candidates,coalesce(sum(eligible AND parked),0) AS parked_candidates FROM candidate_status"),params![now,source])?.unwrap();
+    Ok(pending.as_object().unwrap().clone())
+}
+fn repair_groups(db: &Connection) -> Result<Value> {
+    let mut repair=one(db,"SELECT coalesce(sum(state='pending'),0) AS pending,coalesce(sum(state='done'),0) AS done FROM repair_groups",[])?.unwrap();
+    repair["scope"] = json!("global");
+    Ok(repair)
+}
 pub fn operational_status(
     db: &Connection,
     source: Option<&str>,
@@ -225,11 +246,7 @@ pub fn operational_status_timed(
     lap("extraction_jobs");
     extraction["pending_conversations"] = json!(pending_conversations(db, source)?);
     lap("pending_conversations");
-    extraction["parked_conversations"] = json!(db.query_row(
-        "SELECT count(*) FROM historical_parking WHERE (?1 IS NULL OR source=?1)",
-        [source],
-        |r| r.get::<_, i64>(0)
-    )?);
+    extraction["parked_conversations"] = json!(parked_conversations(db, source)?);
     lap("parked_conversations");
     let mut progress = rows(
         db,
@@ -248,16 +265,12 @@ pub fn operational_status_timed(
     lap("extraction_progress");
     let mut consolidation = jobs(db, "consolidate", source)?;
     lap("consolidation_jobs");
-    let awaiting = AWAITING.replace("?3", "?1");
-    let pending=one(db,&format!("WITH candidate_status AS MATERIALIZED (SELECT ({ELIGIBLE}) AS eligible,NOT EXISTS(SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {awaiting}) AS ready,EXISTS(SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL) AS parked FROM candidates c WHERE {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND e.source=?2))) SELECT coalesce(sum(eligible AND NOT parked),0) AS pending_candidates,coalesce(sum(eligible AND ready AND NOT parked),0) AS ready_candidates,coalesce(sum(NOT eligible),0) AS excluded_legacy_candidates,coalesce(sum(eligible AND parked),0) AS parked_candidates FROM candidate_status"),params![now,source])?.unwrap();
-    lap("candidates");
     consolidation
         .as_object_mut()
         .unwrap()
-        .extend(pending.as_object().unwrap().clone());
-    let mut repair=one(db,"SELECT coalesce(sum(state='pending'),0) AS pending,coalesce(sum(state='done'),0) AS done FROM repair_groups",[])?.unwrap();
-    repair["scope"] = json!("global");
-    consolidation["repair_groups"] = repair;
+        .extend(candidate_counts(db, source, now)?);
+    lap("candidates");
+    consolidation["repair_groups"] = repair_groups(db)?;
     lap("repair_groups");
     let mut historical = historical_status(db)?;
     lap("historical");
@@ -270,6 +283,98 @@ pub fn operational_status_timed(
         json!({"source":source,"captured":captured,"raw_storage":raw,"artifact_storage":artifacts,"indexing":runtime.indexing,"extraction":extraction,"consolidation":consolidation,"historical":historical,"media":media,"drive":runtime.drive}),
     )
 }
+
+/// Pending conversations whose remaining extraction input is counted exactly per request.
+pub const COUNTED_CONVERSATIONS: usize = 64;
+/// Matching episode rows counted per request across those conversations.
+pub const COUNTED_RECORDS: i64 = 50_000;
+const MESSAGE: &str = "e.kind IN ('user','assistant')";
+/// Compact global processing summary for the viewer dashboard: the same job,
+/// candidate and historical counts as status, without per-conversation progress.
+/// Record counts use the extraction input predicate and admission rule, are
+/// bounded, and report `partial` instead of guessing past the bound.
+pub fn processing_summary(
+    db: &Connection,
+    indexing: &Value,
+    now: f64,
+    instant: chrono::DateTime<chrono::Utc>,
+) -> Result<Value> {
+    bounded_summary(db, indexing, now, instant, COUNTED_CONVERSATIONS, COUNTED_RECORDS)
+}
+fn bounded_summary(
+    db: &Connection,
+    indexing: &Value,
+    now: f64,
+    instant: chrono::DateTime<chrono::Utc>,
+    conversation_limit: usize,
+    record_limit: i64,
+) -> Result<Value> {
+    let mut extraction = jobs(db, "extract", None)?;
+    let pending = pending_conversations(db, None)?;
+    extraction["pending_conversations"] = json!(pending);
+    extraction["parked_conversations"] = json!(parked_conversations(db, None)?);
+    let progress = "FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND h.conversation_id=p.conversation_id";
+    let mut conversations = one(db, &format!("SELECT count(*) AS tracked,coalesce(sum(h.source IS NULL AND p.latest_seq<=p.seq),0) AS up_to_date,coalesce(sum(h.source IS NOT NULL AND p.latest_seq<=h.live_seq),0) AS parked_live_up_to_date {progress}"), [])?.unwrap();
+    conversations["in_live_job"] = json!(db.query_row(
+        "SELECT count(*) FROM (SELECT DISTINCT json_extract(payload,'$.source'),json_extract(payload,'$.conversation_id') FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.mode') IS NULL)",
+        [],
+        |r| r.get::<_, i64>(0)
+    )?);
+    extraction["conversations"] = conversations;
+    // Remaining live input after each cursor, newest conversations first like admission.
+    let groups = rows(db, &format!("SELECT p.source,p.conversation_id,p.latest_seq,p.latest_at,p.compact_through,coalesce(h.live_seq,p.seq) AS cursor {progress} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY p.latest_seq DESC LIMIT ?1"), [conversation_limit as i64])?;
+    let count = format!("SELECT coalesce(sum(e.seq<=?4 AND {MESSAGE}),0) AS admissible_messages,coalesce(sum(e.seq<=?4 AND NOT ({MESSAGE})),0) AS admissible_other,coalesce(sum(e.seq>?4 AND {MESSAGE}),0) AS waiting_messages,coalesce(sum(e.seq>?4 AND NOT ({MESSAGE})),0) AS waiting_other,count(*) AS rows FROM (SELECT e.seq,e.kind FROM episodes e WHERE e.source=?1 AND e.conversation_id=?2 AND e.seq>?3 AND e.seq<=?5 AND {EXTRACTION_INPUT} LIMIT ?6) e");
+    let fields = ["admissible_messages", "admissible_other", "waiting_messages", "waiting_other"];
+    let mut totals = json!({"admissible_messages":0,"admissible_other":0,"waiting_messages":0,"waiting_other":0});
+    let (mut budget, mut counted, mut partial) = (record_limit, 0, groups.len() as i64 != pending);
+    for group in &groups {
+        if budget <= 0 {
+            partial = true;
+            break;
+        }
+        let cursor = group["cursor"].as_i64().unwrap_or(0);
+        let latest = group["latest_seq"].as_i64().unwrap_or(0);
+        let Ok(through) = admissible_through(group, instant) else {
+            partial = true;
+            continue;
+        };
+        let boundary = if through == 0 { cursor } else { through.clamp(cursor, latest) };
+        let row = one(db, &count, params![group["source"].as_str(), group["conversation_id"].as_str(), cursor, boundary, latest, budget + 1])?.unwrap();
+        let used = row["rows"].as_i64().unwrap_or(0);
+        if used > budget {
+            partial = true;
+            break;
+        }
+        budget -= used;
+        counted += 1;
+        for field in fields {
+            totals[field] = json!(totals[field].as_i64().unwrap() + row[field].as_i64().unwrap());
+        }
+    }
+    totals["counted_conversations"] = json!(counted);
+    totals["partial"] = json!(partial);
+    extraction["remaining"] = totals;
+    // Distinct episodes named by queued and leased extraction jobs.
+    let empty = json!({"jobs":0,"messages":0,"other":0});
+    let mut batched = json!({"pending_live":empty,"leased_live":empty,"pending_demand":empty,"leased_demand":empty});
+    for row in rows(db, &format!("SELECT j.state,CASE WHEN json_extract(j.payload,'$.mode') IS NULL THEN 'live' ELSE 'demand' END AS mode,count(DISTINCT j.id) AS jobs,count(DISTINCT CASE WHEN {MESSAGE} THEN e.id END) AS messages,count(DISTINCT CASE WHEN NOT ({MESSAGE}) THEN e.id END) AS other FROM jobs j CROSS JOIN json_each(j.payload,'$.windows') w JOIN episodes e ON e.id=json_extract(w.value,'$.episode_id') WHERE j.kind='extract' AND j.state IN ('pending','leased') GROUP BY 1,2"), [])? {
+        let key = format!("{}_{}", row["state"].as_str().unwrap_or(""), row["mode"].as_str().unwrap_or(""));
+        if batched.get(&key).is_some() {
+            batched[key] = json!({"jobs":row["jobs"],"messages":row["messages"],"other":row["other"]});
+        }
+    }
+    extraction["batched"] = batched;
+    let mut consolidation = jobs(db, "consolidate", None)?;
+    consolidation
+        .as_object_mut()
+        .unwrap()
+        .extend(candidate_counts(db, None, now)?);
+    consolidation["repair_groups"] = repair_groups(db)?;
+    Ok(json!({"generated_at":now,"indexing":indexing,"extraction":extraction,"consolidation":consolidation,"historical":historical_status(db)?}))
+}
+#[cfg(test)]
+#[path = "processing_summary_tests.rs"]
+mod processing_summary_tests;
 pub fn status(
     store: &Arc<Store>,
     query: &StatusQuery,

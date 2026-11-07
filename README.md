@@ -353,6 +353,8 @@ On a client device, download `/runner` from `https://YOUR_MACHINE.YOUR_TAILNET.t
 
 Open `/ui/` on the same private origin (for example `https://YOUR_MACHINE.YOUR_TAILNET.ts.net/ui/`) for a read-only graph of current memories, behavioral suggestions, open loops and unprocessed conversations/candidates. It only answers on loopback names or hosts listed in `MEMENTO_ALLOWED_HOSTS`, loads no third-party resources, renders memory text as plain text and never writes. "Show all" draws up to 50,000 memories; above that it reports the count instead.
 
+The native viewer's **Processing** tab shows messages ready for extraction, messages waiting for compaction/inactivity, queued/running batches, completed jobs, consolidation candidates and cheap historical parking/release summaries. Messages, conversations, jobs and search-index units are labelled separately; completed jobs are not an all-time count of extracted messages. Live message counting covers at most 64 pending conversations and 50,000 extraction-input records per refresh, with explicit lower bounds when partial. The compact read-only `/ui/api/processing` snapshot refreshes once a minute while visible; request failures preserve the previous values and mark them stale. It reads the latest search-index count without starting a recount, and does not report whether the processor is online or change its schedule. The Python comparison service does not provide this native dashboard endpoint.
+
 ### Technical architecture and trust boundaries
 
 ![Memento architecture: native capture and automatic recall, separate service identity, evidence-backed candidates, nightly consolidation and optional Drive storage](docs/images/architecture.svg)

@@ -15,6 +15,7 @@
     <button type="button" data-view="behaviors" aria-pressed="false">Behaviors</button>
     <button type="button" data-view="loops" aria-pressed="false">Open loops</button>
     <button type="button" data-view="unprocessed" aria-pressed="false">Unprocessed</button>
+    <button type="button" data-view="processing" aria-pressed="false">Processing</button>
   </nav>
   <form id="search" role="search">
     <input id="q" type="search" placeholder="Search memories" autocomplete="off" aria-label="Search memories" enterkeyhint="search">
@@ -60,6 +61,16 @@
       <ol id="candidates" class="rows"></ol>
       <div class="pager"><button type="button" id="cand-prev">Newer</button><button type="button" id="cand-next">Older</button></div>
     </div>
+  </section>
+  <section id="processing-view" hidden aria-labelledby="proc-title">
+    <div class="proc-bar">
+      <h2 id="proc-title">Processing status</h2>
+      <span id="proc-updated" class="meta" role="status" aria-live="polite"></span>
+      <button type="button" id="proc-refresh">Refresh</button>
+    </div>
+    <p class="meta proc-note">Global counts across all sources and scopes; filters do not apply. Read-only snapshot, refreshed every minute while this view is visible.</p>
+    <div id="proc-alert" class="proc-alert" role="alert" hidden></div>
+    <div id="proc-cards" class="proc-grid"></div>
   </section>
   <aside id="panel" hidden tabindex="-1" aria-label="Details">
     <button type="button" id="panel-close" aria-label="Close details">×</button>

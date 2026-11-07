@@ -257,6 +257,53 @@ macro_rules! query {
         }
     };
 }
+/// Viewer dashboard: compact global processing counts. It shares the status
+/// admission permit and only reads the latest index count, never scheduling one.
+pub async fn processing(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if host(&state, &headers).is_err() {
+        return denied();
+    }
+    let admission = state.status_admission.clone();
+    result(
+        admitted_blocking(admission, move || {
+            let now = memento_domain::jobs::timestamp();
+            let indexing = if state.recall.is_some() {
+                let projection = state.services.as_ref().and_then(|s| s.projection());
+                let failed = state
+                    .services
+                    .as_ref()
+                    .is_some_and(|s| s.index_error.load(Ordering::Acquire));
+                let latest = state.index_counts.latest();
+                let counted = latest.is_some();
+                let mut value = crate::index_counts::view(
+                    latest,
+                    failed,
+                    projection.as_ref().is_some_and(|p| p.ready(Tier::Hot)),
+                    projection.as_ref().is_some_and(|p| p.ready(Tier::Cold)),
+                    now,
+                );
+                if !counted {
+                    let object = value.as_object_mut().unwrap();
+                    object.remove("counting");
+                    object.insert("not_counted".into(), json!(true));
+                }
+                value
+            } else {
+                RuntimeStatus::disabled().indexing
+            };
+            state.store.read(|tx| {
+                operational_status::processing_summary(
+                    tx.sql(),
+                    &indexing,
+                    now,
+                    chrono::Utc::now(),
+                )
+            })
+        })
+        .await,
+        &headers,
+    )
+}
 query!(search, viewer::SearchQuery, search);
 query!(conversations, viewer::PageQuery, conversations);
 query!(candidates, viewer::CandidatesQuery, candidates);

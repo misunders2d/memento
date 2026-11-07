@@ -39,7 +39,7 @@ input[type="search"] { width: 100%; padding: 6px 10px; border: 1px solid var(--l
 select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
 .toggle { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 main { position: relative; flex: 1; min-height: 0; }
-#graph-view, #unprocessed-view { position: absolute; inset: 0; }
+#graph-view, #unprocessed-view, #processing-view { position: absolute; inset: 0; }
 #canvas { position: absolute; inset: 0; }
 #status { position: absolute; left: 16px; top: 12px; color: var(--muted); background: var(--surface);
   border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; max-width: calc(100% - 32px); }
@@ -93,6 +93,26 @@ blockquote { margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--line
 .pager { display: flex; justify-content: space-between; margin-top: 8px; }
 .pager button { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
 .pager button:disabled { opacity: .4; cursor: default; }
+#processing-view { overflow: auto; padding: 16px; }
+#processing-view[hidden] { display: none; }
+.proc-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.proc-bar h2 { font-size: 15px; margin: 0; }
+#proc-refresh { margin-left: auto; border: 1px solid var(--line); background: var(--surface); border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+#proc-refresh:disabled { opacity: .5; cursor: default; }
+.proc-note { margin: 4px 0 12px; }
+.proc-alert { margin: 0 0 12px; padding: 8px 12px; border: 1px solid var(--overdue); border-radius: 6px; background: var(--surface); color: var(--text); }
+.proc-alert[hidden] { display: none; }
+.proc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+.proc-card > .meta { margin: 0 0 8px; }
+.proc-metrics { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 0; margin: 0; }
+.proc-metrics dt { padding-top: 6px; border-top: 1px solid var(--line); }
+.proc-metrics dt.sub { padding-left: 14px; color: var(--muted); }
+.proc-metrics dd { margin: 0; padding-top: 6px; border-top: 1px solid var(--line); padding-left: 12px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+.proc-metrics dd.help { grid-column: 1 / -1; padding: 0 0 4px; border: none; text-align: left; font-weight: normal; white-space: normal; color: var(--muted); font-size: 12px; }
+.proc-metrics dt.sub + dd { font-weight: normal; }
+.proc-card details { margin-top: 10px; }
+.proc-card summary { cursor: pointer; color: var(--accent); }
+.proc-card details p { margin: 6px 0 0; }
 @media (max-width: 760px) {
   header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 6px 8px; padding: 6px 10px; }
   .brand { grid-column: 1; }
@@ -122,6 +142,10 @@ blockquote { margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--line
   .sheet-toggle { position: sticky; top: -8px; background: var(--surface); min-height: 40px; padding: 0; margin-top: -8px; }
   .rows li { padding: 10px 8px; }
   #unprocessed-view { grid-template-columns: 1fr; padding: 10px; gap: 10px; }
+  #processing-view { padding: 10px; }
+  .proc-grid { grid-template-columns: 1fr; gap: 10px; }
+  #proc-refresh { min-height: 40px; padding: 0 14px; }
+  .proc-card summary { min-height: 32px; display: flex; align-items: center; }
   .pager button { min-height: 40px; padding: 0 14px; }
   #panel { position: fixed; inset: 0; width: 100%; z-index: 10; border-left: none; padding: 12px 14px 24px; }
   #panel-close { top: -12px; margin: -12px -14px 0 8px; }

@@ -376,7 +376,7 @@ async function search(event) {
   if (!q) {
     state.matches = new Set(); state.searchResults = null;
   } else {
-    if (state.view === 'unprocessed') setView('memories');
+    if (state.view === 'unprocessed' || state.view === 'processing') setView('memories');
     try {
       const {results} = await api('api/search', {q, scope: state.scope});
       state.searchResults = results;
@@ -452,37 +452,210 @@ function markFilters() {
   $('filters-toggle').setAttribute('aria-label', active ? 'Filters (active)' : 'Filters');
 }
 
+function centerActiveTab() {
+  const active = document.querySelector('#tabs [aria-pressed="true"]'), tabs = $('tabs');
+  if (active && tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = Math.max(0, active.offsetLeft - (tabs.clientWidth - active.offsetWidth) / 2);
+}
+
 function setView(view) {
   state.view = view;
   for (const button of document.querySelectorAll('#tabs button')) button.setAttribute('aria-pressed', String(button.dataset.view === view));
-  const active = document.querySelector(`#tabs [data-view="${view}"]`), tabs = $('tabs');
-  if (tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = Math.max(0, active.offsetLeft - (tabs.clientWidth - active.offsetWidth) / 2);
-  const unprocessed = view === 'unprocessed';
-  if (unprocessed) {
+  centerActiveTab();
+  const unprocessed = view === 'unprocessed', processing = view === 'processing', graphless = unprocessed || processing;
+  if (graphless) {
     abortGraph();
     worker.postMessage({stop: true}); layoutRun++;
     if (state.renderer) state.renderer.kill();
     state.renderer = state.graph = null;
   }
-  $('graph-view').hidden = unprocessed;
+  $('graph-view').hidden = graphless;
   $('unprocessed-view').hidden = !unprocessed;
+  $('processing-view').hidden = !processing;
   $('responsibility').hidden = view !== 'loops';
-  $('graph-tools').hidden = unprocessed;
+  $('graph-tools').hidden = graphless;
   markFilters();
   closePanel();
-  if (unprocessed) {
+  if (!processing) stopProcessing();
+  if (processing) {
+    loadProcessing();
+  } else if (unprocessed) {
     Promise.all([loadConversations(), loadCandidates()]).catch(error => openPanel([el('p', {}, `Could not load: ${error.message}`)]));
   } else {
     loadGraph();
   }
 }
 
+// Processing dashboard: one compact global summary, at most one request in flight,
+// refreshed only while this view is visible. Missing numbers render as "—", never 0.
+const PROCESSING_REFRESH_MS = 60000;
+const PROCESSING_TIMEOUT_MS = 15000;
+const proc = {data: null, rendered: null, at: null, fetch: null, timer: null, error: null};
+const num = value => Number.isFinite(value) ? value.toLocaleString() : '—';
+const clock = date => date.toLocaleTimeString();
+
+function metric(label, value, help, sub) {
+  return [el('dt', {class: sub ? 'sub' : ''}, label), el('dd', {}, value),
+    help ? el('dd', {class: 'help'}, help) : null];
+}
+
+function card(title, lead, rows, notes) {
+  return el('section', {class: 'column proc-card', 'aria-label': title}, el('h2', {}, title),
+    lead ? el('p', {class: 'meta'}, lead) : null, el('dl', {class: 'proc-metrics'}, rows),
+    notes && notes.length ? el('details', {}, el('summary', {}, 'Definitions'), notes.map(note => el('p', {class: 'meta'}, note))) : null);
+}
+
+function errorRows(list) {
+  return (list || []).map(item => metric(`${item.state === 'failed' ? 'Failed' : 'Retrying'}: ${item.category}`, num(item.count),
+    item.category === 'night_window_closed' ? 'Routine: the consolidation window closed before the job finished.' : null, true));
+}
+
+function processingCards(data) {
+  const x = data.extraction || {}, c = data.consolidation || {}, h = data.historical || {}, i = data.indexing || {};
+  const r = x.remaining || {}, b = x.batched || {}, conv = x.conversations || {};
+  const pick = (key, field) => (b[key] || {})[field];
+  const coverage = Number.isFinite(r.counted_conversations) && Number.isFinite(x.pending_conversations)
+    ? `Counted in ${num(r.counted_conversations)} of ${num(x.pending_conversations)} conversations with live work.` : '';
+  const messages = card('Messages awaiting extraction', r.partial
+    ? `Partial: ${coverage} The per-request bound was reached, so totals are lower bounds.` : coverage, [
+    metric('Ready to extract', num(r.admissible_messages), 'Compacted, or the conversation has been idle 30 minutes.'),
+    metric('in a queued batch', num(pick('pending_live', 'messages')), `${num(pick('pending_live', 'jobs'))} jobs`, true),
+    metric('being extracted now', num(pick('leased_live', 'messages')), `${num(pick('leased_live', 'jobs'))} leased jobs`, true),
+    metric('Waiting for compaction or inactivity', num(r.waiting_messages), 'Captured after the last compaction in a conversation active in the last 30 minutes.'),
+    metric('Tool outputs and other input ready / waiting', `${num(r.admissible_other)} / ${num(r.waiting_other)}`, 'Extraction input that is not a user or assistant message.'),
+  ], ['Messages are captured user and assistant messages that extraction reads, after each live extraction cursor. Skipped raw records, forgotten sources and legacy instruction text are excluded, using the same predicate as extraction.',
+    'Batched counts are distinct messages named by queued or leased extraction jobs. They can exceed a partial lower-bound count of ready messages. A long message remains awaiting extraction until its remaining text has been processed.',
+    'Parked historical messages are not included here. Per-message totals for extracted history are not available: this summary counts extraction work as jobs and conversations instead.']);
+  const extraction = card('Extraction work', null, [
+    metric('Conversations with live work', num(x.pending_conversations), 'Captured messages after the live cursor, admitted or not yet.'),
+    metric('in a live job', num(conv.in_live_job), null, true),
+    metric('Conversations up to date', num(conv.up_to_date), `${num(conv.parked_live_up_to_date)} more parked conversations have no new live messages`),
+    metric('Tracked conversations', num(conv.tracked)),
+    metric('Jobs queued', num(x.pending_jobs), Number.isFinite(x.retrying_jobs) && x.retrying_jobs ? `${num(x.retrying_jobs)} retrying after an error` : null),
+    metric('Jobs running', num(x.leased_jobs)),
+    metric('Jobs completed', num(x.completed_jobs), 'Extraction batches finished; not messages, and not consolidation.'),
+    metric('Jobs failed', num(x.failed_jobs)),
+    errorRows(x.errors),
+  ], ['A job is one extraction batch of up to 64 text windows from one conversation. Completed extraction produces candidates; it does not mean they were consolidated or that memory quality was verified.']);
+  const consolidation = card('Consolidation', null, [
+    metric('Candidates waiting', num(c.pending_candidates), 'Extracted, not yet promoted, rejected or merged.'),
+    metric('ready now', num(c.ready_candidates), 'Not deferred to a later review time and not waiting on a human review.', true),
+    metric('Jobs queued', num(c.pending_jobs), Number.isFinite(c.retrying_jobs) && c.retrying_jobs ? `${num(c.retrying_jobs)} retrying after an error` : null),
+    metric('Jobs running', num(c.leased_jobs)),
+    metric('Jobs completed', num(c.completed_jobs)),
+    metric('Jobs failed', num(c.failed_jobs)),
+    metric('Jobs rebatched', num(c.rebatched_jobs), 'Routine server rebatches, not failures.'),
+    errorRows(c.errors),
+    metric('Repair groups pending / inspected', `${num((c.repair_groups || {}).pending)} / ${num((c.repair_groups || {}).done)}`),
+  ], ['The processor controls the consolidation schedule. Its current schedule and whether it is online are not reported by this service.',
+    'Inspected repair groups mean the bounded work was reviewed, not proof of semantic completeness.']);
+  const historical = card('Historical backlog', h.active ? `Parked on ${when(h.activated_at)}.` : 'No historical backlog has been parked.', [
+    metric('Parked conversations', num(h.parked_conversations), 'Unextracted history set aside: not queued and not processed.'),
+    metric('with new live messages', num(h.live_pending_conversations), null, true),
+    metric('Parked extraction jobs', num(x.parked_jobs), 'Stopped at parking; not failures, not completed.'),
+    metric('Parked consolidation jobs', num(c.parked_jobs)),
+    metric('Parked candidates', num(h.parked_candidates), 'Stored and searchable, outside consolidation.'),
+    metric('Released candidates', num(h.released_candidates), 'Admitted to consolidation through a citation or explicit owner release; not necessarily consolidated yet.'),
+    metric('Excluded legacy candidates', num(c.excluded_legacy_candidates), 'Supported only by legacy instruction text; never admitted to consolidation.'),
+    metric('On-demand extraction queued / running', `${num(pick('pending_demand', 'messages'))} / ${num(pick('leased_demand', 'messages'))} messages`,
+      `${num(pick('pending_demand', 'jobs'))} / ${num(pick('leased_demand', 'jobs'))} jobs, from cited parked history`),
+  ], ['Parked history is never counted as processed. Citing a parked passage queues on-demand extraction for exactly that span.']);
+  const indexed = i.available === false ? card('Search indexing', 'Indexing is unavailable on this service.', [])
+    : card('Search indexing', i.not_counted ? 'No index count is available yet. Other processing counts remain available.'
+      : `Counted ${Number.isFinite(i.age_seconds) ? `${num(Math.round(i.age_seconds / 60))} min ago` : 'at an unknown time'}.`, [
+      metric('Index units indexed', num(i.indexed)),
+      metric('Index units pending', num(i.pending)),
+      metric('Index units failed', num(i.failed)),
+      metric('Messages not yet chunked', num(i.unprepared_episodes)),
+      i.error ? metric('Indexing error', String(i.error)) : null,
+    ], ['Index units are message chunks, memories, candidates and media segments, not messages. Search readiness is live; counts are the latest background count.']);
+  return [messages, extraction, consolidation, historical, indexed];
+}
+
+function renderProcessing() {
+  const alert = $('proc-alert');
+  if (proc.error) {
+    alert.hidden = false;
+    alert.textContent = proc.data ? `Refresh failed (${proc.error}). Showing data from ${clock(proc.at)}, which may be stale.`
+      : `Could not load processing status: ${proc.error}`;
+  } else {
+    alert.hidden = true;
+    alert.textContent = '';
+  }
+  $('proc-updated').textContent = proc.fetch ? (proc.data ? `Updated ${clock(proc.at)} · refreshing…` : 'Loading…')
+    : proc.data ? `Updated ${clock(proc.at)}` : '';
+  $('proc-refresh').disabled = Boolean(proc.fetch);
+  if (proc.data && proc.rendered !== proc.data) {
+    const root = $('proc-cards');
+    const open = new Set([...root.querySelectorAll('.proc-card')]
+      .filter(section => section.querySelector('details[open]'))
+      .map(section => section.getAttribute('aria-label')));
+    const focused = root.contains(document.activeElement) && document.activeElement.tagName === 'SUMMARY'
+      ? document.activeElement.closest('.proc-card').getAttribute('aria-label') : null;
+    root.replaceChildren(...processingCards(proc.data));
+    for (const section of root.querySelectorAll('.proc-card')) {
+      const title = section.getAttribute('aria-label'), details = section.querySelector('details');
+      if (details) details.open = open.has(title);
+      if (title === focused) section.querySelector('summary')?.focus({preventScroll: true});
+    }
+    proc.rendered = proc.data;
+  }
+  else if (!proc.data && !proc.fetch) $('proc-cards').replaceChildren();
+}
+
+function scheduleProcessing() {
+  clearTimeout(proc.timer);
+  proc.timer = null;
+  if (state.view === 'processing' && document.visibilityState === 'visible') proc.timer = setTimeout(loadProcessing, PROCESSING_REFRESH_MS);
+}
+
+async function loadProcessing() {
+  if (proc.fetch || state.view !== 'processing') return;
+  const request = proc.fetch = new AbortController();
+  let timedOut = false;
+  const deadline = setTimeout(() => { timedOut = true; request.abort(); }, PROCESSING_TIMEOUT_MS);
+  clearTimeout(proc.timer);
+  renderProcessing();
+  try {
+    const response = await fetch(new URL('api/processing', location.href), {headers: {Accept: 'application/json'}, signal: request.signal});
+    if (response.status === 404) throw new Error('not available on this service');
+    if (!response.ok) throw new Error(`${response.status} ${(await response.json().catch(() => ({}))).detail || response.statusText}`);
+    proc.data = await response.json();
+    proc.at = new Date();
+    proc.error = null;
+  } catch (error) {
+    if (request.signal.aborted && !timedOut) return;
+    proc.error = timedOut ? 'request timed out; use Refresh to retry' : error.message;
+  } finally {
+    clearTimeout(deadline);
+    if (proc.fetch === request) proc.fetch = null;
+  }
+  renderProcessing();
+  scheduleProcessing();
+}
+
+function stopProcessing() {
+  clearTimeout(proc.timer);
+  proc.timer = null;
+  if (proc.fetch) proc.fetch.abort();
+  proc.fetch = null;
+}
+
+$('proc-refresh').addEventListener('click', loadProcessing);
+document.addEventListener('visibilitychange', () => {
+  if (state.view !== 'processing') return;
+  if (document.visibilityState !== 'visible') return clearTimeout(proc.timer);
+  if (!proc.at || Date.now() - proc.at.getTime() >= PROCESSING_REFRESH_MS) loadProcessing();
+  else scheduleProcessing();
+});
+
 document.querySelectorAll('#tabs button').forEach(button => button.addEventListener('click', () => setView(button.dataset.view)));
+window.addEventListener('resize', centerActiveTab);
 $('search').addEventListener('submit', search);
 $('q').addEventListener('input', event => { if (!event.target.value && (state.matches.size || state.searchResults)) search(event); });
-$('scope').addEventListener('change', event => { state.scope = event.target.value; markFilters(); state.view === 'unprocessed' || loadGraph(); });
+const graphView = () => state.view !== 'unprocessed' && state.view !== 'processing';
+$('scope').addEventListener('change', event => { state.scope = event.target.value; markFilters(); graphView() && loadGraph(); });
 $('responsibility').addEventListener('change', event => { state.responsibility = event.target.value; markFilters(); loadGraph(); });
-$('all').addEventListener('change', event => { state.all = event.target.checked; markFilters(); state.view === 'unprocessed' || loadGraph(); });
+$('all').addEventListener('change', event => { state.all = event.target.checked; markFilters(); graphView() && loadGraph(); });
 $('panel-close').addEventListener('click', () => select(null));
 document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('panel').hidden) select(null); });
 $('filters-toggle').addEventListener('click', () => {

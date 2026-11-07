@@ -19,6 +19,15 @@ use std::sync::Arc;
 
 pub const PARKED_ERROR: &str = "historical_parked";
 const PROGRESS: &str = "FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND h.conversation_id=p.conversation_id";
+/// Episode rows (alias `e`) that extraction reads: the one shared input predicate.
+pub const EXTRACTION_INPUT: &str = "coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')!='skip' AND NOT legacy_native_context(e.source,e.kind,e.text,e.metadata) AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)";
+/// Last sequence extraction may admit now for one progress row (`latest_seq`,
+/// `latest_at`, `compact_through`): everything after 30 idle minutes, otherwise
+/// through the latest compaction marker.
+pub fn admissible_through(progress: &Value, instant: DateTime<Utc>) -> Result<i64> {
+    let idle = (instant - parse_time(get_str(progress, "latest_at")?)?).num_seconds() >= 1800;
+    get_i64(progress, if idle { "latest_seq" } else { "compact_through" })
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compaction {
@@ -715,19 +724,14 @@ fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
         let source = get_str(&group, "source")?;
         let conversation = get_str(&group, "conversation_id")?;
         if one(tx.sql(),"SELECT 1 FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.source')=? AND json_extract(payload,'$.conversation_id')=? AND json_extract(payload,'$.mode') IS NULL LIMIT 1",params![source,conversation])?.is_some(){continue;}
-        let idle = (instant - parse_time(get_str(&group, "latest_at")?)?).num_seconds() >= 1800;
-        let through = if idle {
-            get_i64(&group, "latest_seq")?
-        } else {
-            get_i64(&group, "compact_through")?
-        };
+        let through = admissible_through(&group, instant)?;
         let cursor = get_i64(&group, "cursor")?;
         if through < cursor || through == 0 {
             continue;
         }
         let selected = rows(
             tx.sql(),
-            "SELECT id,seq,text,kind,metadata FROM episodes e WHERE source=? AND conversation_id=? AND seq<=? AND seq>? AND coalesce(json_extract(metadata,'$.extraction_mode'),'message')!='skip' AND NOT legacy_native_context(e.source,e.kind,e.text,e.metadata) AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) ORDER BY seq LIMIT 65",
+            &format!("SELECT id,seq,text,kind,metadata FROM episodes e WHERE source=? AND conversation_id=? AND seq<=? AND seq>? AND {EXTRACTION_INPUT} ORDER BY seq LIMIT 65"),
             params![source, conversation, through, cursor],
         )?;
         let offset = get_i64(&group, "offset")? as usize;

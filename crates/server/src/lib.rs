@@ -520,6 +520,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/api/conversations", get(query_api::conversations))
         .route("/ui/api/conversation", get(query_api::conversation))
         .route("/ui/api/candidates", get(query_api::candidates))
+        .route("/ui/api/processing", get(query_api::processing))
         .route("/ui/static/{*file}", get(query_api::asset))
         .route("/drive/connect/begin", post(drive_api::begin))
         .route("/drive/connect/finish", post(drive_api::finish))

@@ -755,10 +755,23 @@ async fn status_connect_and_viewer_routes_keep_real_counts_static_bytes_and_priv
     let graph = request(&state, "GET", "/ui/api/graph", None).await;
     assert_eq!(graph.0, StatusCode::OK);
     assert!(graph.1["nodes"].is_array());
+    let (status, processing) = request(&state, "GET", "/ui/api/processing", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(processing["extraction"]["pending_conversations"], 1);
+    let remaining = &processing["extraction"]["remaining"];
+    assert_eq!(
+        remaining["admissible_messages"].as_i64().unwrap()
+            + remaining["waiting_messages"].as_i64().unwrap(),
+        1
+    );
+    assert!(processing["extraction"].get("progress").is_none());
+    assert_eq!(processing["extraction"]["completed_jobs"], 0);
+    assert_eq!(processing["indexing"]["available"], false);
     for (path, mime) in [
         ("/connect", "text/plain"),
         ("/ui/", "text/html"),
         ("/ui/static/app.js", "text/javascript"),
+        ("/ui/api/processing", "application/json"),
     ] {
         let response = router(state.clone())
             .oneshot(
@@ -785,16 +798,18 @@ async fn status_connect_and_viewer_routes_keep_real_counts_static_bytes_and_priv
                 .contains("frame-ancestors 'none'")
         );
     }
-    let response = router(state)
-        .oneshot(
-            Request::get("/ui/api/graph")
-                .header("host", "attacker.invalid")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    for path in ["/ui/api/graph", "/ui/api/processing"] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::get(path)
+                    .header("host", "attacker.invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    }
 }
 
 #[tokio::test]
