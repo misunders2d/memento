@@ -526,9 +526,9 @@ function processingCards(data) {
     'Batched counts are distinct messages named by queued or leased extraction jobs. They can exceed a partial lower-bound count of ready messages. A long message remains awaiting extraction until its remaining text has been processed.',
     'Parked historical messages are not included here. Per-message totals for extracted history are not available: this summary counts extraction work as jobs and conversations instead.']);
   const extraction = card('Extraction work', null, [
-    metric('Conversations with live work', num(x.pending_conversations), 'Captured messages after the live cursor, admitted or not yet.'),
+    metric('Conversations with live work', num(x.pending_conversations), 'Captured records after the live extraction cursor, eligible now or waiting.'),
     metric('in a live job', num(conv.in_live_job), null, true),
-    metric('Conversations up to date', num(conv.up_to_date), `${num(conv.parked_live_up_to_date)} more parked conversations have no new live messages`),
+    metric('Conversations up to date', num(conv.up_to_date), `${num(conv.parked_live_up_to_date)} more parked conversations have no new live records`),
     metric('Tracked conversations', num(conv.tracked)),
     metric('Jobs queued', num(x.pending_jobs), Number.isFinite(x.retrying_jobs) && x.retrying_jobs ? `${num(x.retrying_jobs)} retrying after an error` : null),
     metric('Jobs running', num(x.leased_jobs)),
@@ -550,7 +550,7 @@ function processingCards(data) {
     'Inspected repair groups mean the bounded work was reviewed, not proof of semantic completeness.']);
   const historical = card('Historical backlog', h.active ? `Parked on ${when(h.activated_at)}.` : 'No historical backlog has been parked.', [
     metric('Parked conversations', num(h.parked_conversations), 'Unextracted history set aside: not queued and not processed.'),
-    metric('with new live messages', num(h.live_pending_conversations), null, true),
+    metric('with new live records', num(h.live_pending_conversations), null, true),
     metric('Parked extraction jobs', num(x.parked_jobs), 'Stopped at parking; not failures, not completed.'),
     metric('Parked consolidation jobs', num(c.parked_jobs)),
     metric('Parked candidates', num(h.parked_candidates), 'Stored and searchable, outside consolidation.'),
