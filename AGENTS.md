@@ -22,6 +22,8 @@ The owner-controlled **Memento: immutable top-level requirement** in the [Person
 
 **Background handover:** before reporting a worker started, verify a committed unit of the requested kind and identify its actual service owner. Reap task-owned hung tests; do not confuse them with production work. Report historical admission exclusions explicitly. Owner-authorized `history release-candidates` admits already extracted older candidates without raw-history replay.
 
+**Historical completion:** eligible fresh extraction/consolidation work takes priority. During the configured nightly window, the same shared processor then resumes unfinished historical prefixes in bounded batches using their original extraction cursor; new captures retain the separate live cursor. Historical retries yield to fresh work and pause outside the window. Update the service before the Pi processing bundle so historical-only backlog wakes the normal worker. Never restart forced catch-up to perform this work. Parked cohort totals are not remaining-history counts; report remaining/extracted conversations separately, and do not equate extraction with consolidation.
+
 **Native agent context:** retain the native reasoning and tool history inside unfinished work. Compact completed evidence only after a verified commit/release boundary. A current packet plus last receipt does not preserve enough state to recover from repeated tool errors; verify a real multi-step workflow before claiming persistence works.
 
 ## Local development

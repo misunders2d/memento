@@ -232,7 +232,7 @@ impl Processing {
             }
             result["lease_seconds"] = json!(self.queue.lease_seconds);
             result["eligible_extract_conversations"] = json!(db.query_row(&format!("SELECT count(*) {PROGRESS} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) AND (p.compact_through>coalesce(h.live_seq,p.seq) OR julianday(p.latest_at)<=julianday(?))"),[format_time(Utc::now()-Duration::minutes(30))],|row|row.get::<_,i64>(0))?);
-            result["ready_jobs"] = json!(rows(db,"SELECT kind,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND ((state='pending' AND available_at<=?1) OR (state='leased' AND lease_until<=?1)) GROUP BY kind",[timestamp()])?);
+            result["ready_jobs"] = json!(rows(db,"SELECT kind,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND coalesce(json_extract(payload,'$.cursor'),'')!='history' AND ((state='pending' AND available_at<=?1) OR (state='leased' AND lease_until<=?1)) GROUP BY kind",[timestamp()])?);
             Ok(result)
         })
     }
@@ -340,10 +340,10 @@ impl Processing {
         if let Some(compaction) = command.compaction.clone() {
             self.compact(compaction)?;
         }
-        let schedule = || {
+        let schedule = || -> Result<(bool, bool)> {
             self.graph.store.write(|tx| {
                 enqueue_extract(tx, instant)?;
-                enqueue_night(
+                let night_due = enqueue_night(
                     tx,
                     instant,
                     zone,
@@ -353,12 +353,17 @@ impl Processing {
                     &command.exclude,
                     command.continuous,
                     command.batch_size,
-                )
+                )?;
+                let history_due = historical_due(tx.sql(), instant, zone, window)?;
+                if history_due {
+                    enqueue_history(tx, instant)?;
+                }
+                Ok((night_due, history_due))
             })
         };
         crate::work_timing::count("claim_batch_size", command.batch_size as u64);
         let mut lap = std::time::Instant::now();
-        let night_due = schedule()?;
+        let (night_due, history_due) = schedule()?;
         crate::work_timing::lap("claim_schedule", &mut lap);
         let requested = command
             .kinds
@@ -372,6 +377,14 @@ impl Processing {
                 let _ = self.queue.unclaim(job);
             }
         };
+        // A queued historical retry must yield to fresh arrivals and the night
+        // boundary, without losing its packet, cursor, backoff or feedback.
+        let mut extraction_exclude = command.exclude.clone();
+        if !history_due {
+            extraction_exclude.extend(self.graph.store.read(|tx| Ok(rows(tx.sql(),
+                "SELECT id FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.cursor')='history'", [])?
+                .into_iter().filter_map(|row| row["id"].as_str().map(str::to_owned)).collect::<Vec<_>>()))?);
+        }
         for kind in if night_due {
             vec!["extract", "consolidate"]
         } else {
@@ -383,7 +396,7 @@ impl Processing {
             loop {
                 let Some(job) = self
                     .queue
-                    .claim(&[kind.into()], &command.exclude)
+                    .claim(&[kind.into()], if kind == "extract" { &extraction_exclude } else { &command.exclude })
                     .inspect_err(|_| withhold(&held))?
                 else {
                     break;
@@ -520,7 +533,8 @@ impl Processing {
         // Post-scheduling count of what this caller could claim now, using the queue's
         // own predicate; consolidation only inside its window or an explicit force run.
         lap = std::time::Instant::now();
-        let claimable=|db:&Connection,kind:&str|->Result<i64>{Ok(db.query_row("SELECT count(*) FROM jobs WHERE kind=?1 AND ((state='pending' AND available_at<=?2) OR (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value FROM json_each(?3)) AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE live.kind='consolidate' AND live.state='leased' AND live.lease_until>?2))",params![kind,timestamp(),encode_json(&json!(command.exclude))?],|row|row.get(0))?)};
+        let history_due=self.graph.store.read(|tx|historical_due(tx.sql(),instant,zone,window)).inspect_err(|_|withhold(&held))?;
+        let claimable=|db:&Connection,kind:&str|->Result<i64>{Ok(db.query_row("SELECT count(*) FROM jobs WHERE kind=?1 AND ((state='pending' AND available_at<=?2) OR (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value FROM json_each(?3)) AND (?4 OR coalesce(json_extract(payload,'$.cursor'),'')!='history') AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE live.kind='consolidate' AND live.state='leased' AND live.lease_until>?2))",params![kind,timestamp(),encode_json(&json!(command.exclude))?,history_due],|row|row.get(0))?)};
         let backlog=self.graph.store.read(|tx|Ok(json!({"pending_extract_conversations":pending_conversations(tx.sql(),None)?,"pending_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='pending' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"leased_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='leased' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"claimable":{"extract":claimable(tx.sql(),"extract")?,"consolidate":if night_due {claimable(tx.sql(),"consolidate")?} else {0}}}))).inspect_err(|_| withhold(&held))?;
         crate::work_timing::lap("claim_backlog", &mut lap);
         Ok(json!({"lease_seconds":self.queue.lease_seconds,"work":work,"backlog":backlog}))
@@ -670,10 +684,11 @@ pub fn pending_conversations(db: &Connection, source: Option<&str>) -> Result<i6
 }
 pub fn historical_status(db: &Connection) -> Result<Value> {
     let activation = one(db, "SELECT activated_at FROM historical_activation", [])?;
-    let parking=one(db,"SELECT count(*) AS parked_conversations,coalesce(sum(p.latest_seq>h.live_seq),0) AS live_pending_conversations FROM historical_parking h JOIN processing_progress p ON p.source=h.source AND p.conversation_id=h.conversation_id",[])?.unwrap();
+    let parking=one(db,"SELECT count(*) AS parked_conversations,coalesce(sum(p.latest_seq>h.live_seq),0) AS live_pending_conversations,coalesce(sum(p.seq<h.parked_through),0) AS pending_conversations,coalesce(sum(p.seq>=h.parked_through),0) AS extracted_conversations FROM historical_parking h JOIN processing_progress p ON p.source=h.source AND p.conversation_id=h.conversation_id",[])?.unwrap();
+    let jobs=one(db,"SELECT coalesce(sum(state='pending'),0) AS queued_jobs,coalesce(sum(state='leased'),0) AS running_jobs FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.cursor')='history'",[])?.unwrap();
     let candidates=one(db,"SELECT coalesce(sum(released_at IS NULL),0) AS parked_candidates,coalesce(sum(released_at IS NOT NULL),0) AS released_candidates FROM historical_parked_candidates",[])?.unwrap();
     Ok(
-        json!({"active":activation.is_some(),"activated_at":activation.as_ref().map(|row|row["activated_at"].clone()),"header":db.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0))?,"parked_conversations":parking["parked_conversations"],"live_pending_conversations":parking["live_pending_conversations"],"parked_candidates":candidates["parked_candidates"],"released_candidates":candidates["released_candidates"]}),
+        json!({"active":activation.is_some(),"activated_at":activation.as_ref().map(|row|row["activated_at"].clone()),"header":db.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0))?,"parked_conversations":parking["parked_conversations"],"live_pending_conversations":parking["live_pending_conversations"],"pending_conversations":parking["pending_conversations"],"extracted_conversations":parking["extracted_conversations"],"queued_jobs":jobs["queued_jobs"],"running_jobs":jobs["running_jobs"],"policy":"nightly_after_fresh","parked_candidates":candidates["parked_candidates"],"released_candidates":candidates["released_candidates"]}),
     )
 }
 fn visible_active(db: &Connection, target: &str) -> Result<bool> {
@@ -720,10 +735,35 @@ fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
         ),
         [],
     )?;
+    enqueue_extract_groups(tx, instant, groups, &order, false)
+}
+/// Fresh eligible work, including retries, drains before a historical batch.
+/// Active chats without a compaction boundary do not starve historical work.
+fn historical_due(db: &Connection, instant: DateTime<Utc>, zone: Tz, window: (u32, u32)) -> Result<bool> {
+    let local = instant.with_timezone(&zone);
+    let minute = local.hour() * 60 + local.minute();
+    let (start, end) = window;
+    let within = if start < end { start <= minute && minute < end } else { minute >= start || minute < end };
+    if !within || one(db,"SELECT 1 FROM jobs WHERE state IN ('pending','leased') AND (kind='consolidate' OR (kind='extract' AND coalesce(json_extract(payload,'$.cursor'),'')!='history')) LIMIT 1",[])?.is_some() {
+        return Ok(false);
+    }
+    let fresh = db.query_row(&format!("SELECT EXISTS(SELECT 1 {PROGRESS} WHERE p.latest_seq>coalesce(h.live_seq,p.seq) AND (p.compact_through>coalesce(h.live_seq,p.seq) OR julianday(p.latest_at)<=julianday(?)))"), [format_time(instant-Duration::minutes(30))], |row| row.get::<_,bool>(0))?;
+    Ok(!fresh && consolidation::pending_in(db, 1, 0, i64::MAX, false)?.is_empty())
+}
+fn enqueue_history(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
+    if one(tx.sql(),"SELECT 1 FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.cursor')='history' LIMIT 1",[])?.is_some() {
+        return Ok(());
+    }
+    // The original extraction cursor is the unfinished prefix; the separate
+    // live cursor continues to serve new captures. Neither needs a new counter.
+    let groups = rows(tx.sql(), "SELECT p.source,p.conversation_id,h.parked_through AS latest_seq,p.latest_at,h.parked_through AS compact_through,p.seq AS cursor,p.offset,0 AS live FROM historical_parking h JOIN processing_progress p ON p.source=h.source AND p.conversation_id=h.conversation_id WHERE p.seq<h.parked_through ORDER BY p.rowid LIMIT 64", [])?;
+    enqueue_extract_groups(tx, instant, groups, "history", true)
+}
+fn enqueue_extract_groups(tx: &WriteTxn, instant: DateTime<Utc>, groups: Vec<Value>, order: &str, historical: bool) -> Result<()> {
     for group in groups {
         let source = get_str(&group, "source")?;
         let conversation = get_str(&group, "conversation_id")?;
-        if one(tx.sql(),"SELECT 1 FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.source')=? AND json_extract(payload,'$.conversation_id')=? AND json_extract(payload,'$.mode') IS NULL LIMIT 1",params![source,conversation])?.is_some(){continue;}
+        if one(tx.sql(),"SELECT 1 FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.source')=? AND json_extract(payload,'$.conversation_id')=? AND json_extract(payload,'$.mode') IS NULL AND (coalesce(json_extract(payload,'$.cursor'),'')='history')=? LIMIT 1",params![source,conversation,historical])?.is_some(){continue;}
         let through = admissible_through(&group, instant)?;
         let cursor = get_i64(&group, "cursor")?;
         if through < cursor || through == 0 {
@@ -798,7 +838,9 @@ fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
             continue;
         }
         let mut payload = json!({"version":crate::extraction::VERSION,"source":source,"conversation_id":conversation,"windows":windows,"next_seq":next_seq,"next_offset":next_offset});
-        if live {
+        if historical {
+            payload["cursor"] = json!("history");
+        } else if live {
             payload["cursor"] = json!("live");
         }
         let key = format!(

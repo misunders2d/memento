@@ -316,7 +316,7 @@ fn bounded_summary(
     let progress = "FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND h.conversation_id=p.conversation_id";
     let mut conversations = one(db, &format!("SELECT count(*) AS tracked,coalesce(sum(h.source IS NULL AND p.latest_seq<=p.seq),0) AS up_to_date,coalesce(sum(h.source IS NOT NULL AND p.latest_seq<=h.live_seq),0) AS parked_live_up_to_date {progress}"), [])?.unwrap();
     conversations["in_live_job"] = json!(db.query_row(
-        "SELECT count(*) FROM (SELECT DISTINCT json_extract(payload,'$.source'),json_extract(payload,'$.conversation_id') FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.mode') IS NULL)",
+        "SELECT count(*) FROM (SELECT DISTINCT json_extract(payload,'$.source'),json_extract(payload,'$.conversation_id') FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.mode') IS NULL AND coalesce(json_extract(payload,'$.cursor'),'')!='history')",
         [],
         |r| r.get::<_, i64>(0)
     )?);
@@ -356,8 +356,8 @@ fn bounded_summary(
     extraction["remaining"] = totals;
     // Distinct episodes named by queued and leased extraction jobs.
     let empty = json!({"jobs":0,"messages":0,"other":0});
-    let mut batched = json!({"pending_live":empty,"leased_live":empty,"pending_demand":empty,"leased_demand":empty});
-    for row in rows(db, &format!("SELECT j.state,CASE WHEN json_extract(j.payload,'$.mode') IS NULL THEN 'live' ELSE 'demand' END AS mode,count(DISTINCT j.id) AS jobs,count(DISTINCT CASE WHEN {MESSAGE} THEN e.id END) AS messages,count(DISTINCT CASE WHEN NOT ({MESSAGE}) THEN e.id END) AS other FROM jobs j CROSS JOIN json_each(j.payload,'$.windows') w JOIN episodes e ON e.id=json_extract(w.value,'$.episode_id') WHERE j.kind='extract' AND j.state IN ('pending','leased') GROUP BY 1,2"), [])? {
+    let mut batched = json!({"pending_live":empty,"leased_live":empty,"pending_demand":empty,"leased_demand":empty,"pending_history":empty,"leased_history":empty});
+    for row in rows(db, &format!("SELECT j.state,CASE WHEN json_extract(j.payload,'$.cursor')='history' THEN 'history' WHEN json_extract(j.payload,'$.mode') IS NULL THEN 'live' ELSE 'demand' END AS mode,count(DISTINCT j.id) AS jobs,count(DISTINCT CASE WHEN {MESSAGE} THEN e.id END) AS messages,count(DISTINCT CASE WHEN NOT ({MESSAGE}) THEN e.id END) AS other FROM jobs j CROSS JOIN json_each(j.payload,'$.windows') w JOIN episodes e ON e.id=json_extract(w.value,'$.episode_id') WHERE j.kind='extract' AND j.state IN ('pending','leased') GROUP BY 1,2"), [])? {
         let key = format!("{}_{}", row["state"].as_str().unwrap_or(""), row["mode"].as_str().unwrap_or(""));
         if batched.get(&key).is_some() {
             batched[key] = json!({"jobs":row["jobs"],"messages":row["messages"],"other":row["other"]});

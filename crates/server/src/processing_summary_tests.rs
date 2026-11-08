@@ -108,4 +108,18 @@ fn counts_extraction_input_messages_by_admission_jobs_and_parking() {
     assert_eq!(value["extraction"]["remaining"]["admissible_messages"], 0);
     assert_eq!(value["historical"]["parked_conversations"], 1);
     assert_eq!(value["historical"]["active"], true);
+    assert_eq!(value["historical"]["pending_conversations"], 1);
+    assert_eq!(value["historical"]["extracted_conversations"], 0);
+    assert_eq!(value["historical"]["policy"], "nightly_after_fresh");
+    store.write(|tx| {
+        let mut historical = payload.clone();
+        historical["cursor"] = json!("history");
+        tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) VALUES('historical','historical','extract',?,'pending',0,0)", [historical.to_string()])?;
+        Ok(())
+    }).unwrap();
+    let value = summary(&store, idle, 64, 1000);
+    assert_eq!(value["historical"]["queued_jobs"], 1);
+    assert_eq!(value["extraction"]["batched"]["pending_history"]["messages"], 1);
+    assert_eq!(value["extraction"]["batched"]["pending_live"]["messages"], 0);
+    assert_eq!(value["extraction"]["conversations"]["in_live_job"], 0);
 }
