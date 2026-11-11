@@ -1010,14 +1010,42 @@ fn enqueue_night(
         )?;
         (Some(night), 0, through)
     };
-    let mut candidates = consolidation::pending_in(tx.sql(), batch_size, cursor, through, true)?;
-    // A native agent selects the batch size. Keep related conversation evidence
-    // together; continuous admission has no frozen cursor that could skip others.
+    // Continuous admission looks ahead one extra batch so it can tell which
+    // following conversations fit whole; the frozen/legacy path fetches as before.
+    let fetch = if continuous { batch_size * 2 } else { batch_size };
+    let mut candidates = consolidation::pending_in(tx.sql(), fetch, cursor, through, true)?;
+    // A native agent selects the batch size. Fill it with whole conversations in
+    // rowid order: the first always (at most batch_size of it), each following one
+    // only when all its pending rows inside the lookahead fit the remaining room.
+    // The first that does not fit ends the batch and leads the next one; no later
+    // conversation is pulled ahead of it. Whole is judged inside that bounded
+    // lookahead only; continuous admission has no frozen cursor that could skip the rest.
     if continuous && !candidates.is_empty() {
         let subject = |candidate: &Value| -> Result<Option<Value>> { one(tx.sql(),"SELECT e.source,e.conversation_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=1 ORDER BY e.seq LIMIT 1",[get_str(candidate,"id")?]) };
-        let first = subject(&candidates[0])?;
+        let subjects = candidates.iter().map(subject).collect::<Result<Vec<_>>>()?;
+        let mut admitted: Vec<&Option<Value>> = vec![];
+        let mut room = batch_size;
+        for (index, current) in subjects.iter().enumerate() {
+            if subjects[..index].contains(current) {
+                continue;
+            }
+            let size = subjects.iter().filter(|other| *other == current).count();
+            if !admitted.is_empty() && size > room {
+                break;
+            }
+            admitted.push(current);
+            room = room.saturating_sub(size);
+            if room == 0 {
+                break;
+            }
+        }
+        // Filtering the fetched rows keeps the payload in rowid order.
         let mut related = vec![];
-        for candidate in candidates { if subject(&candidate)? == first { related.push(candidate); } }
+        for (candidate, current) in candidates.into_iter().zip(&subjects) {
+            if related.len() < batch_size && admitted.contains(&current) {
+                related.push(candidate);
+            }
+        }
         candidates = related;
     }
     if candidates.is_empty() {

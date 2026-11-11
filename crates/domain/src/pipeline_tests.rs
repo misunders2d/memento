@@ -316,6 +316,134 @@ fn lone_candidate_keeps_its_old_target_when_endpoints_fill_the_ceiling() {
     assert_eq!(supplied.len(), 48);
 }
 
+/// Extracts `count` distinct candidates from one new episode of `conversation`.
+fn admit(f: &Fixture, conversation: &str, event: &str, count: usize) {
+    let facts = (0..count).map(|i| format!("Depot {i} of {conversation} run {event} holds sealed crates.")).collect::<Vec<_>>();
+    f.capture(&format!("{conversation}-{event}"), conversation, &facts.join(" "), "user", "fill-fixture", json!({}), "2026-10-18T12:00:00Z");
+    // A closed window keeps this extraction claim from scheduling consolidation early.
+    use chrono::Timelike;
+    let hour = chrono::Utc::now().hour();
+    let extraction = f.processing.claim(Claim { agent: "fixture".into(), timezone_name: "UTC".into(),
+        compaction: Some(Compaction { source: "fill-fixture".into(), conversation_id: conversation.into() }),
+        exclude: vec![], consolidate_now: false, kinds: Some(vec!["extract".into()]),
+        consolidation_start: Some(format!("{:02}:00", (hour + 2) % 24)),
+        consolidation_end: Some(format!("{:02}:00", (hour + 3) % 24)),
+        continuous: false, batch_size: 16 }).unwrap()["work"][0].clone();
+    let drafts = facts.iter().enumerate().map(|(i, text)| { let mut item = draft(text, "knowledge", false); item["key"] = json!(format!("k{i}")); item }).collect::<Vec<_>>();
+    f.complete(&extraction, json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":drafts}]})).unwrap();
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM jobs WHERE kind='consolidate'"), 0);
+}
+/// Claims one consolidation batch; returns the job, its candidates' conversations in
+/// payload order and the stored payload.
+fn admitted(f: &Fixture, continuous: bool, size: usize) -> (Value, Vec<String>, Value) {
+    let claimed = f.processing.claim(Claim { agent: "fixture".into(), timezone_name: "UTC".into(), compaction: None,
+        exclude: vec![], consolidate_now: true, kinds: Some(vec!["consolidate".into()]), consolidation_start: None,
+        consolidation_end: None, continuous, batch_size: size }).unwrap();
+    let task = claimed["work"][0].clone();
+    if task.is_null() {
+        return (task, vec![], Value::Null);
+    }
+    let payload: Value = serde_json::from_str(&f.stored::<String>(&format!("SELECT payload FROM jobs WHERE id='{}'", task["id"].as_str().unwrap()))).unwrap();
+    let candidates = task["input"]["candidates"].as_array().unwrap();
+    // The stored payload carries the same candidates in rowid order.
+    let positions = payload["candidate_ids"].as_array().unwrap().iter().map(|id| f.stored::<i64>(&format!("SELECT rowid FROM candidates WHERE id='{}'", id.as_str().unwrap()))).collect::<Vec<_>>();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(payload["next_cursor"], json!(positions.last().unwrap()));
+    assert_eq!(positions.len(), candidates.len());
+    let conversations = candidates.iter().map(|candidate| candidate["text"].as_str().unwrap().split(' ').nth(3).unwrap().to_owned()).collect();
+    (task, conversations, payload)
+}
+fn reject_all(f: &Fixture, task: &Value) {
+    f.complete(task, json!({"actions":task["input"]["candidates"].as_array().unwrap().iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()})).unwrap();
+}
+fn tally(conversations: &[String]) -> Vec<(&str, usize)> {
+    let mut counts: Vec<(&str, usize)> = vec![];
+    for name in conversations {
+        match counts.iter_mut().find(|(seen, _)| *seen == name.as_str()) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((name.as_str(), 1)),
+        }
+    }
+    counts
+}
+
+#[test]
+fn continuous_admission_fills_a_batch_with_whole_conversations() {
+    let f = Fixture::new();
+    // Rows 1-6, 7-11, 12-19 and 20-22: gamma straddles row 16 and does not fit after
+    // alpha and beta, so it stays whole and leads the next batch with delta.
+    for (conversation, count) in [("alpha", 6), ("beta", 5), ("gamma", 8), ("delta", 3)] {
+        admit(&f, conversation, "one", count);
+    }
+    let (first, conversations, payload) = admitted(&f, true, 16);
+    assert_eq!(tally(&conversations), [("alpha", 6), ("beta", 5)]);
+    assert!(payload["night"].is_null());
+    assert_eq!(payload["next_cursor"], 11);
+    reject_all(&f, &first);
+    let (second, conversations, _) = admitted(&f, true, 16);
+    assert_eq!(tally(&conversations), [("gamma", 8), ("delta", 3)]);
+    reject_all(&f, &second);
+    assert!(admitted(&f, true, 16).0.is_null());
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidate_decisions"), 22);
+}
+
+#[test]
+fn continuous_admission_takes_many_small_conversations_up_to_the_size() {
+    let f = Fixture::new();
+    for conversation in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"] {
+        admit(&f, conversation, "one", 2);
+    }
+    admit(&f, "iota", "one", 1);
+    let (_, conversations, _) = admitted(&f, true, 16);
+    assert_eq!(conversations.len(), 16);
+    assert_eq!(tally(&conversations).len(), 8);
+    assert!(!conversations.contains(&"iota".to_owned()));
+}
+
+#[test]
+fn continuous_admission_caps_an_oversized_first_conversation() {
+    let f = Fixture::new();
+    admit(&f, "alpha", "one", 20);
+    admit(&f, "beta", "one", 2);
+    let (first, conversations, payload) = admitted(&f, true, 16);
+    assert_eq!(tally(&conversations), [("alpha", 16)]);
+    assert_eq!(payload["next_cursor"], 16);
+    reject_all(&f, &first);
+    let (_, conversations, _) = admitted(&f, true, 16);
+    assert_eq!(tally(&conversations), [("alpha", 4), ("beta", 2)]);
+}
+
+#[test]
+fn continuous_admission_keeps_interleaved_runs_of_one_conversation_together() {
+    let f = Fixture::new();
+    // alpha rows 1-2 and 6-7 surround beta rows 3-5; gamma is row 8.
+    admit(&f, "alpha", "one", 2);
+    admit(&f, "beta", "one", 3);
+    admit(&f, "alpha", "two", 2);
+    admit(&f, "gamma", "one", 1);
+    let (first, conversations, payload) = admitted(&f, true, 4);
+    assert_eq!(tally(&conversations), [("alpha", 4)]);
+    assert_eq!(payload["next_cursor"], 7);
+    reject_all(&f, &first);
+    let (_, conversations, _) = admitted(&f, true, 4);
+    assert_eq!(tally(&conversations), [("beta", 3), ("gamma", 1)]);
+}
+
+#[test]
+fn frozen_admission_still_cuts_at_the_batch_size() {
+    let f = Fixture::new();
+    for (conversation, count) in [("alpha", 6), ("beta", 5), ("gamma", 8), ("delta", 3)] {
+        admit(&f, conversation, "one", count);
+    }
+    // The legacy path takes the first 16 rows and cuts gamma mid-conversation.
+    let (first, conversations, payload) = admitted(&f, false, 16);
+    assert_eq!(tally(&conversations), [("alpha", 6), ("beta", 5), ("gamma", 5)]);
+    assert_eq!(payload["next_cursor"], 16);
+    reject_all(&f, &first);
+    let (_, conversations, _) = admitted(&f, false, 16);
+    assert_eq!(tally(&conversations), [("gamma", 3), ("delta", 3)]);
+}
+
 #[test]
 fn smaller_admission_repartitions_only_uncommitted_released_work() {
     let f=Fixture::new();
