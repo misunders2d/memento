@@ -116,7 +116,7 @@ def test_explicit_recall_uses_longer_http_budget(monkeypatch):
 
     monkeypatch.setattr(bridge, 'http', request)
     with pytest.raises(TimeoutError) as failure:
-        bridge.native(SimpleNamespace(config={}), dict(harness='pi', session_id='synthetic-session',
+        bridge.native(SimpleNamespace(config={}, commit=lambda: None), dict(harness='pi', session_id='synthetic-session',
             action='tool', tool='recall', arguments={'query': 'synthetic'}))
     assert bridge.upload_error(failure.value)['category'] == 'timeout'
 

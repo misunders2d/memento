@@ -1,5 +1,6 @@
 """Native bridge edge cases; all paths/configuration are synthetic and temporary."""
 import json
+import sqlite3
 import base64
 import builtins
 import io
@@ -400,6 +401,33 @@ def test_offline_cache_does_not_leak_previous_request(tmp_path, monkeypatch):
     assert bridge.passive(spool, 'session', 'different query') == {
         'context': '', 'shown': [], 'error': 'recall_unavailable'}
     spool.close()
+
+
+@pytest.mark.parametrize('tool,arguments', [
+    ('recall', {'query': 'synthetic'}), ('history', {'id': 'synthetic'}), ('loop', {'action': 'list'})])
+def test_native_read_tool_releases_spool_writer_before_service_request(tmp_path, monkeypatch, tool, arguments):
+    spool = spool_at(tmp_path)
+    journal = tmp_path / 'session.jsonl'
+    journal.write_text('{"type":"session","id":"s"}\n')
+    held = []
+
+    def service(*args, **kwargs):
+        # A concurrent capture must get the writer while the request is in flight.
+        other = sqlite3.connect(spool.path, timeout=0)
+        try:
+            other.execute('BEGIN IMMEDIATE')
+            other.rollback()
+        except sqlite3.OperationalError:
+            held.append(tool)
+        finally:
+            other.close()
+        return {}
+
+    monkeypatch.setattr(bridge, 'http', service)
+    bridge.native(spool, {'harness': 'pi', 'session_id': 's', 'session_file': str(journal),
+                          'action': 'tool', 'tool': tool, 'arguments': arguments})
+    spool.close()
+    assert held == []
 
 
 def test_native_transport_failure_is_not_success(tmp_path, monkeypatch, capsys):

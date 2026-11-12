@@ -1465,6 +1465,10 @@ def native(spool, data, *, recall=automatic):
     if data.get('action') == 'tool':
         tool = data['tool']
         arguments = data.get('arguments', {})
+        # Release the spool writer before any service request: journal
+        # registration above opened a write transaction, and concurrent capture
+        # waits only three seconds for it.
+        spool.commit()
         if tool == 'recall':
             parameters = {**arguments}
             if 'query' in parameters:
