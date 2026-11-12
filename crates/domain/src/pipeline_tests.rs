@@ -5,8 +5,6 @@ mod claim_link_tests;
 mod due_tests;
 #[path = "lesson_link_tests.rs"]
 mod lesson_link_tests;
-#[path = "historical_nightly_tests.rs"]
-mod historical_nightly_tests;
 use super::*;
 use crate::{
     pipeline_schema,

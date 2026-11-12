@@ -202,24 +202,6 @@ def test_reopened_kind_is_not_treated_as_exhausted_and_due_kinds_reach_adapter(n
     assert '"id":"late"' in output and '"completed_jobs":1' in output
 
 
-@pytest.mark.parametrize('within', [False, True])
-def test_historical_only_backlog_wakes_native_worker_only_in_normal_night_window(native,monkeypatch,within):
-    config,trace,calls=native
-    original_service=runner.Service
-    class HistoricalService(original_service):
-        def post(self,path,command):
-            value=super().post(path,command)
-            if path=='/work/pool':
-                value.update(ready_candidates=0,historical=dict(policy='nightly_after_fresh',pending_conversations=2,queued_jobs=0))
-            return value
-    monkeypatch.setattr(runner,'Service',HistoricalService)
-    hour=time.gmtime().tm_hour
-    config.update(consolidation_start=f'{(hour if within else (hour+2)%24):02}:00',
-                  consolidation_end=f'{((hour+1)%24 if within else (hour+3)%24):02}:00')
-    assert worker.tick(runner,config)==0
-    assert trace.exists()==within
-
-
 def test_committed_submit_reconciled_by_failed_renewal_keeps_its_delayed_next_lease(native,monkeypatch,capsys):
     config,trace,calls=native
     monkeypatch.setenv('RENEW_FALSE','first')

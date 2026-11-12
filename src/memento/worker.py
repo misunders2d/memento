@@ -52,10 +52,7 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
     seconds = pool.get('lease_seconds')
     if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
         raise api.RunnerError('invalid processing lease')
-    history = pool.get('historical') or {}
-    historical_pending = history.get('policy') == 'nightly_after_fresh' and (
-        history.get('pending_conversations') or history.get('queued_jobs'))
-    if not (pool.get('pending_extract_conversations') or pool.get('ready_candidates') or historical_pending
+    if not (pool.get('pending_extract_conversations') or pool.get('ready_candidates')
             or pool.get('pending_maintenance_groups') or pool.get('jobs')):
         return 0
     local = datetime.now(ZoneInfo(config['timezone']))
@@ -66,7 +63,7 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
     start,end=clock(config.get('consolidation_start','02:00')),clock(config.get('consolidation_end','07:00'))
     within = start<=minute<end if start<end else minute>=start or minute<end
     ready={item['kind']:item['count'] for item in pool.get('ready_jobs',[])}
-    extraction_due=pool.get('eligible_extract_conversations',0) or ready.get('extract',0) or (within and historical_pending)
+    extraction_due=pool.get('eligible_extract_conversations',0) or ready.get('extract',0)
     consolidation_due=(within or consolidate_now) and (pool.get('ready_candidates') or pool.get('pending_maintenance_groups') or ready.get('consolidate',0))
     if not extraction_due and not consolidation_due:
         return 0  # No model process just to discover a closed window or active chat.

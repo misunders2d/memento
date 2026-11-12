@@ -402,7 +402,7 @@ async function loadConversations() {
   $('conversations').replaceChildren(...items.map(item => row(() => showConversation(item),
     el('span', {class: 'badge'}, harness(item.source)), item.conversation_id,
     el('div', {class: 'meta'}, `last activity ${when(item.latest_at)}` +
-      (item.parked ? ` · historical backlog, nightly after fresh work (live cursor ${item.live_cursor})` : '')))));
+      (item.parked ? ` · parked historical, not queued (live cursor ${item.live_cursor})` : '')))));
   $('conv-prev').disabled = state.conv === 0;
   $('conv-next').disabled = state.conv + page >= total;
 }
@@ -549,9 +549,7 @@ function processingCards(data) {
   ], ['The processor controls the consolidation schedule. Its current schedule and whether it is online are not reported by this service.',
     'Inspected repair groups mean the bounded work was reviewed, not proof of semantic completeness.']);
   const historical = card('Historical backlog', h.active ? `Parked on ${when(h.activated_at)}.` : 'No historical backlog has been parked.', [
-    metric('Historical conversations remaining', num(h.pending_conversations), 'Extracted automatically in the nightly window after eligible fresh work drains.'),
-    metric('Historical conversations extracted', num(h.extracted_conversations), `Of ${num(h.parked_conversations)} originally parked conversations; extraction is not consolidation.`),
-    metric('Historical extraction queued / running', `${num(h.queued_jobs)} / ${num(h.running_jobs)} jobs`, 'A queued retry yields to fresh work and waits outside the nightly window.'),
+    metric('Parked conversations', num(h.parked_conversations), 'Unextracted history set aside: not queued and not processed.'),
     metric('with new live records', num(h.live_pending_conversations), null, true),
     metric('Parked extraction jobs', num(x.parked_jobs), 'Stopped at parking; not failures, not completed.'),
     metric('Parked consolidation jobs', num(c.parked_jobs)),
@@ -560,7 +558,7 @@ function processingCards(data) {
     metric('Excluded legacy candidates', num(c.excluded_legacy_candidates), 'Supported only by legacy instruction text; never admitted to consolidation.'),
     metric('On-demand extraction queued / running', `${num(pick('pending_demand', 'messages'))} / ${num(pick('leased_demand', 'messages'))} messages`,
       `${num(pick('pending_demand', 'jobs'))} / ${num(pick('leased_demand', 'jobs'))} jobs, from cited parked history`),
-  ], ['Historical extraction resumes its saved cursor in bounded batches. New eligible work takes priority before the next historical batch. Citing a parked passage can also queue on-demand extraction for that span.']);
+  ], ['Parked history is never counted as processed. Citing a parked passage queues on-demand extraction for exactly that span.']);
   const indexed = i.available === false ? card('Search indexing', 'Indexing is unavailable on this service.', [])
     : card('Search indexing', i.not_counted ? 'No index count is available yet. Other processing counts remain available.'
       : `Counted ${Number.isFinite(i.age_seconds) ? `${num(Math.round(i.age_seconds / 60))} min ago` : 'at an unknown time'}.`, [
