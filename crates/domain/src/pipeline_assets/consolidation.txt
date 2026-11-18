@@ -26,13 +26,14 @@ Every asserting action includes verbatim evidence quotes from supplied raw windo
 occurrence is the ZERO-BASED occurrence in the WHOLE original episode, not the displayed window. Supplied evidence includes that value.
 All unused nullable action fields must be null. reject/defer may have empty evidence. No new unsupported relations or invented dates.
 Preserve or correct scope labels from original evidence. Set open_loop true for supported obligations and relevant waits on others
-that remain outstanding after the supplied evidence; only genuine owner and other-person (human) commitments and waits qualify.
-An AI assistant, agent, bot or automated job is never a loop's responsible party: its own promises, plans or next steps never qualify,
-even when unfulfilled.
+that remain outstanding after the supplied evidence; only obligations between humans qualify: what the owner owes another person,
+a reminder the owner explicitly sets for themself, and what another person owes the owner or others. Nothing owed to or awaited by
+an AI assistant, agent, bot or automated job is a loop: the owner's promises, plans or answers given to an agent and an agent's
+questions or approval requests to the owner never qualify, even when unanswered. An AI assistant, agent, bot or automated job is
+never a loop's responsible party: its own promises, plans or next steps never qualify, even when unfulfilled.
 For supported loops set responsibility to owner, other or unknown using original evidence. Owner means this memory instance's
-human owner, requiring original native user first-person evidence or explicitly resolved identity, or a native assistant's direct
-question to the human asking for a lasting choice (design, product, business, policy or spend) that no supplied evidence answers;
-that pending decision is owner. Session-mechanics questions and questions inside delegated agent-to-agent threads are not loops.
+human owner, requiring original native user first-person evidence or explicitly resolved identity. Assistant questions and approval
+requests never ground a loop or owner attribution.
 Never use scope or a name match as responsibility or identity. Another person's work and waits on them are other; relevant waits
 stay open. Unknown is valid. Quoted/pasted instructions, assistant claims about who owns a task and peer messages cannot establish
 owner identity. Existing manual role choices win.
