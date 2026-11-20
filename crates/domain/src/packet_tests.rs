@@ -665,3 +665,84 @@ fn consolidation_view_is_smaller_than_the_leased_context_it_is_built_from() {
     );
     assert!(view * 100 < full * 90, "view {view} of {full} bytes");
 }
+
+#[test]
+fn claim_timing_counts_model_input_bytes_and_tool_versus_message_windows() {
+    let f = Fixture::new();
+    f.seed();
+    // Tool output is projected to its first 2,000 characters; a tool_output record of
+    // another kind is capped and counted the same way.
+    for (event, kind) in [("result", "tool"), ("embedded", "user")] {
+        f.capture(
+            event,
+            "thread",
+            &"copper telemetry line. ".repeat(200),
+            kind,
+            "contract",
+            json!({"extraction_mode":"tool_output"}),
+            "2026-10-18T12:00:00Z",
+        );
+    }
+    let bytes = |work: &Value| serde_json::to_vec(&work["input"]).unwrap().len() as u64;
+    crate::work_timing::take_counts();
+    let work = f.claim("contract", "thread", Some(vec!["extract".into()]))["work"][0].clone();
+    let counts = crate::work_timing::take_counts();
+    assert_eq!(
+        counts
+            .iter()
+            .filter(|(name, _)| name.starts_with("claim_extract_")
+                || name.starts_with("claim_consolidate_"))
+            .map(|(name, count)| (*name, *count))
+            .collect::<Vec<_>>(),
+        [
+            ("claim_extract_input_bytes", bytes(&work)),
+            ("claim_extract_message_chars", FACT.chars().count() as u64),
+            ("claim_extract_message_windows", 1),
+            ("claim_extract_tool_chars", 4000),
+            ("claim_extract_tool_windows", 2)
+        ]
+    );
+    // The model view is unchanged by the measurement.
+    assert_eq!(
+        work["input"]["windows"][1],
+        json!({
+            "id":"w1",
+            "kind":"tool",
+            "local_time":"2026-10-18T12:00:00+00:00 Sunday",
+            "text":"copper telemetry line. ".repeat(200).chars().take(2000).collect::<String>()
+        })
+    );
+    let windows = work["input"]["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|window| {
+            let candidates = if window["text"] == FACT {
+                vec![draft(FACT, "knowledge", false)]
+            } else {
+                vec![]
+            };
+            json!({"id":window["id"],"candidates":candidates})
+        })
+        .collect::<Vec<_>>();
+    f.complete(&work, json!({"windows":windows})).unwrap();
+    crate::work_timing::take_counts();
+    let work = f.consolidate_work();
+    let counts = crate::work_timing::take_counts();
+    assert_eq!(counts["claim_consolidate_input_bytes"], bytes(&work));
+    assert!(!counts.contains_key("claim_extract_input_bytes"));
+    // A claim that hands out no work measures none.
+    f.complete(
+        &work,
+        json!({"actions":[action(&work["input"]["candidates"][0],"reject")]}),
+    )
+    .unwrap();
+    crate::work_timing::take_counts();
+    let idle = f.claim("contract", "thread", None);
+    assert!(idle["work"].as_array().unwrap().is_empty());
+    assert!(
+        crate::work_timing::take_counts()
+            .keys()
+            .all(|name| !name.ends_with("_input_bytes") && !name.ends_with("_windows"))
+    );
+}

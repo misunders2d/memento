@@ -710,6 +710,44 @@ impl Processing {
                         schedule()?;
                         return Ok(None);
                     }
+                    // Counts only, for work a model actually receives: the compact JSON
+                    // size of its input as the HTTP response carries it.
+                    crate::work_timing::count(
+                        if kind == "extract" {
+                            "claim_extract_input_bytes"
+                        } else {
+                            "claim_consolidate_input_bytes"
+                        },
+                        serde_json::to_vec(&input)?.len() as u64,
+                    );
+                    if kind == "extract" {
+                        for (tool, windows, chars) in [
+                            (
+                                false,
+                                "claim_extract_message_windows",
+                                "claim_extract_message_chars",
+                            ),
+                            (
+                                true,
+                                "claim_extract_tool_windows",
+                                "claim_extract_tool_chars",
+                            ),
+                        ] {
+                            let texts = prepared["windows"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter(|window| (window["tool_output"] == true) == tool)
+                                .map(|window| {
+                                    window["text"]
+                                        .as_str()
+                                        .map_or(0, |text| text.chars().count())
+                                })
+                                .collect::<Vec<_>>();
+                            crate::work_timing::count(windows, texts.len() as u64);
+                            crate::work_timing::count(chars, texts.iter().sum::<usize>() as u64);
+                        }
+                    }
                     let instruction = if kind == "extract" {
                         format!(
                             "{}\nReturn windows with exactly the supplied ids and candidates for each. Entity keys are \

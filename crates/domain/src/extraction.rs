@@ -56,11 +56,9 @@ impl Extractor {
                     .as_u64()
                     .ok_or(Error::Validation("Invalid extraction window"))?
                     as usize;
-                let end = if metadata["extraction_mode"] == "tool_output" || kind == "tool" {
-                    end.min(start + 2000)
-                } else {
-                    end
-                };
+                let tool = metadata["extraction_mode"] == "tool_output" || kind == "tool";
+                let end = if tool { end.min(start + 2000) } else { end };
+                // tool_output is kept for claim measurement only; the model view omits it.
                 windows.push(json!({
                     "id":item["id"],
                     "episode_id":id,
@@ -69,7 +67,8 @@ impl Extractor {
                     "start":start,
                     "end":end,
                     "text":substring(&text,start,end),
-                    "occurred_at":row["occurred_at"]
+                    "occurred_at":row["occurred_at"],
+                    "tool_output":tool
                 }));
             }
             Ok(json!({"windows":windows,"window_view":"handles-v1","policy_version":VERSION}))
