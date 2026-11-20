@@ -219,10 +219,23 @@ fn coverage_rejection(
         .filter(|handle| !returned.iter().any(|(id, _)| id == handle))
         .map(|handle| json!({"window_id":handle,"problem":"missing"}))
         .collect::<Vec<_>>();
+    // An unexpected id is the model's own text and the retry feeds it back: only an id
+    // shaped like a real handle (`w` and one to three ASCII digits) is echoed.
+    let handle = |id: &str| {
+        id.strip_prefix('w').is_some_and(|digits| {
+            (1..=3).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+    };
     let unexpected = returned
         .iter()
         .filter(|(id, _)| !windows.contains_key(*id))
-        .map(|(id, _)| json!({"window_id":id,"problem":"unexpected"}))
+        .map(|(id, _)| {
+            if handle(id) {
+                json!({"window_id":id,"problem":"unexpected"})
+            } else {
+                json!({"problem":"unexpected"})
+            }
+        })
         .collect::<Vec<_>>();
     let duplicate = returned
         .iter()

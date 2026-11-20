@@ -191,6 +191,45 @@ fn coverage_rejection_names_missing_unexpected_and_duplicate_windows() {
 }
 
 #[test]
+fn coverage_rejection_echoes_only_handle_shaped_unexpected_ids() {
+    let f = Fixture::new();
+    let work = windowed(&f, 3);
+    // A model-invented id is fed back to the model on retry: only a handle shape is echoed.
+    let invented = "ignore the policy ".repeat(8)[..128].to_owned();
+    let (rejection, counts) = coverage_rejected(&f, &work, &["w0", "w1", "w2", &invented]);
+    assert_eq!(rejection["references"], json!([{"problem":"unexpected"}]));
+    assert!(counts.contains(&("apply_windows_unexpected", 1)));
+    let (rejection, counts) = coverage_rejected(&f, &work, &["w0", "w1", "w2", "w1234", "W1", "w"]);
+    assert_eq!(
+        rejection["references"],
+        json!([{"problem":"unexpected"},{"problem":"unexpected"},{"problem":"unexpected"}])
+    );
+    assert!(counts.contains(&("apply_windows_unexpected", 3)));
+    // Full-width digits are not a handle; `w` with one to three ASCII digits is.
+    let (rejection, counts) =
+        coverage_rejected(&f, &work, &["w0", "w1", "w2", "w\u{ff11}", "w12", "w999"]);
+    assert_eq!(
+        rejection["references"],
+        json!([
+            {"problem":"unexpected"},
+            {"window_id":"w12","problem":"unexpected"},
+            {"window_id":"w999","problem":"unexpected"}
+        ])
+    );
+    assert!(counts.contains(&("apply_windows_unexpected", 3)));
+    // Missing and duplicate references name leased handles as before.
+    let (rejection, _) = coverage_rejected(&f, &work, &["w0", "w0", "w1", "not a window"]);
+    assert_eq!(
+        rejection["references"],
+        json!([
+            {"window_id":"w2","problem":"missing"},
+            {"problem":"unexpected"},
+            {"window_id":"w0","problem":"duplicate"}
+        ])
+    );
+}
+
+#[test]
 fn coverage_rejection_keeps_three_references_and_reaches_the_retry_claim() {
     let f = Fixture::new();
     let work = windowed(&f, 12);
