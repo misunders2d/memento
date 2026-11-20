@@ -24,24 +24,27 @@ Owner-controlled **Memento: immutable top-level requirement** in [Personal Clone
 
 **Native agent context:** retain native reasoning + tool history inside unfinished work. Compact completed evidence only after verified commit/release boundary. Current packet + last receipt does not preserve enough state to recover from repeated tool errors; verify real multi-step workflow before claiming persistence works.
 
-## Hard gates (always apply; detail docs below add conditions, never loosen these)
+## Hard gates (always apply)
+
+Short reminders of rules stated in the detail docs. The detail doc holds the exact wording, conditions and exceptions; read it before acting in that area.
 
 - **Contabo:** do not deploy, test, profile or diagnose Memento on Contabo without new explicit user authorization.
-- **Human/operator/owner only, never the agent:** Compose install/recreate/restart, `sudo`, `loginctl enable-linger`, and every owner-socket or recovery command on a real database: `memento-admin` (`backup`, review `list|approve|reject`, `forget`, `inventory`, `merge`, `revisions`, `recover-revisions`, `compact`, `export`, `history park`), `memento-restore`, `memento-drive configure|connect`. No approval field or owner impersonation exists for agents.
+- **Human/operator steps, not agent commands:** fresh Compose installation, `sudo`, `sudo loginctl enable-linger <agent-user>`, and restarting the container after a panic or poisoned writer. Other rollout needs authorization (see **Clean coding handover**, **Stop expanding after acceptance**).
+- **Owner socket = service owner/human, never the agent:** review `list|approve|reject`, `forget`, `inventory`/`merge`, `revisions`/`recover-revisions` (never on a real database), and the owner-only `backup`, `compact`, `export`, `history park`, `memento-restore`. No approval field or owner impersonation exists for agents.
 - **Isolation:** agent must not share the service UID; no sudo or Docker-daemon access when human-review isolation matters.
 - **Network:** never expose this unauthenticated API publicly. Loopback listener + tailnet Serve only; keep MCP host protection on.
 - **One writer:** one service process per data directory. Never point the Python comparison service at a native database. No in-place conversion, no lowering the DB header, never two instances accepting writes. Keep `data/` on local Linux storage (not NFS/SMB/FUSE).
-- **Production data:** never target production with acceptance tests or synthetic runs; use a launcher-owned fresh instance. Synthetic text only, never secrets. Keep reports private.
-- **Do not restart** the service during startup index builds, `compact` or export. Restart after a panic/poisoned writer is the human/operator's action.
-- **Processing:** one server processor/timer only. Never restart a stopped unscheduled catch-up without owner authorization. Codex and AGY server processing stay refused; do not claim Codex extraction acceptance.
-- **Native trust:** never grant native trust, hook or MCP permissions (Codex `/hooks`), never force an agent continuation; the human approves.
-- **Rollout order:** service first, then processing runner, then `memento agent update` on clients. Say deployment started only after its command runs.
-- **Secrets/Drive:** never read private credential files into the conversation, print secret values, use ambient Google credentials or broaden scopes beyond `drive.file`. Never create a replacement OAuth client or Drive folder; recovery always passes the known `--folder-id`.
-- **Evidence:** explicit saves need nonempty verbatim quotes; never invent evidence. Derived-memory cleanup never deletes raw history. Agents cannot forget data or approve sensitive changes.
-- **Identities/history:** do not copy histories or config identities across devices. Do not delete native histories or import processing sessions as human evidence.
+- **Acceptance runs:** `tests/memory_acceptance.py` never targets production; it needs a launcher-owned fresh instance. Tests use synthetic text, not secrets. Keep reports private.
+- **Do not restart** the service during startup index builds or `compact`.
+- **Processing:** one server processing config/timer. Never restart a stopped unscheduled catch-up without owner authorization. Codex server processing stays fail-closed and AGY server processing stays refused; do not claim Codex extraction acceptance.
+- **Native trust:** setup never grants native trust, hook or MCP permissions (Codex `/hooks`); never grant them or force an agent continuation. The human approves.
+- **Rollout order:** service first, then processing runner, then `memento agent update` on clients. Say deployment started only after its command is running.
+- **Secrets/Drive:** never read private credential files into the conversation, print secret values, use ambient Google credentials or broaden scopes beyond `drive.file`. Never create a replacement OAuth client or Drive folder during recovery; never omit the known `--folder-id`. Initial secret provisioning belongs to the service owner; an agent may only use explicitly authorized credential-manager injection, otherwise pause for owner approval.
+- **Evidence:** explicit saves need nonempty verbatim quotes; never invent evidence. Forget and derived-memory retirement keep raw history. Agents cannot forget data or approve sensitive changes.
+- **Identities/history:** do not copy histories/config identities across devices and claim cross-device deduplication. Do not delete native histories or import processing sessions as human evidence.
 - **Website:** deploy only `website/`, never the repository root; never point `memento.bezosapp.uk` at the private memory API.
 - **Config:** keep code defaults generic; per-machine values go in the deployment's private configuration.
-- **Claims:** a timer firing, queue counts, healthy `/health` or installed files prove nothing; verify a committed unit / actual capture, extraction and recall separately.
+- **Claims:** a timer firing, queue counts, healthy `/health` or installed files prove nothing; verify a committed unit and actual capture, extraction and recall separately.
 
 ## Detail docs (read the matching one BEFORE acting; they are binding, not optional)
 

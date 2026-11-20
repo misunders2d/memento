@@ -4,7 +4,7 @@ Detail for [AGENTS.md](../../AGENTS.md). Caveman-compressed; every rule here is 
 
 ## Import histories on each origin device
 
-Finish first-test sequence above before importing history.
+Finish first-test sequence ([processing.md](processing.md)) before importing history.
 
 After client/server setup there, keep that device's private config + stable generated `client_uid`; setup rerun preserves it. Select actual local history files/directories explicitly (no automatic discovery). Run all applicable commands, replacing example paths:
 ```sh
