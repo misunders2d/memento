@@ -231,7 +231,7 @@ def test_citation_renews_recency_without_redating_original_evidence(retrieval, r
 
 @pytest.mark.parametrize('protection', ['pinned', 'explicit_user', 'inferred'])
 def test_pins_and_explicit_preferences_keep_priority_and_bridge_source_provenance(
-        retrieval, recency_clock, monkeypatch, protection):
+        retrieval, recency_clock, monkeypatch, tmp_path, protection):
     from memento import bridge
     r = retrieval
     text = 'Use the supported Cedar installer for ordinary setup.'
@@ -254,18 +254,15 @@ def test_pins_and_explicit_preferences_keep_priority_and_bridge_source_provenanc
     hit = next(item for item in hits if item['id'] == target)
     assert hit['decay'] == pytest.approx(1 if protection != 'inferred' else math.exp2(-293 / 90))
     assert hit['source_occurred_at'] == '2026-01-01T00:00:00+00:00'
-    class Spool:
-        db = sqlite3.connect(':memory:')
-        config = {}
-    spool = Spool()
-    spool.db.execute('CREATE TABLE recall_cache(conversation TEXT PRIMARY KEY,query TEXT,context TEXT,shown TEXT,updated REAL)')
+    # The shipped spool owns the recall_cache layout; a hand-copied table goes stale.
+    spool = bridge.Spool(tmp_path / 'client' / 'runner.json', {})
     monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {'memories': hits})
     try:
         rendered = bridge.passive(spool, 'time', 'Ordinary Cedar setup')['context']
         assert 'Source 2026-01-01:' in rendered and text in rendered and len(rendered.encode()) <= 1500
         assert '[fact] Source 2026-01-01: The Cedar installer supports local setup.' in rendered
     finally:
-        spool.db.close()
+        spool.close()
     assert r.graph._behavior(target) == original
 
 
