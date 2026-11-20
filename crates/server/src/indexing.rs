@@ -7,6 +7,7 @@ use memento_embedding::EmbeddingModel;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
+    cell::Cell,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -82,6 +83,160 @@ const UNUSED: &str = concat!(
     query_feedback q WHERE q.target IS NOT NULL)"
 );
 const RETIRE_BATCH: i64 = 512;
+/// At most one aggregated `index_timing` line per interval; quiet intervals print nothing.
+const TIMING_INTERVAL: Duration = Duration::from_secs(60);
+macro_rules! keys {
+    ($kind:ident, $names:ident, $($variant:ident = $name:literal),+ $(,)?) => {
+        #[derive(Clone, Copy)]
+        enum $kind { $($variant),+ }
+        const $names: &[&str] = &[$($name),+];
+    };
+}
+// Disjoint wall-clock intervals inside `run_once`. Every store read opens its own
+// connection, which is part of the stage that reads. `encode` is the whole background
+// lane call: lane lock wait, prompt tokenization and inference are not separable here.
+keys!(
+    Stage,
+    STAGES,
+    ResolveFailures = "resolve_failures",
+    Retire = "retire",
+    SelectRetry = "select_retry",
+    SelectCursor = "select_cursor",
+    SelectWalk = "select_walk",
+    SelectChunk = "select_chunk",
+    PrepareHydrate = "prepare_hydrate",
+    PrepareTokenize = "prepare_tokenize",
+    PrepareWrite = "prepare_write",
+    Hydrate = "hydrate",
+    Encode = "encode",
+    EntityHints = "entity_hints",
+    Commit = "commit",
+    FailureWrite = "failure_write",
+);
+// `node`/`candidate`/`episode` are units whose vector was encoded and handed to the
+// commit; `failures` are units recorded for retry; `errors` are failed `run_once` calls.
+keys!(
+    Count,
+    COUNTS,
+    Calls = "calls",
+    Node = "node",
+    Candidate = "candidate",
+    Episode = "episode",
+    Failures = "failures",
+    Errors = "errors",
+    PreparedEpisodes = "prepared_episodes",
+    PreparedChunks = "prepared_chunks",
+    RetireBatches = "retire_batches",
+    HydratedBytes = "hydrated_bytes",
+    EncodedBytes = "encoded_bytes",
+);
+/// One `run_once` call's clocks. `Instant` reads only: no IDs, text or payloads.
+#[derive(Default)]
+struct Tally {
+    stages: [Cell<Duration>; STAGES.len()],
+    counts: [Cell<u64>; COUNTS.len()],
+}
+impl Tally {
+    /// Adds the time since `since` to `stage` and restarts `since`.
+    fn lap(&self, stage: Stage, since: &mut Instant) {
+        let now = Instant::now();
+        let cell = &self.stages[stage as usize];
+        cell.set(cell.get() + (now - *since));
+        *since = now;
+    }
+    fn count(&self, count: Count, n: usize) {
+        let cell = &self.counts[count as usize];
+        cell.set(cell.get() + n as u64);
+    }
+}
+/// The current interval's totals over all calls.
+struct IndexTimings {
+    since: Instant,
+    busy: Duration,
+    stages: [Duration; STAGES.len()],
+    counts: [u64; COUNTS.len()],
+}
+impl IndexTimings {
+    fn new(since: Instant) -> Self {
+        Self {
+            since,
+            busy: Duration::ZERO,
+            stages: Default::default(),
+            counts: Default::default(),
+        }
+    }
+    /// An interval is worth a line only when a unit was processed or a call failed;
+    /// idle polls and retirement-only batches print nothing.
+    fn worked(&self) -> bool {
+        [
+            Count::Node,
+            Count::Candidate,
+            Count::Episode,
+            Count::Failures,
+            Count::Errors,
+        ]
+        .iter()
+        .any(|count| self.counts[*count as usize] > 0)
+    }
+    /// Ends the interval at `now`. Returns its line when anything was processed.
+    fn take(&mut self, now: Instant, reason: &'static str) -> Option<String> {
+        let done = std::mem::replace(self, Self::new(now));
+        if !done.worked() {
+            return None;
+        }
+        let us = |d: Duration| json!(u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+        let stages: serde_json::Map<String, Value> = STAGES
+            .iter()
+            .zip(&done.stages)
+            .map(|(k, v)| ((*k).to_owned(), us(*v)))
+            .collect();
+        let counts: serde_json::Map<String, Value> = COUNTS
+            .iter()
+            .zip(&done.counts)
+            .map(|(k, v)| ((*k).to_owned(), json!(v)))
+            .collect();
+        Some(
+            json!({
+                "event":"index_timing",
+                "reason":reason,
+                "interval_us":us(now.saturating_duration_since(done.since)),
+                "busy_us":us(done.busy),
+                "stages_us":stages,
+                "counts":counts
+            })
+            .to_string(),
+        )
+    }
+}
+/// The indexer's two model calls. Tests substitute a deterministic encoder.
+enum Encoder {
+    Model(EmbeddingModel),
+    #[cfg(test)]
+    Fixed(fn(&str) -> Option<[f32; 768]>),
+}
+impl Encoder {
+    /// Passage spans of `text` as character offsets.
+    fn chunks(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+        match self {
+            Self::Model(model) => Ok(model
+                .chunk_text(text)
+                .map_err(|_| Error::Unavailable("Passage tokenization failed"))?
+                .into_iter()
+                .map(|chunk| (chunk.start, chunk.end))
+                .collect()),
+            #[cfg(test)]
+            Self::Fixed(_) => Ok(vec![(0, text.chars().count())]),
+        }
+    }
+    fn encode(&self, text: &str) -> Result<[f32; 768]> {
+        match self {
+            Self::Model(model) => model.background().encode_document(text, None).ok(),
+            #[cfg(test)]
+            Self::Fixed(encode) => encode(text),
+        }
+        .ok_or(Error::Unavailable("Native background encoding failed"))
+    }
+}
 pub(crate) fn sources() -> [(String, &'static str); 3] {
     [
         (NODE.into(), "node_versions"),
@@ -92,7 +247,7 @@ pub(crate) fn sources() -> [(String, &'static str); 3] {
 pub struct Indexer {
     store: Arc<Store>,
     projection: Arc<Projection>,
-    model: EmbeddingModel,
+    model: Encoder,
     /// Ascending cursors for nodes and candidates, which are served before episodes.
     cursors: Mutex<[i64; 2]>,
     /// Newest-first walk over message episodes: chunking happens when the walk
@@ -102,13 +257,30 @@ pub struct Indexer {
     retired: Mutex<Option<i64>>,
     /// Then a cursor over chunk rowids removing excluded chunks the vector pass left vectorless.
     unused: Mutex<Option<i64>>,
+    timings: Mutex<IndexTimings>,
+    #[cfg(test)]
+    lines: Arc<Mutex<Vec<String>>>,
     pub stop: Arc<AtomicBool>,
+}
+/// The worker may never call `run_once` again after the stop flag is set.
+impl Drop for Indexer {
+    fn drop(&mut self) {
+        self.flush(Instant::now(), true);
+    }
 }
 impl Indexer {
     pub fn new(
         store: Arc<Store>,
         projection: Arc<Projection>,
         model: EmbeddingModel,
+        stop: Arc<AtomicBool>,
+    ) -> Arc<Self> {
+        Self::with_encoder(store, projection, Encoder::Model(model), stop)
+    }
+    fn with_encoder(
+        store: Arc<Store>,
+        projection: Arc<Projection>,
+        model: Encoder,
         stop: Arc<AtomicBool>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -119,16 +291,55 @@ impl Indexer {
             episodes: Mutex::new(Frontier::default()),
             retired: Mutex::new(Some(i64::MIN)),
             unused: Mutex::new(Some(i64::MIN)),
+            timings: Mutex::new(IndexTimings::new(Instant::now())),
+            #[cfg(test)]
+            lines: Default::default(),
             stop,
         })
     }
+    /// Folds one call into the open interval. Timing never fails indexing: a
+    /// poisoned clock is skipped.
+    fn record(&self, tally: &Tally, busy: Duration, failed: bool) {
+        tally.count(Count::Calls, 1);
+        tally.count(Count::Errors, usize::from(failed));
+        if let Ok(mut total) = self.timings.lock() {
+            total.busy += busy;
+            for (sum, cell) in total.stages.iter_mut().zip(&tally.stages) {
+                *sum += cell.get();
+            }
+            for (sum, cell) in total.counts.iter_mut().zip(&tally.counts) {
+                *sum += cell.get();
+            }
+        }
+        self.flush(Instant::now(), self.stop.load(Ordering::Acquire));
+    }
+    /// Prints the open interval's `index_timing` line when it is over at `now` or the
+    /// indexer is stopping. The idle worker still polls, so a finished burst is
+    /// reported at its interval end; an interval without work prints nothing.
+    fn flush(&self, now: Instant, stopping: bool) {
+        let line = match self.timings.lock() {
+            Ok(mut total)
+                if stopping || now.saturating_duration_since(total.since) >= TIMING_INTERVAL =>
+            {
+                total.take(now, if stopping { "shutdown" } else { "interval" })
+            }
+            _ => None,
+        };
+        if let Some(line) = line {
+            #[cfg(test)]
+            if let Ok(mut lines) = self.lines.lock() {
+                lines.push(line.clone());
+            }
+            eprintln!("{line}");
+        }
+    }
     /// Chunks one message episode; a concurrent chunking or forgetting wins.
-    fn prepare(&self, id: &str) -> Result<()> {
+    fn prepare(&self, id: &str, tally: &Tally) -> Result<()> {
         // Full original hydration and tokenization happen outside the writer transaction.
-        let text = self
-            .store
-            .read(|tx| tx.original_text(id))?
-            .ok_or(Error::Unavailable("Index source is unavailable"))?;
+        let mut at = Instant::now();
+        let text = self.store.read(|tx| tx.original_text(id));
+        tally.lap(Stage::PrepareHydrate, &mut at);
+        let text = text?.ok_or(Error::Unavailable("Index source is unavailable"))?;
         let mut spans = Vec::new();
         for (left, right) in domain::source_text_ranges(&text) {
             let part = CharSpan {
@@ -136,18 +347,17 @@ impl Indexer {
                 end: right,
             }
             .slice(&text)?;
-            for chunk in self
-                .model
-                .chunk_text(&part)
-                .map_err(|_| Error::Unavailable("Passage tokenization failed"))?
-            {
-                spans.push((left + chunk.start, left + chunk.end));
+            for (start, end) in self.model.chunks(&part)? {
+                spans.push((left + start, left + end));
             }
         }
         if spans.is_empty() {
             spans.push((0, 0));
         }
-        self.store.write(|tx| {
+        tally.count(Count::PreparedEpisodes, 1);
+        tally.count(Count::PreparedChunks, spans.len());
+        tally.lap(Stage::PrepareTokenize, &mut at);
+        let written = self.store.write(|tx| {
             let exists: bool = tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks WHERE episode_id=?1) OR EXISTS(SELECT 1 FROM \
                 episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE \
                 e.id=?1)", [id], |r| r.get(0))?;
@@ -160,31 +370,35 @@ impl Indexer {
                 }
             }
             Ok(())
-        })?;
-        Ok(())
+        });
+        tally.lap(Stage::PrepareWrite, &mut at);
+        written
     }
     /// Next raw chunk, newest message episode first.
-    fn episode_unit(&self) -> Result<Option<Value>> {
+    fn episode_unit(&self, tally: &Tally) -> Result<Option<Value>> {
         let mut frontier = self
             .episodes
             .lock()
             .map_err(|_| Error::Unavailable("Index cursor is unavailable"))?;
         loop {
-            let Some((id, seq, chunked)) = self
-                .store
-                .read(|tx| next_episode(tx.sql(), &mut frontier))?
-            else {
+            let mut at = Instant::now();
+            let next = self.store.read(|tx| next_episode(tx.sql(), &mut frontier));
+            tally.lap(Stage::SelectWalk, &mut at);
+            let Some((id, seq, chunked)) = next? else {
                 return Ok(None);
             };
             if !chunked {
-                self.prepare(&id)?;
+                self.prepare(&id, tally)?;
             }
+            let mut at = Instant::now();
             let chunk = self
                 .store
                 .read(|tx| records::one(tx.sql(), &format!("SELECT a.* FROM ({EPISODE}) a WHERE a.episode_id=? AND NOT EXISTS(SELECT 1 FROM \
                     vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND \
                     i.version=a.version) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND \
-                    f.version=a.version AND f.resolved=0) ORDER BY a.start LIMIT 1"), [&id]))?;
+                    f.version=a.version AND f.resolved=0) ORDER BY a.start LIMIT 1"), [&id]));
+            tally.lap(Stage::SelectChunk, &mut at);
+            let chunk = chunk?;
             if chunk.is_some() {
                 return Ok(chunk);
             }
@@ -216,11 +430,12 @@ impl Indexer {
         *cursor = next;
         Ok(scanned > 0)
     }
-    fn pending(&self) -> Result<Option<Value>> {
+    fn pending(&self, tally: &Tally) -> Result<Option<Value>> {
         let mut cursors = self
             .cursors
             .lock()
             .map_err(|_| Error::Unavailable("Index cursor is unavailable"))?;
+        let (mut at, mut stage) = (Instant::now(), Stage::SelectRetry);
         let ordered = self.store.read(|tx| {
             for (source, _) in sources() {
                 if let Some(row) = records::one(tx.sql(), &format!("SELECT a.* FROM ({source}) a JOIN index_failures f ON f.target=a.id AND f.version=a.version \
@@ -230,6 +445,8 @@ impl Indexer {
                     return Ok(Some(row));
                 }
             }
+            tally.lap(stage, &mut at);
+            stage = Stage::SelectCursor;
             for (index, (source, table)) in sources().iter().take(2).enumerate() {
                 let row = records::one(tx.sql(), &format!("SELECT a.* FROM ({source}) a WHERE a.position>? AND NOT EXISTS(SELECT 1 FROM vector_items i \
                     JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND \
@@ -243,27 +460,45 @@ impl Indexer {
                     .query_row(&format!("SELECT coalesce(max(rowid),0) FROM {table}"), [], |r| r.get(0))?;
             }
             Ok(None)
-        })?;
+        });
+        tally.lap(stage, &mut at);
         drop(cursors);
-        match ordered {
+        match ordered? {
             Some(row) => Ok(Some(row)),
-            None => self.episode_unit(),
+            None => self.episode_unit(tally),
         }
     }
+    /// One unit at most. Also feeds the aggregated `index_timing` line: counts and
+    /// durations only.
     pub fn run_once(&self) -> Result<bool> {
+        let (tally, started) = (Tally::default(), Instant::now());
+        let result = self.step(&tally);
+        self.record(&tally, started.elapsed(), result.is_err());
+        result
+    }
+    fn step(&self, tally: &Tally) -> Result<bool> {
         if self.stop.load(Ordering::Acquire) || !self.projection.ready(Tier::Hot) {
             return Ok(false);
         }
-        resolve_due_failures(&self.store)?;
-        let retired = self.retire_excluded()?;
-        let Some(mut row) = self.pending()? else {
+        let mut at = Instant::now();
+        let resolved = resolve_due_failures(&self.store);
+        tally.lap(Stage::ResolveFailures, &mut at);
+        resolved?;
+        let retired = self.retire_excluded();
+        tally.lap(Stage::Retire, &mut at);
+        let retired = retired?;
+        tally.count(Count::RetireBatches, usize::from(retired));
+        let Some(mut row) = self.pending(tally)? else {
             return Ok(retired);
         };
+        let mut at = Instant::now();
         if row["kind"] == "episode" {
             let original = self
                 .store
-                .read(|tx| tx.original_text(row["episode_id"].as_str().unwrap()))?
-                .ok_or(Error::Unavailable("Index source is unavailable"))?;
+                .read(|tx| tx.original_text(row["episode_id"].as_str().unwrap()));
+            tally.lap(Stage::Hydrate, &mut at);
+            let original = original?.ok_or(Error::Unavailable("Index source is unavailable"))?;
+            tally.count(Count::HydratedBytes, original.len());
             row["text"] = json!(
                 CharSpan {
                     start: row["start"].as_u64().unwrap() as usize,
@@ -271,15 +506,15 @@ impl Indexer {
                 }
                 .slice(&original)?
             );
+            tally.lap(Stage::Hydrate, &mut at);
         }
         if self.stop.load(Ordering::Acquire) {
             return Ok(true);
         }
-        let vector = self
-            .model
-            .background()
-            .encode_document(row["text"].as_str().unwrap(), None)
-            .map_err(|_| Error::Unavailable("Native background encoding failed"));
+        let text = row["text"].as_str().unwrap();
+        tally.count(Count::EncodedBytes, text.len());
+        let vector = self.model.encode(text);
+        tally.lap(Stage::Encode, &mut at);
         match vector {
             Ok(vector) => {
                 let norm = vector
@@ -288,17 +523,37 @@ impl Indexer {
                     .sum::<f64>()
                     .sqrt();
                 if !vector.iter().all(|v| v.is_finite()) || (norm - 1.).abs() > 0.001 {
-                    self.failed(&row)?;
+                    let failed = self.failed(&row);
+                    tally.lap(Stage::FailureWrite, &mut at);
+                    failed?;
+                    tally.count(Count::Failures, 1);
                     return Ok(true);
                 }
                 let hints = if row["kind"] == "candidate" {
-                    self.entity_hints(&row, &vector)?
+                    let hints = self.entity_hints(&row, &vector);
+                    tally.lap(Stage::EntityHints, &mut at);
+                    hints?
                 } else {
                     Vec::new()
                 };
-                self.commit(&row, &vector, &hints)?;
+                let committed = self.commit(&row, &vector, &hints);
+                tally.lap(Stage::Commit, &mut at);
+                committed?;
+                tally.count(
+                    match row["kind"].as_str() {
+                        Some("node") => Count::Node,
+                        Some("candidate") => Count::Candidate,
+                        _ => Count::Episode,
+                    },
+                    1,
+                );
             }
-            Err(_) => self.failed(&row)?,
+            Err(_) => {
+                let failed = self.failed(&row);
+                tally.lap(Stage::FailureWrite, &mut at);
+                failed?;
+                tally.count(Count::Failures, 1);
+            }
         }
         if let Some(index) = match row["kind"].as_str() {
             Some("node") => Some(0),
@@ -867,6 +1122,284 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+    const UNENCODABLE: &str = "Qzvunencodable";
+    fn fixed(text: &str) -> Option<[f32; 768]> {
+        let mut vector = [0f32; 768];
+        vector[0] = 1.;
+        (!text.contains(UNENCODABLE)).then_some(vector)
+    }
+    /// A store with one node, one candidate and three message episodes (one of them
+    /// unencodable), and an indexer over a deterministic encoder.
+    fn timed() -> (tempfile::TempDir, Arc<Store>, Arc<Indexer>) {
+        let (dir, store, graph, episode) = fixture();
+        for (event, kind, text) in [
+            ("two", "assistant", "Wxyreplysentinel assistant passage"),
+            ("three", "user", "Qzvunencodable user passage"),
+        ] {
+            store
+                .capture(
+                    serde_json::from_value(json!({
+                        "source":"synthetic",
+                        "event_id":event,
+                        "conversation_id":"thread",
+                        "kind":kind,
+                        "text":text,
+                        "metadata":{}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":"save",
+                    "actor":"owner",
+                    "why":"Grounded source",
+                    "type":"knowledge",
+                    "text":"Jkqnodesentinel assertion",
+                    "scope":["personal"],
+                    "evidence":[{"episode_id":episode,"quote":"Original exact source"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .command(
+                &domain::context("extract".into(), "model-fixture".into(), "Synthetic candidate".into()),
+                &json!({"kind":"fixture"}),
+                |tx, commit| {
+                    tx.sql().execute(
+                        "INSERT INTO extraction_runs VALUES('run',?,?,'extract-v2','native','[]','{}',?)",
+                        params![commit, episode, memento_core::now_utc()],
+                    )?;
+                    tx.sql().execute("INSERT INTO candidates(id,run_id,kind,type,text,confidence,why,scope) \
+                        VALUES('candidate-sentinel','run','memory','knowledge','Vbncandidatesentinel fact',0.8,'Exact \
+                        synthetic source','[\"personal\"]')", [])?;
+                    Ok(json!({}))
+                },
+            )
+            .unwrap();
+        let projection =
+            Projection::open(store.clone(), memento_core::ModelSignature::pinned()).unwrap();
+        projection
+            .rebuild(Tier::Hot, &AtomicBool::new(false))
+            .unwrap();
+        let indexer = Indexer::with_encoder(
+            store.clone(),
+            projection,
+            Encoder::Fixed(fixed),
+            Arc::new(AtomicBool::new(false)),
+        );
+        (dir, store, indexer)
+    }
+    fn drain(indexer: &Indexer) {
+        for _ in 0..64 {
+            if !indexer.run_once().unwrap() {
+                return;
+            }
+        }
+        panic!("indexer did not go idle");
+    }
+    fn only_line(lines: &Mutex<Vec<String>>) -> (String, Value) {
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        (lines[0].clone(), serde_json::from_str(&lines[0]).unwrap())
+    }
+    fn sorted(mut names: Vec<&str>) -> Vec<&str> {
+        names.sort_unstable();
+        names
+    }
+    fn names(value: &Value) -> Vec<&str> {
+        sorted(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect(),
+        )
+    }
+    #[test]
+    fn index_timing_aggregates_units_by_kind_with_every_stage_once_per_interval() {
+        let (_dir, store, indexer) = timed();
+        let lines = indexer.lines.clone();
+        drain(&indexer);
+        let (vectors, failures): (i64, i64) = store
+            .read(|tx| {
+                Ok(tx.sql().query_row(
+                    "SELECT (SELECT count(*) FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq),(SELECT \
+                        count(*) FROM index_failures WHERE resolved=0)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!((vectors, failures), (4, 1));
+        // Five units and several idle polls inside one interval print nothing yet.
+        assert!(lines.lock().unwrap().is_empty());
+        let later = Instant::now() + TIMING_INTERVAL;
+        indexer.flush(later, false);
+        let (_, record) = only_line(&lines);
+        assert_eq!(
+            names(&record),
+            [
+                "busy_us",
+                "counts",
+                "event",
+                "interval_us",
+                "reason",
+                "stages_us"
+            ]
+        );
+        assert_eq!(
+            (&record["event"], &record["reason"]),
+            (&json!("index_timing"), &json!("interval"))
+        );
+        let counts = &record["counts"];
+        assert_eq!(names(counts), sorted(COUNTS.to_vec()));
+        for (name, expected) in [
+            ("node", 1),
+            ("candidate", 1),
+            ("episode", 2),
+            ("failures", 1),
+            ("errors", 0),
+            ("prepared_episodes", 3),
+            ("prepared_chunks", 3),
+        ] {
+            assert_eq!(counts[name], expected, "{name}: {record}");
+        }
+        // Two encoded chunks were sliced from their whole hydrated messages.
+        let bytes = |text: &str| text.len() as u64;
+        let chunks = bytes("Original exact source for revision tests")
+            + bytes("Wxyreplysentinel assistant passage");
+        assert_eq!(
+            counts["hydrated_bytes"],
+            chunks + bytes("Qzvunencodable user passage")
+        );
+        assert_eq!(
+            counts["encoded_bytes"],
+            chunks
+                + bytes("Qzvunencodable user passage")
+                + bytes("Jkqnodesentinel assertion")
+                + bytes("Vbncandidatesentinel fact")
+        );
+        assert!(counts["calls"].as_u64().unwrap() >= 6, "{record}");
+        let stages = &record["stages_us"];
+        assert_eq!(names(stages), sorted(STAGES.to_vec()));
+        let measured: u64 = STAGES.iter().map(|s| stages[*s].as_u64().unwrap()).sum();
+        let busy = record["busy_us"].as_u64().unwrap();
+        assert!(measured > 0 && measured <= busy, "{record}");
+        assert!(busy <= record["interval_us"].as_u64().unwrap(), "{record}");
+        assert!(record["interval_us"].as_u64().unwrap() >= 60_000_000);
+        // A following interval without work prints nothing, however often it is polled.
+        drain(&indexer);
+        indexer.flush(later + TIMING_INTERVAL, false);
+        assert_eq!(lines.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn index_timing_line_holds_only_fixed_labels_and_numbers() {
+        let (_dir, store, indexer) = timed();
+        let lines = indexer.lines.clone();
+        drain(&indexer);
+        indexer.flush(Instant::now() + TIMING_INTERVAL, false);
+        let (line, record) = only_line(&lines);
+        let ids = store
+            .read(|tx| {
+                let mut query = tx.sql().prepare(
+                    "SELECT id FROM episodes UNION ALL SELECT id FROM episode_chunks UNION ALL SELECT id \
+                        FROM node_versions UNION ALL SELECT id FROM candidates UNION ALL SELECT event_id \
+                        FROM episodes",
+                )?;
+                Ok(query
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(ids.len(), 3 + 3 + 1 + 1 + 3);
+        for secret in ids.iter().map(String::as_str).chain([
+            "sentinel",
+            UNENCODABLE,
+            "Original",
+            "assertion",
+            "passage",
+            "synthetic",
+            "thread",
+        ]) {
+            assert!(!line.contains(secret), "{secret}: {line}");
+        }
+        for (key, value) in record.as_object().unwrap() {
+            match key.as_str() {
+                "event" => assert_eq!(value, "index_timing"),
+                "reason" => assert_eq!(value, "interval"),
+                "stages_us" | "counts" => {
+                    assert!(value.as_object().unwrap().values().all(Value::is_u64))
+                }
+                _ => assert!(value.is_u64(), "{key}"),
+            }
+        }
+    }
+    #[test]
+    fn index_timing_flushes_once_at_shutdown_and_never_without_work() {
+        // Stop seen by the next call: the open interval is printed, then nothing more.
+        let (_dir, _store, indexer) = timed();
+        let lines = indexer.lines.clone();
+        drain(&indexer);
+        indexer.stop.store(true, Ordering::Release);
+        assert!(!indexer.run_once().unwrap());
+        assert!(!indexer.run_once().unwrap());
+        let (_, record) = only_line(&lines);
+        assert_eq!(record["reason"], "shutdown");
+        assert_eq!(
+            (&record["counts"]["episode"], &record["counts"]["failures"]),
+            (&json!(2), &json!(1))
+        );
+        drop(indexer);
+        assert_eq!(lines.lock().unwrap().len(), 1);
+        // The worker may exit without another call: dropping the indexer flushes.
+        let (_dir, _store, indexer) = timed();
+        let lines = indexer.lines.clone();
+        drain(&indexer);
+        drop(indexer);
+        let (_, record) = only_line(&lines);
+        assert_eq!(record["reason"], "shutdown");
+        assert_eq!(record["counts"]["node"], 1);
+        // A restart over indexed data rescans retirement batches but encodes nothing.
+        let (_dir, _store, first) = timed();
+        drain(&first);
+        let indexer = Indexer::with_encoder(
+            first.store.clone(),
+            first.projection.clone(),
+            Encoder::Fixed(fixed),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let lines = indexer.lines.clone();
+        drain(&indexer);
+        let retired = indexer.timings.lock().unwrap().counts[Count::RetireBatches as usize];
+        assert!(retired >= 1);
+        indexer.flush(Instant::now() + TIMING_INTERVAL, false);
+        drop(indexer);
+        assert!(lines.lock().unwrap().is_empty());
+        // An indexer that processed nothing stays silent at every exit.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        let projection =
+            Projection::open(store.clone(), memento_core::ModelSignature::pinned()).unwrap();
+        projection
+            .rebuild(Tier::Hot, &AtomicBool::new(false))
+            .unwrap();
+        let indexer = Indexer::with_encoder(
+            store,
+            projection,
+            Encoder::Fixed(fixed),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let lines = indexer.lines.clone();
+        drain(&indexer);
+        indexer.flush(Instant::now() + TIMING_INTERVAL, false);
+        drop(indexer);
+        assert!(lines.lock().unwrap().is_empty());
     }
 }
 
