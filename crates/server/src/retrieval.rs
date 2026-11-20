@@ -17,7 +17,8 @@ use memento_embedding::EmbeddingModel;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -146,6 +147,9 @@ fn filter_text_passages(
 ) -> Result<()> {
     validate_text_passages(db, found, limit, deadline, score, or_only, false)
 }
+fn invalid_logits() -> Error {
+    Error::Unavailable("Text passage scoring returned invalid logits")
+}
 // `explain` only keeps each passing logit on its row; selection is identical.
 fn validate_text_passages(
     db: &rusqlite::Connection,
@@ -200,9 +204,7 @@ fn validate_text_passages(
             .collect();
         let logits = score(&documents, deadline)?;
         if logits.len() != batch.len() || logits.iter().any(|v| !v.is_finite()) {
-            return Err(Error::Unavailable(
-                "Text passage scoring returned invalid logits",
-            ));
+            return Err(invalid_logits());
         }
         for (id, logit) in batch.iter().zip(logits) {
             if f64::from(logit) < SEMANTIC_TEXT_LOGIT_FLOOR {
@@ -217,6 +219,48 @@ fn validate_text_passages(
         found.remove(&id);
     }
     Ok(())
+}
+/// Passage logits already computed in one recall request, by exact passage text.
+/// One request scores against one query, so the text is the whole key. Owned by a
+/// single `passes` call: never shared between requests and bounded by what that
+/// request scores. Only complete, finite scorer results are stored.
+#[derive(Default)]
+struct ScoreMemo(RefCell<HashMap<String, f32>>);
+impl ScoreMemo {
+    /// Logits for `documents` in input order. `scorer` runs once, in input order, on the
+    /// distinct passages not scored yet; `reused` receives the passages it did not run.
+    fn score(
+        &self,
+        documents: &[&str],
+        until: Instant,
+        scorer: &TextScore<'_>,
+        reused: &mut usize,
+    ) -> Result<Vec<f32>> {
+        // An expired deadline (or an empty batch) takes the scorer's own path and
+        // error: a stored score never answers after the deadline, and nothing is stored.
+        if documents.is_empty() || Instant::now() >= until {
+            return scorer(documents, until);
+        }
+        let mut memo = self.0.borrow_mut();
+        let mut missing = Vec::<&str>::new();
+        for document in documents {
+            if !memo.contains_key(*document) && !missing.contains(document) {
+                missing.push(*document);
+            }
+        }
+        if !missing.is_empty() {
+            // A failed, expired or malformed call stores nothing.
+            let logits = scorer(&missing, until)?;
+            if logits.len() != missing.len() || logits.iter().any(|v| !v.is_finite()) {
+                return Err(invalid_logits());
+            }
+            for (document, logit) in missing.iter().zip(logits) {
+                memo.insert((*document).to_owned(), logit);
+            }
+        }
+        *reused = documents.len() - missing.len();
+        Ok(documents.iter().map(|document| memo[*document]).collect())
+    }
 }
 fn ranked(db: &rusqlite::Connection, record: &mut Value, at: DateTime<Utc>) -> Result<()> {
     let authority = record["authority"].as_str().map(str::to_owned);
@@ -287,13 +331,21 @@ impl Retrieval {
         scorer: &TextScore<'_>,
         timings: &RecallTimings,
     ) -> Result<Vec<Value>> {
-        // Every passage-scoring batch on either cut.
-        let score = |documents: &[&str], until: Instant| {
+        // Every model run on either cut: calls and passages that reach the scorer.
+        let run = |documents: &[&str], until: Instant| {
             let at = Instant::now();
             let logits = scorer(documents, until);
             timings.lap(Stage::Scorer, at);
             timings.count(Count::ScorerCalls, 1);
             timings.count(Count::ScoredPassages, documents.len());
+            logits
+        };
+        // The archive cut repeats the hot cut's shortlist; a passage is scored once.
+        let memo = ScoreMemo::default();
+        let score = |documents: &[&str], until: Instant| {
+            let mut reused = 0;
+            let logits = memo.score(documents, until, &run, &mut reused);
+            timings.count(Count::ScorerMemoHits, reused);
             logits
         };
         // A stored-memory period never reads raw history, so it needs no Cold cut.
@@ -1748,6 +1800,7 @@ mod tests {
     include!("full_text_tests.rs");
     include!("explain_tests.rs");
     include!("recall_timing_tests.rs");
+    include!("score_memo_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,

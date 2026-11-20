@@ -60,8 +60,11 @@ keys!(
     ColdHits = "cold_hits",
     Finished = "finished",
     PartialAnchors = "partial_anchors",
+    // Model runs only: batches and passages that reached the scorer.
     ScorerCalls = "scorer_calls",
     ScoredPassages = "scored_passages",
+    // Passages answered from a score already computed in this request.
+    ScorerMemoHits = "scorer_memo_hits",
     Returned = "returned",
     QueryChars = "query_chars",
     ContextChars = "context_chars",
