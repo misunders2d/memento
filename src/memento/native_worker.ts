@@ -116,7 +116,26 @@ export default function worker(pi: any) {
       return { block: true, reason: "Invalid or foreign processing work; use the current work and supplied schema" };
     }
   });
-  pi.on("tool_result", (event: any) => {
+  // A service-confirmed release, whether the model or the adapter asked for it.
+  function released(id: string) {
+    claims.delete(id); current = [];
+    cooling.set(id, Date.now() + 900000); resetContext = true;
+  }
+  // The release request the model otherwise sends through the tool; true only on service confirmation.
+  async function release(leased: any, signal?: AbortSignal) {
+    const abort = new AbortController(), stop = () => abort.abort();
+    const timer = setTimeout(stop, 15000);
+    try {
+      if (signal?.aborted) return false;
+      signal?.addEventListener("abort", stop, { once: true });
+      const response = await fetch(url + "/work", { method: "POST", signal: abort.signal,
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "release",
+          command: { id: leased.id, owner: leased.owner, error: "service_rejected" } }) });
+      return response.ok && JSON.parse(await response.text()).released === true;
+    } catch { return false; }
+    finally { clearTimeout(timer); signal?.removeEventListener("abort", stop); }
+  }
+  pi.on("tool_result", async (event: any, ctx: any) => {
     if (event.toolName !== TOOL) return;
     let value: any;
     try { value = JSON.parse(event.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n")); }
@@ -128,7 +147,22 @@ export default function worker(pi: any) {
       emit({ type: "memento_worker_state", error: true, code: failure?.[2],
         action: ["pool","claim","submit","complete","status","release","renew"].includes(event.input?.action) ? event.input.action : "unknown",
         http_status: Number(failure?.[1] ?? text.match(/MEMENTO_HTTP_(\d{3})/)?.[1]) || undefined });
-      return;
+      // The service rejected this held job's output. Give the job back here instead of
+      // spending a model call, with the whole packet re-sent, on the release.
+      const rejected = event.input?.action === "submit" ? event.input.command?.complete?.id
+        : event.input?.action === "complete" ? event.input.command?.id : undefined;
+      const leased = failure?.[1] === "422" ? claims.get(rejected) : undefined;
+      if (!leased) return;
+      if (!await release(leased, ctx?.signal))
+        return { content: [{ type: "text", text: text + "\nThe rejected job " + leased.id
+          + " is still held: release it, or inspect its status if the outcome is uncertain." }] };
+      released(leased.id);
+      last = { rejected: leased.id, http_status: 422, code: failure?.[2], released: true,
+        next: "The adapter released this rejected job; do not release it. Claim other work." };
+      emit({ type: "memento_worker_state", claimed: [], empty_kinds: [...emptyKinds], completed: null,
+        released: leased.id, boundary: completed >= ROTATE_AFTER && !current.length, empty: false });
+      return { content: [{ type: "text", text: JSON.stringify({ current_work: [], receipt: last,
+        empty_kinds: [...emptyKinds], session_boundary: completed >= ROTATE_AFTER && !current.length }) }] };
     }
     const action = event.input.action;
     const completedId = value.completed || (action === "complete" && !event.isError ? event.input.command.id : null)
@@ -137,10 +171,7 @@ export default function worker(pi: any) {
       claims.delete(completedId); current = current.filter(item => item.id !== completedId);
       cooling.set(completedId, Date.now() + 900000); completed++; resetContext = true;
     }
-    if (action === "release" && value.released) {
-      claims.delete(event.input.command.id); current = [];
-      cooling.set(event.input.command.id, Date.now() + 900000); resetContext = true;
-    }
+    if (action === "release" && value.released) released(event.input.command.id);
     const offered = action === "claim" ? value : value.next;
     const held: any[] = [];
     if (offered && Array.isArray(offered.work)) {

@@ -46,6 +46,18 @@ def native(tmp_path,monkeypatch):
                     emit(dict(type='memento_worker_state',completed='late',claimed=[],empty_kinds=['extract']),True)
                     emit(dict(type='memento_worker_state',empty=True,kind='consolidate',claimed=[],empty_kinds=['consolidate','extract']),True)
                     continue
+                if os.environ.get('AUTO_RELEASE'):
+                    # The adapter releases a service-rejected job itself: failed attempt, then release, no model turn.
+                    emit(dict(type='memento_worker_state',claimed=[dict(id='first',owner='lease-a',kind='consolidate')],lease_seconds=.12,empty_kinds=[]),True)
+                    emit(dict(type='memento_worker_model',model='synthetic',usage=dict(input=10,output=2),stop_reason='toolUse'),True)
+                    emit(dict(type='memento_worker_state',error=True,code=os.environ['AUTO_RELEASE'],action='submit',http_status=422),True)
+                    emit(dict(type='memento_worker_state',claimed=[],empty_kinds=[],completed=None,released='first',boundary=False,empty=False),True)
+                    time.sleep(.3)  # several renewal intervals with nothing held
+                    emit(dict(type='memento_worker_model',model='synthetic',usage=dict(input=3,output=1),stop_reason='toolUse'),True)
+                    emit(dict(type='memento_worker_state',claimed=[dict(id='second',owner='lease-b',kind='consolidate')],lease_seconds=.12,kind='consolidate',empty_kinds=[]),True)
+                    emit(dict(type='memento_worker_state',completed='second',claimed=[],empty_kinds=[]),True)
+                    emit(dict(type='memento_worker_state',empty=True,kind='consolidate',claimed=[],empty_kinds=['consolidate','extract']),True)
+                    continue
                 if os.environ.get('FAIL_DETAIL'):
                     for code in (os.environ['FAIL_DETAIL'],'secret private evidence'):
                         emit(dict(type='memento_worker_state',error=True,code=code,action='submit',http_status=422),True)
@@ -173,6 +185,37 @@ def test_rejected_submission_receipt_keeps_fixed_code_and_action_only(native,mon
         dict(stage='worker',error='processing_request_failed',detail_code='Loop responsibility requires exact source evidence',
              action='submit',http_status=422),
         dict(stage='worker',error='processing_request_failed',action='submit',http_status=422)]
+
+
+def test_adapter_released_rejection_logs_the_failed_attempt_and_drops_the_lease(native,monkeypatch,capsys):
+    config,trace,calls=native
+    monkeypatch.setenv('AUTO_RELEASE','consolidation_schema_invalid')
+    assert worker.tick(runner,config,consolidate_now=True)==1  # the rejected attempt still fails the tick
+    output=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [row for row in output if row.get('error')]==[
+        dict(stage='worker',error='processing_request_failed',detail_code='consolidation_schema_invalid',
+             action='submit',http_status=422)]
+    # Finishing requires no active lease: the released job left the heartbeat without a model release.
+    assert output[-1]==dict(stage='worker_done',completed_jobs=1,model_calls=2,failed_attempts=1)
+    assert [row['id'] for row in output if row.get('stage')=='worker_committed']==['second']
+    assert not any(path=='/work/release' for path,_ in calls)  # nothing left for the host to give back
+    # About ten renewal intervals pass after the release; at most an already started one names the job.
+    assert sum(path=='/work/renew' and command['id']=='first' for path,command in calls)<=2
+    assert [row['type'] for row in map(json.loads,trace.read_text().splitlines())]==['prompt']
+
+
+def test_system_prompt_no_longer_asks_the_model_to_release_rejected_jobs():
+    text=' '.join(worker.SYSTEM.split())
+    assert 'After a rejected submission, release that job' not in text
+    assert 'The adapter itself releases a job whose submission the service rejects as invalid.' in text
+    # Keyed on state, so a rejection the adapter did not release (conflict, unconfirmed release) is still given back.
+    assert 'A job is released only when the result says released; never call release for it then' in text
+    assert 'continue with a fresh claim of unrelated work.' in text
+    assert 'After any other rejected submission the job is still in current work: release it yourself' in text
+    assert 'A fresh later claim supplies rejection feedback.' in text
+    # Neighbouring instructions are unchanged.
+    assert 'Do not repeat an unchanged failed submission.' in text
+    assert 'If an operation outcome is uncertain, inspect status before retrying.' in text
 
 
 def test_worker_receipt_keeps_fixed_protocol_rejection_code(native,monkeypatch,capsys):

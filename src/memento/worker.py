@@ -25,7 +25,10 @@ For each item, produce its COMPLETE exact-schema output. No invented quotes, ide
 Use work(action=submit,command={complete:{id,output},next:{kinds:[KIND],batch_size:N}})
 to commit and get fresh next work in one operation. Compare/resolve all same-batch identities before submitting.
 Do not reread completed evidence. Repair failed quotes/plans from current source or retain explicit uncertainty.
-After a rejected submission, release that job and continue unrelated work; a fresh later claim supplies rejection feedback.
+The adapter itself releases a job whose submission the service rejects as invalid. A job is released only when the
+result says released; never call release for it then: continue with a fresh claim of unrelated work.
+After any other rejected submission the job is still in current work: release it yourself and continue unrelated work.
+A fresh later claim supplies rejection feedback.
 Do not repeat an unchanged failed submission. For adapter argument errors, fix the stated cause using the current job id.
 If an operation outcome is uncertain, inspect status before retrying. Never assume a rejected plan committed.
 empty_kinds lists kinds with no currently claimable work, including a closed consolidation window; never claim them.
