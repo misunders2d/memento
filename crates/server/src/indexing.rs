@@ -330,7 +330,10 @@ impl Indexer {
             if let Ok(mut lines) = self.lines.lock() {
                 lines.push(line.clone());
             }
-            eprintln!("{line}");
+            // Never `eprintln!`: it panics on a closed stderr, which would end the background
+            // jobs thread (interval) or abort shutdown cleanup (Drop). A lost line is ignored.
+            use std::io::Write as _;
+            let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
         }
     }
     /// Chunks one message episode; a concurrent chunking or forgetting wins.
@@ -354,25 +357,30 @@ impl Indexer {
         if spans.is_empty() {
             spans.push((0, 0));
         }
-        tally.count(Count::PreparedEpisodes, 1);
-        tally.count(Count::PreparedChunks, spans.len());
         tally.lap(Stage::PrepareTokenize, &mut at);
         let written = self.store.write(|tx| {
             let exists: bool = tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks WHERE episode_id=?1) OR EXISTS(SELECT 1 FROM \
                 episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE \
                 e.id=?1)", [id], |r| r.get(0))?;
-            if !exists {
-                for (start, end) in &spans {
-                    let chunk =
-                        format!("e_{}", &raw::sha256(format!("{id}:{start}:{end}").as_bytes())[..32]);
-                    tx.sql()
-                        .execute("INSERT INTO episode_chunks VALUES(?,?,?,?)", params![chunk, id, start, end])?;
-                }
+            if exists {
+                return Ok(0);
             }
-            Ok(())
+            for (start, end) in &spans {
+                let chunk =
+                    format!("e_{}", &raw::sha256(format!("{id}:{start}:{end}").as_bytes())[..32]);
+                tx.sql()
+                    .execute("INSERT INTO episode_chunks VALUES(?,?,?,?)", params![chunk, id, start, end])?;
+            }
+            Ok(spans.len())
         });
         tally.lap(Stage::PrepareWrite, &mut at);
-        written
+        // Counted only once committed, with what this call inserted.
+        let inserted = written?;
+        if inserted > 0 {
+            tally.count(Count::PreparedEpisodes, 1);
+            tally.count(Count::PreparedChunks, inserted);
+        }
+        Ok(())
     }
     /// Next raw chunk, newest message episode first.
     fn episode_unit(&self, tally: &Tally) -> Result<Option<Value>> {
@@ -1339,6 +1347,81 @@ mod tests {
                 _ => assert!(value.is_u64(), "{key}"),
             }
         }
+    }
+    #[test]
+    fn index_timing_line_survives_a_closed_stderr() {
+        const CHILD: &str = "MEMENTO_INDEX_TIMING_CLOSED_STDERR";
+        if std::env::var_os(CHILD).is_some() {
+            // Child: stderr is a pipe nobody reads. Neither the interval line (background
+            // jobs thread) nor the shutdown line (Drop) may panic.
+            let (_dir, _store, indexer) = timed();
+            let lines = indexer.lines.clone();
+            drain(&indexer);
+            indexer.flush(Instant::now() + TIMING_INTERVAL, false);
+            assert_eq!(lines.lock().unwrap().len(), 1);
+            let (_dir, _store, indexer) = timed();
+            let lines = indexer.lines.clone();
+            drain(&indexer);
+            drop(indexer);
+            assert_eq!(lines.lock().unwrap().len(), 1);
+            return;
+        }
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        // Uncaptured, so the line really reaches the closed descriptor.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "indexing::tests::index_timing_line_survives_a_closed_stderr",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(writer)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status}");
+    }
+    #[test]
+    fn prepared_counts_only_chunks_this_call_inserted() {
+        let (_dir, store, indexer) = timed();
+        let id: String = store
+            .read(|tx| {
+                Ok(tx.sql().query_row(
+                    "SELECT id FROM episodes e WHERE NOT EXISTS(SELECT 1 FROM episode_chunks c WHERE \
+                        c.episode_id=e.id) ORDER BY seq LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        let chunks = || {
+            store
+                .read(|tx| {
+                    Ok(tx.sql().query_row(
+                        "SELECT count(*) FROM episode_chunks WHERE episode_id=?",
+                        [&id],
+                        |r| r.get::<_, u64>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        let counted = |tally: &Tally| {
+            (
+                tally.counts[Count::PreparedEpisodes as usize].get(),
+                tally.counts[Count::PreparedChunks as usize].get(),
+            )
+        };
+        let tally = Tally::default();
+        indexer.prepare(&id, &tally).unwrap();
+        let inserted = chunks();
+        assert!(inserted > 0);
+        assert_eq!(counted(&tally), (1, inserted));
+        // Chunked meanwhile (a concurrent chunking won): nothing inserted, nothing counted.
+        let tally = Tally::default();
+        indexer.prepare(&id, &tally).unwrap();
+        assert_eq!(chunks(), inserted);
+        assert_eq!(counted(&tally), (0, 0));
     }
     #[test]
     fn index_timing_flushes_once_at_shutdown_and_never_without_work() {

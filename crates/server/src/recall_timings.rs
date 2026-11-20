@@ -60,10 +60,12 @@ keys!(
     ColdHits = "cold_hits",
     Finished = "finished",
     PartialAnchors = "partial_anchors",
-    // Model runs only: batches and passages that reached the scorer.
+    // Scorer calls and the passages sent with them, memo hits excluded. A call past its
+    // deadline returns before inference but is still counted.
     ScorerCalls = "scorer_calls",
     ScoredPassages = "scored_passages",
-    // Passages answered from a score already computed in this request.
+    // Passages not sent to the scorer: scored earlier in this request, or a repeat of
+    // another passage in the same batch.
     ScorerMemoHits = "scorer_memo_hits",
     Returned = "returned",
     QueryChars = "query_chars",

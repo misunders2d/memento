@@ -228,7 +228,8 @@ fn validate_text_passages(
 struct ScoreMemo(RefCell<HashMap<String, f32>>);
 impl ScoreMemo {
     /// Logits for `documents` in input order. `scorer` runs once, in input order, on the
-    /// distinct passages not scored yet; `reused` receives the passages it did not run.
+    /// distinct passages not scored yet; `reused` receives how many of `documents` were not
+    /// sent to it: passages scored earlier in this request plus repeats within `documents`.
     fn score(
         &self,
         documents: &[&str],
@@ -331,7 +332,9 @@ impl Retrieval {
         scorer: &TextScore<'_>,
         timings: &RecallTimings,
     ) -> Result<Vec<Value>> {
-        // Every model run on either cut: calls and passages that reach the scorer.
+        // Every scorer call on either cut and the passages sent with it. A call past its
+        // deadline (expired already, or while waiting for the scorer) returns before
+        // inference but is still counted.
         let run = |documents: &[&str], until: Instant| {
             let at = Instant::now();
             let logits = scorer(documents, until);
