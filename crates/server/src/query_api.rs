@@ -211,11 +211,19 @@ pub async fn status(
                     )
                 });
                 // One stderr line per request: section names and microseconds only.
-                let stages_us: serde_json::Map<String, Value> =
-                    stages.into_iter().map(|(k, v)| (k.to_owned(), json!(v as u64))).collect();
+                let stages_us: serde_json::Map<String, Value> = stages
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), json!(v as u64)))
+                    .collect();
                 eprintln!(
                     "{}",
-                    json!({"event":"status_timing","ok":result.is_ok(),"source_filtered":query.source.is_some(),"total_us":started.elapsed().as_micros() as u64,"stages_us":stages_us})
+                    json!({
+                        "event":"status_timing",
+                        "ok":result.is_ok(),
+                        "source_filtered":query.source.is_some(),
+                        "total_us":started.elapsed().as_micros() as u64,
+                        "stages_us":stages_us
+                    })
                 );
                 result
             })

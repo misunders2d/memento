@@ -33,7 +33,17 @@ fn binding() -> PublicBinding {
     }
 }
 fn connection(data: &Path) {
-    let config = json!({"type":"authorized_user","client_id":"synthetic-client","client_secret":"SYNTHETIC CLIENT SECRET","token":"SYNTHETIC TOKEN","refresh_token":"SYNTHETIC REFRESH TOKEN","scopes":[SCOPE],"expiry":"2099-01-01T00:00:00+00:00","token_uri":drive_auth::TOKEN_URI,"memento":{"account":"owner@example.test","folder_id":"original_folder"}});
+    let config = json!({
+        "type":"authorized_user",
+        "client_id":"synthetic-client",
+        "client_secret":"SYNTHETIC CLIENT SECRET",
+        "token":"SYNTHETIC TOKEN",
+        "refresh_token":"SYNTHETIC REFRESH TOKEN",
+        "scopes":[SCOPE],
+        "expiry":"2099-01-01T00:00:00+00:00",
+        "token_uri":drive_auth::TOKEN_URI,
+        "memento":{"account":"owner@example.test","folder_id":"original_folder"}
+    });
     fs_safe::atomic_private(
         &data.join("drive-oauth.json"),
         &serde_json::to_vec(&config).unwrap(),
@@ -42,7 +52,19 @@ fn connection(data: &Path) {
 }
 fn bootstrap(data: &Path) {
     let client = data.join("original-client.json");
-    fs_safe::atomic_private(&client,&serde_json::to_vec(&json!({"installed":{"client_id":"synthetic-client","client_secret":"SYNTHETIC CLIENT SECRET","auth_uri":drive_auth::AUTH_URI,"token_uri":drive_auth::TOKEN_URI}})).unwrap()).unwrap();
+    fs_safe::atomic_private(
+        &client,
+        &serde_json::to_vec(&json!({
+            "installed": {
+                "client_id":"synthetic-client",
+                "client_secret":"SYNTHETIC CLIENT SECRET",
+                "auth_uri":drive_auth::AUTH_URI,
+                "token_uri":drive_auth::TOKEN_URI
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     drive_auth::configure_client(&client, "owner@example.test", "original_folder", data).unwrap();
 }
 struct Step {
@@ -120,7 +142,12 @@ fn verification() -> Vec<Step> {
             "GET",
             "/files/original_folder?",
             200,
-            json!({"id":"original_folder","mimeType":"application/vnd.google-apps.folder","ownedByMe":true,"trashed":false}),
+            json!({
+                "id":"original_folder",
+                "mimeType":"application/vnd.google-apps.folder",
+                "ownedByMe":true,
+                "trashed":false
+            }),
         ),
     ]
 }
@@ -129,7 +156,13 @@ fn token() -> Step {
         "POST",
         "oauth2.googleapis.com/token",
         200,
-        json!({"access_token":"SYNTHETIC ACCESS","refresh_token":"SYNTHETIC REFRESH","expires_in":3600,"scope":SCOPE,"token_type":"Bearer"}),
+        json!({
+            "access_token":"SYNTHETIC ACCESS",
+            "refresh_token":"SYNTHETIC REFRESH",
+            "expires_in":3600,
+            "scope":SCOPE,
+            "token_type":"Bearer"
+        }),
     )
 }
 #[test]
@@ -200,11 +233,35 @@ fn broader_scope_wrong_account_changed_pin_and_provider_errors_never_install() {
         let before = fs::read(data.path().join("drive-oauth.json")).unwrap();
         let mut first = token();
         let mut steps = Vec::new();
-        match kind{
-            "scope"=>first.body=serde_json::to_vec(&json!({"access_token":"DO NOT REFLECT SECRET","refresh_token":"DO NOT REFLECT REFRESH","expires_in":3600,"scope":format!("{SCOPE} https://www.googleapis.com/auth/drive")})).unwrap(),
-            "provider"=>{first.status=500;first.body=serde_json::to_vec(&json!({"error_description":"DO NOT REFLECT SECRET"})).unwrap();},
-            "binding"=>{let path=data.path().to_owned();first.check=Some(Box::new(move|_|{let mut different=binding();different.folder_id="changed_folder".into();fs_safe::atomic_private(&path.join("drive-binding.json"),&serde_json::to_vec(&different).unwrap()).unwrap();}));},
-            _=>(),
+        match kind {
+            "scope" => {
+                first.body = serde_json::to_vec(&json!({
+                    "access_token":"DO NOT REFLECT SECRET",
+                    "refresh_token":"DO NOT REFLECT REFRESH",
+                    "expires_in":3600,
+                    "scope":format!("{SCOPE} https://www.googleapis.com/auth/drive")
+                }))
+                .unwrap()
+            }
+            "provider" => {
+                first.status = 500;
+                first.body =
+                    serde_json::to_vec(&json!({"error_description":"DO NOT REFLECT SECRET"}))
+                        .unwrap();
+            }
+            "binding" => {
+                let path = data.path().to_owned();
+                first.check = Some(Box::new(move |_| {
+                    let mut different = binding();
+                    different.folder_id = "changed_folder".into();
+                    fs_safe::atomic_private(
+                        &path.join("drive-binding.json"),
+                        &serde_json::to_vec(&different).unwrap(),
+                    )
+                    .unwrap();
+                }));
+            }
+            _ => (),
         }
         steps.push(first);
         if !["scope", "provider", "binding"].contains(&kind) {
@@ -216,7 +273,13 @@ fn broader_scope_wrong_account_changed_pin_and_provider_errors_never_install() {
                 verify.pop();
             }
             if kind == "folder" {
-                verify[1].body=serde_json::to_vec(&json!({"id":"original_folder","mimeType":"application/vnd.google-apps.folder","ownedByMe":false,"trashed":false})).unwrap();
+                verify[1].body = serde_json::to_vec(&json!({
+                    "id":"original_folder",
+                    "mimeType":"application/vnd.google-apps.folder",
+                    "ownedByMe":false,
+                    "trashed":false
+                }))
+                .unwrap();
             }
             steps.extend(verify);
         }
@@ -348,7 +411,7 @@ fn resumable_lost_ack_queries_server_and_verifies_before_checkpoint() {
         );
     }));
     steps.push(finish);
-    steps.push(Step::json("GET","/files/verified_object?",200,json!({"id":"verified_object","size":size.to_string(),"md5Checksum":md5,"sha256Checksum":sha})));
+    steps.push(Step::json("GET", "/files/verified_object?", 200, json!({"id":"verified_object","size":size.to_string(),"md5Checksum":md5,"sha256Checksum":sha})));
     let provider = Script::new(steps);
     let drive = DriveColdStore::from_file(data.path().to_owned(), provider.clone()).unwrap();
     let mut checkpoint = json!({});
@@ -410,7 +473,17 @@ fn upload_checksum_mismatch_and_external_session_keep_unverified_checkpoint() {
                 200,
                 json!({"id":"uploaded"}),
             ));
-            steps.push(Step::json("GET","/files/uploaded?",200,json!({"id":"uploaded","size":size.to_string(),"md5Checksum":if kind=="md5"{"bad"}else{&md5},"sha256Checksum":if kind=="sha"{"bad"}else{&sha}})));
+            steps.push(Step::json(
+                "GET",
+                "/files/uploaded?",
+                200,
+                json!({
+                    "id":"uploaded",
+                    "size":size.to_string(),
+                    "md5Checksum":if kind=="md5"{"bad"}else{&md5},
+                    "sha256Checksum":if kind=="sha"{"bad"}else{&sha}
+                }),
+            ));
         }
         let provider = Script::new(steps);
         let drive = DriveColdStore::from_file(data.path().to_owned(), provider.clone()).unwrap();
@@ -493,7 +566,12 @@ fn token_refresh_retains_exact_scope_and_only_structured_rejection_requests_reau
                 .unwrap();
             }
             "broader-scope" => {
-                step.body=serde_json::to_vec(&json!({"access_token":"SYNTHETIC NEW ACCESS","expires_in":3600,"scope":format!("{SCOPE} another")})).unwrap();
+                step.body = serde_json::to_vec(&json!({
+                    "access_token":"SYNTHETIC NEW ACCESS",
+                    "expires_in":3600,
+                    "scope":format!("{SCOPE} another")
+                }))
+                .unwrap();
             }
             _ => (),
         }

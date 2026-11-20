@@ -18,7 +18,18 @@ fn fixture(root: &Path) -> std::sync::Arc<Store> {
     fs::create_dir(root).unwrap();
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
     let store = Store::open(root).unwrap();
-    store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"e","conversation_id":"c","kind":"user","text":"Exact Ω😀\r\nsource\u{0000}history"})).unwrap()).unwrap();
+    store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"synthetic",
+                "event_id":"e",
+                "conversation_id":"c",
+                "kind":"user",
+                "text":"Exact Ω😀\r\nsource\u{0000}history"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let info = store.blobs().put(&mut &b"original\0\xff"[..], 100).unwrap();
     store
         .write(|tx| {
@@ -319,7 +330,14 @@ fn restore_rejects_trigger_that_changes_authority_during_permitted_rebase() {
     let parent = private();
     let data = parent.path().join("source");
     let store = fixture(&data);
-    store.write(|tx|{tx.sql().execute("INSERT INTO node_stats(node_id,importance) VALUES('synthetic-node',1)",[])?;tx.sql().execute_batch("CREATE TRIGGER malicious_restore AFTER UPDATE ON blobs BEGIN UPDATE node_stats SET importance=0; END;")?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO node_stats(node_id,importance) VALUES('synthetic-node',1)", [])?;
+            tx.sql().execute_batch("CREATE TRIGGER malicious_restore AFTER UPDATE ON blobs BEGIN UPDATE node_stats SET \
+                importance=0; END;")?;
+            Ok(())
+        })
+        .unwrap();
     let archive = parent.path().join("malicious.tar");
     export_archive(&data, &archive).unwrap();
     let before = hash_file(&archive).unwrap();

@@ -94,9 +94,12 @@ impl Period {
         }
         let window = window.join(" AND ");
         let latest = latest.join(" AND ");
-        let known = "e.occurred_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)";
+        let known = "e.occurred_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE \
+            f.source=e.source AND f.event_id=e.event_id)";
         let node = format!(
-            "n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?3))",
+            "n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) \
+            AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?3 IS \
+            NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?3))",
             visible_sql("n.id")
         );
         format!(
@@ -137,13 +140,10 @@ pub fn eligible(tx: &ReadTxn<'_>, period: &Period, scope: Option<&str>) -> Resul
     // Only rows near a widened bound need exact source hydration. Keep those
     // false positives out of both ANN and lexical admission before their limits,
     // rather than discarding them after they have crowded out valid matches.
-    let boundary = "((?1 IS NOT NULL AND r.latest<=julianday(?1,'+0.003 seconds')) OR (?2 IS NOT NULL AND r.latest>=julianday(?2,'-0.003 seconds')))";
-    for row in period.rows(
-        tx,
-        &format!("SELECT r.id,r.kind,r.version,i.seq,{boundary} AS boundary FROM in_range r LEFT JOIN vector_items i ON i.target=r.id AND i.kind=r.kind \
-         UNION ALL SELECT r.id,r.kind,r.version,i.seq,{boundary} AS boundary FROM in_range r JOIN segments s ON s.node_id=r.id JOIN vector_items i ON i.target=s.id AND i.kind='segment'"),
-        scope,
-    )? {
+    let boundary = "((?1 IS NOT NULL AND r.latest<=julianday(?1,'+0.003 seconds')) OR (?2 IS NOT NULL AND \
+        r.latest>=julianday(?2,'-0.003 seconds')))";
+    for row in period.rows(tx, &format!("SELECT r.id,r.kind,r.version,i.seq,{boundary} AS boundary FROM in_range r LEFT JOIN vector_items i ON i.target=r.id AND i.kind=r.kind \
+         UNION ALL SELECT r.id,r.kind,r.version,i.seq,{boundary} AS boundary FROM in_range r JOIN segments s ON s.node_id=r.id JOIN vector_items i ON i.target=s.id AND i.kind='segment'"), scope)? {
         let id = row["id"].as_str().unwrap_or("");
         if row["boundary"].as_i64() == Some(1) {
             if !checked.contains_key(id) {

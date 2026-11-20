@@ -131,7 +131,7 @@ pub(crate) fn integrity(db: &Connection) -> Result<()> {
 /// Rebase may change only host transfer state and blob locations. Compare exact
 /// typed authority rows around those writes, including user-defined triggers.
 pub(crate) fn authority_fingerprint(db: &Connection) -> Result<BTreeMap<String, (String, u64)>> {
-    let mut q=db.prepare("SELECT name,sql FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?;
+    let mut q = db.prepare("SELECT name,sql FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?;
     let tables = q
         .query_map([], |r| {
             Ok((
@@ -214,8 +214,20 @@ pub(crate) fn validate_native_with_gaps(
             "Backup gap references an unregistered original",
         ));
     }
-    let mut refs = "SELECT sha256 FROM media_files UNION SELECT artifact_sha256 FROM segments UNION SELECT source_sha256 FROM segments WHERE source_sha256 IS NOT NULL UNION SELECT json_extract(payload,'$.sha256') FROM jobs WHERE kind='media' AND json_extract(payload,'$.sha256') IS NOT NULL".to_owned();
-    if db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='media_stage_units')",[],|r|r.get::<_,bool>(0))?{refs.push_str(" UNION SELECT json_extract(u.metadata,'$.artifact_sha256') FROM media_stage_units u JOIN jobs j ON j.id=u.job_id WHERE j.state IN ('pending','leased') AND json_extract(u.metadata,'$.artifact_sha256') IS NOT NULL UNION SELECT json_extract(u.metadata,'$.source_sha256') FROM media_stage_units u JOIN jobs j ON j.id=u.job_id WHERE j.state IN ('pending','leased') AND json_extract(u.metadata,'$.source_sha256') IS NOT NULL");}
+    let mut refs =
+        "SELECT sha256 FROM media_files UNION SELECT artifact_sha256 FROM segments UNION SELECT \
+        source_sha256 FROM segments WHERE source_sha256 IS NOT NULL UNION SELECT \
+        json_extract(payload,'$.sha256') FROM jobs WHERE kind='media' AND \
+        json_extract(payload,'$.sha256') IS NOT NULL"
+            .to_owned();
+    if db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='media_stage_units')", [], |r| r.get::<_, bool>(0))? {
+        refs.push_str(" UNION SELECT json_extract(u.metadata,'$.artifact_sha256') FROM media_stage_units u JOIN \
+            jobs j ON j.id=u.job_id WHERE j.state IN ('pending','leased') AND \
+            json_extract(u.metadata,'$.artifact_sha256') IS NOT NULL UNION SELECT \
+            json_extract(u.metadata,'$.source_sha256') FROM media_stage_units u JOIN jobs j ON \
+            j.id=u.job_id WHERE j.state IN ('pending','leased') AND \
+            json_extract(u.metadata,'$.source_sha256') IS NOT NULL");
+    }
     let mut q = db.prepare(&refs)?;
     for sha in q.query_map([], |r| r.get::<_, String>(0))? {
         if !map.contains_key(sha?.as_str()) {
@@ -225,7 +237,10 @@ pub(crate) fn validate_native_with_gaps(
         }
     }
     raw::validate_frames(db)?;
-    let mut q=db.prepare("SELECT id,text_runs,raw_frame,text_sha256 FROM episodes WHERE text_runs IS NOT NULL OR raw_frame IS NOT NULL")?;
+    let mut q = db.prepare(
+        "SELECT id,text_runs,raw_frame,text_sha256 FROM episodes WHERE text_runs IS NOT NULL OR \
+        raw_frame IS NOT NULL",
+    )?;
     for row in q.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -742,7 +757,7 @@ pub fn import_archive(archive: &Path, destination: &Path) -> Result<ArchiveRepor
     db.execute_batch(
         "DELETE FROM cold_transfers; DELETE FROM cold_failures; DELETE FROM backups;",
     )?;
-    let has_index:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='episodes_activity')",[],|r|r.get(0))?;
+    let has_index: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='episodes_activity')", [], |r| r.get(0))?;
     if has_index {
         db.execute_batch("REINDEX episodes_activity")?;
     }

@@ -144,16 +144,23 @@ impl Store {
         )?;
         // Add only this disposable progress table to earlier private header5 checkouts.
         // A healthy reopen performs no DDL and never rewrites authority/history.
-        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='media_stage_units')",[],|r|r.get::<_,bool>(0))?{
-            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(include_str!("media_stage.sql"))?;tx.commit()?;
+        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='media_stage_units')", [], |r| r.get::<_, bool>(0))? {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("media_stage.sql"))?;
+            tx.commit()?;
         }
         // Append-only revision metadata for same-identity content versions.
-        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_revisions')",[],|r|r.get::<_,bool>(0))?{
-            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(include_str!("node_revisions.sql"))?;tx.commit()?;
+        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='node_revisions')", [], |r| r.get::<_, bool>(0))? {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("node_revisions.sql"))?;
+            tx.commit()?;
         }
-        let stage_indexes:i64=db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('media_stage_artifact','media_stage_source')",[],|r|r.get(0))?;
+        let stage_indexes: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN \
+            ('media_stage_artifact','media_stage_source')",
+            [],
+            |r| r.get(0),
+        )?;
         if stage_indexes != 2 {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(include_str!("media_stage_indexes.sql"))?;
@@ -162,7 +169,8 @@ impl Store {
         // Ordinary derived indexes also serve earlier private header5 archives.
         // The unknown-header check and exclusive writer lease precede all DDL;
         // a healthy reopen leaves schema_version and authority untouched.
-        let status_indexes:i64=db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('vector_blobs_status_current_v1','episodes_status_indexable_v2','episodes_status_raw_v1')",[],|r|r.get(0))?;
+        let status_indexes: i64 = db.query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN \
+            ('vector_blobs_status_current_v1','episodes_status_indexable_v2','episodes_status_raw_v1')", [], |r| r.get(0))?;
         if status_indexes != 3 {
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(include_str!("status_indexes.sql"))?;
@@ -170,12 +178,19 @@ impl Store {
         }
         // Admits deletion of excluded episodes' vectorless, uncited chunk rows only;
         // DDL-only, after the message index it uses. Older header5 images never delete chunks.
-        if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name='episode_chunks_no_DELETE_v2')",[],|r|r.get::<_,bool>(0))?{
-            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(include_str!("chunk_retirement.sql"))?;tx.commit()?;
+        if !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND \
+            name='episode_chunks_no_DELETE_v2')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(include_str!("chunk_retirement.sql"))?;
+            tx.commit()?;
         }
         let relation_indexes: i64 = db.query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('search_candidate_relation_src_v1','search_candidate_relation_dst_v1')",
+            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN \
+            ('search_candidate_relation_src_v1','search_candidate_relation_dst_v1')",
             [],
             |r| r.get(0),
         )?;
@@ -185,7 +200,8 @@ impl Store {
             tx.commit()?;
         }
         let loop_indexes: i64 = db.query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('node_versions_superseded_by','candidate_decisions_promoted_target')",
+            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN \
+            ('node_versions_superseded_by','candidate_decisions_promoted_target')",
             [],
             |r| r.get(0),
         )?;
@@ -326,10 +342,26 @@ impl ReadTxn<'_> {
         raw::read_original(self.sql, self.directory, id)
     }
     pub fn fence(&self, tier: Tier) -> Result<EventFence> {
-        Ok(self.sql.query_row("SELECT id,nonce,generation FROM projection_events WHERE tier=? ORDER BY id DESC LIMIT 1",[tier.as_str()],|r|Ok(EventFence{id:r.get(0)?,nonce:r.get(1)?,generation:r.get(2)?})).optional()?.unwrap_or(self.sql.query_row("SELECT id,nonce,generation FROM projection_ack WHERE tier=?",[tier.as_str()],|r|Ok(EventFence{id:r.get(0)?,nonce:r.get(1)?,generation:r.get(2)?}))?))
+        Ok(self
+            .sql
+            .query_row("SELECT id,nonce,generation FROM projection_events WHERE tier=? ORDER BY id DESC LIMIT 1", [tier.as_str()], |r| {
+                Ok(EventFence {
+                    id: r.get(0)?,
+                    nonce: r.get(1)?,
+                    generation: r.get(2)?,
+                })
+            })
+            .optional()?
+            .unwrap_or(self.sql.query_row("SELECT id,nonce,generation FROM projection_ack WHERE tier=?", [tier.as_str()], |r| {
+                Ok(EventFence {
+                    id: r.get(0)?,
+                    nonce: r.get(1)?,
+                    generation: r.get(2)?,
+                })
+            })?))
     }
     pub fn dirty(&self, tier: Tier, through: i64) -> Result<Vec<DirtyEvent>> {
-        let mut s=self.sql.prepare("SELECT id,nonce,generation,vector_seq FROM projection_events WHERE tier=? AND id<=? ORDER BY id")?;
+        let mut s = self.sql.prepare("SELECT id,nonce,generation,vector_seq FROM projection_events WHERE tier=? AND id<=? ORDER BY id")?;
         Ok(s.query_map(params![tier.as_str(), through], |r| {
             Ok(DirtyEvent {
                 fence: EventFence {
@@ -358,7 +390,7 @@ impl<'tx, 'conn> WriteTxn<'tx, 'conn> {
         if let Some(value) = self.generation.get() {
             return Ok(value);
         }
-        let value=self.sql.query_row("UPDATE runtime_state SET generation=generation+1 WHERE singleton=1 RETURNING generation",[],|r|r.get(0))?;
+        let value = self.sql.query_row("UPDATE runtime_state SET generation=generation+1 WHERE singleton=1 RETURNING generation", [], |r| r.get(0))?;
         self.generation.set(Some(value));
         Ok(value)
     }
@@ -414,8 +446,22 @@ impl<'tx, 'conn> WriteTxn<'tx, 'conn> {
                 |r| r.get::<_, String>(0),
             )
             .optional()?;
-        self.sql.execute("INSERT INTO vector_items VALUES(?,?,?,?) ON CONFLICT(seq) DO UPDATE SET target=excluded.target,kind=excluded.kind,version=excluded.version",params![value.seq,value.target,value.kind.as_str(),value.version])?;
-        self.sql.execute("INSERT INTO vector_blobs VALUES(?,?,?,?,?) ON CONFLICT(seq) DO UPDATE SET embedding=excluded.embedding,current=excluded.current,generation=excluded.generation,tier=excluded.tier",params![value.seq,value.embedding.as_bytes(),value.current,self.generation()?,value.tier.as_str()])?;
+        self.sql.execute(
+            "INSERT INTO vector_items VALUES(?,?,?,?) ON CONFLICT(seq) DO UPDATE SET \
+                target=excluded.target,kind=excluded.kind,version=excluded.version",
+            params![value.seq, value.target, value.kind.as_str(), value.version],
+        )?;
+        self.sql.execute(
+            "INSERT INTO vector_blobs VALUES(?,?,?,?,?) ON CONFLICT(seq) DO UPDATE SET \
+                embedding=excluded.embedding,current=excluded.current,generation=excluded.generation,tier=excluded.tier",
+            params![
+                value.seq,
+                value.embedding.as_bytes(),
+                value.current,
+                self.generation()?,
+                value.tier.as_str()
+            ],
+        )?;
         if previous.is_some_and(|p| p != value.tier.as_str()) {
             self.touch_vector(
                 value.seq,
@@ -430,7 +476,13 @@ impl<'tx, 'conn> WriteTxn<'tx, 'conn> {
     }
     /// Coordinator precondition: Edge flush and external checkpoint are durable first.
     pub fn acknowledge(&self, tier: Tier, fence: &EventFence) -> Result<()> {
-        let known:bool=self.sql.query_row("SELECT EXISTS(SELECT 1 FROM projection_events WHERE tier=?1 AND id=?2 AND nonce=?3 AND generation=?4) OR EXISTS(SELECT 1 FROM projection_ack WHERE tier=?1 AND id=?2 AND nonce=?3 AND generation=?4)",params![tier.as_str(),fence.id,fence.nonce,fence.generation],|r|r.get(0))?;
+        let known: bool = self.sql.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projection_events WHERE tier=?1 AND id=?2 AND nonce=?3 AND \
+                generation=?4) OR EXISTS(SELECT 1 FROM projection_ack WHERE tier=?1 AND id=?2 AND nonce=?3 \
+                AND generation=?4)",
+            params![tier.as_str(), fence.id, fence.nonce, fence.generation],
+            |r| r.get(0),
+        )?;
         if !known {
             return Err(Error::Conflict(
                 "Projection fence differs from the source timeline",

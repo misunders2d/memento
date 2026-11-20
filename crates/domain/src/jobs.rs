@@ -97,7 +97,11 @@ impl Queue {
             return Ok(get_str(&prior, "id")?.into());
         }
         let job = id();
-        tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) VALUES (?,?,?,?,'pending',?,0)",params![job,key,kind,serialized,timestamp()])?;
+        tx.sql().execute(
+            "INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) VALUES \
+                (?,?,?,?,'pending',?,0)",
+            params![job, key, kind, serialized, timestamp()],
+        )?;
         Ok(job)
     }
     pub fn submit_media(&self, command: &Value) -> Result<Value> {
@@ -149,7 +153,24 @@ impl Queue {
         }
         let now = timestamp();
         let owner = id();
-        let row=self.graph.store.write(|tx|{let row=one(tx.sql(),"SELECT * FROM jobs WHERE kind IN (SELECT value FROM json_each(?1)) AND ((state='pending' AND available_at<=?2) OR (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value FROM json_each(?3)) AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE live.kind='consolidate' AND live.state='leased' AND live.lease_until>?2)) ORDER BY available_at,id LIMIT 1",params![encode_json(&json!(kinds))?,now,encode_json(&json!(exclude))?])?;if let Some(row)=&row{tx.sql().execute("UPDATE jobs SET state='leased',owner=?,lease_until=?,attempts=attempts+1 WHERE id=?",params![owner,now+self.lease_seconds as f64,row["id"].as_str()])?;}Ok(row)})?;
+        let row = self.graph.store.write(|tx| {
+            let row = one(
+                tx.sql(),
+                "SELECT * FROM jobs WHERE kind IN (SELECT value FROM json_each(?1)) AND ((state='pending' \
+                    AND available_at<=?2) OR (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value \
+                    FROM json_each(?3)) AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE \
+                    live.kind='consolidate' AND live.state='leased' AND live.lease_until>?2)) ORDER BY \
+                    available_at,id LIMIT 1",
+                params![encode_json(&json!(kinds))?, now, encode_json(&json!(exclude))?],
+            )?;
+            if let Some(row) = &row {
+                tx.sql().execute(
+                    "UPDATE jobs SET state='leased',owner=?,lease_until=?,attempts=attempts+1 WHERE id=?",
+                    params![owner, now + self.lease_seconds as f64, row["id"].as_str()],
+                )?;
+            }
+            Ok(row)
+        })?;
         row.map(|row| {
             Ok(Job {
                 queue: self.clone(),
@@ -164,14 +185,31 @@ impl Queue {
     }
     pub fn renew(&self, job: &Job) -> Result<bool> {
         let now = timestamp();
-        self.graph.store.write(|tx|Ok(tx.sql().execute("UPDATE jobs SET lease_until=? WHERE id=? AND state='leased' AND owner=? AND lease_until>?",params![now+self.lease_seconds as f64,job.id,job.owner,now])?==1))
+        self.graph.store.write(|tx| {
+            Ok(tx.sql().execute(
+                "UPDATE jobs SET lease_until=? WHERE id=? AND state='leased' AND owner=? AND lease_until>?",
+                params![now + self.lease_seconds as f64, job.id, job.owner, now],
+            )? == 1)
+        })
     }
     pub fn complete(&self, job: &Job, result: &Value) -> Result<()> {
-        self.graph.store.write(|tx|{job.check_in(tx.sql())?;tx.sql().execute("UPDATE jobs SET state='done',result=?,error=NULL,owner=NULL,lease_until=NULL,context=NULL WHERE id=? AND owner=?",params![encode_json(result)?,job.id,job.owner])?;Ok(())})
+        self.graph.store.write(|tx| {
+            job.check_in(tx.sql())?;
+            tx.sql().execute(
+                "UPDATE jobs SET state='done',result=?,error=NULL,owner=NULL,lease_until=NULL,context=NULL \
+                    WHERE id=? AND owner=?",
+                params![encode_json(result)?, job.id, job.owner],
+            )?;
+            Ok(())
+        })
     }
     /// Returns a lease its client never received: no failure, backoff or attempt.
     pub fn unclaim(&self, job: &Job) -> Result<()> {
-        self.graph.store.write(|tx|{tx.sql().execute("UPDATE jobs SET state='pending',owner=NULL,lease_until=NULL,attempts=max(attempts-1,0) WHERE id=? AND state='leased' AND owner=?",params![job.id,job.owner])?;Ok(())})
+        self.graph.store.write(|tx| {
+            tx.sql().execute("UPDATE jobs SET state='pending',owner=NULL,lease_until=NULL,attempts=max(attempts-1,0) \
+                WHERE id=? AND state='leased' AND owner=?", params![job.id, job.owner])?;
+            Ok(())
+        })
     }
     pub fn fail(&self, job: &Job, failure: JobFailure) -> Result<()> {
         let delay = failure.retry_after.unwrap_or_else(|| {
@@ -179,7 +217,28 @@ impl Queue {
                 (5u64.saturating_mul(1 << ((job.attempts - 1).clamp(0, 10) as u32))).min(3600),
             )
         });
-        self.graph.store.write(|tx|{let retryable=if failure.category=="CapturedSourceUnavailable"&&job.kind=="media"&&job.payload["captured"]==true{active_captured_source(tx.sql(),get_str(&job.payload,"sha256")?)?}else{failure.retryable};tx.sql().execute("UPDATE jobs SET state=?,available_at=?,error=?,owner=NULL,lease_until=NULL WHERE id=? AND state='leased' AND owner=?",params![if retryable{"pending"}else{"failed"},timestamp()+delay.as_secs_f64(),failure.category,job.id,job.owner])?;Ok(())})
+        self.graph.store.write(|tx| {
+            let retryable = if failure.category == "CapturedSourceUnavailable"
+                && job.kind == "media"
+                && job.payload["captured"] == true
+            {
+                active_captured_source(tx.sql(), get_str(&job.payload, "sha256")?)?
+            } else {
+                failure.retryable
+            };
+            tx.sql().execute(
+                "UPDATE jobs SET state=?,available_at=?,error=?,owner=NULL,lease_until=NULL WHERE id=? AND \
+                    state='leased' AND owner=?",
+                params![
+                    if retryable { "pending" } else { "failed" },
+                    timestamp() + delay.as_secs_f64(),
+                    failure.category,
+                    job.id,
+                    job.owner
+                ],
+            )?;
+            Ok(())
+        })
     }
 }
 /// One bounded batch from `from`: drop leased inputs that completed jobs kept
@@ -189,9 +248,16 @@ pub fn clear_done_contexts(store: &memento_core::Store, from: i64) -> Result<(i6
     const BATCH: i64 = 256;
     let (scanned, last, stale) = store.read(|tx| {
         Ok(tx.sql().query_row(
-            "SELECT count(*),max(rowid),coalesce(sum(state='done' AND context IS NOT NULL),0) FROM (SELECT rowid,state,context FROM jobs WHERE rowid>=?1 ORDER BY rowid LIMIT ?2)",
+            "SELECT count(*),max(rowid),coalesce(sum(state='done' AND context IS NOT NULL),0) FROM \
+            (SELECT rowid,state,context FROM jobs WHERE rowid>=?1 ORDER BY rowid LIMIT ?2)",
             params![from, BATCH],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, i64>(2)?)),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
         )?)
     })?;
     let Some(last) = last else {
@@ -199,10 +265,8 @@ pub fn clear_done_contexts(store: &memento_core::Store, from: i64) -> Result<(i6
     };
     if stale > 0 {
         store.write(|tx| {
-            tx.sql().execute(
-                "UPDATE jobs SET context=NULL WHERE rowid BETWEEN ?1 AND ?2 AND state='done' AND context IS NOT NULL",
-                params![from, last],
-            )?;
+            tx.sql().execute("UPDATE jobs SET context=NULL WHERE rowid BETWEEN ?1 AND ?2 AND state='done' AND context IS \
+                NOT NULL", params![from, last])?;
             Ok(())
         })?;
     }
@@ -214,7 +278,10 @@ pub fn clear_done_contexts(store: &memento_core::Store, from: i64) -> Result<(i6
     Ok((scanned, next))
 }
 pub fn active_captured_source(db: &Connection, sha: &str) -> Result<bool> {
-    Ok(one(db,"SELECT 1 FROM captured_media_refs r JOIN episodes e ON e.id=r.episode_id WHERE r.sha256=? AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=r.sha256) LIMIT 1",[sha])?.is_some())
+    Ok(one(db, "SELECT 1 FROM captured_media_refs r JOIN episodes e ON e.id=r.episode_id WHERE r.sha256=? \
+        AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND \
+        f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN forgotten_targets f \
+        ON f.target=m.node_id WHERE m.sha256=r.sha256) LIMIT 1", [sha])?.is_some())
 }
 
 pub fn error_category(error: &Error) -> &'static str {
@@ -424,12 +491,20 @@ mod context_tests {
     fn cleanup_drops_only_done_job_contexts_and_keeps_results() {
         let dir = tempfile::tempdir().unwrap();
         let store = memento_core::Store::open(dir.path().join("data")).unwrap();
-        store.write(|tx| {
-            for (id, state) in [("done", "done"), ("failed", "failed"), ("pending", "pending"), ("leased", "leased")] {
-                tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts,result,context) VALUES(?1,?1,'consolidate','{}',?2,0,0,'{\"kept\":true}','{\"input\":true}')", params![id, state])?;
-            }
-            Ok(())
-        }).unwrap();
+        store
+            .write(|tx| {
+                for (id, state) in [
+                    ("done", "done"),
+                    ("failed", "failed"),
+                    ("pending", "pending"),
+                    ("leased", "leased"),
+                ] {
+                    tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts,result,context) \
+                        VALUES(?1,?1,'consolidate','{}',?2,0,0,'{\"kept\":true}','{\"input\":true}')", params![id, state])?;
+                }
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(clear_done_contexts(&store, i64::MIN).unwrap(), (4, None));
         store
             .read(|tx| {

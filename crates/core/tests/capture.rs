@@ -10,7 +10,15 @@ fn fixture() -> (tempfile::TempDir, Arc<Store>) {
     (temp, store)
 }
 fn episode(id: &str, text: &str) -> EpisodeInput {
-    serde_json::from_value(json!({"source":"native:fixture:pi","event_id":id,"conversation_id":"thread","kind":"user","text":text,"metadata":{}})).unwrap()
+    serde_json::from_value(json!({
+        "source":"native:fixture:pi",
+        "event_id":id,
+        "conversation_id":"thread",
+        "kind":"user",
+        "text":text,
+        "metadata":{}
+    }))
+    .unwrap()
 }
 #[test]
 fn capture_retry_preserves_source_offset_unicode_metadata_and_literal_search() {
@@ -168,7 +176,18 @@ fn captured_artifact_offsets_wake_after_upload_and_instruction_context_is_exclud
     let sha = raw::sha256(bytes);
     let text = format!("前🧠 original artifact {sha}");
     let mut input = episode("media", &text);
-    input.metadata.insert("artifacts".into(),json!([{ "type":"image","sha256":sha,"filename":"../actual.png","artifact_status":"ready","mime":"image/png"}]));
+    input.metadata.insert(
+        "artifacts".into(),
+        json!([
+            {
+                "type":"image",
+                "sha256":sha,
+                "filename":"../actual.png",
+                "artifact_status":"ready",
+                "mime":"image/png"
+            }
+        ]),
+    );
     let captured = store.capture(input.clone()).unwrap();
     store
         .read(|tx| {
@@ -280,9 +299,29 @@ fn native_raw_frame_compression_keeps_exact_unicode_retries_and_normal_messages(
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("data")).unwrap();
     let text = "Ω🧠б, line\r\n".repeat(30000);
-    let input:memento_core::capture::EpisodeInput=serde_json::from_value(serde_json::json!({"source":"native:synthetic:pi","event_id":"raw","conversation_id":"thread","kind":"native_record","text":text,"metadata":{"extraction_mode":"skip"}})).unwrap();
+    let input: memento_core::capture::EpisodeInput = serde_json::from_value(serde_json::json!({
+        "source":"native:synthetic:pi",
+        "event_id":"raw",
+        "conversation_id":"thread",
+        "kind":"native_record",
+        "text":text,
+        "metadata":{"extraction_mode":"skip"}
+    }))
+    .unwrap();
     let first = store.capture(input.clone()).unwrap();
-    let normal=store.capture(serde_json::from_value(serde_json::json!({"source":"native:synthetic:pi","event_id":"normal","conversation_id":"thread","kind":"user","text":"Unchanged searchable projection Ω","metadata":{}})).unwrap()).unwrap();
+    let normal = store
+        .capture(
+            serde_json::from_value(serde_json::json!({
+                "source":"native:synthetic:pi",
+                "event_id":"normal",
+                "conversation_id":"thread",
+                "kind":"user",
+                "text":"Unchanged searchable projection Ω",
+                "metadata":{}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     while store.compress_raw_step().unwrap() {}
     let restored = store.episode(&first.id).unwrap().unwrap();
     assert_eq!(restored["text"], text);
@@ -333,7 +372,19 @@ fn frame_compression_keeps_conversation_boundaries() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("data")).unwrap();
     for i in 0..3 {
-        store.capture(serde_json::from_value(serde_json::json!({"source":"native:synthetic:pi","event_id":format!("r{i}"),"conversation_id":format!("thread{i}"),"kind":"native_record","text":format!("private synthetic {i}"),"metadata":{"extraction_mode":"skip"}})).unwrap()).unwrap();
+        store
+            .capture(
+                serde_json::from_value(serde_json::json!({
+                    "source":"native:synthetic:pi",
+                    "event_id":format!("r{i}"),
+                    "conversation_id":format!("thread{i}"),
+                    "kind":"native_record",
+                    "text":format!("private synthetic {i}"),
+                    "metadata":{"extraction_mode":"skip"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
     }
     assert!(store.compress_raw_step().unwrap());
     let count = store
@@ -368,8 +419,26 @@ fn failed_frame_publication_rolls_back_all_frames_and_cursor_then_retries() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("data")).unwrap();
     let original = "Ω exact retained raw text";
-    let episode=store.capture(serde_json::from_value(serde_json::json!({"source":"native:synthetic:pi","event_id":"rollback","conversation_id":"thread","kind":"native_record","text":original,"metadata":{"extraction_mode":"skip"}})).unwrap()).unwrap();
-    store.write(|tx|{tx.sql().execute_batch("CREATE TRIGGER synthetic_reject BEFORE UPDATE ON episodes WHEN NEW.raw_frame IS NOT NULL BEGIN SELECT RAISE(ABORT,'synthetic rollback'); END;")?;Ok(())}).unwrap();
+    let episode = store
+        .capture(
+            serde_json::from_value(serde_json::json!({
+                "source":"native:synthetic:pi",
+                "event_id":"rollback",
+                "conversation_id":"thread",
+                "kind":"native_record",
+                "text":original,
+                "metadata":{"extraction_mode":"skip"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute_batch("CREATE TRIGGER synthetic_reject BEFORE UPDATE ON episodes WHEN NEW.raw_frame IS NOT NULL \
+                BEGIN SELECT RAISE(ABORT,'synthetic rollback'); END;")?;
+            Ok(())
+        })
+        .unwrap();
     assert!(store.compress_raw_step().is_err());
     store
         .read(|tx| {
@@ -424,7 +493,14 @@ fn captured_missing_document_filename_uses_baseline_mime_suffix_for_real_decoder
     .enumerate()
     {
         let sha = format!("{i:064x}");
-        let input=serde_json::from_value(serde_json::json!({"source":"native:synthetic:pi","event_id":format!("doc{i}"),"conversation_id":"thread","kind":"user","text":sha,"metadata":{"artifacts":[{"type":"file","artifact_status":"captured","sha256":sha,"mime":mime}]}})).unwrap();
+        let input = serde_json::from_value(serde_json::json!({
+            "source":"native:synthetic:pi",
+            "event_id":format!("doc{i}"),
+            "conversation_id":"thread",
+            "kind":"user",
+            "text":sha,
+            "metadata": {"artifacts":[{"type":"file","artifact_status":"captured","sha256":sha,"mime":mime}]}
+        })).unwrap();
         store.capture(input).unwrap();
         let filename = store
             .read(|tx| {

@@ -53,7 +53,9 @@ fn walk(
         let commit = get_str(link, "commit_id")?;
         let edge = one(
             db,
-            "SELECT e.id,e.src,e.dst,l.version,l.state FROM edge_versions e JOIN edge_versions l ON l.id=e.id AND l.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) WHERE e.src=? AND e.rel='supersedes' AND e.dst=? AND e.version=1 AND e.commit_id=?",
+            "SELECT e.id,e.src,e.dst,l.version,l.state FROM edge_versions e JOIN edge_versions l ON \
+            l.id=e.id AND l.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) WHERE \
+            e.src=? AND e.rel='supersedes' AND e.dst=? AND e.version=1 AND e.commit_id=?",
             params![to, current, commit],
         )?;
         let created = one(
@@ -111,7 +113,12 @@ fn walk(
         if content(db, &current, version)?.is_none() {
             return Ok((members, hops, Some("unproven_lineage")));
         }
-        hops.push(json!({"kind":revision["kind"],"valid_at":revision["valid_at"],"source":{"id":current,"version":version},"supersedes":null}));
+        hops.push(json!({
+            "kind":revision["kind"],
+            "valid_at":revision["valid_at"],
+            "source":{"id":current,"version":version},
+            "supersedes":null
+        }));
     }
     let forgotten = one(
         db,
@@ -139,7 +146,13 @@ fn fence(
     let mut rows_seen = vec![];
     for id in members {
         let n = node(db, id)?;
-        summaries.push(json!({"id":id,"version":n["version"],"state":n["state"],"type":n["type"],"text":excerpt(get_str(&n,"text")?,160)}));
+        summaries.push(json!({
+            "id":id,
+            "version":n["version"],
+            "state":n["state"],
+            "type":n["type"],
+            "text":excerpt(get_str(&n,"text")?,160)
+        }));
         // Event identity and manual/source chronology, not only display state.
         let mut mark = loops::snapshot(db, id, get_i64(&n, "version")?)?;
         if let Some(live) = loops::current(db, id)? {
@@ -189,7 +202,10 @@ fn fence(
     let mut reattached = vec![];
     for edge in rows(
         db,
-        "SELECT e.id,e.version,e.src,e.dst FROM edge_versions e WHERE (e.src IN (SELECT value FROM json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id",
+        "SELECT e.id,e.version,e.src,e.dst FROM edge_versions e WHERE (e.src IN (SELECT value FROM \
+        json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND \
+        e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE \
+        x.id=e.id) ORDER BY e.id",
         [&ids],
     )? {
         let edge_id = get_str(&edge, "id")?;
@@ -208,10 +224,16 @@ fn fence(
             reattached.push(edge_id.to_owned());
         }
     }
-    let reviews = rows(db, "SELECT DISTINCT p.id FROM review_proposals p,json_each(p.base_versions) j WHERE j.key IN (SELECT value FROM json_each(?)) AND NOT EXISTS (SELECT 1 FROM review_decisions d WHERE d.proposal_id=p.id) ORDER BY p.id", [&ids])?
-        .into_iter()
-        .map(|row| row["id"].clone())
-        .collect::<Vec<_>>();
+    let reviews = rows(
+        db,
+        "SELECT DISTINCT p.id FROM review_proposals p,json_each(p.base_versions) j WHERE j.key IN \
+        (SELECT value FROM json_each(?)) AND NOT EXISTS (SELECT 1 FROM review_decisions d WHERE \
+        d.proposal_id=p.id) ORDER BY p.id",
+        [&ids],
+    )?
+    .into_iter()
+    .map(|row| row["id"].clone())
+    .collect::<Vec<_>>();
     if blocked.is_none() && !obsolete.is_empty() {
         blocked = Some(("relations_need_review", obsolete));
     }
@@ -242,7 +264,9 @@ pub fn plan(
     }
     let links = rows(
         db,
-        "SELECT n.id,n.version,n.state,n.superseded_by,n.commit_id FROM node_versions n WHERE n.state IN ('refined','corrected','superseded') AND n.superseded_by IS NOT NULL AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY n.id",
+        "SELECT n.id,n.version,n.state,n.superseded_by,n.commit_id FROM node_versions n WHERE \
+        n.state IN ('refined','corrected','superseded') AND n.superseded_by IS NOT NULL AND \
+        n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY n.id",
         [],
     )?;
     let mut next = HashMap::new();
@@ -353,8 +377,17 @@ fn apply_chain(tx: &WriteTxn, commit: &str, chain: &Value) -> Result<Value> {
             ],
         )?;
         tx.sql().execute(
-            "INSERT INTO node_revisions(id,version,kind,valid_at,commit_id,source_id,source_version) VALUES (?,?,?,?,?,?,?)",
-            params![root, version, hop["kind"].as_str(), hop["valid_at"].as_str(), commit, source, source_version],
+            "INSERT INTO node_revisions(id,version,kind,valid_at,commit_id,source_id,source_version) \
+                VALUES (?,?,?,?,?,?,?)",
+            params![
+                root,
+                version,
+                hop["kind"].as_str(),
+                hop["valid_at"].as_str(),
+                commit,
+                source,
+                source_version
+            ],
         )?;
         curation::union_evidence(tx, root, version, &[(source.into(), source_version)])?;
         // The replacement no longer supersedes its predecessor; its row stays.
@@ -449,7 +482,13 @@ pub fn recover(graph: &Graph, command: dto::RecoverRevisions) -> Result<Value> {
     let mut protected = command.protected;
     protected.sort();
     protected.dedup();
-    let request = json!({"op":"recover_revisions","limit":command.limit,"exclude":exclude,"protected":protected,"token":command.token});
+    let request = json!({
+        "op":"recover_revisions",
+        "limit":command.limit,
+        "exclude":exclude,
+        "protected":protected,
+        "token":command.token
+    });
     let ctx = context(command.command_id, command.actor, command.why);
     graph.store.command(&ctx, &request, |tx, commit| {
         let plan = plan(tx.sql(), command.limit, &exclude, &protected)?;
@@ -466,7 +505,11 @@ pub fn recover(graph: &Graph, command: dto::RecoverRevisions) -> Result<Value> {
         for chain in chains {
             recovered.push(apply_chain(tx, commit, chain)?);
         }
-        Ok(json!({"recovered":recovered,"remaining_ready":plan["remaining_ready"],"ambiguous_count":plan["ambiguous_count"]}))
+        Ok(json!({
+            "recovered":recovered,
+            "remaining_ready":plan["remaining_ready"],
+            "ambiguous_count":plan["ambiguous_count"]
+        }))
     })
 }
 
@@ -492,12 +535,8 @@ pub(crate) fn legacy_supersede(graph: &Graph, command: Value) -> Result<Value> {
             "refinement" => (previous["valid_from"].clone(), previous["valid_to"].clone()),
             _ => (Value::Null, Value::Null),
         };
-        let replacement = TxGraph::insert_node(
-            tx,
-            commit,
-            &json!({"type":new["type"],"text":new["text"],"scope":new["scope"],
-            "valid_from":from,"valid_to":to,"evidence":request["evidence"],"pinned":previous["pinned"].as_i64().unwrap_or(0) != 0}),
-        )?;
+        let replacement = TxGraph::insert_node(tx, commit, &json!({"type":new["type"],"text":new["text"],"scope":new["scope"],
+            "valid_from":from,"valid_to":to,"evidence":request["evidence"],"pinned":previous["pinned"].as_i64().unwrap_or(0) != 0}))?;
         let replacement_id = get_str(&replacement, "id")?;
         let version = get_i64(&previous, "version")? + 1;
         let state = match kind {

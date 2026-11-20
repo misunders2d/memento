@@ -182,7 +182,16 @@ fn active_original_and_cache_readers_fence_eviction_pending_media_keeps_hot_unti
     assert!(store.blobs().path(&sha).unwrap().exists());
     assert_eq!(manager.trim_cache(0, 0).unwrap().evicted, 0);
     drop(hot);
-    store.write(|tx|{tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) VALUES('media','media','media',?,'pending',0,0)",[json!({"sha256":sha}).to_string()])?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute(
+                "INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) \
+                VALUES('media','media','media',?,'pending',0,0)",
+                [json!({"sha256":sha}).to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     manager.promote(&sha).unwrap();
     assert!(store.blobs().path(&sha).unwrap().exists());
     store
@@ -235,7 +244,17 @@ fn media_offload_preserves_pin_manual_loop_and_importance_history() {
     let temp = private();
     let (store, manager, _) = setup(temp.path());
     let sha = blob(&store, b"important pinned photo", "image/png");
-    store.write(|tx|{tx.sql().execute("INSERT INTO graph_commits VALUES('commit','command','{}','{}','human','explicit','2026')",[])?;tx.sql().execute("INSERT INTO node_versions VALUES('node',1,'commit','knowledge','original','active',NULL,NULL,NULL,1,'[\"personal\"]')",[])?;tx.sql().execute("INSERT INTO node_stats(node_id,importance) VALUES('node',1)",[])?;tx.sql().execute("INSERT INTO media_files VALUES('node',?,'original.png','image','commit')",[&sha])?;tx.sql().execute("INSERT INTO loop_events VALUES('manual','node','commit','open',NULL,NULL)",[])?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO graph_commits VALUES('commit','command','{}','{}','human','explicit','2026')", [])?;
+            tx.sql().execute("INSERT INTO node_versions \
+                VALUES('node',1,'commit','knowledge','original','active',NULL,NULL,NULL,1,'[\"personal\"]')", [])?;
+            tx.sql().execute("INSERT INTO node_stats(node_id,importance) VALUES('node',1)", [])?;
+            tx.sql().execute("INSERT INTO media_files VALUES('node',?,'original.png','image','commit')", [&sha])?;
+            tx.sql().execute("INSERT INTO loop_events VALUES('manual','node','commit','open',NULL,NULL)", [])?;
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(manager.sweep(90, 10 * 1024 * 1024, 10).unwrap().promoted, 1);
     assert!(manager.reader(&sha).is_ok());
     store
@@ -268,7 +287,18 @@ fn complete_disk_loss_restore_needs_only_remote_backup_and_pinned_binding() {
     let (store, manager, backend) = setup(temp.path());
     let content = b"exact original image\0\xff";
     let sha = blob(&store, content, "image/png");
-    let captured=store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"source","conversation_id":"thread","kind":"user","text":"The copper key stays in the blue tin. Ω"})).unwrap()).unwrap();
+    let captured = store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"synthetic",
+                "event_id":"source",
+                "conversation_id":"thread",
+                "kind":"user",
+                "text":"The copper key stays in the blue tin. Ω"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let backup = manager.backup().unwrap();
     assert!(backup.complete);
     assert_eq!(manager.info(&sha).unwrap().tier, "hot");
@@ -334,7 +364,18 @@ fn blocked_backup_upload_does_not_block_hot_reader_or_capture_writer() {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"read while Drive stalls");
-    store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"during-backup","conversation_id":"thread","kind":"user","text":"Capture stays available."})).unwrap()).unwrap();
+    store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"synthetic",
+                "event_id":"during-backup",
+                "conversation_id":"thread",
+                "kind":"user",
+                "text":"Capture stays available."
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     release_tx.send(()).unwrap();
     assert!(handle.join().unwrap().unwrap().complete);
 }
@@ -395,7 +436,23 @@ fn pending_derived_media_stage_retains_its_registered_artifact_until_job_finishe
     let (store, manager, _) = setup(temp.path());
     let original = blob(&store, b"original video", "video/mp4");
     let derived = blob(&store, b"derived preview", "image/png");
-    store.write(|tx|{tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) VALUES('media-stage','media-stage','media',?,'pending',0,0)",[json!({"sha256":original}).to_string()])?;tx.sql().execute("INSERT INTO media_stage_units VALUES('media-stage',0,'fixed',?,?)",rusqlite::params![json!({"artifact_sha256":derived,"source_sha256":original}).to_string(),vec![0_u8;3072]])?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute(
+                "INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) \
+                VALUES('media-stage','media-stage','media',?,'pending',0,0)",
+                [json!({"sha256":original}).to_string()],
+            )?;
+            tx.sql().execute(
+                "INSERT INTO media_stage_units VALUES('media-stage',0,'fixed',?,?)",
+                rusqlite::params![
+                    json!({"artifact_sha256":derived,"source_sha256":original}).to_string(),
+                    vec![0_u8; 3072]
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     manager.promote(&derived).unwrap();
     assert!(store.blobs().path(&derived).unwrap().exists());
     store

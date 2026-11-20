@@ -11,7 +11,17 @@ fn capture(
     metadata: Value,
 ) -> (String, i64) {
     let id = store
-        .capture(serde_json::from_value(json!({"source":"native:fixture:pi","event_id":event,"conversation_id":conversation,"kind":kind,"text":format!("Synthetic {event} text"),"metadata":metadata})).unwrap())
+        .capture(
+            serde_json::from_value(json!({
+                "source":"native:fixture:pi",
+                "event_id":event,
+                "conversation_id":conversation,
+                "kind":kind,
+                "text":format!("Synthetic {event} text"),
+                "metadata":metadata
+            }))
+            .unwrap(),
+        )
         .unwrap()
         .id;
     let seq = store
@@ -55,7 +65,11 @@ fn counts_extraction_input_messages_by_admission_jobs_and_parking() {
     capture(&store, "thread", "forgotten", "user", json!({}));
     store
         .write(|tx| {
-            tx.sql().execute("INSERT INTO forgotten_sources(source,event_id,target,commit_id) VALUES('native:fixture:pi','forgotten','t','c')", [])?;
+            tx.sql().execute(
+                "INSERT INTO forgotten_sources(source,event_id,target,commit_id) \
+                VALUES('native:fixture:pi','forgotten','t','c')",
+                [],
+            )?;
             Ok(())
         })
         .unwrap();
@@ -104,10 +118,21 @@ fn counts_extraction_input_messages_by_admission_jobs_and_parking() {
     assert_eq!(remaining["partial"], true);
 
     // Batched messages count distinct episodes, not windows.
-    let payload = json!({"source":"native:fixture:pi","conversation_id":"thread","windows":[{"id":"a","episode_id":user,"start":0,"end":5},{"id":"b","episode_id":user,"start":4,"end":9}]});
+    let payload = json!({
+        "source":"native:fixture:pi",
+        "conversation_id":"thread",
+        "windows": [
+            {"id":"a","episode_id":user,"start":0,"end":5},
+            {"id":"b","episode_id":user,"start":4,"end":9}
+        ]
+    });
     store
         .write(|tx| {
-            tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) VALUES('live','live','extract',?,'leased',0,1)", [payload.to_string()])?;
+            tx.sql().execute(
+                "INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) \
+                VALUES('live','live','extract',?,'leased',0,1)",
+                [payload.to_string()],
+            )?;
             Ok(())
         })
         .unwrap();

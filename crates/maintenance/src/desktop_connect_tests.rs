@@ -18,7 +18,19 @@ fn private() -> tempfile::TempDir {
 fn fixture() -> (tempfile::TempDir, ConnectOptions) {
     let dir = private();
     let client = dir.path().join("client.json");
-    fs_safe::atomic_private(&client,&serde_json::to_vec(&json!({"installed":{"client_id":"original-client","client_secret":"SYNTHETIC CLIENT SECRET","auth_uri":AUTH_URI,"token_uri":TOKEN_URI}})).unwrap()).unwrap();
+    fs_safe::atomic_private(
+        &client,
+        &serde_json::to_vec(&json!({
+            "installed": {
+                "client_id":"original-client",
+                "client_secret":"SYNTHETIC CLIENT SECRET",
+                "auth_uri":AUTH_URI,
+                "token_uri":TOKEN_URI
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let options = ConnectOptions {
         client_json: client,
         account: "owner@example.test".into(),
@@ -81,7 +93,13 @@ fn token() -> Step {
     step(
         "POST",
         "oauth2.googleapis.com/token",
-        json!({"access_token":"SYNTHETIC ACCESS","refresh_token":"SYNTHETIC REFRESH","expires_in":3600,"scope":SCOPE,"token_type":"Bearer"}),
+        json!({
+            "access_token":"SYNTHETIC ACCESS",
+            "refresh_token":"SYNTHETIC REFRESH",
+            "expires_in":3600,
+            "scope":SCOPE,
+            "token_type":"Bearer"
+        }),
     )
 }
 fn about() -> Step {
@@ -95,7 +113,12 @@ fn folder() -> Step {
     step(
         "GET",
         "/files/original_folder?",
-        json!({"id":"original_folder","mimeType":"application/vnd.google-apps.folder","ownedByMe":true,"trashed":false}),
+        json!({
+            "id":"original_folder",
+            "mimeType":"application/vnd.google-apps.folder",
+            "ownedByMe":true,
+            "trashed":false
+        }),
     )
 }
 fn provider(create: bool) -> Arc<Provider> {
@@ -315,7 +338,19 @@ fn restored_pin_reuses_original_folder_and_rejects_new_binding_before_consent() 
             "folder" => changed.folder_id = Some("replacement_folder".into()),
             _ => {
                 let path = dir.path().join("changed-client.json");
-                fs_safe::atomic_private(&path,&serde_json::to_vec(&json!({"installed":{"client_id":"replacement-client","client_secret":"SYNTHETIC","auth_uri":AUTH_URI,"token_uri":TOKEN_URI}})).unwrap()).unwrap();
+                fs_safe::atomic_private(
+                    &path,
+                    &serde_json::to_vec(&json!({
+                        "installed": {
+                            "client_id":"replacement-client",
+                            "client_secret":"SYNTHETIC",
+                            "auth_uri":AUTH_URI,
+                            "token_uri":TOKEN_URI
+                        }
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
                 changed.client_json = path;
             }
         }

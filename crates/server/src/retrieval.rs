@@ -590,7 +590,11 @@ impl Retrieval {
             let keyword_semantic = keyword && cosine >= floor(&record, false);
             records::merge(
                 &mut record,
-                json!({"cosine":cosine,"score":cosine+if keyword {0.25}else{0.0},"match":if keyword_semantic{"hybrid"}else if keyword {"keyword"}else{"semantic"}}),
+                json!({
+                    "cosine":cosine,
+                    "score":cosine+if keyword {0.25}else{0.0},
+                    "match":if keyword_semantic{"hybrid"}else if keyword {"keyword"}else{"semantic"}
+                }),
             );
             let replace = matches.get(&id).is_none_or(|old| {
                 old["cosine"].is_null() || number(&record, "score", 0.) > number(old, "score", 0.)
@@ -648,7 +652,11 @@ impl Retrieval {
                     let cosine = old.and_then(|v| v["cosine"].as_f64());
                     records::merge(
                         &mut row,
-                        json!({"score":cosine.unwrap_or(TEXT_FLOOR)+0.25,"cosine":cosine,"match":if cosine.is_some(){"hybrid"}else{"keyword"}}),
+                        json!({
+                            "score":cosine.unwrap_or(TEXT_FLOOR)+0.25,
+                            "cosine":cosine,
+                            "match":if cosine.is_some(){"hybrid"}else{"keyword"}
+                        }),
                     );
                     raw_matches.insert(key(&row).into(), row);
                 }
@@ -696,7 +704,14 @@ impl Retrieval {
                         finish(db, &mut row, at)?;
                         records::merge(
                             &mut row,
-                            json!({"category":"memory","cosine":hit.cosine,"score":hit.cosine,"match":"semantic","related":[],"duplicate_ids":[]}),
+                            json!({
+                                "category":"memory",
+                                "cosine":hit.cosine,
+                                "score":hit.cosine,
+                                "match":"semantic",
+                                "related":[],
+                                "duplicate_ids":[]
+                            }),
                         );
                         let label = source_label(&row);
                         if let Some(full) = row["_full_text"].as_str() {
@@ -896,7 +911,8 @@ impl Retrieval {
                     let Some(base) = records::one(
                         db,
                         &format!(
-                            "SELECT {},n.text AS name FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)",
+                            "SELECT {},n.text AS name FROM node_versions n WHERE n.id=? AND n.state='active' AND \
+                            n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)",
                             records::NODE_SUMMARY
                         ),
                         [key(&endpoint)],
@@ -992,7 +1008,10 @@ impl Retrieval {
                     },
                     "passage_validation": match logit {
                         Some(logit) => json!({"status":"passed","logit":logit,"floor":SEMANTIC_TEXT_LOGIT_FLOOR}),
-                        None => json!({"status":"not_run","reason":if score.is_none() {"no_scorer"} else {"route_exempt"}}),
+                        None => json!({
+                            "status":"not_run",
+                            "reason":if score.is_none() {"no_scorer"} else {"route_exempt"}
+                        }),
                     },
                     // Ranked rows only; anchors and connections are positional.
                     "ordering": "sort_key",
@@ -1051,7 +1070,13 @@ impl Retrieval {
                     Some("recorded_connection") => "recorded_connection",
                     _ => "positional",
                 };
-                row["explain"] = json!({"route":route,"pass":if archive { "archive" } else { "hot" },"ordering":"positional","sort_key":null,"passage_validation":{"status":"not_run","reason":"positional"}});
+                row["explain"] = json!({
+                    "route":route,
+                    "pass":if archive { "archive" } else { "hot" },
+                    "ordering":"positional",
+                    "sort_key":null,
+                    "passage_validation":{"status":"not_run","reason":"positional"}
+                });
             }
         }
         Ok((output, need_archive && !archive))
@@ -1092,7 +1117,10 @@ impl Retrieval {
         hits: &mut Vec<SearchHit>,
     ) -> Result<()> {
         for (kind, id, version) in keyword_ids(tx, query, (limit * 4).min(100), scope, allowed)? {
-            let mut statement=tx.sql().prepare("SELECT i.seq,b.embedding,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind=? AND i.version=? AND b.current=1")?;
+            let mut statement = tx.sql().prepare(
+                "SELECT i.seq,b.embedding,b.generation FROM vector_items i JOIN vector_blobs b ON \
+                b.seq=i.seq WHERE i.target=? AND i.kind=? AND i.version=? AND b.current=1",
+            )?;
             for row in statement.query_map(params![id, kind, version], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -1147,11 +1175,20 @@ impl Retrieval {
         Ok(())
     }
     fn raw_fallback_state(tx: &ReadTxn<'_>, episode_id: &str) -> Result<Option<bool>> {
-        let state = tx.sql().query_row(
-            &format!("SELECT e.source,e.kind,e.text,e.metadata,({RAW_FALLBACK}),({HISTORICAL}) FROM episodes e WHERE e.id=?"),
-            [episode_id],
-            |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, Option<String>>(2)?,r.get::<_, String>(3)?,r.get::<_, bool>(4)?,r.get::<_, bool>(5)?)),
-        ).optional()?;
+        let state = tx
+            .sql()
+            .query_row(&format!("SELECT e.source,e.kind,e.text,e.metadata,({RAW_FALLBACK}),({HISTORICAL}) FROM episodes e \
+                WHERE e.id=?"), [episode_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, bool>(4)?,
+                    r.get::<_, bool>(5)?,
+                ))
+            })
+            .optional()?;
         let Some((source, kind, text, metadata, allowed, historical)) = state else {
             return Ok(None);
         };
@@ -1233,7 +1270,11 @@ impl Retrieval {
                     let cosine = found.get(key(&passage)).and_then(|v| v["cosine"].as_f64());
                     records::merge(
                         &mut passage,
-                        json!({"score":cosine.unwrap_or(TEXT_FLOOR)+0.25,"cosine":cosine,"match":if cosine.is_some(){"hybrid"}else{"keyword"}}),
+                        json!({
+                            "score":cosine.unwrap_or(TEXT_FLOOR)+0.25,
+                            "cosine":cosine,
+                            "match":if cosine.is_some(){"hybrid"}else{"keyword"}
+                        }),
                     );
                     found.insert(key(&passage).into(), passage);
                 }
@@ -1457,7 +1498,12 @@ fn keyword_ids(
     };
     let mut out = Vec::new();
     for row in rows(format!(
-        "SELECT n.id,n.version FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)){} ORDER BY bm25(node_fts),n.id LIMIT ?3",
+        "SELECT n.id,n.version FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND \
+        n.version=node_fts.version WHERE node_fts MATCH ?1 AND n.state='active' AND \
+        n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT \
+        EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?2 IS NULL OR \
+        EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)){} ORDER BY bm25(node_fts),n.id \
+        LIMIT ?3",
         visible_sql("n.id"),
         within("n.id")
     ))? {
@@ -1468,13 +1514,20 @@ fn keyword_ids(
         ));
     }
     for row in rows(format!(
-        "SELECT c.id FROM candidate_fts JOIN candidates c ON c.id=candidate_fts.id WHERE candidate_fts MATCH ?1 AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(c.scope) WHERE value=?2)){} ORDER BY bm25(candidate_fts),c.id LIMIT ?3",
+        "SELECT c.id FROM candidate_fts JOIN candidates c ON c.id=candidate_fts.id WHERE \
+        candidate_fts MATCH ?1 AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM \
+        json_each(c.scope) WHERE value=?2)){} ORDER BY bm25(candidate_fts),c.id LIMIT ?3",
         within("c.id")
     ))? {
         out.push(("candidate".into(), key(&row).into(), 1));
     }
     for row in rows(format!(
-        "SELECT s.id,n.version FROM segment_fts JOIN segments s ON s.id=segment_fts.id JOIN media_files f ON f.node_id=s.node_id JOIN node_versions n ON n.id=s.node_id WHERE segment_fts MATCH ?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)){} ORDER BY bm25(segment_fts),s.id LIMIT ?3",
+        "SELECT s.id,n.version FROM segment_fts JOIN segments s ON s.id=segment_fts.id JOIN \
+        media_files f ON f.node_id=s.node_id JOIN node_versions n ON n.id=s.node_id WHERE \
+        segment_fts MATCH ?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM \
+        node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE \
+        f.target=n.id) AND {} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE \
+        value=?2)){} ORDER BY bm25(segment_fts),s.id LIMIT ?3",
         visible_sql("n.id"),
         within("n.id")
     ))? {
@@ -1529,21 +1582,90 @@ mod tests {
         ) -> String {
             self.seq += 1;
             let event = format!("s{}", self.seq);
-            let episode=self.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":event,"conversation_id":event,"kind":"user","text":text,"occurred_at":date,"metadata":{}})).unwrap()).unwrap();
-            let node=self.graph.remember(serde_json::from_value(json!({"command_id":event,"actor":"owner","why":"Exact synthetic evidence","type":kind,"text":text,"scope":[scope],"evidence":[{"episode_id":episode.id,"quote":text}]})).unwrap()).unwrap();
+            let episode = self
+                .store
+                .capture(
+                    serde_json::from_value(json!({
+                        "source":"synthetic",
+                        "event_id":event,
+                        "conversation_id":event,
+                        "kind":"user",
+                        "text":text,
+                        "occurred_at":date,
+                        "metadata":{}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            let node = self
+                .graph
+                .remember(
+                    serde_json::from_value(json!({
+                        "command_id":event,
+                        "actor":"owner",
+                        "why":"Exact synthetic evidence",
+                        "type":kind,
+                        "text":text,
+                        "scope":[scope],
+                        "evidence":[{"episode_id":episode.id,"quote":text}]
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
             let id = key(&node).to_owned();
             let mut vector = [0f32; 768];
             vector[0] = cosine;
             vector[1] = (1. - cosine * cosine).sqrt();
             let seq = self.seq;
-            self.store.write(|tx|{tx.sql().execute("INSERT INTO node_stats(node_id,importance) VALUES(?,?) ON CONFLICT(node_id) DO UPDATE SET importance=excluded.importance",params![id,importance])?;tx.put_vector(&VectorWrite{seq,target:id.clone(),kind:VectorKind::Node,version:1,embedding:F32Blob::from_values(&vector)?,current:true,tier:Tier::Hot})?;Ok(())}).unwrap();
+            self.store
+                .write(|tx| {
+                    tx.sql().execute("INSERT INTO node_stats(node_id,importance) VALUES(?,?) ON CONFLICT(node_id) DO UPDATE SET \
+                        importance=excluded.importance", params![id, importance])?;
+                    tx.put_vector(&VectorWrite {
+                        seq,
+                        target: id.clone(),
+                        kind: VectorKind::Node,
+                        version: 1,
+                        embedding: F32Blob::from_values(&vector)?,
+                        current: true,
+                        tier: Tier::Hot,
+                    })?;
+                    Ok(())
+                })
+                .unwrap();
             id
         }
         fn connect(&self, a: &str, b: &str) {
             let id = format!("edge-{a}-{b}");
             let text = "Recorded source directly connects the two fixture records";
-            let source=self.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":id,"conversation_id":"edges","kind":"user","text":text,"metadata":{}})).unwrap()).unwrap();
-            self.graph.link(serde_json::from_value(json!({"command_id":id,"actor":"owner","why":"Exact recorded fixture connection","a":a,"b":b,"rel":"related_to","evidence":[{"episode_id":source.id,"quote":text}]})).unwrap()).unwrap();
+            let source = self
+                .store
+                .capture(
+                    serde_json::from_value(json!({
+                        "source":"synthetic",
+                        "event_id":id,
+                        "conversation_id":"edges",
+                        "kind":"user",
+                        "text":text,
+                        "metadata":{}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            self.graph
+                .link(
+                    serde_json::from_value(json!({
+                        "command_id":id,
+                        "actor":"owner",
+                        "why":"Exact recorded fixture connection",
+                        "a":a,
+                        "b":b,
+                        "rel":"related_to",
+                        "evidence":[{"episode_id":source.id,"quote":text}]
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
         }
         fn recall(
             &self,
@@ -1715,7 +1837,12 @@ mod tests {
             f.recall("unseen request", 1, false, Some("personal"))[0]["id"],
             recent
         );
-        f.store.write(|tx|{tx.sql().execute("UPDATE node_stats SET last_cited_at='2026-10-26T00:00:00+00:00' WHERE node_id IN (?,?)",params![old,recent])?;Ok(())}).unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("UPDATE node_stats SET last_cited_at='2026-10-26T00:00:00+00:00' WHERE node_id IN (?,?)", params![old, recent])?;
+                Ok(())
+            })
+            .unwrap();
         let row = f.recall("unseen request", 1, false, Some("personal"));
         assert_eq!(row[0]["id"], old);
         assert_eq!(row[0]["ranking_anchor"], "2026-10-26T00:00:00+00:00");
@@ -1816,8 +1943,34 @@ mod tests {
             "personal",
         );
         let text = "Nadia coordinates the pickup";
-        let episode=f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"edge","conversation_id":"edge","kind":"user","text":text,"metadata":{}})).unwrap()).unwrap();
-        f.graph.link(serde_json::from_value(json!({"command_id":"edge","actor":"owner","why":"Recorded exact relation","a":fact,"b":person,"rel":"related_to","evidence":[{"episode_id":episode.id,"quote":text}]})).unwrap()).unwrap();
+        let episode = f
+            .store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"edge",
+                    "conversation_id":"edge",
+                    "kind":"user",
+                    "text":text,
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        f.graph
+            .link(
+                serde_json::from_value(json!({
+                    "command_id":"edge",
+                    "actor":"owner",
+                    "why":"Recorded exact relation",
+                    "a":fact,
+                    "b":person,
+                    "rel":"related_to",
+                    "evidence":[{"episode_id":episode.id,"quote":text}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let rows = f.recall("unseen pickup request", 2, true, Some("personal"));
         assert_eq!(rows[0]["id"], fact);
         assert!(rows.iter().all(|r| r["category"] != "entity_context"));
@@ -1869,8 +2022,34 @@ mod tests {
             "personal",
         );
         let quote = "Pi is related to this helper";
-        let source=f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"weak-edge","conversation_id":"thread","kind":"user","text":quote,"metadata":{}})).unwrap()).unwrap();
-        f.graph.link(serde_json::from_value(json!({"command_id":"weak-edge","actor":"owner","why":"Exact synthetic connection","a":weak,"b":tool,"rel":"related_to","evidence":[{"episode_id":source.id,"quote":quote}]})).unwrap()).unwrap();
+        let source = f
+            .store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"weak-edge",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":quote,
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        f.graph
+            .link(
+                serde_json::from_value(json!({
+                    "command_id":"weak-edge",
+                    "actor":"owner",
+                    "why":"Exact synthetic connection",
+                    "a":weak,
+                    "b":tool,
+                    "rel":"related_to",
+                    "evidence":[{"episode_id":source.id,"quote":quote}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         for automatic in [false, true] {
             let rows = f.recall(
                 "unseen Pi retention request",
@@ -2247,7 +2426,12 @@ mod tests {
                 0.7,
                 "personal",
             );
-            f.store.write(|tx|{tx.sql().execute("INSERT INTO forgotten_targets SELECT ?1,commit_id,'node' FROM node_versions WHERE id=?1",[&forgotten])?;Ok(())}).unwrap();
+            f.store
+                .write(|tx| {
+                    tx.sql().execute("INSERT INTO forgotten_targets SELECT ?1,commit_id,'node' FROM node_versions WHERE id=?1", [&forgotten])?;
+                    Ok(())
+                })
+                .unwrap();
         }
         assert!(
             f.recall("Who is Leonid?", 6, true, Some("personal"))
@@ -2294,22 +2478,42 @@ mod tests {
             0.9,
             "personal",
         );
-        f.store.write(|tx|{
-            tx.sql().execute("INSERT INTO node_versions SELECT id,2,commit_id,type,'Leo North','active',valid_from,valid_to,superseded_by,1,scope FROM node_versions WHERE id=? AND version=1",[&entity])?;
-            tx.sql().execute("INSERT INTO graph_evidence SELECT target,2,episode_id,start,end,quote FROM graph_evidence WHERE target=? AND version=1",[&entity])?;
-            tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?)",[&entity])?;
-            let mut v=[0.;768];v[0]=0.8;v[1]=0.6;
-            tx.put_vector(&VectorWrite{seq:1000,target:entity.clone(),kind:VectorKind::Node,version:2,embedding:F32Blob::from_values(&v)?,current:true,tier:Tier::Hot})?;Ok(())
-        }).unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO node_versions SELECT id,2,commit_id,type,'Leo \
+                    North','active',valid_from,valid_to,superseded_by,1,scope FROM node_versions WHERE id=? AND \
+                    version=1", [&entity])?;
+                tx.sql().execute("INSERT INTO graph_evidence SELECT target,2,episode_id,start,end,quote FROM graph_evidence \
+                    WHERE target=? AND version=1", [&entity])?;
+                tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?)", [&entity])?;
+                let mut v = [0.; 768];
+                v[0] = 0.8;
+                v[1] = 0.6;
+                tx.put_vector(&VectorWrite {
+                    seq: 1000,
+                    target: entity.clone(),
+                    kind: VectorKind::Node,
+                    version: 2,
+                    embedding: F32Blob::from_values(&v)?,
+                    current: true,
+                    tier: Tier::Hot,
+                })?;
+                Ok(())
+            })
+            .unwrap();
         assert!(
             f.recall("Who is Leonid?", 6, true, Some("personal"))
                 .iter()
                 .all(|r| r["id"] != entity)
         );
-        f.store.write(|tx|{
-            tx.sql().execute("INSERT INTO entity_merges SELECT 'reviewed-source',id,commit_id FROM node_versions WHERE id=? AND version=2",[&entity])?;
-            tx.sql().execute("INSERT INTO alias_fts VALUES('reviewed-source','Leonid North — old reviewed description')",[])?;Ok(())
-        }).unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO entity_merges SELECT 'reviewed-source',id,commit_id FROM node_versions WHERE \
+                    id=? AND version=2", [&entity])?;
+                tx.sql().execute("INSERT INTO alias_fts VALUES('reviewed-source','Leonid North — old reviewed description')", [])?;
+                Ok(())
+            })
+            .unwrap();
         let rows = f.recall("Who is Leonid?", 6, true, Some("personal"));
         let anchor = rows.iter().find(|r| r["id"] == entity).unwrap();
         assert_eq!(anchor["version"], 2);
@@ -2397,14 +2601,43 @@ mod tests {
             0.8,
             "personal",
         );
-        let episode=f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"pending-alex","conversation_id":"pending-alex","kind":"user","text":"Alex South","metadata":{}})).unwrap()).unwrap();
-        f.store.write(|tx|{
-            tx.sql().execute("INSERT INTO extraction_runs SELECT 'pending-run',commit_id,?2,'test','test','[]','{}','2026-10-25' FROM node_versions WHERE id=?1 AND version=1",params![seed,episode.id])?;
-            tx.sql().execute("INSERT INTO candidates VALUES('pending-alex','pending-run','entity','person','Alex South','Exact source',NULL,NULL,1,NULL,NULL,'[\"personal\"]')",[])?;
-            tx.sql().execute("INSERT INTO graph_evidence VALUES('pending-alex',1,?1,0,10,'Alex South')",[&episode.id])?;
-            let mut v=[0.;768];v[0]=0.81;v[1]=(1f32-v[0]*v[0]).sqrt();
-            tx.put_vector(&VectorWrite{seq:2000,target:"pending-alex".into(),kind:VectorKind::Candidate,version:1,embedding:F32Blob::from_values(&v)?,current:true,tier:Tier::Hot})?;Ok(())
-        }).unwrap();
+        let episode = f
+            .store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"pending-alex",
+                    "conversation_id":"pending-alex",
+                    "kind":"user",
+                    "text":"Alex South",
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO extraction_runs SELECT \
+                    'pending-run',commit_id,?2,'test','test','[]','{}','2026-10-25' FROM node_versions WHERE \
+                    id=?1 AND version=1", params![seed, episode.id])?;
+                tx.sql().execute("INSERT INTO candidates VALUES('pending-alex','pending-run','entity','person','Alex \
+                    South','Exact source',NULL,NULL,1,NULL,NULL,'[\"personal\"]')", [])?;
+                tx.sql().execute("INSERT INTO graph_evidence VALUES('pending-alex',1,?1,0,10,'Alex South')", [&episode.id])?;
+                let mut v = [0.; 768];
+                v[0] = 0.81;
+                v[1] = (1f32 - v[0] * v[0]).sqrt();
+                tx.put_vector(&VectorWrite {
+                    seq: 2000,
+                    target: "pending-alex".into(),
+                    kind: VectorKind::Candidate,
+                    version: 1,
+                    embedding: F32Blob::from_values(&v)?,
+                    current: true,
+                    tier: Tier::Hot,
+                })?;
+                Ok(())
+            })
+            .unwrap();
         let rows = f.recall("Which Alex?", 6, true, Some("personal"));
         assert_eq!(rows[0]["id"], fact);
         assert_eq!(rows[1]["id"], seed); // durable tie class precedes candidate even with slightly lower cosine
@@ -2417,24 +2650,55 @@ mod tests {
                 .iter()
                 .all(|r| r["id"] != "pending-alex")
         );
-        f.store.write(|tx|{tx.sql().execute("INSERT INTO forgotten_sources SELECT 'synthetic','pending-alex','pending-alex',commit_id FROM node_versions WHERE id=? AND version=1",[&seed])?;Ok(())}).unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO forgotten_sources SELECT 'synthetic','pending-alex','pending-alex',commit_id \
+                    FROM node_versions WHERE id=? AND version=1", [&seed])?;
+                Ok(())
+            })
+            .unwrap();
         assert!(
             f.recall("Which Alex?", 6, true, Some("personal"))
                 .iter()
                 .all(|r| r["id"] != "pending-alex")
         );
-        f.store.write(|tx|{
-            tx.sql().execute("INSERT INTO extraction_runs SELECT 'reject-run',r.commit_id,g.episode_id,r.version,r.requested_model,r.reported_models,r.usage,r.recorded_at FROM extraction_runs r JOIN graph_evidence g ON g.target=?1 WHERE r.id='pending-run' LIMIT 1",[&seed])?;
-            tx.sql().execute("INSERT INTO candidates SELECT 'pending-rejected','reject-run',kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope FROM candidates WHERE id='pending-alex'",[])?;
-            let mut v=[0.;768];v[0]=0.81;v[1]=(1f32-v[0]*v[0]).sqrt();
-            tx.put_vector(&VectorWrite{seq:2001,target:"pending-rejected".into(),kind:VectorKind::Candidate,version:1,embedding:F32Blob::from_values(&v)?,current:true,tier:Tier::Hot})?;Ok(())
-        }).unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO extraction_runs SELECT \
+                    'reject-run',r.commit_id,g.episode_id,r.version,r.requested_model,r.reported_models,r.usage,r.recorded_at \
+                    FROM extraction_runs r JOIN graph_evidence g ON g.target=?1 WHERE r.id='pending-run' LIMIT \
+                    1", [&seed])?;
+                tx.sql().execute("INSERT INTO candidates SELECT \
+                    'pending-rejected','reject-run',kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope \
+                    FROM candidates WHERE id='pending-alex'", [])?;
+                let mut v = [0.; 768];
+                v[0] = 0.81;
+                v[1] = (1f32 - v[0] * v[0]).sqrt();
+                tx.put_vector(&VectorWrite {
+                    seq: 2001,
+                    target: "pending-rejected".into(),
+                    kind: VectorKind::Candidate,
+                    version: 1,
+                    embedding: F32Blob::from_values(&v)?,
+                    current: true,
+                    tier: Tier::Hot,
+                })?;
+                Ok(())
+            })
+            .unwrap();
         assert!(
             f.recall("Which Alex?", 6, true, Some("personal"))
                 .iter()
                 .any(|r| r["id"] == "pending-rejected")
         );
-        f.store.write(|tx|{tx.sql().execute("INSERT INTO candidate_decisions SELECT 'reject-pending','pending-rejected',commit_id,'reject',NULL,NULL FROM node_versions WHERE id=? AND version=1",[&seed])?;Ok(())}).unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO candidate_decisions SELECT \
+                    'reject-pending','pending-rejected',commit_id,'reject',NULL,NULL FROM node_versions WHERE \
+                    id=? AND version=1", [&seed])?;
+                Ok(())
+            })
+            .unwrap();
         assert!(
             f.recall("Which Alex?", 6, true, Some("personal"))
                 .iter()
@@ -2453,27 +2717,69 @@ mod tests {
             0.9,
             "personal",
         );
-        let episode=f.store.capture(serde_json::from_value(json!({"source":"native:fixture:codex","event_id":"legacy-only","conversation_id":"legacy-only","kind":"developer","text":"Leonid Legacy","metadata":{}})).unwrap()).unwrap();
+        let episode = f
+            .store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"native:fixture:codex",
+                    "event_id":"legacy-only",
+                    "conversation_id":"legacy-only",
+                    "kind":"developer",
+                    "text":"Leonid Legacy",
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         // Synthetic historical graph supported only by developer instruction evidence.
-        f.store.write(|tx|{
-            tx.sql().execute("INSERT INTO node_versions SELECT 't3-legacy',1,commit_id,'person','Leonid Legacy','active',NULL,NULL,NULL,0,'[\"personal\"]' FROM node_versions WHERE id=? AND version=1",[&fact])?;
-            tx.sql().execute("INSERT INTO graph_evidence VALUES('t3-legacy',1,?,0,13,'Leonid Legacy')",[&episode.id])?;
-            let mut v=[0.;768];v[0]=0.8;v[1]=0.6;
-            tx.put_vector(&VectorWrite{seq:3000,target:"t3-legacy".into(),kind:VectorKind::Node,version:1,embedding:F32Blob::from_values(&v)?,current:true,tier:Tier::Hot})?;Ok(())
-        }).unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO node_versions SELECT 't3-legacy',1,commit_id,'person','Leonid \
+                    Legacy','active',NULL,NULL,NULL,0,'[\"personal\"]' FROM node_versions WHERE id=? AND \
+                    version=1", [&fact])?;
+                tx.sql().execute("INSERT INTO graph_evidence VALUES('t3-legacy',1,?,0,13,'Leonid Legacy')", [&episode.id])?;
+                let mut v = [0.; 768];
+                v[0] = 0.8;
+                v[1] = 0.6;
+                tx.put_vector(&VectorWrite {
+                    seq: 3000,
+                    target: "t3-legacy".into(),
+                    kind: VectorKind::Node,
+                    version: 1,
+                    embedding: F32Blob::from_values(&v)?,
+                    current: true,
+                    tier: Tier::Hot,
+                })?;
+                Ok(())
+            })
+            .unwrap();
         for (name, mode) in [
             ("Leonid Forgotten", "forgotten"),
             ("Leonid Nan", "nan"),
             ("Leonid Missing", "missing"),
         ] {
             let id = f.add(name, "person", "2020-01-01T00:00:00Z", 0.5, 0.8, "personal");
-            f.store.write(|tx|{
-                match mode {
-                    "forgotten"=>{tx.sql().execute("INSERT INTO forgotten_targets SELECT id,commit_id,'node' FROM node_versions WHERE id=? AND version=1",[&id])?;},
-                    "nan"=>{let v=[f32::NAN;768];tx.sql().execute("UPDATE vector_blobs SET embedding=?1 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?2)",params![F32Blob::from_values(&v)?.as_bytes(),id])?;},
-                    _=>{tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?)",[&id])?;}
-                } Ok(())
-            }).unwrap();
+            f.store
+                .write(|tx| {
+                    match mode {
+                        "forgotten" => {
+                            tx.sql().execute("INSERT INTO forgotten_targets SELECT id,commit_id,'node' FROM node_versions WHERE id=? AND \
+                                version=1", [&id])?;
+                        }
+                        "nan" => {
+                            let v = [f32::NAN; 768];
+                            tx.sql().execute(
+                                "UPDATE vector_blobs SET embedding=?1 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?2)",
+                                params![F32Blob::from_values(&v)?.as_bytes(), id],
+                            )?;
+                        }
+                        _ => {
+                            tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN(SELECT seq FROM vector_items WHERE target=?)", [&id])?;
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
         }
         // Reject before any ANN engine handles the deliberately corrupt fixture bytes.
         f.store
@@ -2657,13 +2963,31 @@ mod tests {
             0.8,
             "personal",
         );
-        let episode=f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"pending-alex","conversation_id":"pending-alex","kind":"user","text":"Alex North","metadata":{}})).unwrap()).unwrap();
-        f.store.write(|tx| {
-            tx.sql().execute("INSERT INTO extraction_runs SELECT 'pending-run',commit_id,?2,'test','test','[]','{}','2026-10-25' FROM node_versions WHERE id=?1 AND version=1",params![seed,episode.id])?;
-            tx.sql().execute("INSERT INTO candidates VALUES('pending-alex','pending-run','entity','person','Alex North','Exact source',NULL,NULL,1,NULL,NULL,'[\"personal\"]')",[])?;
-            tx.sql().execute("INSERT INTO graph_evidence VALUES('pending-alex',1,?1,0,10,'Alex North')",[&episode.id])?;
-            Ok(())
-        }).unwrap();
+        let episode = f
+            .store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"pending-alex",
+                    "conversation_id":"pending-alex",
+                    "kind":"user",
+                    "text":"Alex North",
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO extraction_runs SELECT \
+                    'pending-run',commit_id,?2,'test','test','[]','{}','2026-10-25' FROM node_versions WHERE \
+                    id=?1 AND version=1", params![seed, episode.id])?;
+                tx.sql().execute("INSERT INTO candidates VALUES('pending-alex','pending-run','entity','person','Alex \
+                    North','Exact source',NULL,NULL,1,NULL,NULL,'[\"personal\"]')", [])?;
+                tx.sql().execute("INSERT INTO graph_evidence VALUES('pending-alex',1,?1,0,10,'Alex North')", [&episode.id])?;
+                Ok(())
+            })
+            .unwrap();
         let rows = f.recall("Alex North", 6, true, Some("personal"));
         assert!(rows.iter().any(|row| row["same_name_count"] == 2));
         let state = crate::AppState::new(f.store.clone()).unwrap();
@@ -2801,10 +3125,14 @@ mod tests {
             0.8,
             "personal",
         );
-        f.store.write(|tx|{
-            tx.sql().execute("INSERT INTO entity_merges SELECT 'reviewed-source',id,commit_id FROM node_versions WHERE id=? AND version=1",[&canonical])?;
-            tx.sql().execute("INSERT INTO alias_fts VALUES('reviewed-source','Mark Petrov — checklist done')",[])?;Ok(())
-        }).unwrap();
+        f.store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO entity_merges SELECT 'reviewed-source',id,commit_id FROM node_versions WHERE \
+                    id=? AND version=1", [&canonical])?;
+                tx.sql().execute("INSERT INTO alias_fts VALUES('reviewed-source','Mark Petrov — checklist done')", [])?;
+                Ok(())
+            })
+            .unwrap();
         let rows = f.recall("Mark", 6, true, Some("personal"));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], canonical);
@@ -2836,18 +3164,46 @@ mod tests {
             0.7,
             "personal",
         );
-        f.store.read(|tx|{
-            let mut vector=[0.;768];vector[0]=1.;
-            let assertion:String=tx.sql().query_row("SELECT text FROM node_versions WHERE id=? AND version=1",[&fact],|r|r.get(0))?;
-            for original in [json!(assertion),Value::Null] {
-                for display in ["Source 2020-01-01: Logistics (Connected: Mark Petrov)","Unverified historical source Mark: Logistics"] {
-                    let fact=json!({"id":fact,"type":"knowledge","tier":"durable","category":"memory","text":display,"_full_text":original,"cosine":0.7});
-                    let mut output=vec![fact.clone()];
-                    anchors::add_partials(tx.sql(),"Mark checklist done",&vector,Some("personal"),TEXT_FLOOR,&[fact],&mut output,6)?;
-                    assert_eq!(output.len(),1);assert!(output.iter().all(|r|r["category"]!="entity_context"));
+        f.store
+            .read(|tx| {
+                let mut vector = [0.; 768];
+                vector[0] = 1.;
+                let assertion: String = tx.sql().query_row(
+                    "SELECT text FROM node_versions WHERE id=? AND version=1",
+                    [&fact],
+                    |r| r.get(0),
+                )?;
+                for original in [json!(assertion), Value::Null] {
+                    for display in [
+                        "Source 2020-01-01: Logistics (Connected: Mark Petrov)",
+                        "Unverified historical source Mark: Logistics",
+                    ] {
+                        let fact = json!({
+                            "id":fact,
+                            "type":"knowledge",
+                            "tier":"durable",
+                            "category":"memory",
+                            "text":display,
+                            "_full_text":original,
+                            "cosine":0.7
+                        });
+                        let mut output = vec![fact.clone()];
+                        anchors::add_partials(
+                            tx.sql(),
+                            "Mark checklist done",
+                            &vector,
+                            Some("personal"),
+                            TEXT_FLOOR,
+                            &[fact],
+                            &mut output,
+                            6,
+                        )?;
+                        assert_eq!(output.len(), 1);
+                        assert!(output.iter().all(|r| r["category"] != "entity_context"));
+                    }
                 }
-            }
-            Ok(())
-        }).unwrap();
+                Ok(())
+            })
+            .unwrap();
     }
 }

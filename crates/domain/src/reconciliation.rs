@@ -47,8 +47,14 @@ impl Graph {
                 }
                 let mut grounded = false;
                 for (episode, start, end, _) in &spans {
-                    if one(tx.sql(), "SELECT 1 FROM graph_evidence WHERE target=? AND version=? AND episode_id=? AND start<=? AND end>=? LIMIT 1",
-                        params![id, version.as_i64(), episode, start, end])?.is_some() {
+                    if one(
+                        tx.sql(),
+                        "SELECT 1 FROM graph_evidence WHERE target=? AND version=? AND episode_id=? AND start<=? AND \
+                            end>=? LIMIT 1",
+                        params![id, version.as_i64(), episode, start, end],
+                    )?
+                    .is_some()
+                    {
                         grounded = true;
                         break;
                     }
@@ -57,8 +63,15 @@ impl Graph {
                     return Err(Error::Validation("Reconcile must cite original evidence for every member"));
                 }
             }
-            curation::absorb(tx, commit, get_str(&request, "survivor")?,
-                &absorbed, Some(&request["evidence"]), false, None)
+            curation::absorb(
+                tx,
+                commit,
+                get_str(&request, "survivor")?,
+                &absorbed,
+                Some(&request["evidence"]),
+                false,
+                None,
+            )
         })
     }
 }

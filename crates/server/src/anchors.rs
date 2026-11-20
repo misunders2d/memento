@@ -219,7 +219,20 @@ fn durable(db: &Connection, item: &Value, scope: Option<&str>) -> Result<Option<
             picked.push(row);
         }
     }
-    let connections=picked.into_iter().map(|row|json!({"id":row["id"],"type":row["type"],"relation":row["relation"],"direction":row["direction"],"relation_id":row["edge_id"],"basis":"edge","text":row["one_line"]})).collect();
+    let connections = picked
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id":row["id"],
+                "type":row["type"],
+                "relation":row["relation"],
+                "direction":row["direction"],
+                "relation_id":row["edge_id"],
+                "basis":"edge",
+                "text":row["one_line"]
+            })
+        })
+        .collect();
     Ok(Some(compose(
         record,
         item["text"].as_str().unwrap(),
@@ -308,7 +321,12 @@ fn pending(db: &Connection, item: &Value, scope: Option<&str>) -> Result<Option<
         if let Some(mut endpoint) = endpoint(db, other, scope)? {
             merge(
                 &mut endpoint,
-                json!({"relation":row["relation"],"direction":if out{"out"}else{"in"},"relation_id":row["id"],"basis":"pending_relation"}),
+                json!({
+                    "relation":row["relation"],
+                    "direction":if out{"out"}else{"in"},
+                    "relation_id":row["id"],
+                    "basis":"pending_relation"
+                }),
             );
             connections.push(endpoint);
         }
@@ -324,7 +342,15 @@ fn pending(db: &Connection, item: &Value, scope: Option<&str>) -> Result<Option<
         if connections.len() == 5 {
             break;
         }
-        connections.push(json!({"id":row["target"],"type":row["type"],"text":row["text"],"relation":"possibly_same_as","direction":"out","relation_id":null,"basis":"candidate_entity_match"}));
+        connections.push(json!({
+            "id":row["target"],
+            "type":row["type"],
+            "text":row["text"],
+            "relation":"possibly_same_as",
+            "direction":"out",
+            "relation_id":null,
+            "basis":"candidate_entity_match"
+        }));
     }
     Ok(Some(compose(
         record,
@@ -392,7 +418,15 @@ fn compose(
     };
     merge(
         &mut record,
-        json!({"text":format!("{head} {body}"),"category":"entity_context","match":"entity_name","connections":connections,"cosine":null,"score":1.0,"related":[]}),
+        json!({
+            "text":format!("{head} {body}"),
+            "category":"entity_context",
+            "match":"entity_name",
+            "connections":connections,
+            "cosine":null,
+            "score":1.0,
+            "related":[]
+        }),
     );
     record["duplicate_ids"] = json!([]);
     Ok(record)
@@ -536,7 +570,11 @@ fn partials(
         let mut rare = Vec::new();
         for token in &overlap {
             if !rarity.contains_key(token) {
-                let df:i64=db.query_row(&format!("SELECT count(*) FROM (SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND {active} LIMIT ?3)"),params![quoted(token),scope,threshold+1],|r|r.get(0))?;
+                let df: i64 = db.query_row(
+                    &format!("SELECT count(*) FROM (SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND {active} LIMIT ?3)"),
+                    params![quoted(token), scope, threshold + 1],
+                    |r| r.get(0),
+                )?;
                 rarity.insert(token.clone(), df <= threshold);
             }
             if rarity[token] {
@@ -552,7 +590,9 @@ fn partials(
         } else {
             "candidate"
         };
-        let bytes:Option<Vec<u8>>=db.query_row("SELECT b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind=? AND i.version=? AND b.current=1 ORDER BY i.seq LIMIT 1",params![id,kind,version],|r|r.get(0)).optional()?;
+        let bytes: Option<Vec<u8>> = db
+            .query_row("SELECT b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind=? AND i.version=? AND b.current=1 ORDER BY i.seq LIMIT 1", params![id, kind, version], |r| r.get(0))
+            .optional()?;
         let Some(bytes) = bytes else { continue };
         let values = memento_core::F32Blob::from_bytes(bytes)?.values();
         let norm = values
@@ -746,33 +786,70 @@ mod lesson_slot_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         let text = "For Hubtool deploys, run the dry-run first.";
-        let source = store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"lesson","conversation_id":"lesson","kind":"user","text":text,"metadata":{}})).unwrap()).unwrap();
-        store.write(|tx| {
-            let db = tx.sql();
-            db.execute("INSERT INTO graph_commits VALUES('manual','manual','{}','{}','owner','Explicit manual relation fixture','2026-10-26T00:00:00Z')", [])?;
-            db.execute("INSERT INTO node_versions VALUES('hub',1,'manual','tool','Hubtool','active',NULL,NULL,NULL,0,'[\"professional\"]')", [])?;
-            // Ten peer edges whose ids sort before the lesson edge fill related()'s eight-edge window.
-            for i in 0..10 {
-                let peer = format!("peer{i:02}");
-                db.execute("INSERT INTO node_versions VALUES(?1,1,'manual','person',?1,'active',NULL,NULL,NULL,0,'[\"professional\"]')", [&peer])?;
-                db.execute("INSERT INTO edge_versions VALUES(?,1,'manual','hub','related_to',?,'active')", params![format!("e{i:02}"), peer])?;
-            }
-            Ok(())
-        }).unwrap();
+        let source = store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"lesson",
+                    "conversation_id":"lesson",
+                    "kind":"user",
+                    "text":text,
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .write(|tx| {
+                let db = tx.sql();
+                db.execute("INSERT INTO graph_commits VALUES('manual','manual','{}','{}','owner','Explicit manual relation fixture','2026-10-26T00:00:00Z')", [])?;
+                db.execute("INSERT INTO node_versions VALUES('hub',1,'manual','tool','Hubtool','active',NULL,NULL,NULL,0,'[\"professional\"]')", [])?;
+                // Ten peer edges whose ids sort before the lesson edge fill related()'s eight-edge window.
+                for i in 0..10 {
+                    let peer = format!("peer{i:02}");
+                    db.execute("INSERT INTO node_versions VALUES(?1,1,'manual','person',?1,'active',NULL,NULL,NULL,0,'[\"professional\"]')", [&peer])?;
+                    db.execute("INSERT INTO edge_versions VALUES(?,1,'manual','hub','related_to',?,'active')", params![format!("e{i:02}"), peer])?;
+                }
+                Ok(())
+            })
+            .unwrap();
         // Behavior comes only from the consolidation commit that produced the version.
         let context = CommandContext {
             command_id: "lesson".into(),
             actor: "fixture".into(),
             why: "Synthetic behavior provenance".into(),
         };
-        let request = json!({"op":"consolidate","output":{"actions":[{"candidate_id":"lesson","operation":"remember","type":"experience","behavior":{"authority":"explicit_user","applicability":"Hubtool deploys","conduct":text,"exceptions":[],"rationale":"Exact fixture user instruction"}}]}});
-        store.command(&context, &request, |tx, commit| {
-            tx.touch_target("lesson-node")?;
-            tx.sql().execute("INSERT INTO node_versions VALUES('lesson-node',1,?,'experience',?,'active',NULL,NULL,NULL,0,'[\"professional\"]')", params![commit, text])?;
-            tx.sql().execute("INSERT INTO graph_evidence(target,version,episode_id,start,end,quote) VALUES('lesson-node',1,?,0,?,?)", params![source.id, text.chars().count() as i64, text])?;
-            tx.sql().execute("INSERT INTO edge_versions VALUES('z-lesson',1,?,'lesson-node','mentions','hub','active')", [commit])?;
-            Ok(json!({"results":{"lesson":{"id":"lesson-node"}}}))
-        }).unwrap();
+        let request = json!({
+            "op":"consolidate",
+            "output": {
+                "actions": [
+                    {
+                        "candidate_id":"lesson",
+                        "operation":"remember",
+                        "type":"experience",
+                        "behavior": {
+                            "authority":"explicit_user",
+                            "applicability":"Hubtool deploys",
+                            "conduct":text,
+                            "exceptions":[],
+                            "rationale":"Exact fixture user instruction"
+                        }
+                    }
+                ]
+            }
+        });
+        store
+            .command(&context, &request, |tx, commit| {
+                tx.touch_target("lesson-node")?;
+                tx.sql().execute("INSERT INTO node_versions VALUES('lesson-node',1,?,'experience',?,'active',NULL,NULL,NULL,0,'[\"professional\"]')", params![commit, text])?;
+                tx.sql().execute(
+                    "INSERT INTO graph_evidence(target,version,episode_id,start,end,quote) VALUES('lesson-node',1,?,0,?,?)",
+                    params![source.id, text.chars().count() as i64, text],
+                )?;
+                tx.sql().execute("INSERT INTO edge_versions VALUES('z-lesson',1,?,'lesson-node','mentions','hub','active')", [commit])?;
+                Ok(json!({"results":{"lesson":{"id":"lesson-node"}}}))
+            })
+            .unwrap();
         store
             .read(|tx| {
                 let db = tx.sql();
@@ -1051,127 +1128,345 @@ mod exact_name_equivalence_tests {
         let episodes = (0..3)
             .map(|i| {
                 store
-                    .capture(serde_json::from_value(json!({"source":"synthetic","event_id":format!("anchor-{i}"),"conversation_id":"anchor","kind":"user","text":format!("Anchor fixture {i}"),"occurred_at":format!("2026-0{}-01T00:00:00Z", i + 1),"metadata":{}})).unwrap())
+                    .capture(
+                        serde_json::from_value(json!({
+                            "source":"synthetic",
+                            "event_id":format!("anchor-{i}"),
+                            "conversation_id":"anchor",
+                            "kind":"user",
+                            "text":format!("Anchor fixture {i}"),
+                            "occurred_at":format!("2026-0{}-01T00:00:00Z", i + 1),
+                            "metadata":{}
+                        }))
+                        .unwrap(),
+                    )
                     .unwrap()
                     .id
             })
             .collect::<Vec<_>>();
-        store.write(|tx| {
-            let db = tx.sql();
-            let mut rng = Rng(7);
-            for (i, at) in ["2026-01-01", "2026-02-01", "2026-03-01"].iter().enumerate() {
-                db.execute("INSERT INTO graph_commits VALUES(?1,?1,'{}','{}','owner','Name fixture',?2)", params![format!("c{i}"), format!("{at}T00:00:00Z")])?;
-            }
-            db.execute("INSERT INTO memory_types VALUES('custom_ent','entity',0,'c0')", [])?;
-            db.execute("INSERT INTO memory_types VALUES('custom_mem','memory',0,'c0')", [])?;
-            let node = |id: &str, version: i64, kind: &str, text: &str, state: &str, superseded: Option<&str>, scope: &str, commit: usize| {
-                db.execute("INSERT INTO node_versions VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL,?7,?8,?9)", params![id, version, format!("c{commit}"), kind, text, state, superseded, (version % 2) as i64, scope])
-            };
-            let name = |rng: &mut Rng| {
-                (0..1 + rng.next(3)).map(|_| NAMES[rng.next(NAMES.len())]).collect::<Vec<_>>().join(" ")
-            };
-            let mut ids = Vec::new();
-            for i in 0..400 + extra {
-                let id = format!("n{i:05}");
-                let mut text = name(&mut rng);
-                if rng.next(5) == 0 {
-                    text.push_str(" — the deploy tool for recall memory work");
+        store
+            .write(|tx| {
+                let db = tx.sql();
+                let mut rng = Rng(7);
+                for (i, at) in ["2026-01-01", "2026-02-01", "2026-03-01"]
+                    .iter()
+                    .enumerate()
+                {
+                    db.execute(
+                        "INSERT INTO graph_commits VALUES(?1,?1,'{}','{}','owner','Name fixture',?2)",
+                        params![format!("c{i}"), format!("{at}T00:00:00Z")],
+                    )?;
                 }
-                let kind = TYPES[rng.next(TYPES.len())];
-                let scope = SCOPES[rng.next(3)];
-                if rng.next(6) == 0 {
-                    node(&id, 1, kind, &name(&mut rng), "active", None, scope, 0)?;
-                    node(&id, 2, kind, &text, if rng.next(8) == 0 { "retracted" } else { "active" }, None, scope, 1)?;
-                } else {
-                    node(&id, 1, kind, &text, "active", None, scope, rng.next(3))?;
+                db.execute("INSERT INTO memory_types VALUES('custom_ent','entity',0,'c0')", [])?;
+                db.execute("INSERT INTO memory_types VALUES('custom_mem','memory',0,'c0')", [])?;
+                let node = |id: &str,
+                            version: i64,
+                            kind: &str,
+                            text: &str,
+                            state: &str,
+                            superseded: Option<&str>,
+                            scope: &str,
+                            commit: usize| {
+                    db.execute(
+                        "INSERT INTO node_versions VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL,?7,?8,?9)",
+                        params![
+                            id,
+                            version,
+                            format!("c{commit}"),
+                            kind,
+                            text,
+                            state,
+                            superseded,
+                            (version % 2) as i64,
+                            scope
+                        ],
+                    )
+                };
+                let name = |rng: &mut Rng| {
+                    (0..1 + rng.next(3))
+                        .map(|_| NAMES[rng.next(NAMES.len())])
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let mut ids = Vec::new();
+                for i in 0..400 + extra {
+                    let id = format!("n{i:05}");
+                    let mut text = name(&mut rng);
+                    if rng.next(5) == 0 {
+                        text.push_str(" — the deploy tool for recall memory work");
+                    }
+                    let kind = TYPES[rng.next(TYPES.len())];
+                    let scope = SCOPES[rng.next(3)];
+                    if rng.next(6) == 0 {
+                        node(&id, 1, kind, &name(&mut rng), "active", None, scope, 0)?;
+                        node(
+                            &id,
+                            2,
+                            kind,
+                            &text,
+                            if rng.next(8) == 0 {
+                                "retracted"
+                            } else {
+                                "active"
+                            },
+                            None,
+                            scope,
+                            1,
+                        )?;
+                    } else {
+                        node(&id, 1, kind, &text, "active", None, scope, rng.next(3))?;
+                    }
+                    for k in 0..rng.next(5) {
+                        db.execute("INSERT INTO graph_evidence SELECT id,max(version),?2,?3,?3,'q' FROM node_versions WHERE id=?1", params![id, format!("ep{k}"), k as i64])?;
+                    }
+                    if rng.next(2) == 0 {
+                        db.execute(
+                            "INSERT INTO node_stats(node_id,importance,decay,archived,access_count,last_cited_at) VALUES(?,?,?,?,?,?)",
+                            params![
+                                id,
+                                rng.next(10) as f64 / 10.,
+                                rng.next(10) as f64 / 10.,
+                                rng.next(2) as i64,
+                                rng.next(9) as i64,
+                                "2026-10-01T00:00:00Z"
+                            ],
+                        )?;
+                    }
+                    if rng.next(20) == 0 {
+                        db.execute("INSERT INTO forgotten_targets VALUES(?,'c0','node')", [&id])?;
+                    }
+                    ids.push(id);
                 }
-                for k in 0..rng.next(5) {
-                    db.execute("INSERT INTO graph_evidence SELECT id,max(version),?2,?3,?3,'q' FROM node_versions WHERE id=?1", params![id, format!("ep{k}"), k as i64])?;
+                // Random merge chains source -> target (-> next) with random-name aliases.
+                for i in 0..40 {
+                    let source = format!("m{i:03}");
+                    let target = ids[rng.next(ids.len())].clone();
+                    node(
+                        &source,
+                        1,
+                        "person",
+                        &name(&mut rng),
+                        "active",
+                        None,
+                        SCOPES[rng.next(3)],
+                        0,
+                    )?;
+                    node(
+                        &source,
+                        2,
+                        "person",
+                        &name(&mut rng),
+                        "merged",
+                        Some(target.as_str()),
+                        SCOPES[rng.next(3)],
+                        1,
+                    )?;
+                    db.execute("INSERT INTO entity_merges VALUES(?,?,'c1')", params![source, target])?;
+                    for _ in 0..1 + rng.next(2) {
+                        db.execute("INSERT INTO alias_fts(id,text) VALUES(?,?)", params![source, name(&mut rng)])?;
+                    }
                 }
-                if rng.next(2) == 0 {
-                    db.execute("INSERT INTO node_stats(node_id,importance,decay,archived,access_count,last_cited_at) VALUES(?,?,?,?,?,?)", params![id, rng.next(10) as f64 / 10., rng.next(10) as f64 / 10., rng.next(2) as i64, rng.next(9) as i64, "2026-10-01T00:00:00Z"])?;
+                // Two-hop chain: m-a -> m-b (merged into n00001) carries one alias.
+                node(
+                    "m-a",
+                    1,
+                    "person",
+                    "Echo Stone",
+                    "merged",
+                    Some("m-b"),
+                    SCOPES[0],
+                    0,
+                )?;
+                node(
+                    "m-b",
+                    1,
+                    "person",
+                    "Echo River",
+                    "refined",
+                    Some("n00001"),
+                    SCOPES[0],
+                    0,
+                )?;
+                db.execute("INSERT INTO entity_merges VALUES('m-a','m-b','c1')", [])?;
+                db.execute("INSERT INTO alias_fts(id,text) VALUES('m-a','Echo Stone Mila')", [])?;
+                // Same target, two aliases tied on bm25.
+                node(
+                    "t-tie",
+                    1,
+                    "person",
+                    "Tie target",
+                    "active",
+                    None,
+                    SCOPES[2],
+                    0,
+                )?;
+                for (source, alias) in [("s-tie1", "Mila Stone"), ("s-tie2", "Stone Mila")] {
+                    node(
+                        source,
+                        1,
+                        "person",
+                        alias,
+                        "merged",
+                        Some("t-tie"),
+                        SCOPES[2],
+                        0,
+                    )?;
+                    db.execute("INSERT INTO entity_merges VALUES(?,'t-tie','c1')", [source])?;
+                    db.execute("INSERT INTO alias_fts(id,text) VALUES(?,?)", params![source, alias])?;
                 }
-                if rng.next(20) == 0 {
-                    db.execute("INSERT INTO forgotten_targets VALUES(?,'c0','node')", [&id])?;
+                node("lp1", 1, "person", "Lee Park", "active", None, SCOPES[0], 0)?;
+                node(
+                    "lp2",
+                    1,
+                    "person",
+                    "Lee  park",
+                    "active",
+                    None,
+                    SCOPES[1],
+                    2,
+                )?;
+                for i in 0..90 {
+                    node(
+                        &format!("acme{i:03}"),
+                        1,
+                        "organization",
+                        "Acme",
+                        "active",
+                        None,
+                        SCOPES[i % 3],
+                        i % 3,
+                    )?;
+                    for k in 0..i % 4 {
+                        db.execute(
+                            "INSERT INTO graph_evidence VALUES(?,1,?,0,1,'q')",
+                            params![format!("acme{i:03}"), format!("ep{k}")],
+                        )?;
+                    }
                 }
-                ids.push(id);
-            }
-            // Random merge chains source -> target (-> next) with random-name aliases.
-            for i in 0..40 {
-                let source = format!("m{i:03}");
-                let target = ids[rng.next(ids.len())].clone();
-                node(&source, 1, "person", &name(&mut rng), "active", None, SCOPES[rng.next(3)], 0)?;
-                node(&source, 2, "person", &name(&mut rng), "merged", Some(target.as_str()), SCOPES[rng.next(3)], 1)?;
-                db.execute("INSERT INTO entity_merges VALUES(?,?,'c1')", params![source, target])?;
-                for _ in 0..1 + rng.next(2) {
-                    db.execute("INSERT INTO alias_fts(id,text) VALUES(?,?)", params![source, name(&mut rng)])?;
+                for i in 0..80 {
+                    let (source, target) = (format!("src{i:03}"), format!("tgt{i:03}"));
+                    node(
+                        &target,
+                        1,
+                        "person",
+                        &format!("Target person {i}"),
+                        "active",
+                        None,
+                        SCOPES[i % 3],
+                        0,
+                    )?;
+                    node(
+                        &source,
+                        1,
+                        "person",
+                        "Old Orion",
+                        "active",
+                        None,
+                        SCOPES[i % 3],
+                        0,
+                    )?;
+                    node(
+                        &source,
+                        2,
+                        "person",
+                        "Old Orion",
+                        "merged",
+                        Some(target.as_str()),
+                        SCOPES[i % 3],
+                        1,
+                    )?;
+                    db.execute("INSERT INTO entity_merges VALUES(?,?,'c1')", params![source, target])?;
+                    db.execute("INSERT INTO alias_fts(id,text) VALUES(?,'Orion')", [&source])?;
+                    if i % 10 == 0 {
+                        db.execute("INSERT INTO alias_fts(id,text) VALUES(?,'Orion Belt')", [&source])?;
+                    }
                 }
-            }
-            // Two-hop chain: m-a -> m-b (merged into n00001) carries one alias.
-            node("m-a", 1, "person", "Echo Stone", "merged", Some("m-b"), SCOPES[0], 0)?;
-            node("m-b", 1, "person", "Echo River", "refined", Some("n00001"), SCOPES[0], 0)?;
-            db.execute("INSERT INTO entity_merges VALUES('m-a','m-b','c1')", [])?;
-            db.execute("INSERT INTO alias_fts(id,text) VALUES('m-a','Echo Stone Mila')", [])?;
-            // Same target, two aliases tied on bm25.
-            node("t-tie", 1, "person", "Tie target", "active", None, SCOPES[2], 0)?;
-            for (source, alias) in [("s-tie1", "Mila Stone"), ("s-tie2", "Stone Mila")] {
-                node(source, 1, "person", alias, "merged", Some("t-tie"), SCOPES[2], 0)?;
-                db.execute("INSERT INTO entity_merges VALUES(?,'t-tie','c1')", [source])?;
-                db.execute("INSERT INTO alias_fts(id,text) VALUES(?,?)", params![source, alias])?;
-            }
-            node("lp1", 1, "person", "Lee Park", "active", None, SCOPES[0], 0)?;
-            node("lp2", 1, "person", "Lee  park", "active", None, SCOPES[1], 2)?;
-            for i in 0..90 {
-                node(&format!("acme{i:03}"), 1, "organization", "Acme", "active", None, SCOPES[i % 3], i % 3)?;
-                for k in 0..i % 4 {
-                    db.execute("INSERT INTO graph_evidence VALUES(?,1,?,0,1,'q')", params![format!("acme{i:03}"), format!("ep{k}")])?;
+                db.execute("INSERT INTO extraction_runs VALUES('run0','c0',?,'fixture','fixture','[]','{}','2026-01-01T00:00:00Z')", [&episodes[0]])?;
+                let candidate = |id: &str,
+                                 kind: &str,
+                                 kind_type: &str,
+                                 text: &str,
+                                 src: Option<&str>,
+                                 dst: Option<&str>,
+                                 scope: &str| {
+                    db.execute(
+                        "INSERT INTO candidates VALUES(?1,'run0',?2,?3,?4,'Fixture',?5,?6,0.8,NULL,NULL,?7)",
+                        params![id, kind, kind_type, text, src, dst, scope],
+                    )
+                };
+                for i in 0..80 {
+                    let id = format!("zeta{i:03}");
+                    candidate(&id, "entity", "person", "Zeta", None, None, SCOPES[i % 3])?;
+                    if i % 4 == 0 {
+                        db.execute("INSERT INTO graph_evidence VALUES(?,1,?,0,1,'q')", params![id, episodes[i % 3]])?;
+                    }
                 }
-            }
-            for i in 0..80 {
-                let (source, target) = (format!("src{i:03}"), format!("tgt{i:03}"));
-                node(&target, 1, "person", &format!("Target person {i}"), "active", None, SCOPES[i % 3], 0)?;
-                node(&source, 1, "person", "Old Orion", "active", None, SCOPES[i % 3], 0)?;
-                node(&source, 2, "person", "Old Orion", "merged", Some(target.as_str()), SCOPES[i % 3], 1)?;
-                db.execute("INSERT INTO entity_merges VALUES(?,?,'c1')", params![source, target])?;
-                db.execute("INSERT INTO alias_fts(id,text) VALUES(?,'Orion')", [&source])?;
-                if i % 10 == 0 {
-                    db.execute("INSERT INTO alias_fts(id,text) VALUES(?,'Orion Belt')", [&source])?;
+                for i in 0..60 {
+                    let id = format!("cand{i:03}");
+                    candidate(
+                        &id,
+                        if i % 5 == 0 { "memory" } else { "entity" },
+                        "person",
+                        &name(&mut rng),
+                        None,
+                        None,
+                        SCOPES[rng.next(3)],
+                    )?;
+                    if rng.next(3) == 0 {
+                        db.execute("INSERT INTO graph_evidence VALUES(?,1,?,0,1,'q')", params![id, episodes[rng.next(3)]])?;
+                    }
+                    if rng.next(4) == 0 {
+                        db.execute("INSERT INTO candidate_entity_matches VALUES(?,?,1,0.9,1,'fixture','Fixture','2026-01-01T00:00:00Z')", params![id, ids[rng.next(ids.len())]])?;
+                    }
                 }
-            }
-            db.execute("INSERT INTO extraction_runs VALUES('run0','c0',?,'fixture','fixture','[]','{}','2026-01-01T00:00:00Z')", [&episodes[0]])?;
-            let candidate = |id: &str, kind: &str, kind_type: &str, text: &str, src: Option<&str>, dst: Option<&str>, scope: &str| {
-                db.execute("INSERT INTO candidates VALUES(?1,'run0',?2,?3,?4,'Fixture',?5,?6,0.8,NULL,NULL,?7)", params![id, kind, kind_type, text, src, dst, scope])
-            };
-            for i in 0..80 {
-                let id = format!("zeta{i:03}");
-                candidate(&id, "entity", "person", "Zeta", None, None, SCOPES[i % 3])?;
-                if i % 4 == 0 {
-                    db.execute("INSERT INTO graph_evidence VALUES(?,1,?,0,1,'q')", params![id, episodes[i % 3]])?;
+                for i in 0..20 {
+                    let (src, dst) = (
+                        format!("cand{:03}", rng.next(60)),
+                        format!("cand{:03}", rng.next(60)),
+                    );
+                    candidate(
+                        &format!("rel{i:03}"),
+                        "relation",
+                        "knows",
+                        "relation",
+                        Some(src.as_str()),
+                        Some(dst.as_str()),
+                        SCOPES[rng.next(3)],
+                    )?;
                 }
-            }
-            for i in 0..60 {
-                let id = format!("cand{i:03}");
-                candidate(&id, if i % 5 == 0 { "memory" } else { "entity" }, "person", &name(&mut rng), None, None, SCOPES[rng.next(3)])?;
-                if rng.next(3) == 0 {
-                    db.execute("INSERT INTO graph_evidence VALUES(?,1,?,0,1,'q')", params![id, episodes[rng.next(3)]])?;
+                for (i, (candidate_id, decision)) in [
+                    ("zeta000", "promote"),
+                    ("zeta001", "reject"),
+                    ("zeta002", "defer"),
+                    ("cand001", "promote"),
+                    ("cand002", "reject"),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    db.execute(
+                        "INSERT INTO candidate_decisions VALUES(?,?,'c0',?,?,NULL)",
+                        params![
+                            format!("d{i}"),
+                            candidate_id,
+                            decision,
+                            (*decision == "promote").then_some("n00002")
+                        ],
+                    )?;
                 }
-                if rng.next(4) == 0 {
-                    db.execute("INSERT INTO candidate_entity_matches VALUES(?,?,1,0.9,1,'fixture','Fixture','2026-01-01T00:00:00Z')", params![id, ids[rng.next(ids.len())]])?;
+                for i in 0..300 {
+                    db.execute(
+                        "INSERT INTO edge_versions VALUES(?,1,'c0',?,'related_to',?,'active')",
+                        params![
+                            format!("e{i:03}"),
+                            ids[rng.next(ids.len())],
+                            ids[rng.next(ids.len())]
+                        ],
+                    )?;
                 }
-            }
-            for i in 0..20 {
-                let (src, dst) = (format!("cand{:03}", rng.next(60)), format!("cand{:03}", rng.next(60)));
-                candidate(&format!("rel{i:03}"), "relation", "knows", "relation", Some(src.as_str()), Some(dst.as_str()), SCOPES[rng.next(3)])?;
-            }
-            for (i, (candidate_id, decision)) in [("zeta000", "promote"), ("zeta001", "reject"), ("zeta002", "defer"), ("cand001", "promote"), ("cand002", "reject")].iter().enumerate() {
-                db.execute("INSERT INTO candidate_decisions VALUES(?,?,'c0',?,?,NULL)", params![format!("d{i}"), candidate_id, decision, (*decision == "promote").then_some("n00002")])?;
-            }
-            for i in 0..300 {
-                db.execute("INSERT INTO edge_versions VALUES(?,1,'c0',?,'related_to',?,'active')", params![format!("e{i:03}"), ids[rng.next(ids.len())], ids[rng.next(ids.len())]])?;
-            }
-            Ok(())
-        })
-        .unwrap();
+                Ok(())
+            })
+            .unwrap();
     }
     fn queries() -> Vec<String> {
         let mut result = [

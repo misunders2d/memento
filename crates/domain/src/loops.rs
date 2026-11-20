@@ -26,8 +26,7 @@ pub fn responsibilities(db: &Connection, targets: &[String]) -> Result<HashMap<S
         WHERE NOT EXISTS(SELECT 1 FROM json_each(r.value,'$.evidence') ref
           JOIN episodes e ON e.id=json_extract(ref.value,'$.episode_id')
           JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id)
-        ORDER BY json_extract(r.value,'$.manual') DESC,c.recorded_at DESC,l.rowid DESC",
-        [encode_json(&json!(targets))?])?;
+        ORDER BY json_extract(r.value,'$.manual') DESC,c.recorded_at DESC,l.rowid DESC", [encode_json(&json!(targets))?])?;
     let mut result = HashMap::new();
     for row in selected {
         let value = decode_json(get_str(&row, "attribution")?)?;
@@ -136,7 +135,16 @@ pub fn grounded_sources(
                 source["occurrence"].as_u64().map(|n| n as usize),
             )?,
         };
-        if original && one(tx.sql(),"SELECT 1 FROM graph_evidence WHERE target=? AND episode_id=? AND start<=? AND end>=? LIMIT 1",params![target,episode_id,start as i64,end as i64])?.is_none(){return Err(Error::Validation("Loop responsibility requires an original target source"));}
+        if original
+            && one(
+                tx.sql(),
+                "SELECT 1 FROM graph_evidence WHERE target=? AND episode_id=? AND start<=? AND end>=? LIMIT 1",
+                params![target, episode_id, start as i64, end as i64],
+            )?
+            .is_none()
+        {
+            return Err(Error::Validation("Loop responsibility requires an original target source"));
+        }
         episode["text"] = json!(text);
         grounded_owner |= episode["source"]
             .as_str()
@@ -202,12 +210,16 @@ pub fn assign(
     // A newly created assertion is visible inside this transaction before its
     // graph_commits row exists. Attribution needs its state/protection fields,
     // not the viewer's committed-history summary.
-    let active = match one(tx.sql(),
-        "SELECT n.* FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)",
-        [target_id])? {
+    let active = match one(
+        tx.sql(),
+        "SELECT n.* FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT \
+        max(v.version) FROM node_versions v WHERE v.id=n.id)",
+        [target_id],
+    )? {
         Some(node) => Some(node),
         None => target(tx.sql(), target_id)?,
-    }.ok_or(Error::Validation(
+    }
+    .ok_or(Error::Validation(
         "Responsibility requires an active visible target",
     ))?;
     if one(
@@ -256,7 +268,8 @@ pub fn assign(
 pub fn current(db: &Connection, target: &str) -> Result<Option<Value>> {
     let mut value = one(
         db,
-        "SELECT target AS id,state,due_at,deferred_until FROM loop_events WHERE target=? ORDER BY rowid DESC LIMIT 1",
+        "SELECT target AS id,state,due_at,deferred_until FROM loop_events WHERE target=? ORDER BY \
+        rowid DESC LIMIT 1",
         [target],
     )?;
     if let Some(value) = value.as_mut() {
@@ -267,7 +280,10 @@ pub fn current(db: &Connection, target: &str) -> Result<Option<Value>> {
 pub fn events(db: &Connection, target: &str) -> Result<Vec<Value>> {
     let mut values = rows(
         db,
-        "SELECT l.state,l.due_at,l.deferred_until,l.commit_id,c.actor,c.why,c.recorded_at,r.value AS assignment,json_extract(c.result,'$.evidence') AS evidence FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id LEFT JOIN json_each(c.result,'$.loop_responsibilities') r ON r.key=l.target WHERE l.target=? ORDER BY l.rowid",
+        "SELECT l.state,l.due_at,l.deferred_until,l.commit_id,c.actor,c.why,c.recorded_at,r.value AS \
+        assignment,json_extract(c.result,'$.evidence') AS evidence FROM loop_events l JOIN \
+        graph_commits c ON c.id=l.commit_id LEFT JOIN json_each(c.result,'$.loop_responsibilities') \
+        r ON r.key=l.target WHERE l.target=? ORDER BY l.rowid",
         [target],
     )?;
     for value in &mut values {
@@ -334,7 +350,10 @@ pub fn lineage(db: &Connection, target: &str) -> Result<Vec<String>> {
         }
         let incoming = rows(
             db,
-            "SELECT DISTINCT n.id FROM node_versions n WHERE n.superseded_by=? AND EXISTS (SELECT 1 FROM loop_events l WHERE l.target=n.id) UNION SELECT d.candidate_id AS id FROM candidate_decisions d WHERE d.target_id=? AND d.decision='promote' AND EXISTS (SELECT 1 FROM loop_events l WHERE l.target=d.candidate_id)",
+            "SELECT DISTINCT n.id FROM node_versions n WHERE n.superseded_by=? AND EXISTS (SELECT 1 FROM \
+            loop_events l WHERE l.target=n.id) UNION SELECT d.candidate_id AS id FROM \
+            candidate_decisions d WHERE d.target_id=? AND d.decision='promote' AND EXISTS (SELECT 1 \
+            FROM loop_events l WHERE l.target=d.candidate_id)",
             params![target, target],
         )?;
         for row in incoming {
@@ -354,7 +373,12 @@ pub fn snapshot(db: &Connection, target: &str, version: i64) -> Result<Value> {
     for branch in lineage(db, target)? {
         if let Some(row) = one(
             db,
-            "SELECT c.recorded_at FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? AND json_extract(c.request,'$.command.op')='loop' AND coalesce(json_extract(c.request,'$.command.action'),'') NOT IN ('assign','decline') AND NOT (json_extract(c.request,'$.command.action')='close' AND coalesce(json_array_length(json_extract(c.request,'$.command.evidence')),0)>0) ORDER BY l.rowid DESC LIMIT 1",
+            "SELECT c.recorded_at FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id WHERE \
+            l.target=? AND json_extract(c.request,'$.command.op')='loop' AND \
+            coalesce(json_extract(c.request,'$.command.action'),'') NOT IN ('assign','decline') AND NOT \
+            (json_extract(c.request,'$.command.action')='close' AND \
+            coalesce(json_array_length(json_extract(c.request,'$.command.evidence')),0)>0) ORDER BY \
+            l.rowid DESC LIMIT 1",
             [&branch],
         )? {
             manual_dates.push(get_str(&row, "recorded_at")?.to_owned());
@@ -362,7 +386,8 @@ pub fn snapshot(db: &Connection, target: &str, version: i64) -> Result<Value> {
     }
     let source_dates = rows(
         db,
-        "SELECT DISTINCT e.occurred_at FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?",
+        "SELECT DISTINCT e.occurred_at FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id \
+        WHERE g.target=? AND g.version=?",
         params![target, version],
     )?;
     let pending_date =
@@ -421,7 +446,8 @@ fn closed_at(db: &Connection, target: &str) -> Result<Option<String>> {
     for branch in lineage(db, target)? {
         for row in rows(
             db,
-            "SELECT l.commit_id,l.state,c.request,c.result,c.recorded_at FROM loop_events l LEFT JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? ORDER BY l.rowid DESC",
+            "SELECT l.commit_id,l.state,c.request,c.result,c.recorded_at FROM loop_events l LEFT JOIN \
+            graph_commits c ON c.id=l.commit_id WHERE l.target=? ORDER BY l.rowid DESC",
             [&branch],
         )? {
             if row["state"] != "closed" {
@@ -501,7 +527,8 @@ pub fn mark(
     let boundary = parse_time(&closed)?;
     let sources = rows(
         tx.sql(),
-        "SELECT e.occurred_at FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND e.occurred_at IS NOT NULL",
+        "SELECT e.occurred_at FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE \
+        g.target=? AND e.occurred_at IS NOT NULL",
         [evidence_target.unwrap()],
     )?;
     for row in sources {
@@ -532,13 +559,9 @@ pub fn mark(
 /// `remind` sets a due date manually; other manual actions carry it forward.
 pub fn manual_due(db: &Connection, target: &str) -> Result<bool> {
     for branch in lineage(db, target)? {
-        if one(
-            db,
-            "SELECT 1 FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? AND json_extract(c.request,'$.command.op')='loop' AND json_extract(c.request,'$.command.action')='remind' LIMIT 1",
-            [&branch],
-        )?
-        .is_some()
-        {
+        if one(db, "SELECT 1 FROM loop_events l JOIN graph_commits c ON c.id=l.commit_id WHERE l.target=? AND \
+            json_extract(c.request,'$.command.op')='loop' AND \
+            json_extract(c.request,'$.command.action')='remind' LIMIT 1", [&branch])?.is_some() {
             return Ok(true);
         }
     }
@@ -639,7 +662,8 @@ pub fn decline_automatic(
     // resolves through the committed viewer target.
     let pending = one(
         tx.sql(),
-        "SELECT n.* FROM node_versions n WHERE n.id=? AND n.commit_id=? AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)",
+        "SELECT n.* FROM node_versions n WHERE n.id=? AND n.commit_id=? AND n.state='active' AND \
+        n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)",
         params![target, commit],
     )?;
     let n = match pending {
@@ -724,7 +748,8 @@ pub fn endpoint(db: &Connection, target: &str) -> Result<Option<Value>> {
         }
         if let Some(row) = one(
             db,
-            "SELECT decision,target_id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1",
+            "SELECT decision,target_id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC \
+            LIMIT 1",
             [&current],
         )? {
             if row["decision"] == "promote" {
@@ -778,14 +803,24 @@ pub fn visible_loop_targets(db: &Connection, values: Vec<Value>) -> Result<Vec<V
 pub fn target(db: &Connection, id: &str) -> Result<Option<Value>> {
     let Some(mut n) = one(
         db,
-        "SELECT n.id,n.version,n.type,substr(n.text,1,240) AS text,n.state,n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,(SELECT c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id ORDER BY v.version LIMIT 1) AS created_at,coalesce((SELECT importance FROM node_stats WHERE node_id=n.id),0.5) AS importance,coalesce((SELECT decay FROM node_stats WHERE node_id=n.id),1) AS decay,coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0) AS archived,coalesce((SELECT access_count FROM node_stats WHERE node_id=n.id),0) AS access_count,(SELECT last_cited_at FROM node_stats WHERE node_id=n.id) AS last_cited_at FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)",
+        "SELECT n.id,n.version,n.type,substr(n.text,1,240) AS \
+        text,n.state,n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,(SELECT \
+        c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id \
+        ORDER BY v.version LIMIT 1) AS created_at,coalesce((SELECT importance FROM node_stats WHERE \
+        node_id=n.id),0.5) AS importance,coalesce((SELECT decay FROM node_stats WHERE \
+        node_id=n.id),1) AS decay,coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0) \
+        AS archived,coalesce((SELECT access_count FROM node_stats WHERE node_id=n.id),0) AS \
+        access_count,(SELECT last_cited_at FROM node_stats WHERE node_id=n.id) AS last_cited_at \
+        FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(v.version) \
+        FROM node_versions v WHERE v.id=n.id)",
         [id],
     )?
     else {
         let candidate = one(
             db,
             &format!(
-                "SELECT c.id,c.type,c.kind,c.src,c.dst,substr(c.text,1,240) AS text,c.scope,c.valid_from,c.valid_to FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"
+                "SELECT c.id,c.type,c.kind,c.src,c.dst,substr(c.text,1,240) AS \
+            text,c.scope,c.valid_from,c.valid_to FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"
             ),
             [id],
         )?;
@@ -808,7 +843,8 @@ pub fn target(db: &Connection, id: &str) -> Result<Option<Value>> {
         } else {
             let Some(mut edge) = one(
                 db,
-                "SELECT e.* FROM edge_versions e WHERE e.id=? AND e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id)",
+                "SELECT e.* FROM edge_versions e WHERE e.id=? AND e.state='active' AND e.version=(SELECT \
+                max(v.version) FROM edge_versions v WHERE v.id=e.id)",
                 [id],
             )?
             else {
@@ -848,7 +884,8 @@ pub fn target(db: &Connection, id: &str) -> Result<Option<Value>> {
         };
         value["evidence"] = Value::Array(rows(
             db,
-            "SELECT episode_id,start,end,substr(quote,1,240) AS quote_excerpt FROM graph_evidence WHERE target=? AND version=? ORDER BY episode_id,start LIMIT 5",
+            "SELECT episode_id,start,end,substr(quote,1,240) AS quote_excerpt FROM graph_evidence WHERE \
+                target=? AND version=? ORDER BY episode_id,start LIMIT 5",
             params![id, value["version"].as_i64()],
         )?);
         return Ok(Some(value));
@@ -858,10 +895,20 @@ pub fn target(db: &Connection, id: &str) -> Result<Option<Value>> {
     n["confirmed"] = json!(true);
     n["evidence"] = Value::Array(rows(
         db,
-        "SELECT g.episode_id,g.start,g.end,CASE WHEN EXISTS (SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=g.episode_id) THEN NULL ELSE substr(g.quote,1,240) END AS quote_excerpt FROM graph_evidence g WHERE g.target=? AND g.version=? ORDER BY g.episode_id,g.start LIMIT 5",
+        "SELECT g.episode_id,g.start,g.end,CASE WHEN EXISTS (SELECT 1 FROM episodes e JOIN \
+        forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=g.episode_id) \
+        THEN NULL ELSE substr(g.quote,1,240) END AS quote_excerpt FROM graph_evidence g WHERE \
+        g.target=? AND g.version=? ORDER BY g.episode_id,g.start LIMIT 5",
         params![id, n["version"].as_i64()],
     )?);
-    let change=one(db,"SELECT c.recorded_at,substr(c.actor,1,128) AS actor,substr(c.why,1,240) AS why,(SELECT count(*) FROM node_versions WHERE id=?) AS change_count FROM node_versions n JOIN graph_commits c ON c.id=n.commit_id WHERE n.id=? AND n.version=?",params![id,id,n["version"].as_i64()])?.ok_or(Error::Validation("Missing assertion commit"))?;
+    let change = one(
+        db,
+        "SELECT c.recorded_at,substr(c.actor,1,128) AS actor,substr(c.why,1,240) AS why,(SELECT \
+        count(*) FROM node_versions WHERE id=?) AS change_count FROM node_versions n JOIN \
+        graph_commits c ON c.id=n.commit_id WHERE n.id=? AND n.version=?",
+        params![id, id, n["version"].as_i64()],
+    )?
+    .ok_or(Error::Validation("Missing assertion commit"))?;
     n["change_count"] = change["change_count"].clone();
     n["last_change"] =
         json!({"recorded_at":change["recorded_at"],"actor":change["actor"],"why":change["why"]});
@@ -934,18 +981,63 @@ pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
     }
     let cutoff = time(command.due_before.as_deref())?;
     if command.action == "list" {
-        return graph.store.read(|tx|{
-            let db=tx.sql();let now=now();
-            let sql=format!("WITH eligible AS (SELECT l.target AS id,l.state,l.due_at,l.deferred_until FROM loop_events l WHERE l.rowid=(SELECT max(x.rowid) FROM loop_events x WHERE x.target=l.target) AND l.state='open' AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=l.target) AND (l.deferred_until IS NULL OR l.deferred_until<=?1) AND (?2 IS NULL OR l.due_at<?2) AND EXISTS (SELECT 1 FROM node_versions n WHERE n.id=l.target AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?3)) UNION ALL SELECT 1 FROM candidates c WHERE c.id=l.target AND {ACTIVE_CANDIDATE} AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(c.scope) WHERE value=?3)) UNION ALL SELECT 1 FROM edge_versions e JOIN node_versions a ON a.id=e.src JOIN node_versions b ON b.id=e.dst WHERE e.id=l.target AND e.state='active' AND a.state='active' AND b.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) AND a.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=a.id) AND b.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=b.id) AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(a.scope) WHERE value=?3) OR EXISTS (SELECT 1 FROM json_each(b.scope) WHERE value=?3)))) SELECT eligible.*,c.kind AS candidate_kind,coalesce(c.src,e.src) AS loop_src,coalesce(c.dst,e.dst) AS loop_dst,(SELECT max(julianday(e.occurred_at)) FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=eligible.id) AS newest_evidence FROM eligible LEFT JOIN candidates c ON c.id=eligible.id LEFT JOIN edge_versions e ON e.id=eligible.id AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) ORDER BY due_at IS NULL,due_at,newest_evidence DESC,eligible.id");
-            let selected=visible_loop_targets(db,rows(db,&sql,params![now,cutoff,command.scope])?)?;
-            let ids=selected.iter().map(|row|row["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
-            let roles=responsibilities(db,&ids)?;
-            let role=|row:&Value|roles.get(row["id"].as_str().unwrap()).and_then(|role|role["responsibility"].as_str()).unwrap_or("unknown");
+        return graph.store.read(|tx| {
+            let db = tx.sql();
+            let now = now();
+            let sql = format!("WITH eligible AS (SELECT l.target AS id,l.state,l.due_at,l.deferred_until FROM loop_events \
+                l WHERE l.rowid=(SELECT max(x.rowid) FROM loop_events x WHERE x.target=l.target) AND \
+                l.state='open' AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=l.target) \
+                AND (l.deferred_until IS NULL OR l.deferred_until<=?1) AND (?2 IS NULL OR l.due_at<?2) AND \
+                EXISTS (SELECT 1 FROM node_versions n WHERE n.id=l.target AND n.state='active' AND \
+                n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND (?3 IS NULL OR \
+                EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?3)) UNION ALL SELECT 1 FROM \
+                candidates c WHERE c.id=l.target AND {ACTIVE_CANDIDATE} AND (?3 IS NULL OR EXISTS (SELECT 1 \
+                FROM json_each(c.scope) WHERE value=?3)) UNION ALL SELECT 1 FROM edge_versions e JOIN \
+                node_versions a ON a.id=e.src JOIN node_versions b ON b.id=e.dst WHERE e.id=l.target AND \
+                e.state='active' AND a.state='active' AND b.state='active' AND e.version=(SELECT \
+                max(v.version) FROM edge_versions v WHERE v.id=e.id) AND a.version=(SELECT max(v.version) \
+                FROM node_versions v WHERE v.id=a.id) AND b.version=(SELECT max(v.version) FROM \
+                node_versions v WHERE v.id=b.id) AND (?3 IS NULL OR EXISTS (SELECT 1 FROM \
+                json_each(a.scope) WHERE value=?3) OR EXISTS (SELECT 1 FROM json_each(b.scope) WHERE \
+                value=?3)))) SELECT eligible.*,c.kind AS candidate_kind,coalesce(c.src,e.src) AS \
+                loop_src,coalesce(c.dst,e.dst) AS loop_dst,(SELECT max(julianday(e.occurred_at)) FROM \
+                graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=eligible.id) AS \
+                newest_evidence FROM eligible LEFT JOIN candidates c ON c.id=eligible.id LEFT JOIN \
+                edge_versions e ON e.id=eligible.id AND e.version=(SELECT max(v.version) FROM edge_versions \
+                v WHERE v.id=e.id) ORDER BY due_at IS NULL,due_at,newest_evidence DESC,eligible.id");
+            let selected =
+                visible_loop_targets(db, rows(db, &sql, params![now, cutoff, command.scope])?)?;
+            let ids = selected
+                .iter()
+                .map(|row| row["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            let roles = responsibilities(db, &ids)?;
+            let role = |row: &Value| {
+                roles
+                    .get(row["id"].as_str().unwrap())
+                    .and_then(|role| role["responsibility"].as_str())
+                    .unwrap_or("unknown")
+            };
             // Without a filter, list only assigned loops; unknown ones are unresolved, not obligations.
-            let matches=selected.iter().filter(|row|match command.responsibility.as_deref() {None=>role(row)!="unknown",Some(wanted)=>role(row)==wanted}).collect::<Vec<_>>();
-            let unresolved=selected.iter().filter(|row|role(row)=="unknown").count();
-            let total=json!(matches.len());let mut values=vec![];
-            for row in matches.into_iter().take(command.limit) {if let Some(mut value)=target(db,get_str(row,"id")?)? {for key in ["id","state","due_at","deferred_until"] {value[key]=row[key].clone();}value["responsibility"]=json!(roles.get(row["id"].as_str().unwrap()).and_then(|role|role["responsibility"].as_str()).unwrap_or("unknown"));values.push(value);}}
+            let matches = selected
+                .iter()
+                .filter(|row| match command.responsibility.as_deref() {
+                    None => role(row) != "unknown",
+                    Some(wanted) => role(row) == wanted,
+                })
+                .collect::<Vec<_>>();
+            let unresolved = selected.iter().filter(|row| role(row) == "unknown").count();
+            let total = json!(matches.len());
+            let mut values = vec![];
+            for row in matches.into_iter().take(command.limit) {
+                if let Some(mut value) = target(db, get_str(row, "id")?)? {
+                    for key in ["id", "state", "due_at", "deferred_until"] {
+                        value[key] = row[key].clone();
+                    }
+                    value["responsibility"] = json!(roles.get(row["id"].as_str().unwrap()).and_then(|role|role["responsibility"].as_str()).unwrap_or("unknown"));
+                    values.push(value);
+                }
+            }
             Ok(json!({"loops":values,"total":total,"unresolved":unresolved}))
         });
     }
@@ -984,29 +1076,65 @@ pub fn command(graph: &Graph, command: dto::Loop) -> Result<Value> {
             .unwrap_or("Loop state adjustment".into()),
     );
     graph.store.command(&context, &request, |tx, commit| {
-        let active=target(tx.sql(), target_id)?;
-        if active.is_none() || one(tx.sql(),"SELECT 1 FROM forgotten_targets WHERE target=?",[target_id])?.is_some() {
-            return Err(Error::Validation(
-                "Loop markers require an active memory or unconfirmed candidate",
-            ));
+        let active = target(tx.sql(), target_id)?;
+        if active.is_none() || one(tx.sql(), "SELECT 1 FROM forgotten_targets WHERE target=?", [target_id])?.is_some() {
+            return Err(Error::Validation("Loop markers require an active memory or unconfirmed candidate"));
         }
         let marker = current(tx.sql(), target_id)?;
-        if command.action=="assign" {
-            return assign(tx,commit,target_id,command.responsibility.as_deref().unwrap(),&request["evidence"],true);
+        if command.action == "assign" {
+            return assign(
+                tx,
+                commit,
+                target_id,
+                command.responsibility.as_deref().unwrap(),
+                &request["evidence"],
+                true,
+            );
         }
-        if command.action=="decline" || (command.action=="close" && !command.evidence.is_empty()) {
-            let grounded=grounded_sources(tx,target_id,&request["evidence"],command.action=="decline",command.action=="decline")?;
-            let version=active.as_ref().unwrap()["version"].as_i64().unwrap();
-            let frozen=snapshot(tx.sql(),target_id,version)?;
-            let mut result=if command.action=="decline" {decline_automatic(tx,commit,target_id,version,&frozen)?} else {
-                let times=grounded["source_times"].as_array().unwrap().iter().map(|at|at.as_str().map(str::to_owned)).collect::<Vec<_>>();
-                let(at,mut status)=closure_time(&frozen,&times)?;
-                if protected(tx.sql(),active.as_ref().unwrap())? {status=Some("protected_loop_choice");}
-                let mut result=json!({"id":target_id,"status":status.unwrap_or("closed"),"source_occurred_at":at});
-                if status.is_none(){let previous=marker.as_ref().unwrap();let value=append(tx,commit,target_id,"closed",previous["due_at"].as_str(),None)?;for(key,value)in value.as_object().unwrap(){result[key]=value.clone();}}
+        if command.action == "decline"
+            || (command.action == "close" && !command.evidence.is_empty())
+        {
+            let grounded = grounded_sources(
+                tx,
+                target_id,
+                &request["evidence"],
+                command.action == "decline",
+                command.action == "decline",
+            )?;
+            let version = active.as_ref().unwrap()["version"].as_i64().unwrap();
+            let frozen = snapshot(tx.sql(), target_id, version)?;
+            let mut result = if command.action == "decline" {
+                decline_automatic(tx, commit, target_id, version, &frozen)?
+            } else {
+                let times = grounded["source_times"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|at| at.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>();
+                let (at, mut status) = closure_time(&frozen, &times)?;
+                if protected(tx.sql(), active.as_ref().unwrap())? {
+                    status = Some("protected_loop_choice");
+                }
+                let mut result = json!({"id":target_id,"status":status.unwrap_or("closed"),"source_occurred_at":at});
+                if status.is_none() {
+                    let previous = marker.as_ref().unwrap();
+                    let value = append(
+                        tx,
+                        commit,
+                        target_id,
+                        "closed",
+                        previous["due_at"].as_str(),
+                        None,
+                    )?;
+                    for (key, value) in value.as_object().unwrap() {
+                        result[key] = value.clone();
+                    }
+                }
                 result
             };
-            result["evidence"]=grounded["evidence"].clone();return Ok(result);
+            result["evidence"] = grounded["evidence"].clone();
+            return Ok(result);
         }
         let deadline = marker.as_ref().and_then(|value| value["due_at"].as_str());
         if command.action == "close" {
@@ -1072,14 +1200,34 @@ mod responsibility_tests {
                 .tempdir()
                 .unwrap();
             let store = Store::open(dir.path()).unwrap();
-            let episode=store.capture(parse(json!({"source":"native:fixture:pi","event_id":"one","conversation_id":"thread","kind":"user","text":"I need to renew my passport. Lena owes me signed approval.","occurred_at":"2026-01-01T00:00:00Z"}))).unwrap().id;
+            let episode = store
+                .capture(parse(json!({
+                    "source":"native:fixture:pi",
+                    "event_id":"one",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":"I need to renew my passport. Lena owes me signed approval.",
+                    "occurred_at":"2026-01-01T00:00:00Z"
+                })))
+                .unwrap()
+                .id;
             let graph = Graph::new(store.clone());
             let mut ids = vec![];
             for (key, quote, scope) in [
                 ("owner", "I need to renew my passport.", "professional"),
                 ("other", "Lena owes me signed approval.", "personal"),
             ] {
-                let result=graph.remember(parse(json!({"command_id":key,"actor":"fixture","why":"Original obligation evidence","type":"knowledge","text":quote,"scope":[scope],"evidence":[{"episode_id":episode,"quote":quote}]}))).unwrap();
+                let result = graph
+                    .remember(parse(json!({
+                        "command_id":key,
+                        "actor":"fixture",
+                        "why":"Original obligation evidence",
+                        "type":"knowledge",
+                        "text":quote,
+                        "scope":[scope],
+                        "evidence":[{"episode_id":episode,"quote":quote}]
+                    })))
+                    .unwrap();
                 let id = result["id"].as_str().unwrap().to_owned();
                 graph
                     .loop_command(parse(
@@ -1098,7 +1246,17 @@ mod responsibility_tests {
             }
         }
         fn tag(&self, target: &str, role: &str, episode: &str, quote: &str, key: &str) -> Value {
-            self.graph.loop_command(parse(json!({"action":"assign","id":target,"responsibility":role,"command_id":key,"actor":"owner","why":"Explicit grounded role","evidence":[{"episode_id":episode,"quote":quote}]}))).unwrap()
+            self.graph
+                .loop_command(parse(json!({
+                    "action":"assign",
+                    "id":target,
+                    "responsibility":role,
+                    "command_id":key,
+                    "actor":"owner",
+                    "why":"Explicit grounded role",
+                    "evidence":[{"episode_id":episode,"quote":quote}]
+                })))
+                .unwrap()
         }
     }
 
@@ -1158,7 +1316,17 @@ mod responsibility_tests {
             .unwrap();
         let choice =
             f.store.read(|tx| snapshot(tx.sql(), &f.owner, 1)).unwrap()["manual_choice_at"].clone();
-        let clarification=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"clarification","conversation_id":"thread","kind":"user","text":"That passport obligation is mine."}))).unwrap().id;
+        let clarification = f
+            .store
+            .capture(parse(json!({
+                "source":"native:fixture:pi",
+                "event_id":"clarification",
+                "conversation_id":"thread",
+                "kind":"user",
+                "text":"That passport obligation is mine."
+            })))
+            .unwrap()
+            .id;
         f.tag(
             &f.owner,
             "owner",
@@ -1178,7 +1346,25 @@ mod responsibility_tests {
             f.store.read(|tx| snapshot(tx.sql(), &f.owner, 1)).unwrap()["manual_choice_at"],
             choice
         );
-        let refined=f.graph.supersede(parse(json!({"command_id":"refine","actor":"owner","why":"Clearer same obligation","old":f.owner,"kind":"refinement","new":{"type":"knowledge","text":"Passport renewal remains outstanding.","scope":["professional"]},"evidence":[{"episode_id":f.episode,"quote":"I need to renew my passport."}]}))).unwrap()["id"].as_str().unwrap().to_owned();
+        let refined = f
+            .graph
+            .supersede(parse(json!({
+                "command_id":"refine",
+                "actor":"owner",
+                "why":"Clearer same obligation",
+                "old":f.owner,
+                "kind":"refinement",
+                "new": {
+                    "type":"knowledge",
+                    "text":"Passport renewal remains outstanding.",
+                    "scope":["professional"]
+                },
+                "evidence":[{"episode_id":f.episode,"quote":"I need to renew my passport."}]
+            })))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         // A refinement is the next version of the same obligation memory.
         assert_eq!(refined, f.owner);
         let result = f
@@ -1221,22 +1407,85 @@ mod responsibility_tests {
     fn native_assistant_question_to_owner_does_not_ground_owner() {
         // Owner amendment 2026-11-18: an agent waiting on the owner is never an owner loop.
         let f = F::new();
-        let asked=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"asked","conversation_id":"thread","kind":"assistant","text":"Should the passport renewal use the express service?"}))).unwrap().id;
-        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.owner,"responsibility":"owner","command_id":"asked","actor":"owner","why":"Assistant question","evidence":[{"episode_id":asked,"quote":"Should the passport renewal use the express service?"}]})));
+        let asked = f
+            .store
+            .capture(parse(json!({
+                "source":"native:fixture:pi",
+                "event_id":"asked",
+                "conversation_id":"thread",
+                "kind":"assistant",
+                "text":"Should the passport renewal use the express service?"
+            })))
+            .unwrap()
+            .id;
+        let result = f.graph.loop_command(parse(json!({
+            "action":"assign",
+            "id":f.owner,
+            "responsibility":"owner",
+            "command_id":"asked",
+            "actor":"owner",
+            "why":"Assistant question",
+            "evidence": [{"episode_id":asked,"quote":"Should the passport renewal use the express service?"}]
+        })));
         assert!(result.is_err());
-        let imported=f.store.capture(parse(json!({"source":"telegram:fixture","event_id":"asked","conversation_id":"chat","kind":"assistant","text":"Should Lena sign today?"}))).unwrap().id;
-        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.other,"responsibility":"owner","evidence":[{"episode_id":imported,"quote":"Should Lena sign today?"}]})));
+        let imported = f
+            .store
+            .capture(parse(json!({
+                "source":"telegram:fixture",
+                "event_id":"asked",
+                "conversation_id":"chat",
+                "kind":"assistant",
+                "text":"Should Lena sign today?"
+            })))
+            .unwrap()
+            .id;
+        let result = f.graph.loop_command(parse(json!({
+            "action":"assign",
+            "id":f.other,
+            "responsibility":"owner",
+            "evidence":[{"episode_id":imported,"quote":"Should Lena sign today?"}]
+        })));
         assert!(result.is_err());
     }
 
     #[test]
     fn owner_requires_native_user_evidence_and_forgotten_roles_are_hidden() {
         let f = F::new();
-        let peer=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"peer","conversation_id":"thread","kind":"assistant","text":"[AGENT MESSAGE] The passport is the owner task."}))).unwrap().id;
-        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.owner,"responsibility":"owner","evidence":[{"episode_id":peer,"quote":"The passport is the owner task."}]})));
+        let peer = f
+            .store
+            .capture(parse(json!({
+                "source":"native:fixture:pi",
+                "event_id":"peer",
+                "conversation_id":"thread",
+                "kind":"assistant",
+                "text":"[AGENT MESSAGE] The passport is the owner task."
+            })))
+            .unwrap()
+            .id;
+        let result = f.graph.loop_command(parse(json!({
+            "action":"assign",
+            "id":f.owner,
+            "responsibility":"owner",
+            "evidence":[{"episode_id":peer,"quote":"The passport is the owner task."}]
+        })));
         assert!(result.is_err());
-        let tool=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"tool","conversation_id":"thread","kind":"tool","text":"The passport is the owner task."}))).unwrap().id;
-        let result=f.graph.loop_command(parse(json!({"action":"assign","id":f.owner,"responsibility":"owner","evidence":[{"episode_id":tool,"quote":"The passport is the owner task."}]})));
+        let tool = f
+            .store
+            .capture(parse(json!({
+                "source":"native:fixture:pi",
+                "event_id":"tool",
+                "conversation_id":"thread",
+                "kind":"tool",
+                "text":"The passport is the owner task."
+            })))
+            .unwrap()
+            .id;
+        let result = f.graph.loop_command(parse(json!({
+            "action":"assign",
+            "id":f.owner,
+            "responsibility":"owner",
+            "evidence":[{"episode_id":tool,"quote":"The passport is the owner task."}]
+        })));
         assert!(result.is_err());
         f.tag(
             &f.owner,
@@ -1266,17 +1515,67 @@ mod responsibility_tests {
     fn grounded_recovery_supports_every_loop_target_and_source_time_reopening() {
         for kind in ["node", "candidate", "edge"] {
             let f = F::new();
-            let pending=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"pending","conversation_id":"thread","kind":"user","text":"I still owe the signed report.","occurred_at":"2026-01-01T00:00:00Z"}))).unwrap().id;
-            let node=f.graph.remember(parse(json!({"command_id":"report","actor":"fixture","why":"Original pending evidence","type":"knowledge","text":"I still owe the signed report.","scope":["professional"],"evidence":[{"episode_id":pending,"quote":"I still owe the signed report."}]}))).unwrap()["id"].as_str().unwrap().to_owned();
+            let pending = f
+                .store
+                .capture(parse(json!({
+                    "source":"native:fixture:pi",
+                    "event_id":"pending",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":"I still owe the signed report.",
+                    "occurred_at":"2026-01-01T00:00:00Z"
+                })))
+                .unwrap()
+                .id;
+            let node = f
+                .graph
+                .remember(parse(json!({
+                    "command_id":"report",
+                    "actor":"fixture",
+                    "why":"Original pending evidence",
+                    "type":"knowledge",
+                    "text":"I still owe the signed report.",
+                    "scope":["professional"],
+                    "evidence":[{"episode_id":pending,"quote":"I still owe the signed report."}]
+                })))
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             let target = if kind == "edge" {
-                f.graph.link(parse(json!({"command_id":"report-edge","actor":"fixture","why":"Report connection","a":node,"rel":"related_to","b":f.other,"evidence":[{"episode_id":pending,"quote":"I still owe the signed report."}]}))).unwrap()["id"].as_str().unwrap().to_owned()
+                f.graph
+                    .link(parse(json!({
+                        "command_id":"report-edge",
+                        "actor":"fixture",
+                        "why":"Report connection",
+                        "a":node,
+                        "rel":"related_to",
+                        "b":f.other,
+                        "evidence":[{"episode_id":pending,"quote":"I still owe the signed report."}]
+                    })))
+                    .unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
             } else if kind == "candidate" {
-                f.store.command(&CommandContext{command_id:"candidate".into(),actor:"extractor/fixture".into(),why:"Synthetic pending candidate".into()},&json!({"op":"extract"}),|tx,commit|{
-                    tx.sql().execute("INSERT INTO extraction_runs VALUES('report-run',?,?,'fixture','fixture','[]','{}','2026-01-01T00:00:00Z')",params![commit,pending])?;
-                    tx.sql().execute("INSERT INTO candidates VALUES('report-candidate','report-run','memory','knowledge','I still owe the signed report.','Fixture',NULL,NULL,0.9,NULL,NULL,'[\"professional\"]')",[])?;
-                    tx.sql().execute("INSERT INTO graph_evidence VALUES('report-candidate',1,?,0,30,'I still owe the signed report.')",[&pending])?;
-                    Ok(json!({}))
-                }).unwrap();
+                f.store
+                    .command(
+                        &CommandContext {
+                            command_id: "candidate".into(),
+                            actor: "extractor/fixture".into(),
+                            why: "Synthetic pending candidate".into(),
+                        },
+                        &json!({"op":"extract"}),
+                        |tx, commit| {
+                            tx.sql().execute("INSERT INTO extraction_runs \
+                                VALUES('report-run',?,?,'fixture','fixture','[]','{}','2026-01-01T00:00:00Z')", params![commit, pending])?;
+                            tx.sql().execute("INSERT INTO candidates VALUES('report-candidate','report-run','memory','knowledge','I still \
+                                owe the signed report.','Fixture',NULL,NULL,0.9,NULL,NULL,'[\"professional\"]')", [])?;
+                            tx.sql().execute("INSERT INTO graph_evidence VALUES('report-candidate',1,?,0,30,'I still owe the signed report.')", [&pending])?;
+                            Ok(json!({}))
+                        },
+                    )
+                    .unwrap();
                 "report-candidate".to_owned()
             } else {
                 node
@@ -1306,11 +1605,52 @@ mod responsibility_tests {
                 f.store.read(|tx| snapshot(tx.sql(), &target, 1)).unwrap()["manual_choice_at"]
                     .is_null()
             );
-            let completion=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"complete","conversation_id":"thread","kind":"user","text":"I sent the signed report.","occurred_at":"2026-01-02T00:00:00Z"}))).unwrap().id;
-            let closed=f.graph.loop_command(parse(json!({"action":"close","id":target,"command_id":"grounded-close","evidence":[{"episode_id":completion,"quote":"I sent the signed report."}]}))).unwrap();
+            let completion = f
+                .store
+                .capture(parse(json!({
+                    "source":"native:fixture:pi",
+                    "event_id":"complete",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":"I sent the signed report.",
+                    "occurred_at":"2026-01-02T00:00:00Z"
+                })))
+                .unwrap()
+                .id;
+            let closed = f
+                .graph
+                .loop_command(parse(json!({
+                    "action":"close",
+                    "id":target,
+                    "command_id":"grounded-close",
+                    "evidence":[{"episode_id":completion,"quote":"I sent the signed report."}]
+                })))
+                .unwrap();
             assert_eq!(closed["status"], "closed");
-            let renewed=f.store.capture(parse(json!({"source":"native:fixture:pi","event_id":"renewed","conversation_id":"thread","kind":"user","text":"The signed report is pending again.","occurred_at":"2026-01-03T00:00:00Z"}))).unwrap().id;
-            let fresh=f.graph.remember(parse(json!({"command_id":"renewed-report","actor":"fixture","why":"Later original evidence","type":"knowledge","text":"The signed report is pending again.","scope":["professional"],"evidence":[{"episode_id":renewed,"quote":"The signed report is pending again."}]}))).unwrap()["id"].as_str().unwrap().to_owned();
+            let renewed = f
+                .store
+                .capture(parse(json!({
+                    "source":"native:fixture:pi",
+                    "event_id":"renewed",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":"The signed report is pending again.",
+                    "occurred_at":"2026-01-03T00:00:00Z"
+                })))
+                .unwrap()
+                .id;
+            let fresh = f.graph.remember(parse(json!({
+                "command_id":"renewed-report",
+                "actor":"fixture",
+                "why":"Later original evidence",
+                "type":"knowledge",
+                "text":"The signed report is pending again.",
+                "scope":["professional"],
+                "evidence":[{"episode_id":renewed,"quote":"The signed report is pending again."}]
+            }))).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             f.store
                 .command(
                     &CommandContext {
@@ -1343,7 +1683,12 @@ mod responsibility_tests {
     fn empty_quote_occurrence_zero_cannot_assign_close_or_decline() {
         let f = F::new();
         for action in ["assign", "close", "decline"] {
-            let mut command = json!({"action":action,"id":f.owner,"command_id":format!("empty-{action}"),"evidence":[{"episode_id":f.episode,"quote":"","occurrence":0}]});
+            let mut command = json!({
+                "action":action,
+                "id":f.owner,
+                "command_id":format!("empty-{action}"),
+                "evidence":[{"episode_id":f.episode,"quote":"","occurrence":0}]
+            });
             if action == "assign" {
                 command["responsibility"] = json!("unknown");
             }

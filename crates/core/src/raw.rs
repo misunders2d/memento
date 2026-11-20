@@ -85,7 +85,18 @@ pub fn validate_frames(db: &Connection) -> Result<()> {
     Ok(())
 }
 pub fn read_original(db: &Connection, data_dir: &Path, id: &str) -> Result<Option<String>> {
-    let row=db.query_row("SELECT text,text_runs,raw_frame,text_sha256,source,conversation_id FROM episodes WHERE id=?",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))).optional()?;
+    let row = db
+        .query_row("SELECT text,text_runs,raw_frame,text_sha256,source,conversation_id FROM episodes WHERE id=?", [id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })
+        .optional()?;
     let Some((text, runs, frames, checksum, source, conversation)) = row else {
         return Ok(None);
     };

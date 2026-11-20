@@ -39,12 +39,22 @@ fn owned_hot_paused_scorer_allows_capture_query_and_keeps_old_current_and_forget
         entered_rx.recv_timeout(Duration::from_secs(5)).expect("scorer did not pause");
         let store=f.store.clone();let projection=f.projection.clone();let writer_changed=changed.clone();let writer_forgotten=forgotten.clone();
         let writer=scope.spawn(move|| {
-            let captured=store.capture(serde_json::from_value(json!({"source":"concurrent-proof","event_id":"new","conversation_id":"new","kind":"user","text":"Exact new capture while scorer is paused","metadata":{}})).unwrap()).unwrap();
+            let captured=store.capture(serde_json::from_value(json!({
+                "source":"concurrent-proof",
+                "event_id":"new",
+                "conversation_id":"new",
+                "kind":"user",
+                "text":"Exact new capture while scorer is paused",
+                "metadata":{}
+            })).unwrap()).unwrap();
             store.write(|tx| {
-                tx.sql().execute("INSERT INTO node_versions SELECT id,2,commit_id,type,'Updated assertion after the pinned cut',state,valid_from,valid_to,superseded_by,pinned,scope FROM node_versions WHERE id=? AND version=1",[&writer_changed])?;
+                tx.sql().execute("INSERT INTO node_versions SELECT id,2,commit_id,type,'Updated assertion after the pinned \
+                    cut',state,valid_from,valid_to,superseded_by,pinned,scope FROM node_versions WHERE id=? AND \
+                    version=1",[&writer_changed])?;
                 let mut v=[0.;768];v[0]=0.8;v[1]=0.6;
                 tx.put_vector(&VectorWrite{seq:1,target:writer_changed.clone(),kind:VectorKind::Node,version:2,current:true,tier:Tier::Hot,embedding:F32Blob::from_values(&v)?})?;
-                tx.sql().execute("INSERT INTO forgotten_targets SELECT ?1,commit_id,'node' FROM node_versions WHERE id=?1 AND version=1",[&writer_forgotten])?;
+                tx.sql().execute("INSERT INTO forgotten_targets SELECT ?1,commit_id,'node' FROM node_versions WHERE id=?1 AND \
+                    version=1",[&writer_forgotten])?;
                 tx.touch_target(&writer_forgotten)?;
                 Ok(())
             }).unwrap();

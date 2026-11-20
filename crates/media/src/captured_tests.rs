@@ -16,7 +16,18 @@ impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
-        store.write(|tx| { tx.sql().execute("INSERT INTO vector_model(singleton,model_id,revision,dimensions,text_encoding) VALUES(1,?,?,768,1)",params![memento_embedding::MODEL_ID,memento_embedding::MODEL_REVISION])?; Ok(()) }).unwrap();
+        store
+            .write(|tx| {
+                tx.sql().execute(
+                    "INSERT INTO vector_model(singleton,model_id,revision,dimensions,text_encoding) VALUES(1,?,?,768,1)",
+                    params![
+                        memento_embedding::MODEL_ID,
+                        memento_embedding::MODEL_REVISION
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let queue = Queue::new(Graph::new(store.clone()));
         Self {
             _dir: dir,
@@ -45,10 +56,37 @@ impl Fixture {
             .unwrap();
     }
     fn capture(&self, event: &str, text: &str, metadata: Value) -> String {
-        self.store.capture(serde_json::from_value::<EpisodeInput>(json!({"source":"native:pi:fixture","event_id":event,"conversation_id":"thread","kind":"user","text":text,"metadata":metadata})).unwrap()).unwrap().id
+        self.store
+            .capture(
+                serde_json::from_value::<EpisodeInput>(json!({
+                    "source":"native:pi:fixture",
+                    "event_id":event,
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":text,
+                    "metadata":metadata
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .id
     }
     fn carrier(&self, event: &str, info: &BlobInfo) -> String {
-        self.capture(event,&format!("Ω😀 {} {}",info.sha256,info.sha256),json!({"artifacts":[{"type":"file","artifact_status":"available","mime":"text/plain","filename":"source.txt","sha256":info.sha256}]}))
+        self.capture(
+            event,
+            &format!("Ω😀 {} {}", info.sha256, info.sha256),
+            json!({
+                "artifacts": [
+                    {
+                        "type":"file",
+                        "artifact_status":"available",
+                        "mime":"text/plain",
+                        "filename":"source.txt",
+                        "sha256":info.sha256
+                    }
+                ]
+            }),
+        )
     }
     fn count(&self, table: &str) -> i64 {
         self.store
@@ -77,7 +115,7 @@ fn captured_discovery_backfills_64_at_a_time_using_core_parser() {
     let f = Fixture::new();
     let one = f.blob("body", false);
     let two = f.blob("metadata", false);
-    let body=json!([{"type":"file","artifact_status":"available","mime":"text/plain","sha256":one.sha256}]).to_string();
+    let body = json!([{"type":"file","artifact_status":"available","mime":"text/plain","sha256":one.sha256}]).to_string();
     f.capture("0", &body, json!({}));
     for n in 1..64 {
         f.capture(&n.to_string(), "ordinary projected text", json!({}));
@@ -119,7 +157,10 @@ fn captured_discovery_backfills_64_at_a_time_using_core_parser() {
 fn captured_skip_context_never_creates_attachment_authority() {
     let f = Fixture::new();
     let info = f.blob("context", true);
-    let metadata = json!({"extraction_mode":"skip","artifacts":[{"type":"file","artifact_status":"available","sha256":info.sha256}]});
+    let metadata = json!({
+        "extraction_mode":"skip",
+        "artifacts":[{"type":"file","artifact_status":"available","sha256":info.sha256}]
+    });
     f.capture("skip", "not human evidence", metadata);
     assert!(f.captured.step().unwrap());
     assert_eq!(f.count("captured_media"), 0);
@@ -143,7 +184,11 @@ fn captured_admission_caps_pending_and_leased_then_makes_progress() {
         .unwrap();
     assert!(f.captured.admit().unwrap());
     assert_eq!(f.count("jobs"), 3);
-    let outstanding:i64=f.store.read(|tx|Ok(tx.sql().query_row("SELECT count(*) FROM captured_media cm JOIN jobs j ON j.id=cm.job_id WHERE j.state IN ('pending','leased')",[],|r|r.get(0))?)).unwrap();
+    let outstanding: i64 = f
+        .store
+        .read(|tx| Ok(tx.sql().query_row("SELECT count(*) FROM captured_media cm JOIN jobs j ON j.id=cm.job_id WHERE j.state IN \
+            ('pending','leased')", [], |r| r.get(0))?))
+        .unwrap();
     assert_eq!(outstanding, 2);
 }
 
@@ -212,7 +257,12 @@ fn captured_source_and_target_forgetting_fence_admission() {
     let f = Fixture::new();
     let b = f.blob("forgotten", true);
     f.carrier("first", &b);
-    f.store.write(|tx|{tx.sql().execute("INSERT INTO forgotten_sources VALUES('native:pi:fixture','first','gone','control')",[])?;Ok(())}).unwrap();
+    f.store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO forgotten_sources VALUES('native:pi:fixture','first','gone','control')", [])?;
+            Ok(())
+        })
+        .unwrap();
     assert!(!f.captured.admit().unwrap());
     assert_eq!(
         f.state(&b.sha256),

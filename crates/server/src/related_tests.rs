@@ -7,11 +7,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 fn fixture() -> (tempfile::TempDir, std::sync::Arc<Store>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("data")).unwrap();
-    store.write(|tx|{tx.sql().execute("INSERT INTO graph_commits VALUES('manual','manual','{}','{}','owner','Explicit manual relation fixture','2026-10-26T00:00:00Z')",[])?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO graph_commits VALUES('manual','manual','{}','{}','owner','Explicit manual \
+                relation fixture','2026-10-26T00:00:00Z')", [])?;
+            Ok(())
+        })
+        .unwrap();
     (dir, store)
 }
 fn node(db: &Connection, id: &str, state: &str, scope: &str, importance: f64) {
-    db.execute("INSERT INTO node_versions VALUES(?1,1,'manual','person',?1,?2,'2020-01-01T00:00:00Z',NULL,NULL,0,?3)",params![id,state,scope]).unwrap();
+    db.execute(
+        "INSERT INTO node_versions \
+        VALUES(?1,1,'manual','person',?1,?2,'2020-01-01T00:00:00Z',NULL,NULL,0,?3)",
+        params![id, state, scope],
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO node_stats(node_id,importance) VALUES(?,?)",
         params![id, importance],
@@ -47,47 +58,120 @@ fn parity(db: &Connection, id: &str, hops: usize, scope: Option<&str>) -> Vec<Va
 #[test]
 fn targeted_related_matches_current_history_direction_scope_forgetting_loops_and_cycles() {
     let (_dir, store) = fixture();
-    let source=store.capture(serde_json::from_value(json!({"source":"synthetic:media","event_id":"event","conversation_id":"media","kind":"user","text":"Exact synthetic source","metadata":{}})).unwrap()).unwrap();
-    store.write(|tx|{let db=tx.sql();
-        for(id,state,scope,importance)in [
-            ("root","active","[\"personal\",\"professional\"]",0.5),
-            ("a","active","[\"personal\"]",0.7),("b","active","[\"professional\"]",0.9),
-            ("c","active","[\"personal\",\"professional\"]",0.3),
-            ("d","retired","[\"personal\"]",1.),("e","active","[\"personal\"]",1.),
-            ("f","active","[\"personal\"]",0.8),("g","retired","[\"personal\"]",0.4),
-            ("h","active","[\"personal\"]",1.),("i","active","[\"professional\"]",0.9),
-            ("j","active","[\"personal\"]",0.)]{node(db,id,state,scope,importance);}
-        db.execute("INSERT INTO node_versions VALUES('media',1,'manual','media','Captured media','active',NULL,NULL,NULL,0,'[\"personal\"]')",[])?;
-        db.execute("INSERT INTO media_files VALUES('media','sha','synthetic.png','image','manual')",[])?;
-        db.execute("INSERT INTO node_versions SELECT id,2,commit_id,type,'Ω😀 latest',CASE id WHEN 'f' THEN 'superseded' ELSE 'active' END,valid_from,valid_to,superseded_by,pinned,scope FROM node_versions WHERE id IN ('f','g')",[])?;
-        db.execute("INSERT INTO forgotten_targets VALUES('e','manual','node')",[])?;
-        db.execute("INSERT INTO captured_media VALUES('sha','image','synthetic.png','indexed',NULL,'media',NULL)",[])?;
-        db.execute("INSERT INTO captured_media_refs VALUES('sha',?,0,5,'Exact')",[&source.id])?;
-        db.execute("INSERT INTO forgotten_sources VALUES('synthetic:media','event','media','manual')",[])?;
-        for(id,a,b)in [
-            ("00-retired","root","d"),("01-forgotten","root","e"),("02-superseded","root","f"),("03-hidden","root","media"),
-            ("10-out","root","a"),("11-in","c","root"),("12-prof","root","b"),("13-current","root","g"),
-            ("14-duplicate","root","a"),("15-old-edge","root","h"),("16-rewired","root","h"),("17-self","root","root"),
-            ("18-cycle","a","c"),("19-back","a","root"),("19-direct","root","j"),
-            ("20-path","a","h"),("21-path","c","h"),("22-prof","a","i"),("23-cycle","h","a"),("24-self","a","a")]{edge(db,id,a,b);}
-        db.execute("INSERT INTO edge_versions SELECT id,2,commit_id,src,rel,dst,'forgotten' FROM edge_versions WHERE id='15-old-edge'",[])?;
-        db.execute("INSERT INTO edge_versions SELECT id,2,commit_id,'i',rel,'j','active' FROM edge_versions WHERE id='16-rewired'",[])?;
-        db.execute("INSERT INTO loop_events VALUES('loop-a','a','manual','open','2027-01-01T00:00:00Z','2026-12-01T00:00:00Z')",[])?;
-        Ok(())
-    }).unwrap();
-    store.read(|tx|{
-        for origin in ["root","a","g","h","absent"]{for hops in [1,2]{for scope in [None,Some("personal"),Some("professional")]{parity(tx.sql(),origin,hops,scope);}}}
-        let personal=parity(tx.sql(),"root",1,Some("personal"));
-        assert!(personal.iter().all(|r|!matches!(r["id"].as_str(),Some("b"|"d"|"e"|"f"|"media"))));
-        let a=personal.iter().find(|r|r["id"]=="a").unwrap();assert_eq!(a["loop"]["state"],"open");assert_eq!(a["edge_id"],"10-out");assert_eq!(a["direction"],"out");
-        let c=personal.iter().find(|r|r["id"]=="c").unwrap();assert_eq!(c["direction"],"in");
-        assert!(matches!(related(tx.sql(),"root",0,None),Err(Error::Validation(_))));
-        assert!(matches!(related(tx.sql(),"root",3,None),Err(Error::Validation(_))));
-        // The entire traversal retains the caller's old cut after a current-version change.
-        store.write(|write|{write.sql().execute("INSERT INTO node_versions SELECT id,3,commit_id,type,text,'retired',valid_from,valid_to,superseded_by,pinned,scope FROM node_versions WHERE id='g' AND version=2",[])?;Ok(())})?;
-        assert_eq!(related(tx.sql(),"root",1,Some("personal"))?,personal);
-        Ok(())
-    }).unwrap();
+    let source = store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"synthetic:media",
+                "event_id":"event",
+                "conversation_id":"media",
+                "kind":"user",
+                "text":"Exact synthetic source",
+                "metadata":{}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    store
+        .write(|tx| {
+            let db = tx.sql();
+            for (id, state, scope, importance) in [
+                ("root", "active", "[\"personal\",\"professional\"]", 0.5),
+                ("a", "active", "[\"personal\"]", 0.7),
+                ("b", "active", "[\"professional\"]", 0.9),
+                ("c", "active", "[\"personal\",\"professional\"]", 0.3),
+                ("d", "retired", "[\"personal\"]", 1.),
+                ("e", "active", "[\"personal\"]", 1.),
+                ("f", "active", "[\"personal\"]", 0.8),
+                ("g", "retired", "[\"personal\"]", 0.4),
+                ("h", "active", "[\"personal\"]", 1.),
+                ("i", "active", "[\"professional\"]", 0.9),
+                ("j", "active", "[\"personal\"]", 0.),
+            ] {
+                node(db, id, state, scope, importance);
+            }
+            db.execute("INSERT INTO node_versions VALUES('media',1,'manual','media','Captured \
+                media','active',NULL,NULL,NULL,0,'[\"personal\"]')", [])?;
+            db.execute("INSERT INTO media_files VALUES('media','sha','synthetic.png','image','manual')", [])?;
+            db.execute("INSERT INTO node_versions SELECT id,2,commit_id,type,'Ω😀 latest',CASE id WHEN 'f' THEN \
+                'superseded' ELSE 'active' END,valid_from,valid_to,superseded_by,pinned,scope FROM \
+                node_versions WHERE id IN ('f','g')", [])?;
+            db.execute("INSERT INTO forgotten_targets VALUES('e','manual','node')", [])?;
+            db.execute("INSERT INTO captured_media VALUES('sha','image','synthetic.png','indexed',NULL,'media',NULL)", [])?;
+            db.execute("INSERT INTO captured_media_refs VALUES('sha',?,0,5,'Exact')", [&source.id])?;
+            db.execute("INSERT INTO forgotten_sources VALUES('synthetic:media','event','media','manual')", [])?;
+            for (id, a, b) in [
+                ("00-retired", "root", "d"),
+                ("01-forgotten", "root", "e"),
+                ("02-superseded", "root", "f"),
+                ("03-hidden", "root", "media"),
+                ("10-out", "root", "a"),
+                ("11-in", "c", "root"),
+                ("12-prof", "root", "b"),
+                ("13-current", "root", "g"),
+                ("14-duplicate", "root", "a"),
+                ("15-old-edge", "root", "h"),
+                ("16-rewired", "root", "h"),
+                ("17-self", "root", "root"),
+                ("18-cycle", "a", "c"),
+                ("19-back", "a", "root"),
+                ("19-direct", "root", "j"),
+                ("20-path", "a", "h"),
+                ("21-path", "c", "h"),
+                ("22-prof", "a", "i"),
+                ("23-cycle", "h", "a"),
+                ("24-self", "a", "a"),
+            ] {
+                edge(db, id, a, b);
+            }
+            db.execute("INSERT INTO edge_versions SELECT id,2,commit_id,src,rel,dst,'forgotten' FROM edge_versions \
+                WHERE id='15-old-edge'", [])?;
+            db.execute("INSERT INTO edge_versions SELECT id,2,commit_id,'i',rel,'j','active' FROM edge_versions \
+                WHERE id='16-rewired'", [])?;
+            db.execute("INSERT INTO loop_events \
+                VALUES('loop-a','a','manual','open','2027-01-01T00:00:00Z','2026-12-01T00:00:00Z')", [])?;
+            Ok(())
+        })
+        .unwrap();
+    store
+        .read(|tx| {
+            for origin in ["root", "a", "g", "h", "absent"] {
+                for hops in [1, 2] {
+                    for scope in [None, Some("personal"), Some("professional")] {
+                        parity(tx.sql(), origin, hops, scope);
+                    }
+                }
+            }
+            let personal = parity(tx.sql(), "root", 1, Some("personal"));
+            assert!(
+                personal
+                    .iter()
+                    .all(|r| !matches!(r["id"].as_str(), Some("b" | "d" | "e" | "f" | "media")))
+            );
+            let a = personal.iter().find(|r| r["id"] == "a").unwrap();
+            assert_eq!(a["loop"]["state"], "open");
+            assert_eq!(a["edge_id"], "10-out");
+            assert_eq!(a["direction"], "out");
+            let c = personal.iter().find(|r| r["id"] == "c").unwrap();
+            assert_eq!(c["direction"], "in");
+            assert!(matches!(
+                related(tx.sql(), "root", 0, None),
+                Err(Error::Validation(_))
+            ));
+            assert!(matches!(
+                related(tx.sql(), "root", 3, None),
+                Err(Error::Validation(_))
+            ));
+            // The entire traversal retains the caller's old cut after a current-version change.
+            store.write(|write| {
+                write.sql().execute("INSERT INTO node_versions SELECT \
+                    id,3,commit_id,type,text,'retired',valid_from,valid_to,superseded_by,pinned,scope FROM \
+                    node_versions WHERE id='g' AND version=2", [])?;
+                Ok(())
+            })?;
+            assert_eq!(related(tx.sql(), "root", 1, Some("personal"))?, personal);
+            Ok(())
+        })
+        .unwrap();
     store
         .read(|tx| {
             let current = parity(tx.sql(), "root", 1, Some("personal"));
@@ -96,7 +180,19 @@ fn targeted_related_matches_current_history_direction_scope_forgetting_loops_and
         })
         .unwrap();
     // A new genuine reference makes captured media visible without changing any edge.
-    let genuine=store.capture(serde_json::from_value(json!({"source":"synthetic:genuine","event_id":"event","conversation_id":"media","kind":"user","text":"Exact second source","metadata":{}})).unwrap()).unwrap();
+    let genuine = store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"synthetic:genuine",
+                "event_id":"event",
+                "conversation_id":"media",
+                "kind":"user",
+                "text":"Exact second source",
+                "metadata":{}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     store
         .write(|tx| {
             tx.sql().execute(

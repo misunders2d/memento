@@ -48,10 +48,16 @@ fn conversation_count(db: &Connection, source: Option<&str>) -> Result<i64> {
     let sources = if source.is_some() {
         "VALUES (?1)"
     } else {
-        "SELECT min(source) FROM episodes UNION ALL SELECT (SELECT min(e.source) FROM episodes e WHERE e.source>s.source) FROM sources s WHERE s.source IS NOT NULL"
+        "SELECT min(source) FROM episodes UNION ALL SELECT (SELECT min(e.source) FROM episodes e \
+            WHERE e.source>s.source) FROM sources s WHERE s.source IS NOT NULL"
     };
     let sql = format!(
-        "WITH RECURSIVE sources(source) AS ({sources}),conversations(source,conversation_id) AS (SELECT s.source,(SELECT min(e.conversation_id) FROM episodes e WHERE e.source=s.source) FROM sources s WHERE s.source IS NOT NULL UNION ALL SELECT c.source,(SELECT min(e.conversation_id) FROM episodes e WHERE e.source=c.source AND e.conversation_id>c.conversation_id) FROM conversations c WHERE c.conversation_id IS NOT NULL) SELECT count(*) FROM conversations WHERE conversation_id IS NOT NULL"
+        "WITH RECURSIVE sources(source) AS ({sources}),conversations(source,conversation_id) AS \
+        (SELECT s.source,(SELECT min(e.conversation_id) FROM episodes e WHERE e.source=s.source) \
+        FROM sources s WHERE s.source IS NOT NULL UNION ALL SELECT c.source,(SELECT \
+        min(e.conversation_id) FROM episodes e WHERE e.source=c.source AND \
+        e.conversation_id>c.conversation_id) FROM conversations c WHERE c.conversation_id IS NOT \
+        NULL) SELECT count(*) FROM conversations WHERE conversation_id IS NOT NULL"
     );
     Ok(if source.is_some() {
         db.query_row(&sql, [source], |r| r.get(0))?
@@ -61,25 +67,40 @@ fn conversation_count(db: &Connection, source: Option<&str>) -> Result<i64> {
 }
 // Source filters probe from each job/file's own rows; CROSS JOIN pins that
 // order so the planner never scans every episode of the source per row.
-const CONSOLIDATE_ORIGIN: &str = "EXISTS(SELECT 1 FROM json_each(j.payload,'$.candidate_ids') c CROSS JOIN graph_evidence g CROSS JOIN episodes e WHERE g.target=c.value AND e.id=g.episode_id AND e.source=?2)";
-const CAPTURED_MEDIA: &str = "SELECT cm.state,j.state AS job_state,count(*) AS count FROM captured_media cm LEFT JOIN jobs j ON j.id=cm.job_id WHERE (?1 IS NULL OR EXISTS(SELECT 1 FROM captured_media_refs r CROSS JOIN episodes e WHERE r.sha256=cm.sha256 AND e.id=r.episode_id AND e.source=?1)) GROUP BY cm.state,j.state";
+const CONSOLIDATE_ORIGIN: &str = "EXISTS(SELECT 1 FROM json_each(j.payload,'$.candidate_ids') c CROSS JOIN graph_evidence g \
+    CROSS JOIN episodes e WHERE g.target=c.value AND e.id=g.episode_id AND e.source=?2)";
+const CAPTURED_MEDIA: &str = "SELECT cm.state,j.state AS job_state,count(*) AS count FROM captured_media cm LEFT JOIN \
+    jobs j ON j.id=cm.job_id WHERE (?1 IS NULL OR EXISTS(SELECT 1 FROM captured_media_refs r \
+    CROSS JOIN episodes e WHERE r.sha256=cm.sha256 AND e.id=r.episode_id AND e.source=?1)) \
+    GROUP BY cm.state,j.state";
 fn jobs(db: &Connection, kind: &str, source: Option<&str>) -> Result<Value> {
     let origin = match kind {
         "extract" => "json_extract(j.payload,'$.source')=?2",
         "consolidate" => CONSOLIDATE_ORIGIN,
         "media" => {
-            "EXISTS(SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=j.id AND e.source=?2)"
+            "EXISTS(SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE \
+            g.target=j.id AND e.source=?2)"
         }
         _ => return Err(Error::Validation("Invalid status work kind")),
     };
     let records = rows(
         db,
         &format!(
-            "SELECT state,error,count(*) AS count FROM jobs j WHERE kind=?1 AND (?2 IS NULL OR {origin}) GROUP BY state,error"
+            "SELECT state,error,count(*) AS count FROM jobs j WHERE kind=?1 AND (?2 IS NULL OR {origin}) \
+        GROUP BY state,error"
         ),
         params![kind, source],
     )?;
-    let mut result = json!({"available":true,"pending_jobs":0,"leased_jobs":0,"completed_jobs":0,"failed_jobs":0,"retrying_jobs":0,"parked_jobs":0,"rebatched_jobs":0});
+    let mut result = json!({
+        "available":true,
+        "pending_jobs":0,
+        "leased_jobs":0,
+        "completed_jobs":0,
+        "failed_jobs":0,
+        "retrying_jobs":0,
+        "parked_jobs":0,
+        "rebatched_jobs":0
+    });
     let mut errors = BTreeMap::<(String, String), i64>::new();
     for row in records {
         let state = row["state"]
@@ -132,7 +153,7 @@ fn jobs(db: &Connection, kind: &str, source: Option<&str>) -> Result<Value> {
             *errors.entry((state.into(), safe.into())).or_default() += count;
         }
     }
-    result["errors"]=json!(errors.into_iter().map(|((state,category),count)|json!({"state":state,"category":category,"count":count})).collect::<Vec<_>>());
+    result["errors"] = json!(errors.into_iter().map(|((state,category),count)|json!({"state":state,"category":category,"count":count})).collect::<Vec<_>>());
     Ok(result)
 }
 fn captured_media_status(db: &Connection, source: Option<&str>) -> Result<Value> {
@@ -153,7 +174,13 @@ fn captured_media_status(db: &Connection, source: Option<&str>) -> Result<Value>
             .ok_or(Error::Unavailable("Invalid captured media state"))?;
         counts[state] = json!(count + row["count"].as_i64().unwrap());
     }
-    let progress=one(db,"SELECT seq,(SELECT coalesce(max(seq),0) FROM episodes) AS latest_seq FROM captured_media_progress WHERE singleton=1",[])?.ok_or(Error::Unavailable("Captured media progress is unavailable"))?;
+    let progress = one(
+        db,
+        "SELECT seq,(SELECT coalesce(max(seq),0) FROM episodes) AS latest_seq FROM \
+        captured_media_progress WHERE singleton=1",
+        [],
+    )?
+    .ok_or(Error::Unavailable("Captured media progress is unavailable"))?;
     counts["discovery"] =
         json!({"scope":"global","through_seq":progress["seq"],"latest_seq":progress["latest_seq"]});
     Ok(counts)
@@ -171,11 +198,27 @@ fn candidate_counts(
     now: f64,
 ) -> Result<serde_json::Map<String, Value>> {
     let awaiting = AWAITING.replace("?3", "?1");
-    let pending=one(db,&format!("WITH candidate_status AS MATERIALIZED (SELECT ({ELIGIBLE}) AS eligible,NOT EXISTS(SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {awaiting}) AS ready,EXISTS(SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL) AS parked FROM candidates c WHERE {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND e.source=?2))) SELECT coalesce(sum(eligible AND NOT parked),0) AS pending_candidates,coalesce(sum(eligible AND ready AND NOT parked),0) AS ready_candidates,coalesce(sum(NOT eligible),0) AS excluded_legacy_candidates,coalesce(sum(eligible AND parked),0) AS parked_candidates FROM candidate_status"),params![now,source])?.unwrap();
+    let pending = one(db, &format!("WITH candidate_status AS MATERIALIZED (SELECT ({ELIGIBLE}) AS eligible,NOT EXISTS(SELECT 1 \
+        FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM \
+        candidate_decisions x WHERE x.candidate_id=c.id) AND {awaiting}) AS ready,EXISTS(SELECT 1 \
+        FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL) AS \
+        parked FROM candidates c WHERE {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM \
+        graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND \
+        e.source=?2))) SELECT coalesce(sum(eligible AND NOT parked),0) AS \
+        pending_candidates,coalesce(sum(eligible AND ready AND NOT parked),0) AS \
+        ready_candidates,coalesce(sum(NOT eligible),0) AS \
+        excluded_legacy_candidates,coalesce(sum(eligible AND parked),0) AS parked_candidates FROM \
+        candidate_status"), params![now, source])?.unwrap();
     Ok(pending.as_object().unwrap().clone())
 }
 fn repair_groups(db: &Connection) -> Result<Value> {
-    let mut repair=one(db,"SELECT coalesce(sum(state='pending'),0) AS pending,coalesce(sum(state='done'),0) AS done FROM repair_groups",[])?.unwrap();
+    let mut repair = one(
+        db,
+        "SELECT coalesce(sum(state='pending'),0) AS pending,coalesce(sum(state='done'),0) AS done \
+        FROM repair_groups",
+        [],
+    )?
+    .unwrap();
     repair["scope"] = json!("global");
     Ok(repair)
 }
@@ -226,17 +269,45 @@ pub fn operational_status_timed(
     } else {
         "episodes_status_raw_v1"
     };
-    let mut raw=one(db,&format!("SELECT coalesce(sum(text_runs IS NULL),0) AS inline_raw_episodes,coalesce(sum(CASE (text_runs IS NULL) WHEN 1 THEN length(CAST(text AS BLOB)) ELSE 0 END),0) AS inline_raw_bytes,coalesce(sum(NOT(text_runs IS NULL)),0) AS offloaded_raw_episodes FROM episodes INDEXED BY {raw_index} WHERE kind IN ('native_record','native_live_record','native_hook') AND CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS TEXT)='skip'{source_and}"),rusqlite::params_from_iter(source))?.unwrap();
+    let mut raw = one(
+        db,
+        &format!("SELECT coalesce(sum(text_runs IS NULL),0) AS inline_raw_episodes,coalesce(sum(CASE \
+            (text_runs IS NULL) WHEN 1 THEN length(CAST(text AS BLOB)) ELSE 0 END),0) AS \
+            inline_raw_bytes,coalesce(sum(NOT(text_runs IS NULL)),0) AS offloaded_raw_episodes FROM \
+            episodes INDEXED BY {raw_index} WHERE kind IN \
+            ('native_record','native_live_record','native_hook') AND \
+            CAST(coalesce(json_extract(metadata,'$.extraction_mode'),'message') AS \
+            TEXT)='skip'{source_and}"),
+        rusqlite::params_from_iter(source),
+    )?
+    .unwrap();
     lap("raw_inline");
-    let compressed=one(db,&format!("SELECT coalesce(sum(record_count),0) AS records,coalesce(sum(raw_size),0) AS original,coalesce(sum(length(data)),0) AS stored FROM raw_frames INDEXED BY raw_frames_status_cover_v1{source_where}"),rusqlite::params_from_iter(source))?.unwrap();
+    let compressed = one(
+        db,
+        &format!(
+            "SELECT coalesce(sum(record_count),0) AS records,coalesce(sum(raw_size),0) AS \
+            original,coalesce(sum(length(data)),0) AS stored FROM raw_frames INDEXED BY \
+            raw_frames_status_cover_v1{source_where}"
+        ),
+        rusqlite::params_from_iter(source),
+    )?
+    .unwrap();
     raw["inline_raw_episodes"] = json!(
         raw["inline_raw_episodes"].as_i64().unwrap() - compressed["records"].as_i64().unwrap()
     );
     raw["compressed_raw_episodes"] = compressed["records"].clone();
     raw["compressed_original_bytes"] = compressed["original"].clone();
     raw["compressed_raw_bytes"] = compressed["stored"].clone();
-    let objects=one(db,"SELECT count(*) AS objects,coalesce(sum(size),0) AS bytes,coalesce(sum(remote_id IS NULL),0) AS local_objects,coalesce(sum(CASE WHEN remote_id IS NULL THEN size ELSE 0 END),0) AS local_bytes,coalesce(sum(remote_id IS NOT NULL),0) AS remote_objects,coalesce(sum(CASE WHEN remote_id IS NOT NULL THEN size ELSE 0 END),0) AS remote_bytes FROM blobs",[])?.unwrap();
-    let artifacts = json!({"scope":"global","registered":{"objects":objects["objects"],"bytes":objects["bytes"]},"local_only":{"objects":objects["local_objects"],"bytes":objects["local_bytes"]},"verified_remote":{"objects":objects["remote_objects"],"bytes":objects["remote_bytes"]}});
+    let objects = one(db, "SELECT count(*) AS objects,coalesce(sum(size),0) AS bytes,coalesce(sum(remote_id IS \
+        NULL),0) AS local_objects,coalesce(sum(CASE WHEN remote_id IS NULL THEN size ELSE 0 END),0) \
+        AS local_bytes,coalesce(sum(remote_id IS NOT NULL),0) AS remote_objects,coalesce(sum(CASE \
+        WHEN remote_id IS NOT NULL THEN size ELSE 0 END),0) AS remote_bytes FROM blobs", [])?.unwrap();
+    let artifacts = json!({
+        "scope":"global",
+        "registered":{"objects":objects["objects"],"bytes":objects["bytes"]},
+        "local_only":{"objects":objects["local_objects"],"bytes":objects["local_bytes"]},
+        "verified_remote":{"objects":objects["remote_objects"],"bytes":objects["remote_bytes"]}
+    });
     lap("raw_frames_and_artifacts");
     let mut extraction = jobs(db, "extract", source)?;
     lap("extraction_jobs");
@@ -246,7 +317,11 @@ pub fn operational_status_timed(
     lap("parked_conversations");
     let mut progress = rows(
         db,
-        "SELECT p.source,p.conversation_id,p.seq AS cursor,p.offset,p.compact_through,p.latest_seq,h.parked_through,h.live_seq AS live_cursor,h.live_offset FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND h.conversation_id=p.conversation_id WHERE (?1 IS NULL OR p.source=?1) ORDER BY p.source,p.conversation_id",
+        "SELECT p.source,p.conversation_id,p.seq AS \
+        cursor,p.offset,p.compact_through,p.latest_seq,h.parked_through,h.live_seq AS \
+        live_cursor,h.live_offset FROM processing_progress p LEFT JOIN historical_parking h ON \
+        h.source=p.source AND h.conversation_id=p.conversation_id WHERE (?1 IS NULL OR p.source=?1) \
+        ORDER BY p.source,p.conversation_id",
         [source],
     )?;
     for row in &mut progress {
@@ -275,9 +350,18 @@ pub fn operational_status_timed(
     lap("media_jobs");
     media["captured_attachments"] = captured_media_status(db, source)?;
     lap("captured_media");
-    Ok(
-        json!({"source":source,"captured":captured,"raw_storage":raw,"artifact_storage":artifacts,"indexing":runtime.indexing,"extraction":extraction,"consolidation":consolidation,"historical":historical,"media":media,"drive":runtime.drive}),
-    )
+    Ok(json!({
+        "source":source,
+        "captured":captured,
+        "raw_storage":raw,
+        "artifact_storage":artifacts,
+        "indexing":runtime.indexing,
+        "extraction":extraction,
+        "consolidation":consolidation,
+        "historical":historical,
+        "media":media,
+        "drive":runtime.drive
+    }))
 }
 
 /// Pending conversations whose remaining extraction input is counted exactly per request.
@@ -316,10 +400,16 @@ fn bounded_summary(
     let pending = pending_conversations(db, None)?;
     extraction["pending_conversations"] = json!(pending);
     extraction["parked_conversations"] = json!(parked_conversations(db, None)?);
-    let progress = "FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND h.conversation_id=p.conversation_id";
-    let mut conversations = one(db, &format!("SELECT count(*) AS tracked,coalesce(sum(h.source IS NULL AND p.latest_seq<=p.seq),0) AS up_to_date,coalesce(sum(h.source IS NOT NULL AND p.latest_seq<=h.live_seq),0) AS parked_live_up_to_date {progress}"), [])?.unwrap();
+    let progress = "FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND \
+        h.conversation_id=p.conversation_id";
+    let mut conversations = one(db, &format!("SELECT count(*) AS tracked,coalesce(sum(h.source IS NULL AND p.latest_seq<=p.seq),0) AS \
+        up_to_date,coalesce(sum(h.source IS NOT NULL AND p.latest_seq<=h.live_seq),0) AS \
+        parked_live_up_to_date {progress}"), [])?.unwrap();
     conversations["in_live_job"] = json!(db.query_row(
-        "SELECT count(*) FROM (SELECT DISTINCT json_extract(payload,'$.source'),json_extract(payload,'$.conversation_id') FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.mode') IS NULL)",
+        "SELECT count(*) FROM (SELECT DISTINCT \
+            json_extract(payload,'$.source'),json_extract(payload,'$.conversation_id') FROM jobs WHERE \
+            kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.mode') IS \
+            NULL)",
         [],
         |r| r.get::<_, i64>(0)
     )?);
@@ -328,12 +418,20 @@ fn bounded_summary(
     let groups = rows(
         db,
         &format!(
-            "SELECT p.source,p.conversation_id,p.latest_seq,p.latest_at,p.compact_through,coalesce(h.live_seq,p.seq) AS cursor {progress} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY p.latest_seq DESC LIMIT ?1"
+            "SELECT \
+        p.source,p.conversation_id,p.latest_seq,p.latest_at,p.compact_through,coalesce(h.live_seq,p.seq) \
+        AS cursor {progress} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) \
+        ORDER BY p.latest_seq DESC LIMIT ?1"
         ),
         [conversation_limit as i64],
     )?;
     let count = format!(
-        "SELECT coalesce(sum(e.seq<=?4 AND {MESSAGE}),0) AS admissible_messages,coalesce(sum(e.seq<=?4 AND NOT ({MESSAGE})),0) AS admissible_other,coalesce(sum(e.seq>?4 AND {MESSAGE}),0) AS waiting_messages,coalesce(sum(e.seq>?4 AND NOT ({MESSAGE})),0) AS waiting_other,count(*) AS rows FROM (SELECT e.seq,e.kind FROM episodes e WHERE e.source=?1 AND e.conversation_id=?2 AND e.seq>?3 AND e.seq<=?5 AND {EXTRACTION_INPUT} LIMIT ?6) e"
+        "SELECT coalesce(sum(e.seq<=?4 AND {MESSAGE}),0) AS \
+        admissible_messages,coalesce(sum(e.seq<=?4 AND NOT ({MESSAGE})),0) AS \
+        admissible_other,coalesce(sum(e.seq>?4 AND {MESSAGE}),0) AS \
+        waiting_messages,coalesce(sum(e.seq>?4 AND NOT ({MESSAGE})),0) AS waiting_other,count(*) AS \
+        rows FROM (SELECT e.seq,e.kind FROM episodes e WHERE e.source=?1 AND e.conversation_id=?2 \
+        AND e.seq>?3 AND e.seq<=?5 AND {EXTRACTION_INPUT} LIMIT ?6) e"
     );
     let fields = [
         "admissible_messages",
@@ -392,7 +490,12 @@ fn bounded_summary(
     for row in rows(
         db,
         &format!(
-            "SELECT j.state,CASE WHEN json_extract(j.payload,'$.mode') IS NULL THEN 'live' ELSE 'demand' END AS mode,count(DISTINCT j.id) AS jobs,count(DISTINCT CASE WHEN {MESSAGE} THEN e.id END) AS messages,count(DISTINCT CASE WHEN NOT ({MESSAGE}) THEN e.id END) AS other FROM jobs j CROSS JOIN json_each(j.payload,'$.windows') w JOIN episodes e ON e.id=json_extract(w.value,'$.episode_id') WHERE j.kind='extract' AND j.state IN ('pending','leased') GROUP BY 1,2"
+            "SELECT j.state,CASE WHEN json_extract(j.payload,'$.mode') IS NULL THEN 'live' ELSE 'demand' \
+        END AS mode,count(DISTINCT j.id) AS jobs,count(DISTINCT CASE WHEN {MESSAGE} THEN e.id END) \
+        AS messages,count(DISTINCT CASE WHEN NOT ({MESSAGE}) THEN e.id END) AS other FROM jobs j \
+        CROSS JOIN json_each(j.payload,'$.windows') w JOIN episodes e ON \
+        e.id=json_extract(w.value,'$.episode_id') WHERE j.kind='extract' AND j.state IN \
+        ('pending','leased') GROUP BY 1,2"
         ),
         [],
     )? {
@@ -413,9 +516,13 @@ fn bounded_summary(
         .unwrap()
         .extend(candidate_counts(db, None, now)?);
     consolidation["repair_groups"] = repair_groups(db)?;
-    Ok(
-        json!({"generated_at":now,"indexing":indexing,"extraction":extraction,"consolidation":consolidation,"historical":historical_status(db)?}),
-    )
+    Ok(json!({
+        "generated_at":now,
+        "indexing":indexing,
+        "extraction":extraction,
+        "consolidation":consolidation,
+        "historical":historical_status(db)?
+    }))
 }
 #[cfg(test)]
 #[path = "processing_summary_tests.rs"]
@@ -439,15 +546,26 @@ mod plan_tests {
         let store = Store::open(dir.path().join("data")).unwrap();
         store
             .read(|tx| {
-                let consolidate = format!("SELECT state,error,count(*) AS count FROM jobs j WHERE kind=?1 AND (?2 IS NULL OR {CONSOLIDATE_ORIGIN}) GROUP BY state,error");
+                let consolidate = format!("SELECT state,error,count(*) AS count FROM jobs j WHERE kind=?1 AND (?2 IS NULL OR \
+                    {CONSOLIDATE_ORIGIN}) GROUP BY state,error");
                 for (sql, params) in [(consolidate.as_str(), 2), (CAPTURED_MEDIA, 1)] {
                     let mut plan = tx.sql().prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
                     let values: Vec<Option<&str>> = vec![Some("consolidate"), Some("source")];
                     let details = plan
-                        .query_map(rusqlite::params_from_iter(&values[2 - params..]), |r| r.get::<_, String>(3))?
+                        .query_map(rusqlite::params_from_iter(&values[2 - params..]), |r| {
+                            r.get::<_, String>(3)
+                        })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
-                    assert!(details.iter().any(|d| d.contains("episodes") && d.contains("(id=?)")), "{details:?}");
-                    assert!(!details.iter().any(|d| d.contains("(source=?)")), "{details:?}");
+                    assert!(
+                        details
+                            .iter()
+                            .any(|d| d.contains("episodes") && d.contains("(id=?)")),
+                        "{details:?}"
+                    );
+                    assert!(
+                        !details.iter().any(|d| d.contains("(source=?)")),
+                        "{details:?}"
+                    );
                 }
                 Ok(())
             })

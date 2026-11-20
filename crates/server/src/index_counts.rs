@@ -100,7 +100,19 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
-        store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"counts","conversation_id":"thread","kind":"user","text":"Index count fixture","metadata":{}})).unwrap()).unwrap();
+        store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"counts",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":"Index count fixture",
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let counts = Arc::new(IndexCounts::default());
         counts.refresh(&store);
         let (at, _) = counts.latest().unwrap();

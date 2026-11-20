@@ -19,9 +19,10 @@ impl Drop for Scratch {
 fn sizes(database: &Path) -> Result<Value> {
     let mut wal = database.as_os_str().to_owned();
     wal.push("-wal");
-    Ok(
-        json!({"database":std::fs::metadata(database)?.len(),"wal":std::fs::metadata(wal).map(|m|m.len()).unwrap_or(0)}),
-    )
+    Ok(json!({
+        "database":std::fs::metadata(database)?.len(),
+        "wal":std::fs::metadata(wal).map(|m|m.len()).unwrap_or(0)
+    }))
 }
 impl Store {
     pub fn compact_with_helper(&self, executable: &Path) -> Result<Value> {
@@ -115,7 +116,13 @@ pub fn compact_worker(data_dir: &Path) -> Result<Value> {
     let busy: i64 = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
     let free_after: i64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
     File::open(&database)?.sync_all()?;
-    Ok(
-        json!({"complete":busy==0,"before":before,"after":sizes(&database)?,"freelist_before":free_before,"freelist_after":free_after,"checkpoint_busy":busy,"elapsed_seconds":started.elapsed().as_secs_f64()}),
-    )
+    Ok(json!({
+        "complete":busy==0,
+        "before":before,
+        "after":sizes(&database)?,
+        "freelist_before":free_before,
+        "freelist_after":free_after,
+        "checkpoint_busy":busy,
+        "elapsed_seconds":started.elapsed().as_secs_f64()
+    }))
 }

@@ -6,15 +6,25 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
 pub fn invalidate_vectors(tx: &WriteTxn, target: &str) -> Result<()> {
-    tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE (kind='node' AND target=?) OR (kind='segment' AND target IN (SELECT id FROM segments WHERE node_id=?)))",params![target,target])?;
+    tx.sql().execute(
+        "UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE \
+        (kind='node' AND target=?) OR (kind='segment' AND target IN (SELECT id FROM segments WHERE \
+        node_id=?)))",
+        params![target, target],
+    )?;
     tx.touch_target(target)?;
     Ok(())
 }
 pub fn copy_vector(tx: &WriteTxn, target: &str, old: i64, new: i64) -> Result<()> {
-    tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='node' AND target=?)",[target])?;
+    tx.sql().execute(
+        "UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE \
+        kind='node' AND target=?)",
+        [target],
+    )?;
     let previous = one(
         tx.sql(),
-        "SELECT i.seq FROM vector_items i JOIN vector_blobs v ON v.seq=i.seq WHERE i.target=? AND i.kind='node' AND i.version=?",
+        "SELECT i.seq FROM vector_items i JOIN vector_blobs v ON v.seq=i.seq WHERE i.target=? AND \
+        i.kind='node' AND i.version=?",
         params![target, old],
     )?;
     if let Some(previous) = previous {
@@ -36,13 +46,33 @@ pub fn union_evidence(
     sources: &[(String, i64)],
 ) -> Result<()> {
     for (source, source_version) in sources {
-        tx.sql().execute("INSERT INTO graph_evidence SELECT ?,?,g.episode_id,g.start,g.end,g.quote FROM graph_evidence g WHERE g.target=? AND g.version=? AND NOT EXISTS (SELECT 1 FROM graph_evidence x WHERE x.target=? AND x.version=? AND x.episode_id=g.episode_id AND x.start=g.start AND x.end=g.end) AND (g.target=? OR NOT EXISTS (SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=g.episode_id))",params![target,version,source,source_version,target,version,target])?;
+        tx.sql().execute(
+            "INSERT INTO graph_evidence SELECT ?,?,g.episode_id,g.start,g.end,g.quote FROM \
+                graph_evidence g WHERE g.target=? AND g.version=? AND NOT EXISTS (SELECT 1 FROM \
+                graph_evidence x WHERE x.target=? AND x.version=? AND x.episode_id=g.episode_id AND \
+                x.start=g.start AND x.end=g.end) AND (g.target=? OR NOT EXISTS (SELECT 1 FROM episodes e \
+                JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE \
+                e.id=g.episode_id))",
+            params![
+                target,
+                version,
+                source,
+                source_version,
+                target,
+                version,
+                target
+            ],
+        )?;
     }
     tx.touch_target(target)?;
     Ok(())
 }
 pub(crate) fn copy_evidence(tx: &WriteTxn, target: &str, old: i64, new: i64) -> Result<()> {
-    tx.sql().execute("INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote FROM graph_evidence WHERE target=? AND version=?",params![new,target,old])?;
+    tx.sql().execute(
+        "INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote FROM graph_evidence \
+        WHERE target=? AND version=?",
+        params![new, target, old],
+    )?;
     tx.touch_target(target)?;
     Ok(())
 }
@@ -316,7 +346,9 @@ pub fn redirect_edges(
     }
     let selected = rows(
         tx.sql(),
-        "SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active' AND e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id",
+        "SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active' AND \
+        e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE \
+        x.id=e.id) ORDER BY e.id",
         params![old, old],
     )?;
     let mut moved = vec![];
@@ -342,7 +374,9 @@ pub fn redirect_edges(
         if src != dst {
             for row in rows(
                 tx.sql(),
-                "SELECT e.* FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.id<>? AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id",
+                "SELECT e.* FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.id<>? AND \
+                    e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) \
+                    ORDER BY e.id",
                 params![src, edge["rel"].as_str(), dst, edge_id],
             )? {
                 let theirs = choice(tx.sql(), get_str(&row, "id")?)?;
@@ -405,7 +439,14 @@ pub fn redirect_edges(
         tx.touch_target(edge_id)?;
         tx.touch_target(src)?;
         tx.touch_target(dst)?;
-        moved.push(json!({"id":edge_id,"version":version+1,"src":src,"dst":dst,"state":state,"folded_into":same.as_ref().map(|row|row["id"].clone())}));
+        moved.push(json!({
+            "id":edge_id,
+            "version":version+1,
+            "src":src,
+            "dst":dst,
+            "state":state,
+            "folded_into":same.as_ref().map(|row|row["id"].clone())
+        }));
     }
     Ok(moved)
 }
@@ -417,7 +458,9 @@ pub(crate) fn requeue_stale(
 ) -> Result<Vec<String>> {
     let proposals = rows(
         tx.sql(),
-        "SELECT DISTINCT p.id,p.base_versions FROM review_proposals p,json_each(p.base_versions) j WHERE j.key IN (SELECT value FROM json_each(?)) AND p.id IS NOT ? AND NOT EXISTS (SELECT 1 FROM review_decisions d WHERE d.proposal_id=p.id) ORDER BY p.id",
+        "SELECT DISTINCT p.id,p.base_versions FROM review_proposals p,json_each(p.base_versions) j \
+            WHERE j.key IN (SELECT value FROM json_each(?)) AND p.id IS NOT ? AND NOT EXISTS (SELECT 1 \
+            FROM review_decisions d WHERE d.proposal_id=p.id) ORDER BY p.id",
         params![encode_json(&json!(targets))?, exclude],
     )?;
     let mut requeued = vec![];
@@ -435,7 +478,9 @@ pub(crate) fn requeue_stale(
         }
         for row in rows(
             tx.sql(),
-            "SELECT d.candidate_id FROM candidate_decisions d WHERE d.decision='review' AND d.target_id=? AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=d.candidate_id) ORDER BY d.candidate_id",
+            "SELECT d.candidate_id FROM candidate_decisions d WHERE d.decision='review' AND \
+            d.target_id=? AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE \
+            x.candidate_id=d.candidate_id) ORDER BY d.candidate_id",
             [get_str(&proposal, "id")?],
         )? {
             let target = get_str(&row, "candidate_id")?;
@@ -545,9 +590,14 @@ pub fn absorb_one(
     let requeued = requeue_stale(tx, commit, &[source.into(), target.into()], proposal)?;
     tx.touch_target(source)?;
     tx.touch_target(target)?;
-    Ok(
-        json!({"id":source,"version":av+1,"merged_into":target,"survivor_version":node(tx.sql(),target)?["version"],"scope":labels,"requeued_candidates":requeued}),
-    )
+    Ok(json!({
+        "id":source,
+        "version":av+1,
+        "merged_into":target,
+        "survivor_version":node(tx.sql(),target)?["version"],
+        "scope":labels,
+        "requeued_candidates":requeued
+    }))
 }
 pub fn canonical(db: &Connection, target: &str) -> Result<Value> {
     let mut current = target.to_owned();
@@ -627,7 +677,9 @@ pub fn absorb_check(
         std::collections::BTreeMap::new();
     for edge in rows(
         db,
-        "SELECT e.* FROM edge_versions e WHERE (e.src IN (SELECT value FROM json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)",
+        "SELECT e.* FROM edge_versions e WHERE (e.src IN (SELECT value FROM json_each(?1)) OR e.dst \
+        IN (SELECT value FROM json_each(?1))) AND e.state='active' AND e.rel<>'supersedes' AND \
+        e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)",
         [encode_json(&json!(ids))?],
     )? {
         let a = get_str(&edge, "src")?;
@@ -718,9 +770,14 @@ pub fn absorb(
     if let Some(evidence) = evidence {
         TxGraph::evidence(tx, survivor, get_i64(last, "survivor_version")?, evidence)?;
     }
-    Ok(
-        json!({"id":survivor,"version":last["survivor_version"],"absorbed":absorbed,"scope":last["scope"],"status":"absorbed","requeued_candidates":requeued.into_iter().collect::<Vec<_>>()}),
-    )
+    Ok(json!({
+        "id":survivor,
+        "version":last["survivor_version"],
+        "absorbed":absorbed,
+        "scope":last["scope"],
+        "status":"absorbed",
+        "requeued_candidates":requeued.into_iter().collect::<Vec<_>>()
+    }))
 }
 pub fn retire(tx: &WriteTxn, commit: &str, target: &str, evidence: &Value) -> Result<Value> {
     let n = node(tx.sql(), target).map_err(|error| match error {
@@ -759,7 +816,9 @@ pub fn retire(tx: &WriteTxn, commit: &str, target: &str, evidence: &Value) -> Re
     }
     let edges = rows(
         tx.sql(),
-        "SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active' AND e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id",
+        "SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active' AND \
+        e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE \
+        x.id=e.id) ORDER BY e.id",
         params![target, target],
     )?;
     let mut protection = if n["pinned"].as_i64().unwrap_or(0) != 0 {
@@ -845,12 +904,16 @@ pub fn retire(tx: &WriteTxn, commit: &str, target: &str, evidence: &Value) -> Re
     )
 }
 
-const LEGACY_REVIEW: &str = "(json_extract(p.command,'$.op')='remember' AND json_extract(p.command,'$.type')='person' AND json_type(p.command,'$.identity') IS NULL)";
+const LEGACY_REVIEW: &str = "(json_extract(p.command,'$.op')='remember' AND json_extract(p.command,'$.type')='person' \
+    AND json_type(p.command,'$.identity') IS NULL)";
 pub fn pending_reviews(db: &Connection) -> Result<Vec<Value>> {
     let mut records = rows(
         db,
         &format!(
-            "SELECT p.*,c.actor,c.why,c.recorded_at,({LEGACY_REVIEW} AND EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.decision='review' AND d.target_id=p.id)) AS legacy FROM review_proposals p JOIN graph_commits c ON c.id=p.commit_id WHERE NOT EXISTS (SELECT 1 FROM review_decisions d WHERE d.proposal_id=p.id) ORDER BY c.recorded_at,p.id"
+            "SELECT p.*,c.actor,c.why,c.recorded_at,({LEGACY_REVIEW} AND EXISTS (SELECT 1 FROM \
+        candidate_decisions d WHERE d.decision='review' AND d.target_id=p.id)) AS legacy FROM \
+        review_proposals p JOIN graph_commits c ON c.id=p.commit_id WHERE NOT EXISTS (SELECT 1 FROM \
+        review_decisions d WHERE d.proposal_id=p.id) ORDER BY c.recorded_at,p.id"
         ),
         [],
     )?;
@@ -872,32 +935,117 @@ pub fn decide_review(graph: &Graph, command: dto::Review) -> Result<Value> {
     let request =
         json!({"op":"review","proposal_id":command.proposal_id,"decision":command.decision});
     let ctx = context(command.command_id, command.actor, command.why);
-    graph.store.command(&ctx,&request,|tx,commit|{
-        let proposal=one(tx.sql(),"SELECT * FROM review_proposals WHERE id=?",[&command.proposal_id])?.ok_or(Error::Validation("Unknown proposal"))?;
-        if one(tx.sql(),"SELECT 1 FROM review_decisions WHERE proposal_id=?",[&command.proposal_id])?.is_some(){return Err(Error::Validation("Proposal already decided"));}
-        let linked=one(tx.sql(),"SELECT 1 FROM candidate_decisions WHERE decision='review' AND target_id=? LIMIT 1",[&command.proposal_id])?.is_some();
-        let legacy=linked&&one(tx.sql(),&format!("SELECT 1 FROM review_proposals p WHERE p.id=? AND {LEGACY_REVIEW}"),[&command.proposal_id])?.is_some();let mut result=json!({"id":command.proposal_id,"status":"rejected"});
-        if command.decision=="approve"{
-            if legacy{return Err(Error::Conflict("Legacy person proposal is stale; its candidate is consolidated again"));}
-            if one(tx.sql(),"SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE g.target=? LIMIT 1",[&command.proposal_id])?.is_some(){return Err(Error::Conflict("Proposal evidence was excluded by a human forget decision"));}
-            for (id,version) in decode_json(get_str(&proposal,"base_versions")?)?.as_object().unwrap(){if node(tx.sql(),id)?["version"]!=*version{return Err(Error::Conflict("Proposal is stale; submit a new proposal"));}}
-            let request=decode_json(get_str(&proposal,"command")?)?;result=match get_str(&request,"op")?{"remember"=>TxGraph::remember(tx,commit,&request,true)?,"supersede"=>TxGraph::supersede(tx,commit,&request,true)?,"link"=>TxGraph::link(tx,commit,&request,true)?,_=>apply_review(tx,commit,&request,Some(&command.proposal_id))?};
+    graph.store.command(&ctx, &request, |tx, commit| {
+        let proposal = one(tx.sql(), "SELECT * FROM review_proposals WHERE id=?", [&command.proposal_id])?
+            .ok_or(Error::Validation("Unknown proposal"))?;
+        if one(tx.sql(), "SELECT 1 FROM review_decisions WHERE proposal_id=?", [&command.proposal_id])?.is_some() {
+            return Err(Error::Validation("Proposal already decided"));
         }
-        tx.sql().execute("INSERT INTO review_decisions VALUES (?,?,?)",params![command.proposal_id,commit,command.decision])?;
-        let candidates=rows(tx.sql(),"SELECT d.candidate_id FROM candidate_decisions d WHERE d.decision='review' AND d.target_id=? AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=d.candidate_id)",[&command.proposal_id])?;
-        let target=if command.decision=="reject"{None}else{result["superseded_by"].as_str().or_else(||result["merged_into"].as_str()).or_else(||result["id"].as_str())};
-        for candidate in candidates{let id=get_str(&candidate,"candidate_id")?;let state=if command.decision=="reject"{if legacy{"defer"}else{"reject"}}else if target.is_some(){"promote"}else{"defer"};
-            tx.sql().execute("INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",params![crate::util::id(),id,commit,state,target,Option::<f64>::None])?;
-            if ["promote","reject"].contains(&state){tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='candidate' AND target=?)",[id])?;}tx.touch_target(id)?;
-            if state=="promote"{if let Some(target)=target{let marker=loops::current(tx.sql(),id)?;loops::transfer(tx,commit,id,target)?;importance::transfer_usage(tx,id,target)?;loops::mark(tx,commit,target,Some(marker.as_ref().is_some_and(|value|value["state"]=="open")),Some(id),marker.as_ref(),None)?;}}
-        }Ok(result)
+        let linked = one(tx.sql(), "SELECT 1 FROM candidate_decisions WHERE decision='review' AND target_id=? LIMIT 1", [&command.proposal_id])?.is_some();
+        let legacy =
+            linked && one(tx.sql(), &format!("SELECT 1 FROM review_proposals p WHERE p.id=? AND {LEGACY_REVIEW}"), [&command.proposal_id])?.is_some();
+        let mut result = json!({"id":command.proposal_id,"status":"rejected"});
+        if command.decision == "approve" {
+            if legacy {
+                return Err(Error::Conflict("Legacy person proposal is stale; its candidate is consolidated again"));
+            }
+            if one(tx.sql(), "SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id JOIN forgotten_sources \
+                f ON f.source=e.source AND f.event_id=e.event_id WHERE g.target=? LIMIT 1", [&command.proposal_id])?.is_some() {
+                return Err(Error::Conflict("Proposal evidence was excluded by a human forget decision"));
+            }
+            for (id, version) in decode_json(get_str(&proposal, "base_versions")?)?
+                .as_object()
+                .unwrap()
+            {
+                if node(tx.sql(), id)?["version"] != *version {
+                    return Err(Error::Conflict("Proposal is stale; submit a new proposal"));
+                }
+            }
+            let request = decode_json(get_str(&proposal, "command")?)?;
+            result = match get_str(&request, "op")? {
+                "remember" => TxGraph::remember(tx, commit, &request, true)?,
+                "supersede" => TxGraph::supersede(tx, commit, &request, true)?,
+                "link" => TxGraph::link(tx, commit, &request, true)?,
+                _ => apply_review(tx, commit, &request, Some(&command.proposal_id))?,
+            };
+        }
+        tx.sql().execute(
+            "INSERT INTO review_decisions VALUES (?,?,?)",
+            params![command.proposal_id, commit, command.decision],
+        )?;
+        let candidates = rows(tx.sql(), "SELECT d.candidate_id FROM candidate_decisions d WHERE d.decision='review' AND \
+            d.target_id=? AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE \
+            x.candidate_id=d.candidate_id)", [&command.proposal_id])?;
+        let target = if command.decision == "reject" {
+            None
+        } else {
+            result["superseded_by"]
+                .as_str()
+                .or_else(|| result["merged_into"].as_str())
+                .or_else(|| result["id"].as_str())
+        };
+        for candidate in candidates {
+            let id = get_str(&candidate, "candidate_id")?;
+            let state = if command.decision == "reject" {
+                if legacy { "defer" } else { "reject" }
+            } else if target.is_some() {
+                "promote"
+            } else {
+                "defer"
+            };
+            tx.sql().execute(
+                "INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",
+                params![
+                    crate::util::id(),
+                    id,
+                    commit,
+                    state,
+                    target,
+                    Option::<f64>::None
+                ],
+            )?;
+            if ["promote", "reject"].contains(&state) {
+                tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE \
+                    kind='candidate' AND target=?)", [id])?;
+            }
+            tx.touch_target(id)?;
+            if state == "promote" {
+                if let Some(target) = target {
+                    let marker = loops::current(tx.sql(), id)?;
+                    loops::transfer(tx, commit, id, target)?;
+                    importance::transfer_usage(tx, id, target)?;
+                    loops::mark(
+                        tx,
+                        commit,
+                        target,
+                        Some(
+                            marker
+                                .as_ref()
+                                .is_some_and(|value| value["state"] == "open"),
+                        ),
+                        Some(id),
+                        marker.as_ref(),
+                        None,
+                    )?;
+                }
+            }
+        }
+        Ok(result)
     })
 }
 
 fn active_entities(db: &Connection) -> Result<Vec<Value>> {
     let mut records = rows(
         db,
-        "SELECT n.id,n.version,n.type,n.text,n.scope,n.pinned,(SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS evidence,(SELECT count(*) FROM edge_versions e WHERE (e.src=n.id OR e.dst=n.id) AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)) AS relations,(SELECT c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id AND v.version=1) AS created_at FROM node_versions n LEFT JOIN memory_types t ON t.name=n.type WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND (n.type IN ('person','organization','project','concept','place','tool') OR t.category='entity') ORDER BY n.id",
+        "SELECT n.id,n.version,n.type,n.text,n.scope,n.pinned,(SELECT count(*) FROM graph_evidence g \
+        WHERE g.target=n.id AND g.version=n.version) AS evidence,(SELECT count(*) FROM \
+        edge_versions e WHERE (e.src=n.id OR e.dst=n.id) AND e.state='active' AND e.version=(SELECT \
+        max(x.version) FROM edge_versions x WHERE x.id=e.id)) AS relations,(SELECT c.recorded_at \
+        FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id AND \
+        v.version=1) AS created_at FROM node_versions n LEFT JOIN memory_types t ON t.name=n.type \
+        WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE \
+        x.id=n.id) AND (n.type IN ('person','organization','project','concept','place','tool') OR \
+        t.category='entity') ORDER BY n.id",
         [],
     )?;
     for record in &mut records {
@@ -946,7 +1094,11 @@ fn summary(db: &Connection, member: &Value) -> Result<Value> {
     let version = get_i64(member, "version")?;
     let sources = rows(
         db,
-        "SELECT g.episode_id,e.source,e.conversation_id,e.occurred_at,CASE WHEN EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) THEN NULL ELSE substr(g.quote,1,160) END AS quote_excerpt FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=? ORDER BY julianday(e.occurred_at) DESC,g.episode_id,g.start LIMIT 3",
+        "SELECT g.episode_id,e.source,e.conversation_id,e.occurred_at,CASE WHEN EXISTS (SELECT 1 \
+        FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) THEN NULL ELSE \
+        substr(g.quote,1,160) END AS quote_excerpt FROM graph_evidence g JOIN episodes e ON \
+        e.id=g.episode_id WHERE g.target=? AND g.version=? ORDER BY julianday(e.occurred_at) \
+        DESC,g.episode_id,g.start LIMIT 3",
         params![target, version],
     )?;
     let mut result = json!({});
@@ -1052,19 +1204,45 @@ pub fn merge_plan(
     let mut relations = json!({});
     for edge in rows(
         db,
-        "SELECT e.id,e.version FROM edge_versions e WHERE (e.src IN (SELECT value FROM json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id",
+        "SELECT e.id,e.version FROM edge_versions e WHERE (e.src IN (SELECT value FROM \
+        json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND \
+        e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id",
         [encode_json(&json!(ids))?],
     )? {
-        relations[get_str(&edge, "id")?] = json!({"version":edge["version"],"loop":loops::snapshot(db,get_str(&edge,"id")?,get_i64(&edge,"version")?)?});
+        relations[get_str(&edge, "id")?] = json!({
+            "version":edge["version"],
+            "loop":loops::snapshot(db,get_str(&edge,"id")?,get_i64(&edge,"version")?)?
+        });
     }
-    let reviews=rows(db,"SELECT DISTINCT p.id FROM review_proposals p,json_each(p.base_versions) j WHERE j.key IN (SELECT value FROM json_each(?)) AND NOT EXISTS (SELECT 1 FROM review_decisions d WHERE d.proposal_id=p.id) ORDER BY p.id",[encode_json(&json!(ids))?])?.into_iter().map(|n|n["id"].clone()).collect::<Vec<_>>();
+    let reviews = rows(
+        db,
+        "SELECT DISTINCT p.id FROM review_proposals p,json_each(p.base_versions) j WHERE j.key IN \
+        (SELECT value FROM json_each(?)) AND NOT EXISTS (SELECT 1 FROM review_decisions d WHERE \
+        d.proposal_id=p.id) ORDER BY p.id",
+        [encode_json(&json!(ids))?],
+    )?
+    .into_iter()
+    .map(|n| n["id"].clone())
+    .collect::<Vec<_>>();
     let mut labels = std::collections::BTreeSet::new();
     for member in &members {
         for label in member["scope"].as_array().unwrap() {
             labels.insert(label.as_str().unwrap().to_owned());
         }
     }
-    let mut plan = json!({"cluster":cluster,"type":found["type"],"name":found["name"],"survivor":summary(db,survivor)?,"absorbed":absorbed,"excluded":excluded,"resulting_scope":labels.into_iter().collect::<Vec<_>>(),"relations":relations,"pending_reviews":reviews,"policy":"owner_selected_exact_plan","raw_history":"retained"});
+    let mut plan = json!({
+        "cluster":cluster,
+        "type":found["type"],
+        "name":found["name"],
+        "survivor":summary(db,survivor)?,
+        "absorbed":absorbed,
+        "excluded":excluded,
+        "resulting_scope":labels.into_iter().collect::<Vec<_>>(),
+        "relations":relations,
+        "pending_reviews":reviews,
+        "policy":"owner_selected_exact_plan",
+        "raw_history":"retained"
+    });
     if !variants.is_empty() {
         plan["included"] = json!(variants);
     }
@@ -1078,10 +1256,56 @@ pub fn merge(graph: &Graph, command: dto::Merge) -> Result<Value> {
     let mut include = command.include;
     include.sort();
     include.dedup();
-    let mut request = json!({"op":"merge_cluster","cluster":command.cluster,"into":command.into,"exclude":exclude,"token":command.token});
+    let mut request = json!({
+        "op":"merge_cluster",
+        "cluster":command.cluster,
+        "into":command.into,
+        "exclude":exclude,
+        "token":command.token
+    });
     if !include.is_empty() {
         request["include"] = json!(include);
     }
     let ctx = context(command.command_id, command.actor, command.why);
-    graph.store.command(&ctx,&request,|tx,commit|{let plan=merge_plan(tx.sql(),&command.cluster,Some(&command.into),&exclude,&include)?;if plan["token"]!=command.token{return Err(Error::Conflict("Merge plan is stale; preview and confirm the current plan"));}let mut merged=vec![];let mut requeued=std::collections::BTreeSet::new();let mut last=None;for member in plan["absorbed"].as_array().unwrap(){let result=absorb_one(tx,commit,get_str(member,"id")?,get_str(&plan["survivor"],"id")?,true,None)?;merged.push(member["id"].clone());for id in result["requeued_candidates"].as_array().unwrap(){requeued.insert(id.as_str().unwrap().to_owned());}last=Some(result);}let last=last.ok_or(Error::Validation("No selected merge members"))?;Ok(json!({"cluster":command.cluster,"survivor":plan["survivor"]["id"],"survivor_version":last["survivor_version"],"merged":merged,"scope":last["scope"],"requeued_candidates":requeued.into_iter().collect::<Vec<_>>()}))})
+    graph.store.command(&ctx, &request, |tx, commit| {
+        let plan = merge_plan(
+            tx.sql(),
+            &command.cluster,
+            Some(&command.into),
+            &exclude,
+            &include,
+        )?;
+        if plan["token"] != command.token {
+            return Err(Error::Conflict(
+                "Merge plan is stale; preview and confirm the current plan",
+            ));
+        }
+        let mut merged = vec![];
+        let mut requeued = std::collections::BTreeSet::new();
+        let mut last = None;
+        for member in plan["absorbed"].as_array().unwrap() {
+            let result = absorb_one(
+                tx,
+                commit,
+                get_str(member, "id")?,
+                get_str(&plan["survivor"], "id")?,
+                true,
+                None,
+            )?;
+            merged.push(member["id"].clone());
+            for id in result["requeued_candidates"].as_array().unwrap() {
+                requeued.insert(id.as_str().unwrap().to_owned());
+            }
+            last = Some(result);
+        }
+        let last = last.ok_or(Error::Validation("No selected merge members"))?;
+        Ok(json!({
+            "cluster":command.cluster,
+            "survivor":plan["survivor"]["id"],
+            "survivor_version":last["survivor_version"],
+            "merged":merged,
+            "scope":last["scope"],
+            "requeued_candidates":requeued.into_iter().collect::<Vec<_>>()
+        }))
+    })
 }

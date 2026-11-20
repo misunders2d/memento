@@ -45,7 +45,19 @@ struct Unit {
     end: Option<usize>,
 }
 fn signature(store: &Store) -> Result<Option<ModelSignature>> {
-    store.read(|tx|Ok(tx.sql().query_row("SELECT model_id,revision,dimensions,text_encoding FROM vector_model WHERE singleton=1",[],|r|Ok(ModelSignature{model_id:r.get(0)?,revision:r.get(1)?,dimensions:r.get(2)?,text_encoding:r.get(3)?})).optional()?))
+    store.read(|tx| {
+        Ok(tx
+            .sql()
+            .query_row("SELECT model_id,revision,dimensions,text_encoding FROM vector_model WHERE singleton=1", [], |r| {
+                Ok(ModelSignature {
+                    model_id: r.get(0)?,
+                    revision: r.get(1)?,
+                    dimensions: r.get(2)?,
+                    text_encoding: r.get(3)?,
+                })
+            })
+            .optional()?)
+    })
 }
 fn check(stop: &AtomicBool) -> Result<()> {
     if stop.load(Ordering::Acquire) {
@@ -90,7 +102,30 @@ fn upgrade_with(
     let mut changed = 0;
     loop {
         check(stop)?;
-        let units=store.read(|tx|{let mut query=tx.sql().prepare("SELECT i.seq,i.target,i.kind,i.version,b.embedding,CASE i.kind WHEN 'node' THEN n.text WHEN 'candidate' THEN c.text WHEN 'segment' THEN s.text END,x.episode_id,x.start,x.end FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq LEFT JOIN node_versions n ON i.kind='node' AND n.id=i.target AND n.version=i.version LEFT JOIN candidates c ON i.kind='candidate' AND c.id=i.target LEFT JOIN segments s ON i.kind='segment' AND s.id=i.target LEFT JOIN episode_chunks x ON i.kind='episode' AND x.id=i.target WHERE (?1 IS NULL OR i.seq>?1) AND (i.kind<>'segment' OR s.modality='text') ORDER BY i.seq LIMIT 16")?;Ok(query.query_map([after],|r|Ok(Unit{seq:r.get(0)?,target:r.get(1)?,kind:r.get(2)?,version:r.get(3)?,bytes:r.get(4)?,text:r.get(5)?,episode:r.get(6)?,start:r.get(7)?,end:r.get(8)?}))?.collect::<std::result::Result<Vec<_>,_>>()?)})?;
+        let units = store.read(|tx| {
+            let mut query = tx.sql().prepare("SELECT i.seq,i.target,i.kind,i.version,b.embedding,CASE i.kind WHEN 'node' THEN n.text WHEN \
+                'candidate' THEN c.text WHEN 'segment' THEN s.text END,x.episode_id,x.start,x.end FROM \
+                vector_items i JOIN vector_blobs b ON b.seq=i.seq LEFT JOIN node_versions n ON \
+                i.kind='node' AND n.id=i.target AND n.version=i.version LEFT JOIN candidates c ON \
+                i.kind='candidate' AND c.id=i.target LEFT JOIN segments s ON i.kind='segment' AND \
+                s.id=i.target LEFT JOIN episode_chunks x ON i.kind='episode' AND x.id=i.target WHERE (?1 IS \
+                NULL OR i.seq>?1) AND (i.kind<>'segment' OR s.modality='text') ORDER BY i.seq LIMIT 16")?;
+            Ok(query
+                .query_map([after], |r| {
+                    Ok(Unit {
+                        seq: r.get(0)?,
+                        target: r.get(1)?,
+                        kind: r.get(2)?,
+                        version: r.get(3)?,
+                        bytes: r.get(4)?,
+                        text: r.get(5)?,
+                        episode: r.get(6)?,
+                        start: r.get(7)?,
+                        end: r.get(8)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?)
+        })?;
         if units.is_empty() {
             break;
         }
@@ -125,10 +160,53 @@ fn upgrade_with(
                     "Literal text upgrade produced an invalid vector",
                 ));
             }
-            store.write(|tx|{let current=tx.sql().query_row("SELECT i.target,i.kind,i.version,b.embedding,b.current,b.tier FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.seq=?",[unit.seq],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,Vec<u8>>(3)?,r.get::<_,bool>(4)?,r.get::<_,String>(5)?))).optional()?;
-    let Some((target,kind,version,bytes,current,tier))=current else{return Err(Error::Conflict("Literal text vector changed during upgrade"))};if target!=unit.target||kind!=unit.kind||version!=unit.version||bytes!=unit.bytes{return Err(Error::Conflict("Literal text vector changed during upgrade"));}
-    // Latest eligibility/tier may have changed during inference; never revive it.
-    tx.put_vector(&VectorWrite{seq:unit.seq,target,kind:match kind.as_str(){"node"=>VectorKind::Node,"candidate"=>VectorKind::Candidate,"episode"=>VectorKind::Episode,"segment"=>VectorKind::Segment,_=>return Err(Error::Unavailable("Stored vector kind is unsupported"))},version,embedding:F32Blob::from_values(&vector)?,current,tier:match tier.as_str(){"hot"=>Tier::Hot,"cold"=>Tier::Cold,_=>return Err(Error::Unavailable("Stored vector tier is unsupported"))}})?;Ok(())})?;
+            store.write(|tx| {
+                let current = tx
+                    .sql()
+                    .query_row("SELECT i.target,i.kind,i.version,b.embedding,b.current,b.tier FROM vector_items i JOIN \
+                        vector_blobs b ON b.seq=i.seq WHERE i.seq=?", [unit.seq], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, Vec<u8>>(3)?,
+                            r.get::<_, bool>(4)?,
+                            r.get::<_, String>(5)?,
+                        ))
+                    })
+                    .optional()?;
+                let Some((target, kind, version, bytes, current, tier)) = current else {
+                    return Err(Error::Conflict("Literal text vector changed during upgrade"));
+                };
+                if target != unit.target
+                    || kind != unit.kind
+                    || version != unit.version
+                    || bytes != unit.bytes
+                {
+                    return Err(Error::Conflict("Literal text vector changed during upgrade"));
+                }
+                // Latest eligibility/tier may have changed during inference; never revive it.
+                tx.put_vector(&VectorWrite {
+                    seq: unit.seq,
+                    target,
+                    kind: match kind.as_str() {
+                        "node" => VectorKind::Node,
+                        "candidate" => VectorKind::Candidate,
+                        "episode" => VectorKind::Episode,
+                        "segment" => VectorKind::Segment,
+                        _ => return Err(Error::Unavailable("Stored vector kind is unsupported")),
+                    },
+                    version,
+                    embedding: F32Blob::from_values(&vector)?,
+                    current,
+                    tier: match tier.as_str() {
+                        "hot" => Tier::Hot,
+                        "cold" => Tier::Cold,
+                        _ => return Err(Error::Unavailable("Stored vector tier is unsupported")),
+                    },
+                })?;
+                Ok(())
+            })?;
             changed += 1;
         }
     }
@@ -137,7 +215,20 @@ fn upgrade_with(
     // rows and unresolved state; the ordinary worker still owns resolution.
     let mut failed_after = None::<(String, i64)>;
     loop {
-        let failures=store.read(|tx|{let mut q=tx.sql().prepare("SELECT target,version FROM index_failures WHERE resolved=0 AND (?1 IS NULL OR (target,version)>(?1,?2)) ORDER BY target,version LIMIT 16")?;Ok(q.query_map(params![failed_after.as_ref().map(|x|x.0.as_str()),failed_after.as_ref().map(|x|x.1)],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?)})?;
+        let failures = store.read(|tx| {
+            let mut q = tx.sql().prepare(
+                "SELECT target,version FROM index_failures WHERE resolved=0 AND (?1 IS NULL OR \
+                (target,version)>(?1,?2)) ORDER BY target,version LIMIT 16",
+            )?;
+            Ok(q.query_map(
+                params![
+                    failed_after.as_ref().map(|x| x.0.as_str()),
+                    failed_after.as_ref().map(|x| x.1)
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+        })?;
         if failures.is_empty() {
             break;
         }
@@ -180,7 +271,12 @@ fn upgrade_with(
                 }
             }
         }
-        store.write(|tx|{for(target,version)in due{tx.sql().execute("UPDATE index_failures SET next_attempt=0 WHERE target=? AND version=? AND resolved=0",params![target,version])?;}Ok(())})?;
+        store.write(|tx| {
+            for (target, version) in due {
+                tx.sql().execute("UPDATE index_failures SET next_attempt=0 WHERE target=? AND version=? AND resolved=0", params![target, version])?;
+            }
+            Ok(())
+        })?;
     }
     // The marker stays0 through all bounded units. A crash/rejection remains fail-closed;
     // replay may encode an affected unit again, never serve a half-upgraded signature.
@@ -234,7 +330,28 @@ mod tests {
         (dir, store)
     }
     fn add(store: &Store, id: &str, seq: i64, text: &str, current: bool) {
-        store.command(&memento_domain::context(id.into(),"owner".into(),"Literal synthetic source".into()),&serde_json::json!({"fixture":id}),|tx,commit|{tx.sql().execute("INSERT INTO node_versions(id,version,type,text,state,pinned,scope,commit_id) VALUES(?,1,'knowledge',?,'active',0,'[\"personal\"]',?)",params![id,text,commit])?;let mut vector=[0f32;768];vector[0]=1.;tx.put_vector(&VectorWrite{seq,target:id.into(),kind:VectorKind::Node,version:1,embedding:F32Blob::from_values(&vector)?,current,tier:Tier::Hot})?;Ok(serde_json::json!({}))}).unwrap();
+        store
+            .command(
+                &memento_domain::context(id.into(), "owner".into(), "Literal synthetic source".into()),
+                &serde_json::json!({"fixture":id}),
+                |tx, commit| {
+                    tx.sql().execute("INSERT INTO node_versions(id,version,type,text,state,pinned,scope,commit_id) \
+                        VALUES(?,1,'knowledge',?,'active',0,'[\"personal\"]',?)", params![id, text, commit])?;
+                    let mut vector = [0f32; 768];
+                    vector[0] = 1.;
+                    tx.put_vector(&VectorWrite {
+                        seq,
+                        target: id.into(),
+                        kind: VectorKind::Node,
+                        version: 1,
+                        embedding: F32Blob::from_values(&vector)?,
+                        current,
+                        tier: Tier::Hot,
+                    })?;
+                    Ok(serde_json::json!({}))
+                },
+            )
+            .unwrap();
     }
     #[test]
     fn selective_upgrade_keeps_ids_flags_unaffected_bytes_and_all_authority() {
@@ -256,7 +373,12 @@ mod tests {
                 ))
             })
             .unwrap();
-        store.write(|tx|{tx.sql().execute("INSERT INTO index_failures VALUES('control',1,3,'LegacyTextEncode',9999999999,0)",[])?;Ok(())}).unwrap();
+        store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO index_failures VALUES('control',1,3,'LegacyTextEncode',9999999999,0)", [])?;
+                Ok(())
+            })
+            .unwrap();
         let mut calls = 0;
         assert_eq!(
             upgrade_with(&store, &AtomicBool::new(false), |text| {
@@ -303,7 +425,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!(signature(&store).unwrap().unwrap().text_encoding, 1);
-        store.read(|tx|{let row:(i64,f64,bool)=tx.sql().query_row("SELECT attempts,next_attempt,resolved FROM index_failures WHERE target='control'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;assert_eq!(row,(3,0.0,false));Ok(())}).unwrap();
+        store
+            .read(|tx| {
+                let row: (i64, f64, bool) = tx
+                    .sql()
+                    .query_row("SELECT attempts,next_attempt,resolved FROM index_failures WHERE target='control'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                assert_eq!(row, (3, 0.0, false));
+                Ok(())
+            })
+            .unwrap();
         crate::indexing::resolve_due_failures(&store).unwrap();
         assert!(
             store
@@ -357,20 +487,70 @@ mod tests {
     fn legacy_upgrade_uses_codepoint_passages_and_leaves_nontext_media_vectors_exact() {
         let (_dir, store) = fixture();
         let text = "🧭 Literal <bos> boundary remains";
-        let episode=store.capture(serde_json::from_value(serde_json::json!({"source":"synthetic","event_id":"literal-kinds","conversation_id":"literal-kinds","kind":"user","text":text,"metadata":{}})).unwrap()).unwrap();
-        store.command(&memento_domain::context("literal-kinds".into(),"owner".into(),"Exact legacy kind fixture".into()),&serde_json::json!({"fixture":"literal-kinds"}),|tx,commit|{
-            tx.sql().execute("INSERT INTO extraction_runs VALUES('literal-run',?,?,'fixture','fixture','[]','{}','2020-01-01T00:00:00Z')",params![commit,episode.id])?;
-            tx.sql().execute(r#"INSERT INTO candidates(id,run_id,kind,type,text,why,confidence,scope) VALUES('literal-candidate','literal-run','memory','knowledge','Candidate <eos> statement','Exact fixture',1,'["personal"]')"#,[])?;
-            for(id,modality,text)in[("literal-text","text","Document <mask> note"),("literal-image","image","Image depicts <bos> marker")]{
-                tx.sql().execute("INSERT INTO segments(id,node_id,modality,text,artifact_sha256) VALUES(?,'literal-media',?,?,?)",params![id,modality,text,"0".repeat(64)])?;
-            }
-            tx.sql().execute("INSERT INTO episode_chunks VALUES('literal-chunk',?,2,?)",params![episode.id,text.chars().count() as i64])?;
-            let mut vector=[0f32;768];vector[0]=1.;
-            for(seq,target,kind,current,tier)in [(10,"literal-candidate",VectorKind::Candidate,true,Tier::Hot),(11,"literal-text",VectorKind::Segment,true,Tier::Hot),(12,"literal-image",VectorKind::Segment,true,Tier::Hot),(13,"literal-chunk",VectorKind::Episode,false,Tier::Cold)] {
-                tx.put_vector(&VectorWrite{seq,target:target.into(),kind,version:1,embedding:F32Blob::from_values(&vector)?,current,tier})?;
-            }
-            Ok(serde_json::json!({}))
-        }).unwrap();
+        let episode = store
+            .capture(
+                serde_json::from_value(serde_json::json!({
+                    "source":"synthetic",
+                    "event_id":"literal-kinds",
+                    "conversation_id":"literal-kinds",
+                    "kind":"user",
+                    "text":text,
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .command(
+                &memento_domain::context(
+                    "literal-kinds".into(),
+                    "owner".into(),
+                    "Exact legacy kind fixture".into(),
+                ),
+                &serde_json::json!({"fixture":"literal-kinds"}),
+                |tx, commit| {
+                    tx.sql().execute("INSERT INTO extraction_runs \
+                        VALUES('literal-run',?,?,'fixture','fixture','[]','{}','2020-01-01T00:00:00Z')", params![commit, episode.id])?;
+                    tx.sql().execute(r#"INSERT INTO candidates(id,run_id,kind,type,text,why,confidence,scope) VALUES('literal-candidate','literal-run','memory','knowledge','Candidate <eos> statement','Exact fixture',1,'["personal"]')"#, [])?;
+                    for (id, modality, text) in [
+                        ("literal-text", "text", "Document <mask> note"),
+                        ("literal-image", "image", "Image depicts <bos> marker"),
+                    ] {
+                        tx.sql()
+                            .execute("INSERT INTO segments(id,node_id,modality,text,artifact_sha256) VALUES(?,'literal-media',?,?,?)", params![id, modality, text, "0".repeat(64)])?;
+                    }
+                    tx.sql().execute(
+                        "INSERT INTO episode_chunks VALUES('literal-chunk',?,2,?)",
+                        params![episode.id, text.chars().count() as i64],
+                    )?;
+                    let mut vector = [0f32; 768];
+                    vector[0] = 1.;
+                    for (seq, target, kind, current, tier) in [
+                        (
+                            10,
+                            "literal-candidate",
+                            VectorKind::Candidate,
+                            true,
+                            Tier::Hot,
+                        ),
+                        (11, "literal-text", VectorKind::Segment, true, Tier::Hot),
+                        (12, "literal-image", VectorKind::Segment, true, Tier::Hot),
+                        (13, "literal-chunk", VectorKind::Episode, false, Tier::Cold),
+                    ] {
+                        tx.put_vector(&VectorWrite {
+                            seq,
+                            target: target.into(),
+                            kind,
+                            version: 1,
+                            embedding: F32Blob::from_values(&vector)?,
+                            current,
+                            tier,
+                        })?;
+                    }
+                    Ok(serde_json::json!({}))
+                },
+            )
+            .unwrap();
         let before = store
             .read(|tx| {
                 Ok(tx.sql().query_row(

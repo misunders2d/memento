@@ -20,8 +20,28 @@ impl Fixture {
     pub(crate) fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
-        store.write(|tx|{tx.sql().execute("INSERT OR REPLACE INTO vector_model(singleton,model_id,revision,dimensions,text_encoding) VALUES (1,?,?,768,1)",rusqlite::params![memento_embedding::MODEL_ID,memento_embedding::MODEL_REVISION])?;Ok(())}).unwrap();
-        let episode:EpisodeInput=serde_json::from_value(json!({"source":"media-test","event_id":"one","conversation_id":"thread","kind":"user","text":"Exact synthetic media evidence Ω😀","metadata":{}})).unwrap();
+        store
+            .write(|tx| {
+                tx.sql().execute(
+                    "INSERT OR REPLACE INTO vector_model(singleton,model_id,revision,dimensions,text_encoding) \
+                        VALUES (1,?,?,768,1)",
+                    rusqlite::params![
+                        memento_embedding::MODEL_ID,
+                        memento_embedding::MODEL_REVISION
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let episode: EpisodeInput = serde_json::from_value(json!({
+            "source":"media-test",
+            "event_id":"one",
+            "conversation_id":"thread",
+            "kind":"user",
+            "text":"Exact synthetic media evidence Ω😀",
+            "metadata":{}
+        }))
+        .unwrap();
         let saved = store.capture(episode).unwrap();
         let blob = store
             .blobs()
@@ -34,7 +54,18 @@ impl Fixture {
             })
             .unwrap();
         let queue = Queue::new(Graph::new(store.clone()));
-        queue.submit_media(&json!({"command_id":"save-media","actor":"fixture","why":"source contract","sha256":blob.sha256,"kind":"document","filename":"source.txt","scope":["personal"],"evidence":[{"episode_id":saved.id,"quote":"Exact synthetic media evidence Ω😀"}]})).unwrap();
+        queue
+            .submit_media(&json!({
+                "command_id":"save-media",
+                "actor":"fixture",
+                "why":"source contract",
+                "sha256":blob.sha256,
+                "kind":"document",
+                "filename":"source.txt",
+                "scope":["personal"],
+                "evidence":[{"episode_id":saved.id,"quote":"Exact synthetic media evidence Ω😀"}]
+            }))
+            .unwrap();
         let job = queue.claim(&["media".into()], &[]).unwrap().unwrap();
         let identity = representation(&store, "document", "source.txt").unwrap();
         Self {
@@ -137,7 +168,13 @@ fn final_failure_rolls_back_graph_and_preserves_every_staged_unit() {
     for n in 0..2 {
         persist(&f.store, &f.job, &f.identity, n, f.unit(n)).unwrap();
     }
-    f.store.write(|tx|{tx.sql().execute_batch("CREATE TEMP TRIGGER reject_second BEFORE INSERT ON segments WHEN NEW.text='unit1' BEGIN SELECT RAISE(ABORT,'injected'); END;")?;Ok(())}).unwrap();
+    f.store
+        .write(|tx| {
+            tx.sql().execute_batch("CREATE TEMP TRIGGER reject_second BEFORE INSERT ON segments WHEN NEW.text='unit1' BEGIN \
+                SELECT RAISE(ABORT,'injected'); END;")?;
+            Ok(())
+        })
+        .unwrap();
     assert!(finish(&f.store, &f.job, &f.identity, 2).is_err());
     for table in [
         "node_versions",

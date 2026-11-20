@@ -31,8 +31,15 @@ fn put(tx: &WriteTxn<'_, '_>) -> Result<EventFence> {
     })
 }
 fn seed(tx: &WriteTxn<'_, '_>, commit: &str) -> Result<()> {
-    tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(1,'episode','fixture','event','chat','user','Ω😀 synthetic source',NULL,'{}','2026-10-20T12:00:00+00:00')",[])?;
-    tx.sql().execute("INSERT INTO node_versions VALUES('node',1,?,'knowledge','Supported fixture','active',NULL,NULL,NULL,0,'[\"personal\"]')",[commit])?;
+    tx.sql().execute("INSERT INTO \
+        episodes(seq,id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+        VALUES(1,'episode','fixture','event','chat','user','Ω😀 synthetic \
+        source',NULL,'{}','2026-10-20T12:00:00+00:00')", [])?;
+    tx.sql().execute(
+        "INSERT INTO node_versions VALUES('node',1,?,'knowledge','Supported \
+        fixture','active',NULL,NULL,NULL,0,'[\"personal\"]')",
+        [commit],
+    )?;
     tx.sql()
         .execute("INSERT INTO node_stats(node_id) VALUES('node')", [])?;
     tx.sql().execute(
@@ -132,7 +139,13 @@ fn exact_old_command_retry_does_not_reapply_or_hide_changes() {
         why: "réessai".into(),
     };
     let old = r#"{"actor": "ø", "command": {"n": 1e-06, "text": "Ω😀"}, "why": "réessai"}"#;
-    store.write(|tx|{tx.sql().execute("INSERT INTO graph_commits VALUES('old','legacy',?,'{\"id\":\"already\"}','ø','réessai','2026-10-20T12:00:00+00:00')",[old])?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO graph_commits \
+                VALUES('old','legacy',?,'{\"id\":\"already\"}','ø','réessai','2026-10-20T12:00:00+00:00')", [old])?;
+            Ok(())
+        })
+        .unwrap();
     let applied = Cell::new(false);
     let request: Value = serde_json::from_str(r#"{"text":"Ω😀","n":0.000001}"#).unwrap();
     let result = store
@@ -358,11 +371,19 @@ fn local_original_raw_frame_and_opaque_blob_hydrate_without_nested_writer() {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(original.as_bytes()).unwrap();
     let compressed = encoder.finish().unwrap();
-    store.write(|tx|{tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at) VALUES(1,'frame','native:fixture:pi','f','raw','native_record',?,'{\"extraction_mode\":\"skip\"}','2026-10-20T12:00:00+00:00')",[original])?;
-        tx.sql().execute("INSERT INTO raw_frames VALUES(1,'native:fixture:pi','raw',?,1,?,?)",params![original.len(),sha,compressed])?;
-        let refs=format!("[[1,0,{}]]",original.len());tx.authorize_frame(1,&refs,&sha)?;
-        tx.sql().execute("UPDATE episodes SET text='',raw_frame=?,text_sha256=? WHERE id='frame'",params![refs,sha])?;
-        assert_eq!(tx.original_text("frame")?,Some(original.into()));Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at) \
+                VALUES(1,'frame','native:fixture:pi','f','raw','native_record',?,'{\"extraction_mode\":\"skip\"}','2026-10-20T12:00:00+00:00')", [original])?;
+            tx.sql()
+                .execute("INSERT INTO raw_frames VALUES(1,'native:fixture:pi','raw',?,1,?,?)", params![original.len(), sha, compressed])?;
+            let refs = format!("[[1,0,{}]]", original.len());
+            tx.authorize_frame(1, &refs, &sha)?;
+            tx.sql().execute("UPDATE episodes SET text='',raw_frame=?,text_sha256=? WHERE id='frame'", params![refs, sha])?;
+            assert_eq!(tx.original_text("frame")?, Some(original.into()));
+            Ok(())
+        })
+        .unwrap();
     store
         .read(|tx| {
             assert_eq!(tx.original_text("frame")?, Some(original.into()));
@@ -398,9 +419,19 @@ fn local_original_raw_frame_and_opaque_blob_hydrate_without_nested_writer() {
     file.write_all(payload.as_bytes()).unwrap();
     file.sync_all().unwrap();
     drop(file);
-    store.write(|tx|{let runs=serde_json::to_string(&json!([[prefix.chars().count(),payload_sha,payload.len()]]))?;
-        tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at,text_runs,text_sha256) VALUES(2,'opaque','native:fixture:pi','o','raw','native_record',?,'{\"extraction_mode\":\"skip\"}','2026-10-20T12:00:00+00:00',?,?)",params![format!("{prefix}{suffix}"),runs,full_sha])?;
-        assert_eq!(tx.original_text("opaque")?,Some(full.clone()));Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            let runs = serde_json::to_string(&json!([[prefix.chars().count(),payload_sha,payload.len()]]))?;
+            tx.sql().execute(
+                "INSERT INTO \
+                    episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at,text_runs,text_sha256) \
+                    VALUES(2,'opaque','native:fixture:pi','o','raw','native_record',?,'{\"extraction_mode\":\"skip\"}','2026-10-20T12:00:00+00:00',?,?)",
+                params![format!("{prefix}{suffix}"), runs, full_sha],
+            )?;
+            assert_eq!(tx.original_text("opaque")?, Some(full.clone()));
+            Ok(())
+        })
+        .unwrap();
     store
         .read(|tx| {
             assert_eq!(tx.original_text("opaque")?, Some(full));
@@ -585,13 +616,19 @@ fn open_replaces_the_chunk_delete_guard_once_and_keeps_other_deletes_refused() {
     drop(store);
     // A database created before chunk retirement carries the unconditional guard.
     let db = Connection::open(path.join("memory.sqlite")).unwrap();
-    db.execute_batch("DROP TRIGGER episode_chunks_no_DELETE_v2; CREATE TRIGGER episode_chunks_no_DELETE BEFORE DELETE ON episode_chunks BEGIN SELECT RAISE(ABORT,'graph history is immutable'); END;").unwrap();
+    db.execute_batch(
+        "DROP TRIGGER episode_chunks_no_DELETE_v2; CREATE TRIGGER episode_chunks_no_DELETE BEFORE \
+        DELETE ON episode_chunks BEGIN SELECT RAISE(ABORT,'graph history is immutable'); END;",
+    )
+    .unwrap();
     drop(db);
     let store = Store::open(&path).unwrap();
     let triggers = store
         .read(|tx| {
             let mut query = tx.sql().prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name='episode_chunks' ORDER BY name")?;
-            Ok(query.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
+            Ok(query
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?)
         })
         .unwrap();
     assert_eq!(
@@ -604,7 +641,12 @@ fn open_replaces_the_chunk_delete_guard_once_and_keeps_other_deletes_refused() {
     );
     store
         .write(|tx| {
-            tx.sql().execute_batch("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(1,'message','fixture','m','chat','user','Human text',NULL,'{}','2026-11-01T00:00:00+00:00'),(2,'output','fixture','o','chat','tool','Tool text',NULL,'{\"extraction_mode\":\"tool_output\"}','2026-11-01T00:00:00+00:00'); INSERT INTO episode_chunks VALUES('chunk-message','message',0,5),('chunk-output','output',0,4);")?;
+            tx.sql().execute_batch("INSERT INTO \
+                episodes(seq,id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+                VALUES(1,'message','fixture','m','chat','user','Human \
+                text',NULL,'{}','2026-11-01T00:00:00+00:00'),(2,'output','fixture','o','chat','tool','Tool \
+                text',NULL,'{\"extraction_mode\":\"tool_output\"}','2026-11-01T00:00:00+00:00'); INSERT \
+                INTO episode_chunks VALUES('chunk-message','message',0,5),('chunk-output','output',0,4);")?;
             Ok(())
         })
         .unwrap();

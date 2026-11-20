@@ -124,7 +124,15 @@ fn record(db: &Connection, sha: &str) -> Result<Option<BlobRecord>> {
         .optional()?)
 }
 fn pending_media(db: &Connection, sha: &str) -> Result<bool> {
-    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='media' AND state IN ('pending','leased') AND json_extract(payload,'$.sha256')=?1) OR EXISTS(SELECT 1 FROM media_stage_units u JOIN jobs j ON j.id=u.job_id WHERE j.kind='media' AND j.state IN ('pending','leased') AND (json_extract(u.metadata,'$.artifact_sha256')=?1 OR json_extract(u.metadata,'$.source_sha256')=?1))",[sha],|r|r.get(0))?)
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='media' AND state IN ('pending','leased') AND \
+        json_extract(payload,'$.sha256')=?1) OR EXISTS(SELECT 1 FROM media_stage_units u JOIN jobs \
+        j ON j.id=u.job_id WHERE j.kind='media' AND j.state IN ('pending','leased') AND \
+        (json_extract(u.metadata,'$.artifact_sha256')=?1 OR \
+        json_extract(u.metadata,'$.source_sha256')=?1))",
+        [sha],
+        |r| r.get(0),
+    )?)
 }
 fn phase(tx: &WriteTxn, sha: &str, name: &str, remote: &str) -> Result<()> {
     let now = now_utc();
@@ -247,7 +255,20 @@ impl ColdManager {
             } else {
                 "copying"
             };
-            self.store.write(|tx|{tx.sql().execute("INSERT INTO cold_transfers(sha256,checkpoint,status,remote_id,updated_at) VALUES(?,?,?,NULL,?) ON CONFLICT(sha256) DO UPDATE SET checkpoint=excluded.checkpoint,status=excluded.status,updated_at=excluded.updated_at",params![info.sha256,serde_json::to_string(&checkpoint)?,status,now_utc()])?;Ok(())})
+            self.store.write(|tx| {
+                tx.sql().execute(
+                    "INSERT INTO cold_transfers(sha256,checkpoint,status,remote_id,updated_at) \
+                        VALUES(?,?,?,NULL,?) ON CONFLICT(sha256) DO UPDATE SET \
+                        checkpoint=excluded.checkpoint,status=excluded.status,updated_at=excluded.updated_at",
+                    params![
+                        info.sha256,
+                        serde_json::to_string(&checkpoint)?,
+                        status,
+                        now_utc()
+                    ],
+                )?;
+                Ok(())
+            })
         };
         let object = self
             .backend
@@ -401,20 +422,52 @@ impl ColdManager {
             ))
         .to_rfc3339();
         let now = seconds();
-        let ids=self.store.read(|tx|{
-            let sql="SELECT b.sha256 FROM blobs b LEFT JOIN cold_failures f USING(sha256) WHERE b.tier='hot' AND (f.next_attempt IS NULL OR f.next_attempt<=?1) AND (b.size>=?2 OR b.mime LIKE 'image/%' OR b.mime LIKE 'audio/%' OR b.mime LIKE 'video/%' OR b.mime IN ('application/pdf','application/x-memento-raw-run') OR EXISTS(SELECT 1 FROM media_files WHERE sha256=b.sha256) OR EXISTS(SELECT 1 FROM segments WHERE artifact_sha256=b.sha256 OR source_sha256=b.sha256) OR EXISTS(SELECT 1 FROM jobs WHERE kind='media' AND json_extract(payload,'$.sha256')=b.sha256) OR (b.created_at<?3 AND NOT EXISTS(SELECT 1 FROM node_versions n LEFT JOIN node_stats s ON s.node_id=n.id WHERE n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND n.state='active' AND (n.pinned=1 OR coalesce(s.importance,0.5)>=?4) AND n.id IN (SELECT node_id FROM media_files WHERE sha256=b.sha256 UNION SELECT node_id FROM segments WHERE artifact_sha256=b.sha256 OR source_sha256=b.sha256))) OR EXISTS(SELECT 1 FROM cold_transfers t WHERE t.sha256=b.sha256 AND t.status IN ('copying','verified','committed'))) ORDER BY coalesce(f.attempts,0),b.created_at,b.sha256 LIMIT ?5";
-            let mut q=tx.sql().prepare(sql)?;Ok(q.query_map(params![now,min_bytes,cutoff,self.max_importance,limit],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?)
+        let ids = self.store.read(|tx| {
+            let sql = "SELECT b.sha256 FROM blobs b LEFT JOIN cold_failures f USING(sha256) WHERE b.tier='hot' AND \
+                (f.next_attempt IS NULL OR f.next_attempt<=?1) AND (b.size>=?2 OR b.mime LIKE 'image/%' OR \
+                b.mime LIKE 'audio/%' OR b.mime LIKE 'video/%' OR b.mime IN \
+                ('application/pdf','application/x-memento-raw-run') OR EXISTS(SELECT 1 FROM media_files \
+                WHERE sha256=b.sha256) OR EXISTS(SELECT 1 FROM segments WHERE artifact_sha256=b.sha256 OR \
+                source_sha256=b.sha256) OR EXISTS(SELECT 1 FROM jobs WHERE kind='media' AND \
+                json_extract(payload,'$.sha256')=b.sha256) OR (b.created_at<?3 AND NOT EXISTS(SELECT 1 FROM \
+                node_versions n LEFT JOIN node_stats s ON s.node_id=n.id WHERE n.version=(SELECT \
+                max(x.version) FROM node_versions x WHERE x.id=n.id) AND n.state='active' AND (n.pinned=1 \
+                OR coalesce(s.importance,0.5)>=?4) AND n.id IN (SELECT node_id FROM media_files WHERE \
+                sha256=b.sha256 UNION SELECT node_id FROM segments WHERE artifact_sha256=b.sha256 OR \
+                source_sha256=b.sha256))) OR EXISTS(SELECT 1 FROM cold_transfers t WHERE t.sha256=b.sha256 \
+                AND t.status IN ('copying','verified','committed'))) ORDER BY \
+                coalesce(f.attempts,0),b.created_at,b.sha256 LIMIT ?5";
+            let mut q = tx.sql().prepare(sql)?;
+            Ok(q.query_map(
+                params![now, min_bytes, cutoff, self.max_importance, limit],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
         })?;
         let mut promoted = 0;
         for sha in &ids {
             match self.promote_inner(sha) {
                 Ok(_) => promoted += 1,
                 Err(_) => {
-                    self.store.write(|tx|{let attempts:i64=tx.sql().query_row("SELECT attempts FROM cold_failures WHERE sha256=?",[sha],|r|r.get(0)).optional()?.unwrap_or(0)+1;let delay=3600_f64.min(60_f64*2_f64.powi((attempts-1).min(6)as i32));tx.sql().execute("INSERT INTO cold_failures VALUES(?,?,'transfer_failed',?) ON CONFLICT(sha256) DO UPDATE SET attempts=excluded.attempts,error=excluded.error,next_attempt=excluded.next_attempt",params![sha,attempts,seconds()+delay])?;Ok(())})?;
+                    self.store.write(|tx| {
+                        let attempts: i64 = tx
+                            .sql()
+                            .query_row("SELECT attempts FROM cold_failures WHERE sha256=?", [sha], |r| r.get(0))
+                            .optional()?
+                            .unwrap_or(0)
+                            + 1;
+                        let delay = 3600_f64.min(60_f64 * 2_f64.powi((attempts - 1).min(6) as i32));
+                        tx.sql()
+                            .execute("INSERT INTO cold_failures VALUES(?,?,'transfer_failed',?) ON CONFLICT(sha256) DO UPDATE SET \
+                                attempts=excluded.attempts,error=excluded.error,next_attempt=excluded.next_attempt", params![sha, attempts, seconds() + delay])?;
+                        Ok(())
+                    })?;
                 }
             }
         }
-        let failure_count=self.store.read(|tx|Ok(tx.sql().query_row("SELECT count(*) FROM cold_failures f JOIN blobs b USING(sha256) WHERE b.tier='hot'",[],|r|r.get(0))?))?;
+        let failure_count = self
+            .store
+            .read(|tx| Ok(tx.sql().query_row("SELECT count(*) FROM cold_failures f JOIN blobs b USING(sha256) WHERE b.tier='hot'", [], |r| r.get(0))?))?;
         Ok(Sweep {
             promoted,
             failure_count,
@@ -614,7 +667,14 @@ impl ColdManager {
         ids.iter().map(|id| self.upload_backup(id)).collect()
     }
     pub fn latest_backup_gap_count(&self) -> Result<u64> {
-        self.store.read(|tx|Ok(tx.sql().query_row("SELECT count(*) FROM backup_gaps WHERE backup_id=(SELECT id FROM backups ORDER BY created_at DESC,id DESC LIMIT 1)",[],|r|r.get(0))?))
+        self.store.read(|tx| {
+            Ok(tx.sql().query_row(
+                "SELECT count(*) FROM backup_gaps WHERE backup_id=(SELECT id FROM backups ORDER BY \
+                created_at DESC,id DESC LIMIT 1)",
+                [],
+                |r| r.get(0),
+            )?)
+        })
     }
     pub fn restore_from(
         backend: &dyn ColdStore,

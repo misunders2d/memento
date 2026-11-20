@@ -55,7 +55,15 @@ async fn rpc(state: &AppState, method: &str, params: Value) -> (StatusCode, Valu
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 fn capture(text: &str) -> Value {
-    json!({"source":"native:synthetic:pi","event_id":"one","conversation_id":"thread","kind":"user","text":text,"occurred_at":"2026-01-01T12:00:00+02:00","metadata":{}})
+    json!({
+        "source":"native:synthetic:pi",
+        "event_id":"one",
+        "conversation_id":"thread",
+        "kind":"user",
+        "text":text,
+        "occurred_at":"2026-01-01T12:00:00+02:00",
+        "metadata":{}
+    })
 }
 #[tokio::test]
 async fn open_directional_predicates_work_over_http_mcp_and_advertised_schemas() {
@@ -230,7 +238,15 @@ async fn actual_http_capture_graph_raw_recall_and_history_share_one_authority() 
         .0,
         StatusCode::CONFLICT
     );
-    let mut command = json!({"command_id":"remember","actor":"synthetic-owner","why":"Exact fixture evidence","type":"knowledge","text":"Stored synthetic fact","scope":["personal"],"evidence":[{"episode_id":created["id"],"quote":"Ω🧠"}]});
+    let mut command = json!({
+        "command_id":"remember",
+        "actor":"synthetic-owner",
+        "why":"Exact fixture evidence",
+        "type":"knowledge",
+        "text":"Stored synthetic fact",
+        "scope":["personal"],
+        "evidence":[{"episode_id":created["id"],"quote":"Ω🧠"}]
+    });
     let (status, node) = request(&state, "POST", "/remember", Some(command.clone())).await;
     assert_eq!(status, StatusCode::OK);
     let (status, history) = request(
@@ -283,7 +299,16 @@ async fn actual_mcp_lists_shared_tools_normalizes_only_optional_empties_and_wrap
         Some(capture("Exact quoted source")),
     )
     .await;
-    let initialized=rpc(&state,"initialize",json!({"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"synthetic","version":"1"}})).await;
+    let initialized = rpc(
+        &state,
+        "initialize",
+        json!({
+            "protocolVersion":"2026-07-28",
+            "capabilities":{},
+            "clientInfo":{"name":"synthetic","version":"1"}
+        }),
+    )
+    .await;
     assert_eq!(initialized.0, StatusCode::OK);
     assert_eq!(initialized.1["result"]["protocolVersion"], "2026-07-28");
     let tools = rpc(&state, "tools/list", json!({})).await.1;
@@ -306,7 +331,18 @@ async fn actual_mcp_lists_shared_tools_normalizes_only_optional_empties_and_wrap
             "work"
         ]
     );
-    let command = json!({"command_id":"tool-save","actor":"synthetic","why":"Grounded fixture","type":"knowledge","text":"Remembered source","scope":["personal"],"valid_from":"","source":"","conversation_id":"","evidence":[{"episode_id":created["id"],"quote":"Exact quoted source"}]});
+    let command = json!({
+        "command_id":"tool-save",
+        "actor":"synthetic",
+        "why":"Grounded fixture",
+        "type":"knowledge",
+        "text":"Remembered source",
+        "scope":["personal"],
+        "valid_from":"",
+        "source":"",
+        "conversation_id":"",
+        "evidence":[{"episode_id":created["id"],"quote":"Exact quoted source"}]
+    });
     let saved = rpc(
         &state,
         "tools/call",
@@ -353,7 +389,7 @@ async fn shared_processing_tool_uses_checked_api_and_one_evidence_envelope() {
         )),
     )
     .await;
-    let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"pool","command":{"kind":"extract","policies":true}}})).await;
+    let (_, response) = rpc(&state, "tools/call", json!({"name":"work","arguments":{"action":"pool","command":{"kind":"extract","policies":true}}})).await;
     assert_eq!(response["result"]["isError"], false);
     assert!(response["result"].get("structuredContent").is_none());
     let page: Value =
@@ -365,7 +401,15 @@ async fn shared_processing_tool_uses_checked_api_and_one_evidence_envelope() {
     let mut after = 0;
     let mut policy = String::new();
     loop {
-        let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"read","command":{"policy":"consolidate","after":after}}})).await;
+        let (_, response) = rpc(
+            &state,
+            "tools/call",
+            json!({
+                "name":"work",
+                "arguments":{"action":"read","command":{"policy":"consolidate","after":after}}
+            }),
+        )
+        .await;
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.len() < 16_000);
         let part: Value = serde_json::from_str(text).unwrap();
@@ -377,7 +421,7 @@ async fn shared_processing_tool_uses_checked_api_and_one_evidence_envelope() {
     }
     let policy: Value = serde_json::from_str(&policy).unwrap();
     assert_eq!(policy["schema"]["properties"]["actions"]["maxItems"], 128);
-    let (_,bad)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"pool","command":{"kind":"extract","path":"/private"}}})).await;
+    let (_, bad) = rpc(&state, "tools/call", json!({"name":"work","arguments":{"action":"pool","command":{"kind":"extract","path":"/private"}}})).await;
     assert_eq!(bad["result"]["isError"], true);
     let (status, _) = request(
         &state,
@@ -387,7 +431,23 @@ async fn shared_processing_tool_uses_checked_api_and_one_evidence_envelope() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["extract"],"compaction":{"source":"native:synthetic:pi","conversation_id":"thread"}}}})).await;
+    let (_, response) = rpc(
+        &state,
+        "tools/call",
+        json!({
+            "name":"work",
+            "arguments": {
+                "action":"claim",
+                "command": {
+                    "agent":"fixture",
+                    "timezone":"UTC",
+                    "kinds":["extract"],
+                    "compaction":{"source":"native:synthetic:pi","conversation_id":"thread"}
+                }
+            }
+        }),
+    )
+    .await;
     let claim: Value =
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     let mut read = claim["work"][0]["read"].clone();
@@ -1010,7 +1070,17 @@ async fn configured_bare_mcp_hosts_accept_valid_ports_and_reject_host_origin_con
     let (_dir, mut state) = fixture();
     state.allowed_hosts = std::sync::Arc::new(vec!["127.0.0.1".into(), "localhost".into()]);
     for host in ["127.0.0.1:18775", "localhost:18775"] {
-        let response=router(state.clone()).oneshot(Request::post("/mcp/").header("host",host).header("content-type","application/json").header("accept","application/json, text/event-stream").body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)).unwrap()).await.unwrap();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/mcp/")
+                    .header("host", host)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
     for host in [

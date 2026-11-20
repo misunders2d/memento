@@ -77,17 +77,57 @@ impl MediaIngest {
         Arc::new(move |job| this.handle(job))
     }
     pub fn handle(&self, job: &Job) -> std::result::Result<Value, JobFailure> {
-        self.run(job).map_err(|error|{
-   if matches!(error,Error::Stopped){return JobFailure{category:"InterruptedError",retryable:true,retry_after:Some(Duration::ZERO)}}
-   if matches!(&error,Error::Core(memento_core::Error::Conflict(message)) if *message=="Work lease expired or was reassigned"){
-    return JobFailure{category:"ConflictError",retryable:true,retry_after:Some(Duration::ZERO)}
-   }
-   if job.payload["captured"]==true{
-    let unavailable=self.graph.store.read(|tx|{let sha=stage::string(&job.payload,"sha256")?;let target:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=?)",[sha],|r|r.get(0))?;Ok(!target&& !memento_domain::jobs::active_captured_source(tx.sql(),sha)?)}).unwrap_or(false);
-    if unavailable{return JobFailure{category:"CapturedSourceUnavailable",retryable:false,retry_after:None}}
-   }
-   match error{Error::Core(e)=>e.into(),Error::Io(e)=>memento_core::Error::Io(e).into(),Error::Decode(_)|Error::Zip(_)|Error::Xml(_)|Error::Json(_)|Error::Image(_)|Error::Av(_)|Error::Pdf(_)=>JobFailure{category:"ValueError",retryable:false,retry_after:None},_=>JobFailure{category:"RuntimeError",retryable:true,retry_after:None}}
-  })
+        self.run(job).map_err(|error| {
+            if matches!(error, Error::Stopped) {
+                return JobFailure {
+                    category: "InterruptedError",
+                    retryable: true,
+                    retry_after: Some(Duration::ZERO),
+                };
+            }
+            if matches!(&error,Error::Core(memento_core::Error::Conflict(message)) if *message=="Work lease expired or was reassigned") {
+                return JobFailure {
+                    category: "ConflictError",
+                    retryable: true,
+                    retry_after: Some(Duration::ZERO),
+                };
+            }
+            if job.payload["captured"] == true {
+                let unavailable = self
+                    .graph
+                    .store
+                    .read(|tx| {
+                        let sha = stage::string(&job.payload, "sha256")?;
+                        let target: bool = tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id \
+                            WHERE m.sha256=?)", [sha], |r| r.get(0))?;
+                        Ok(!target && !memento_domain::jobs::active_captured_source(tx.sql(), sha)?)
+                    })
+                    .unwrap_or(false);
+                if unavailable {
+                    return JobFailure {
+                        category: "CapturedSourceUnavailable",
+                        retryable: false,
+                        retry_after: None,
+                    };
+                }
+            }
+            match error {
+                Error::Core(e) => e.into(),
+                Error::Io(e) => memento_core::Error::Io(e).into(),
+                Error::Decode(_) | Error::Zip(_) | Error::Xml(_) | Error::Json(_) | Error::Image(_) | Error::Av(_) | Error::Pdf(_) => {
+                    JobFailure {
+                        category: "ValueError",
+                        retryable: false,
+                        retry_after: None,
+                    }
+                }
+                _ => JobFailure {
+                    category: "RuntimeError",
+                    retryable: true,
+                    retry_after: None,
+                },
+            }
+        })
     }
     fn save(&self, bytes: &[u8], mime: &str) -> Result<(BlobInfo, String)> {
         Ok((
@@ -185,10 +225,29 @@ impl MediaIngest {
         })
     }
     fn reuse(&self, job: &Job, identity: &str, cursor: usize, ordinal: &mut usize) -> Result<bool> {
-        let candidate=self.graph.store.read(|tx|{
-   use rusqlite::OptionalExtension;
-   Ok(tx.sql().query_row("SELECT f.node_id FROM media_files f JOIN media_representations r ON r.node_id=f.node_id JOIN node_versions n ON n.id=f.node_id WHERE f.sha256=?1 AND r.identity=?2 AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets x WHERE x.target=n.id) AND (NOT EXISTS(SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) OR EXISTS(SELECT 1 FROM captured_media cm JOIN captured_media_refs cr ON cr.sha256=cm.sha256 JOIN episodes e ON e.id=cr.episode_id WHERE cm.node_id=n.id AND NOT EXISTS(SELECT 1 FROM forgotten_sources fs WHERE fs.source=e.source AND fs.event_id=e.event_id) AND NOT EXISTS(SELECT 1 FROM media_files mf JOIN forgotten_targets ft ON ft.target=mf.node_id WHERE mf.sha256=cm.sha256))) AND EXISTS(SELECT 1 FROM segments s WHERE s.node_id=n.id) AND NOT EXISTS(SELECT 1 FROM segments s LEFT JOIN vector_items i ON i.target=s.id AND i.kind='segment' AND i.version=1 LEFT JOIN vector_blobs b ON b.seq=i.seq AND b.current=1 WHERE s.node_id=n.id AND b.seq IS NULL) ORDER BY f.rowid LIMIT 1",rusqlite::params![stage::string(&job.payload,"sha256")?,identity],|r|r.get::<_,String>(0)).optional()?)
-  })?;
+        let candidate = self.graph.store.read(|tx| {
+            use rusqlite::OptionalExtension;
+            Ok(tx
+                .sql()
+                .query_row(
+                    "SELECT f.node_id FROM media_files f JOIN media_representations r ON r.node_id=f.node_id \
+                        JOIN node_versions n ON n.id=f.node_id WHERE f.sha256=?1 AND r.identity=?2 AND \
+                        n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) \
+                        AND NOT EXISTS(SELECT 1 FROM forgotten_targets x WHERE x.target=n.id) AND (NOT \
+                        EXISTS(SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) OR EXISTS(SELECT 1 FROM \
+                        captured_media cm JOIN captured_media_refs cr ON cr.sha256=cm.sha256 JOIN episodes e ON \
+                        e.id=cr.episode_id WHERE cm.node_id=n.id AND NOT EXISTS(SELECT 1 FROM forgotten_sources fs \
+                        WHERE fs.source=e.source AND fs.event_id=e.event_id) AND NOT EXISTS(SELECT 1 FROM \
+                        media_files mf JOIN forgotten_targets ft ON ft.target=mf.node_id WHERE \
+                        mf.sha256=cm.sha256))) AND EXISTS(SELECT 1 FROM segments s WHERE s.node_id=n.id) AND NOT \
+                        EXISTS(SELECT 1 FROM segments s LEFT JOIN vector_items i ON i.target=s.id AND \
+                        i.kind='segment' AND i.version=1 LEFT JOIN vector_blobs b ON b.seq=i.seq AND b.current=1 \
+                        WHERE s.node_id=n.id AND b.seq IS NULL) ORDER BY f.rowid LIMIT 1",
+                    rusqlite::params![stage::string(&job.payload, "sha256")?, identity],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?)
+        })?;
         let Some(node) = candidate else {
             return Ok(false);
         };
@@ -204,10 +263,33 @@ impl MediaIngest {
             if job.stopping() {
                 return Err(Error::Stopped);
             }
-            let next=self.graph.store.read(|tx|{
-    use rusqlite::OptionalExtension;
-    Ok(tx.sql().query_row("SELECT s.rowid,s.modality,s.text,s.artifact_sha256,s.start_s,s.end_s,s.page,s.char_start,s.char_end,s.source_sha256,b.embedding FROM segments s JOIN vector_items i ON i.target=s.id AND i.kind='segment' AND i.version=1 JOIN vector_blobs b ON b.seq=i.seq AND b.current=1 WHERE s.node_id=? AND s.rowid>? ORDER BY s.rowid LIMIT 1",rusqlite::params![node,last],|r|Ok((r.get::<_,i64>(0)?,Metadata{modality:r.get(1)?,text:r.get(2)?,artifact_sha256:r.get(3)?,start_s:r.get(4)?,end_s:r.get(5)?,page:r.get::<_,Option<i64>>(6)?.map(|n|n as usize),char_start:r.get::<_,Option<i64>>(7)?.map(|n|n as usize),char_end:r.get::<_,Option<i64>>(8)?.map(|n|n as usize),source_sha256:r.get(9)?},r.get::<_,Vec<u8>>(10)?))).optional()?)
-   })?;
+            let next = self.graph.store.read(|tx| {
+                use rusqlite::OptionalExtension;
+                Ok(tx
+                    .sql()
+                    .query_row("SELECT \
+                        s.rowid,s.modality,s.text,s.artifact_sha256,s.start_s,s.end_s,s.page,s.char_start,s.char_end,s.source_sha256,b.embedding \
+                        FROM segments s JOIN vector_items i ON i.target=s.id AND i.kind='segment' AND i.version=1 \
+                        JOIN vector_blobs b ON b.seq=i.seq AND b.current=1 WHERE s.node_id=? AND s.rowid>? ORDER BY \
+                        s.rowid LIMIT 1", rusqlite::params![node, last], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            Metadata {
+                                modality: r.get(1)?,
+                                text: r.get(2)?,
+                                artifact_sha256: r.get(3)?,
+                                start_s: r.get(4)?,
+                                end_s: r.get(5)?,
+                                page: r.get::<_, Option<i64>>(6)?.map(|n| n as usize),
+                                char_start: r.get::<_, Option<i64>>(7)?.map(|n| n as usize),
+                                char_end: r.get::<_, Option<i64>>(8)?.map(|n| n as usize),
+                                source_sha256: r.get(9)?,
+                            },
+                            r.get::<_, Vec<u8>>(10)?,
+                        ))
+                    })
+                    .optional()?)
+            })?;
             let Some((rowid, metadata, bytes)) = next else {
                 break;
             };

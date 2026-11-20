@@ -268,18 +268,26 @@ fn shard(path: PathBuf) -> Result<Shard> {
     })
 }
 fn known(tx: &ReadTxn<'_>, tier: Tier, fence: &EventFence) -> Result<bool> {
-    Ok(tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM projection_events WHERE tier=?1 AND id=?2 AND nonce=?3 AND generation=?4) OR EXISTS(SELECT 1 FROM projection_ack WHERE tier=?1 AND id=?2 AND nonce=?3 AND generation=?4)",params![tier.as_str(),fence.id,fence.nonce,fence.generation],|r|r.get(0))?)
+    Ok(tx.sql().query_row(
+        "SELECT EXISTS(SELECT 1 FROM projection_events WHERE tier=?1 AND id=?2 AND nonce=?3 AND \
+            generation=?4) OR EXISTS(SELECT 1 FROM projection_ack WHERE tier=?1 AND id=?2 AND nonce=?3 \
+            AND generation=?4)",
+        params![tier.as_str(), fence.id, fence.nonce, fence.generation],
+        |r| r.get(0),
+    )?)
 }
 fn rebuild_page(after: Option<i64>) -> (&'static str, i64) {
     match after {
         Some(seq) => (
-            "SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND i.seq>?2 ORDER BY i.seq LIMIT ?3",
+            "SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items \
+            i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND i.seq>?2 ORDER BY i.seq LIMIT ?3",
             seq,
         ),
         // An inclusive bound keeps the first page seekable and includes i64::MIN.
         // Later pages use the cursor directly, without overflowing i64::MAX.
         None => (
-            "SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND i.seq>=?2 ORDER BY i.seq LIMIT ?3",
+            "SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items \
+            i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND i.seq>=?2 ORDER BY i.seq LIMIT ?3",
             i64::MIN,
         ),
     }
@@ -293,7 +301,8 @@ fn rows(
     let mut result = Vec::new();
     if let Some(ids) = ids {
         // Point-keyed reads retain every i64 ID, including negative and zero.
-        let mut one=tx.sql().prepare("SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=? AND i.seq=?")?;
+        let mut one = tx.sql().prepare("SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items \
+            i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=? AND i.seq=?")?;
         for id in ids {
             if let Some(row) = one
                 .query_row(params![tier.as_str(), id], decode_row)
@@ -414,8 +423,10 @@ fn reconcile_raw_tiers(store: &Store) -> Result<()> {
     let mut next = i64::MIN;
     loop {
         let last = store.write(|tx| {
-            let mut query = tx.sql().prepare("SELECT i.seq FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.kind='episode' AND i.seq>=?1 AND b.tier='hot' ORDER BY i.seq LIMIT ?2")?;
-            let ids = query.query_map(params![next, BATCH], |r| r.get::<_, i64>(0))?
+            let mut query = tx.sql().prepare("SELECT i.seq FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.kind='episode' \
+                AND i.seq>=?1 AND b.tier='hot' ORDER BY i.seq LIMIT ?2")?;
+            let ids = query
+                .query_map(params![next, BATCH], |r| r.get::<_, i64>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             drop(query);
             for id in &ids {
@@ -445,10 +456,38 @@ impl Projection {
                 ));
             }
         }
-        store.write(|tx|{
-            let stored=tx.sql().query_row("SELECT model_id,revision,dimensions,text_encoding FROM vector_model WHERE singleton=1",[],|r|Ok(ModelSignature{model_id:r.get(0)?,revision:r.get(1)?,dimensions:r.get(2)?,text_encoding:r.get(3)?})).optional()?;
-            if let Some(stored)=stored{if stored!=signature{return Err(Error::Unavailable("Stored vectors use a different model signature"))}}
-            else{let count:i64=tx.sql().query_row("SELECT count(*) FROM vector_blobs",[],|r|r.get(0))?;if count!=0{return Err(Error::Unavailable("Stored vectors have no model signature"))}tx.sql().execute("INSERT INTO vector_model VALUES(1,?,?,?,?)",params![signature.model_id,signature.revision,signature.dimensions,signature.text_encoding])?;}Ok(())
+        store.write(|tx| {
+            let stored = tx
+                .sql()
+                .query_row("SELECT model_id,revision,dimensions,text_encoding FROM vector_model WHERE singleton=1", [], |r| {
+                    Ok(ModelSignature {
+                        model_id: r.get(0)?,
+                        revision: r.get(1)?,
+                        dimensions: r.get(2)?,
+                        text_encoding: r.get(3)?,
+                    })
+                })
+                .optional()?;
+            if let Some(stored) = stored {
+                if stored != signature {
+                    return Err(Error::Unavailable("Stored vectors use a different model signature"));
+                }
+            } else {
+                let count: i64 = tx.sql().query_row("SELECT count(*) FROM vector_blobs", [], |r| r.get(0))?;
+                if count != 0 {
+                    return Err(Error::Unavailable("Stored vectors have no model signature"));
+                }
+                tx.sql().execute(
+                    "INSERT INTO vector_model VALUES(1,?,?,?,?)",
+                    params![
+                        signature.model_id,
+                        signature.revision,
+                        signature.dimensions,
+                        signature.text_encoding
+                    ],
+                )?;
+            }
+            Ok(())
         })?;
         // Idempotent bounded transactions: legacy Hot raw points move through the
         // existing two-tier dirty log without changing source text or vector bytes.
@@ -528,7 +567,8 @@ impl Projection {
         // Background pages yield to optimization every 256 points. Foreground
         // retains its existing bounded 512-event admission and never optimizes.
         let limit = if foreground { FOREGROUND_EVENTS } else { BATCH };
-        let mut query=tx.sql().prepare("SELECT id,nonce,generation,vector_seq FROM projection_events WHERE tier=? AND id>? AND id<=? ORDER BY id LIMIT ?")?;
+        let mut query = tx.sql().prepare("SELECT id,nonce,generation,vector_seq FROM projection_events WHERE tier=? AND id>? AND \
+            id<=? ORDER BY id LIMIT ?")?;
         let events = query
             .query_map(
                 params![tier.as_str(), checkpoint.cursor.id, cut.id, limit + 1],
@@ -966,7 +1006,27 @@ mod recovery_tests {
         (dir, store, projection)
     }
     fn add(store: &Store, id: &str, seq: i64, cos: f32) {
-        store.write(|tx|{tx.sql().execute("INSERT INTO graph_commits SELECT 'test','test','{}','{}','test','test','2026' WHERE NOT EXISTS(SELECT 1 FROM graph_commits WHERE id='test')",[])?;tx.sql().execute("INSERT INTO node_versions VALUES(?,1,'test','person','A recorded person','active',NULL,NULL,NULL,0,'[\"personal\"]')",[id])?;let mut v=[0.;768];v[0]=cos;v[1]=(1.-cos*cos).sqrt();tx.put_vector(&VectorWrite{seq,target:id.into(),kind:VectorKind::Node,version:1,current:true,tier:Tier::Hot,embedding:F32Blob::from_values(&v)?})?;Ok(())}).unwrap()
+        store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO graph_commits SELECT 'test','test','{}','{}','test','test','2026' WHERE NOT \
+                    EXISTS(SELECT 1 FROM graph_commits WHERE id='test')", [])?;
+                tx.sql().execute("INSERT INTO node_versions VALUES(?,1,'test','person','A recorded \
+                    person','active',NULL,NULL,NULL,0,'[\"personal\"]')", [id])?;
+                let mut v = [0.; 768];
+                v[0] = cos;
+                v[1] = (1. - cos * cos).sqrt();
+                tx.put_vector(&VectorWrite {
+                    seq,
+                    target: id.into(),
+                    kind: VectorKind::Node,
+                    version: 1,
+                    current: true,
+                    tier: Tier::Hot,
+                    embedding: F32Blob::from_values(&v)?,
+                })?;
+                Ok(())
+            })
+            .unwrap()
     }
     fn top(index: &Projection) -> Result<String> {
         index.snapshot(true, false, |_, view| {

@@ -284,6 +284,25 @@ impl WriteTxn<'_, '_> {
             "UPDATE captured_media SET state='ready' WHERE sha256=? AND state='waiting'",
             [&info.sha256],
         )?;
-        Ok(self.sql().query_row("SELECT sha256,size,mime,tier,remote_id,created_at FROM blobs WHERE sha256=?",[&info.sha256],|r|Ok(serde_json::json!({"sha256":r.get::<_,String>(0)?,"size":r.get::<_,u64>(1)?,"mime":r.get::<_,String>(2)?,"tier":r.get::<_,String>(3)?,"remote_id":r.get::<_,Option<String>>(4)?,"created_at":r.get::<_,String>(5)?})))?)
+        Ok(self.sql().query_row(
+            "SELECT sha256,size,mime,tier,remote_id,created_at FROM blobs WHERE sha256=?",
+            [&info.sha256],
+            |r| {
+                Ok(serde_json::json!({
+                    "sha256":r.get::<_,
+                    String>(0)?,
+                    "size":r.get::<_,
+                    u64>(1)?,
+                    "mime":r.get::<_,
+                    String>(2)?,
+                    "tier":r.get::<_,
+                    String>(3)?,
+                    "remote_id":r.get::<_,
+                    Option<String>>(4)?,
+                    "created_at":r.get::<_,
+                    String>(5)?
+                }))
+            },
+        )?)
     }
 }

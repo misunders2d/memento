@@ -91,7 +91,23 @@ fn prior(
     input: &EpisodeInput,
     encoded: &str,
 ) -> Result<Option<CaptureResult>> {
-    let old=tx.sql().query_row("SELECT id,source,event_id,conversation_id,kind,text,occurred_at,metadata,text_sha256 FROM episodes WHERE source=? AND event_id=?",params![input.source,input.event_id],|r|Ok(Prior{id:r.get(0)?,source:r.get(1)?,event_id:r.get(2)?,conversation:r.get(3)?,kind:r.get(4)?,text:r.get(5)?,occurred:r.get(6)?,metadata:r.get(7)?,sha:r.get(8)?})).optional()?;
+    let old = tx
+        .sql()
+        .query_row("SELECT id,source,event_id,conversation_id,kind,text,occurred_at,metadata,text_sha256 FROM \
+            episodes WHERE source=? AND event_id=?", params![input.source, input.event_id], |r| {
+            Ok(Prior {
+                id: r.get(0)?,
+                source: r.get(1)?,
+                event_id: r.get(2)?,
+                conversation: r.get(3)?,
+                kind: r.get(4)?,
+                text: r.get(5)?,
+                occurred: r.get(6)?,
+                metadata: r.get(7)?,
+                sha: r.get(8)?,
+            })
+        })
+        .optional()?;
     match old {
         None => Ok(None),
         Some(old) => {
@@ -177,10 +193,42 @@ impl Store {
         }
         let (text, runs, sha, artifacts) = elide(self, &input)?;
         let references = captured_references(&input)?;
-        self.write(|tx|{if let Some(result)=prior(tx,&input,&encoded)?{return Ok(result)}for artifact in artifacts{tx.register_blob(&artifact,"application/x-memento-raw-run")?;}
-            let id=uuid::Uuid::new_v4().simple().to_string();let captured=now_utc();tx.sql().execute("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at,text_runs,text_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![id,input.source,input.event_id,input.conversation_id,input.kind,text,input.occurred_at,encoded,captured,runs,sha])?;let seq=tx.sql().last_insert_rowid();
-            record_references(tx,&id,&references)?;
-            tx.sql().execute("INSERT INTO processing_progress(source,conversation_id,latest_seq,latest_at) VALUES(?,?,?,?) ON CONFLICT(source,conversation_id) DO UPDATE SET latest_seq=excluded.latest_seq,latest_at=excluded.latest_at",params![input.source,input.conversation_id,seq,captured])?;Ok(CaptureResult{id,created:true})
+        self.write(|tx| {
+            if let Some(result) = prior(tx, &input, &encoded)? {
+                return Ok(result);
+            }
+            for artifact in artifacts {
+                tx.register_blob(&artifact, "application/x-memento-raw-run")?;
+            }
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let captured = now_utc();
+            tx.sql().execute(
+                "INSERT INTO \
+                    episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at,text_runs,text_sha256) \
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    id,
+                    input.source,
+                    input.event_id,
+                    input.conversation_id,
+                    input.kind,
+                    text,
+                    input.occurred_at,
+                    encoded,
+                    captured,
+                    runs,
+                    sha
+                ],
+            )?;
+            let seq = tx.sql().last_insert_rowid();
+            record_references(tx, &id, &references)?;
+            tx.sql().execute(
+                "INSERT INTO processing_progress(source,conversation_id,latest_seq,latest_at) \
+                    VALUES(?,?,?,?) ON CONFLICT(source,conversation_id) DO UPDATE SET \
+                    latest_seq=excluded.latest_seq,latest_at=excluded.latest_at",
+                params![input.source, input.conversation_id, seq, captured],
+            )?;
+            Ok(CaptureResult { id, created: true })
         })
     }
     pub fn episode(&self, id: &str) -> Result<Option<Value>> {
@@ -199,7 +247,30 @@ impl Store {
 }
 impl ReadTxn<'_> {
     pub fn episode(&self, id: &str) -> Result<Option<Value>> {
-        let row=self.sql().query_row("SELECT id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at FROM episodes WHERE id=?",[id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"source":r.get::<_,String>(1)?,"event_id":r.get::<_,String>(2)?,"conversation_id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"text":r.get::<_,String>(5)?,"occurred_at":r.get::<_,Option<String>>(6)?,"metadata":r.get::<_,String>(7)?,"captured_at":r.get::<_,String>(8)?}))).optional()?;
+        let row = self
+            .sql()
+            .query_row("SELECT id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at FROM \
+                episodes WHERE id=?", [id], |r| Ok(json!({
+                "id":r.get::<_,
+                String>(0)?,
+                "source":r.get::<_,
+                String>(1)?,
+                "event_id":r.get::<_,
+                String>(2)?,
+                "conversation_id":r.get::<_,
+                String>(3)?,
+                "kind":r.get::<_,
+                String>(4)?,
+                "text":r.get::<_,
+                String>(5)?,
+                "occurred_at":r.get::<_,
+                Option<String>>(6)?,
+                "metadata":r.get::<_,
+                String>(7)?,
+                "captured_at":r.get::<_,
+                String>(8)?
+            })))
+            .optional()?;
         let Some(mut value) = row else {
             return Ok(None);
         };
@@ -229,7 +300,8 @@ impl ReadTxn<'_> {
         }
         let since = since.map(utc_time).transpose()?;
         let mut filters = String::from(
-            " AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)",
+            " AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND \
+            f.event_id=e.event_id)",
         );
         let mut values = Vec::new();
         if let Some(conversation) = conversation {
@@ -258,17 +330,54 @@ impl ReadTxn<'_> {
             values.insert(0, SqlValue::Text(matched));
             values.push(SqlValue::Integer(limit as i64));
             sql = format!(
-                "SELECT {columns},substr(snippet(episodes_fts,0,'','','…',32),1,512),NULL FROM episodes_fts JOIN episodes e ON e.seq=episodes_fts.rowid WHERE episodes_fts MATCH ? AND episodes_fts.rowid IN(SELECT episodes_fts.rowid FROM episodes_fts JOIN episodes e ON e.seq=episodes_fts.rowid WHERE episodes_fts MATCH ?{filters} ORDER BY bm25(episodes_fts),e.id LIMIT ?) ORDER BY bm25(episodes_fts),e.id"
+                "SELECT {columns},substr(snippet(episodes_fts,0,'','','…',32),1,512),NULL FROM episodes_fts \
+                JOIN episodes e ON e.seq=episodes_fts.rowid WHERE episodes_fts MATCH ? AND \
+                episodes_fts.rowid IN(SELECT episodes_fts.rowid FROM episodes_fts JOIN episodes e ON \
+                e.seq=episodes_fts.rowid WHERE episodes_fts MATCH ?{filters} ORDER BY \
+                bm25(episodes_fts),e.id LIMIT ?) ORDER BY bm25(episodes_fts),e.id"
             );
         } else {
             values.push(SqlValue::Integer(limit as i64));
             sql = format!(
-                "SELECT {columns},substr(e.text,1,512),e.raw_frame FROM episodes e WHERE 1=1{filters} ORDER BY julianday(coalesce(e.occurred_at,e.captured_at)) DESC,e.seq DESC LIMIT ?"
+                "SELECT {columns},substr(e.text,1,512),e.raw_frame FROM episodes e WHERE 1=1{filters} ORDER \
+                BY julianday(coalesce(e.occurred_at,e.captured_at)) DESC,e.seq DESC LIMIT ?"
             );
         }
         let mut statement = self.sql().prepare(&sql)?;
         let mut result = Vec::new();
-        for row in statement.query_map(rusqlite::params_from_iter(values),|r|Ok((json!({"id":r.get::<_,String>(0)?,"source":r.get::<_,String>(1)?,"event_id":r.get::<_,String>(2)?,"conversation_id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"occurred_at":r.get::<_,Option<String>>(5)?,"captured_at":r.get::<_,String>(6)?,"excerpt":r.get::<_,String>(7)?}),r.get::<_,Option<String>>(8)?)))?{let (mut value,frame)=row?;if frame.is_some(){let id=value["id"].as_str().unwrap();let text=self.original_text(id)?.ok_or(Error::NotFound("Episode not found"))?;value["excerpt"]=json!(text.chars().take(512).collect::<String>());}result.push(value);}
+        for row in statement.query_map(rusqlite::params_from_iter(values), |r| {
+            Ok((
+                json!({
+                    "id":r.get::<_,
+                    String>(0)?,
+                    "source":r.get::<_,
+                    String>(1)?,
+                    "event_id":r.get::<_,
+                    String>(2)?,
+                    "conversation_id":r.get::<_,
+                    String>(3)?,
+                    "kind":r.get::<_,
+                    String>(4)?,
+                    "occurred_at":r.get::<_,
+                    Option<String>>(5)?,
+                    "captured_at":r.get::<_,
+                    String>(6)?,
+                    "excerpt":r.get::<_,
+                    String>(7)?
+                }),
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })? {
+            let (mut value, frame) = row?;
+            if frame.is_some() {
+                let id = value["id"].as_str().unwrap();
+                let text = self
+                    .original_text(id)?
+                    .ok_or(Error::NotFound("Episode not found"))?;
+                value["excerpt"] = json!(text.chars().take(512).collect::<String>());
+            }
+            result.push(value);
+        }
         Ok(result)
     }
 }
@@ -482,19 +591,57 @@ pub fn record_references(tx: &WriteTxn<'_, '_>, episode: &str, refs: &[Reference
         } else {
             "waiting"
         };
-        tx.sql().execute("INSERT OR IGNORE INTO captured_media(sha256,kind,filename,state,error) VALUES(?,?,?,?,?)",params![reference.sha,reference.kind,reference.filename,state,if reference.kind.is_none(){Some("unsupported_type")}else{None}])?;
-        let inserted=tx.sql().execute("INSERT OR IGNORE INTO captured_media_refs(sha256,episode_id,start,end,quote) VALUES(?,?,?,?,?)",params![reference.sha,episode,reference.start,reference.end,reference.quote])?;
+        tx.sql().execute(
+            "INSERT OR IGNORE INTO captured_media(sha256,kind,filename,state,error) VALUES(?,?,?,?,?)",
+            params![
+                reference.sha,
+                reference.kind,
+                reference.filename,
+                state,
+                if reference.kind.is_none() {
+                    Some("unsupported_type")
+                } else {
+                    None
+                }
+            ],
+        )?;
+        let inserted = tx.sql().execute(
+            "INSERT OR IGNORE INTO captured_media_refs(sha256,episode_id,start,end,quote) VALUES(?,?,?,?,?)",
+            params![
+                reference.sha,
+                episode,
+                reference.start,
+                reference.end,
+                reference.quote
+            ],
+        )?;
         if exists {
             tx.sql().execute(
                 "UPDATE captured_media SET state='ready' WHERE sha256=? AND state='waiting'",
                 [&reference.sha],
             )?;
         }
-        let active:bool=tx.sql().query_row("SELECT NOT EXISTS(SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=?1) AND EXISTS(SELECT 1 FROM captured_media_refs r JOIN episodes e ON e.id=r.episode_id WHERE r.sha256=?1 AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id))",[&reference.sha],|r|r.get(0))?;
+        let active: bool = tx
+            .sql()
+            .query_row("SELECT NOT EXISTS(SELECT 1 FROM media_files m JOIN forgotten_targets f ON \
+                f.target=m.node_id WHERE m.sha256=?1) AND EXISTS(SELECT 1 FROM captured_media_refs r JOIN \
+                episodes e ON e.id=r.episode_id WHERE r.sha256=?1 AND NOT EXISTS(SELECT 1 FROM \
+                forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id))", [&reference.sha], |r| r.get(0))?;
         if active {
-            tx.sql().execute("UPDATE captured_media SET state=?,error=NULL WHERE sha256=? AND state='forgotten' AND error='forgotten_source' AND job_id IS NULL",params![if exists{"ready"}else{"waiting"},reference.sha])?;
+            tx.sql().execute(
+                "UPDATE captured_media SET state=?,error=NULL WHERE sha256=? AND state='forgotten' AND \
+                    error='forgotten_source' AND job_id IS NULL",
+                params![if exists { "ready" } else { "waiting" }, reference.sha],
+            )?;
             if inserted > 0 {
-                tx.sql().execute("UPDATE jobs SET state='pending',available_at=?,error=NULL WHERE id=(SELECT job_id FROM captured_media WHERE sha256=?) AND state='failed' AND error='CapturedSourceUnavailable'",params![chrono::Utc::now().timestamp_millis() as f64/1000.,reference.sha])?;
+                tx.sql().execute(
+                    "UPDATE jobs SET state='pending',available_at=?,error=NULL WHERE id=(SELECT job_id FROM \
+                        captured_media WHERE sha256=?) AND state='failed' AND error='CapturedSourceUnavailable'",
+                    params![
+                        chrono::Utc::now().timestamp_millis() as f64 / 1000.,
+                        reference.sha
+                    ],
+                )?;
             }
         }
         tx.touch_media(&reference.sha)?;

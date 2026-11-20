@@ -5,7 +5,14 @@ use memento_domain::{behavior, loops};
 use rusqlite::{Connection, Params, params, types::ValueRef};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-pub const NODE_SUMMARY: &str = "n.id,n.version,n.type,substr(n.text,1,240) AS text,n.state,n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,(SELECT c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id ORDER BY v.version LIMIT 1) AS created_at,coalesce((SELECT importance FROM node_stats WHERE node_id=n.id),0.5) AS importance,coalesce((SELECT decay FROM node_stats WHERE node_id=n.id),1) AS decay,coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0) AS archived,coalesce((SELECT access_count FROM node_stats WHERE node_id=n.id),0) AS access_count,(SELECT last_cited_at FROM node_stats WHERE node_id=n.id) AS last_cited_at";
+pub const NODE_SUMMARY: &str = "n.id,n.version,n.type,substr(n.text,1,240) AS \
+    text,n.state,n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,(SELECT \
+    c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id \
+    ORDER BY v.version LIMIT 1) AS created_at,coalesce((SELECT importance FROM node_stats WHERE \
+    node_id=n.id),0.5) AS importance,coalesce((SELECT decay FROM node_stats WHERE \
+    node_id=n.id),1) AS decay,coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0) \
+    AS archived,coalesce((SELECT access_count FROM node_stats WHERE node_id=n.id),0) AS \
+    access_count,(SELECT last_cited_at FROM node_stats WHERE node_id=n.id) AS last_cited_at";
 pub fn rows<P: Params>(db: &Connection, sql: &str, params: P) -> Result<Vec<Value>> {
     let mut statement = db.prepare(sql)?;
     let names = statement
@@ -60,7 +67,9 @@ pub fn node(db: &Connection, id: &str, version: i64) -> Result<Option<Value>> {
     one(
         db,
         &format!(
-            "SELECT {NODE_SUMMARY} FROM node_versions n WHERE n.id=? AND n.version=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}",
+            "SELECT {NODE_SUMMARY} FROM node_versions n WHERE n.id=? AND n.version=? AND \
+            n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) \
+            AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}",
             visible_sql("n.id")
         ),
         params![id, version],
@@ -70,7 +79,14 @@ pub fn candidate(db: &Connection, id: &str) -> Result<Option<Value>> {
     let row = one(
         db,
         &format!(
-            "SELECT c.id,c.type,substr(c.text,1,240) AS text,c.kind AS candidate_kind,c.src,c.dst,c.confidence,c.valid_from,c.valid_to,c.scope,coalesce((SELECT importance FROM node_stats WHERE node_id=c.id),0.5) AS importance,coalesce((SELECT decay FROM node_stats WHERE node_id=c.id),1) AS decay,coalesce((SELECT archived FROM node_stats WHERE node_id=c.id),0) AS archived,substr(c.why,1,240) AS why,r.episode_id,r.recorded_at AS created_at,EXISTS(SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL) AS historical FROM candidates c JOIN extraction_runs r ON r.id=c.run_id WHERE c.id=? AND {ACTIVE_CANDIDATE}"
+            "SELECT c.id,c.type,substr(c.text,1,240) AS text,c.kind AS \
+        candidate_kind,c.src,c.dst,c.confidence,c.valid_from,c.valid_to,c.scope,coalesce((SELECT \
+        importance FROM node_stats WHERE node_id=c.id),0.5) AS importance,coalesce((SELECT decay \
+        FROM node_stats WHERE node_id=c.id),1) AS decay,coalesce((SELECT archived FROM node_stats \
+        WHERE node_id=c.id),0) AS archived,substr(c.why,1,240) AS why,r.episode_id,r.recorded_at AS \
+        created_at,EXISTS(SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id \
+        AND h.released_at IS NULL) AS historical FROM candidates c JOIN extraction_runs r ON \
+        r.id=c.run_id WHERE c.id=? AND {ACTIVE_CANDIDATE}"
         ),
         [id],
     )?;
@@ -87,7 +103,14 @@ pub fn segment(db: &Connection, id: &str) -> Result<Option<Value>> {
     one(
         db,
         &format!(
-            "SELECT {NODE_SUMMARY},s.id AS segment_id,s.modality,s.start_s,s.end_s,s.page,s.char_start,s.char_end,substr(s.text,1,240) AS match_text,'/blobs/'||s.source_sha256 AS source_text_url,'/blobs/'||f.sha256 AS blob_url,'/blobs/'||s.artifact_sha256 AS artifact_url,f.sha256,f.filename,f.kind AS media_kind FROM segments s JOIN media_files f ON f.node_id=s.node_id JOIN node_versions n ON n.id=s.node_id WHERE s.id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}",
+            "SELECT {NODE_SUMMARY},s.id AS \
+        segment_id,s.modality,s.start_s,s.end_s,s.page,s.char_start,s.char_end,substr(s.text,1,240) \
+        AS match_text,'/blobs/'||s.source_sha256 AS source_text_url,'/blobs/'||f.sha256 AS \
+        blob_url,'/blobs/'||s.artifact_sha256 AS artifact_url,f.sha256,f.filename,f.kind AS \
+        media_kind FROM segments s JOIN media_files f ON f.node_id=s.node_id JOIN node_versions n \
+        ON n.id=s.node_id WHERE s.id=? AND n.state='active' AND n.version=(SELECT max(x.version) \
+        FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f \
+        WHERE f.target=n.id) AND {}",
             visible_sql("n.id")
         ),
         [id],
@@ -96,31 +119,56 @@ pub fn segment(db: &Connection, id: &str) -> Result<Option<Value>> {
 pub fn candidate_details(db: &Connection, id: &str) -> Result<Value> {
     let evidence = rows(
         db,
-        "SELECT episode_id,start,end,substr(quote,1,240) AS quote_excerpt FROM graph_evidence WHERE target=? AND version=1 ORDER BY episode_id,start LIMIT 5",
+        "SELECT episode_id,start,end,substr(quote,1,240) AS quote_excerpt FROM graph_evidence WHERE \
+        target=? AND version=1 ORDER BY episode_id,start LIMIT 5",
         [id],
     )?;
     let run = one(
         db,
-        "SELECT g.recorded_at,g.actor,substr(g.why,1,240) AS why FROM candidates c JOIN extraction_runs r ON r.id=c.run_id JOIN graph_commits g ON g.id=r.commit_id WHERE c.id=?",
+        "SELECT g.recorded_at,g.actor,substr(g.why,1,240) AS why FROM candidates c JOIN \
+        extraction_runs r ON r.id=c.run_id JOIN graph_commits g ON g.id=r.commit_id WHERE c.id=?",
         [id],
     )?;
     let matches = rows(
         db,
-        "SELECT m.target,m.cosine,m.name_match,n.type,substr(n.text,1,160) AS one_line FROM candidate_entity_matches m JOIN node_versions n ON n.id=m.target AND n.version=m.version WHERE m.candidate_id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) LIMIT 5",
+        "SELECT m.target,m.cosine,m.name_match,n.type,substr(n.text,1,160) AS one_line FROM \
+        candidate_entity_matches m JOIN node_versions n ON n.id=m.target AND n.version=m.version \
+        WHERE m.candidate_id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM \
+        node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE \
+        f.target=n.id) LIMIT 5",
         [id],
     )?;
-    Ok(
-        json!({"evidence":evidence,"change_count":1,"last_change":run,"entity_matches":matches,"loop":loops::current(db,id)?}),
-    )
+    Ok(json!({
+        "evidence":evidence,
+        "change_count":1,
+        "last_change":run,
+        "entity_matches":matches,
+        "loop":loops::current(db,id)?
+    }))
 }
 pub fn details(db: &Connection, id: &str, version: i64) -> Result<Value> {
-    let change=one(db,"SELECT c.recorded_at,substr(c.actor,1,128) AS actor,substr(c.why,1,240) AS why,(SELECT count(*) FROM node_versions WHERE id=?1) AS change_count FROM node_versions n JOIN graph_commits c ON c.id=n.commit_id WHERE n.id=?1 AND n.version=?2",params![id,version])?.ok_or(Error::Unavailable("Recall version is unavailable"))?;
+    let change = one(
+        db,
+        "SELECT c.recorded_at,substr(c.actor,1,128) AS actor,substr(c.why,1,240) AS why,(SELECT \
+            count(*) FROM node_versions WHERE id=?1) AS change_count FROM node_versions n JOIN \
+            graph_commits c ON c.id=n.commit_id WHERE n.id=?1 AND n.version=?2",
+        params![id, version],
+    )?
+    .ok_or(Error::Unavailable("Recall version is unavailable"))?;
     let evidence = rows(
         db,
-        "SELECT g.episode_id,g.start,g.end,CASE WHEN EXISTS(SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=g.episode_id) THEN NULL ELSE substr(g.quote,1,240) END AS quote_excerpt FROM graph_evidence g WHERE g.target=? AND g.version=? ORDER BY g.episode_id,g.start LIMIT 5",
+        "SELECT g.episode_id,g.start,g.end,CASE WHEN EXISTS(SELECT 1 FROM episodes e JOIN \
+        forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=g.episode_id) \
+        THEN NULL ELSE substr(g.quote,1,240) END AS quote_excerpt FROM graph_evidence g WHERE \
+        g.target=? AND g.version=? ORDER BY g.episode_id,g.start LIMIT 5",
         params![id, version],
     )?;
-    let mut result = json!({"evidence":evidence,"change_count":change["change_count"],"last_change":{"recorded_at":change["recorded_at"],"actor":change["actor"],"why":change["why"]},"loop":loops::current(db,id)?});
+    let mut result = json!({
+        "evidence":evidence,
+        "change_count":change["change_count"],
+        "last_change": {"recorded_at":change["recorded_at"],"actor":change["actor"],"why":change["why"]},
+        "loop":loops::current(db,id)?
+    });
     if let Some(behavior) = behavior(db, id)? {
         result["authority"] = behavior["authority"].clone();
         result["behavior"] = behavior;
@@ -209,9 +257,30 @@ pub fn episode(
         end: end.min(start + 240),
     }
     .slice(text)?;
-    Ok(Some(
-        json!({"id":chunk.unwrap_or(id),"episode_id":id,"type":"raw_episode","tier":"raw","version":1,"state":"raw","confirmed":false,"historical":historical,"text":quote,"source":source,"source_kind":episode["kind"],"conversation_id":episode["conversation_id"],"occurred_at":episode["occurred_at"],"pinned":0,"created_at":episode["captured_at"],"valid_from":null,"valid_to":null,"chunk_id":chunk,"evidence":[{"episode_id":id,"start":start,"end":end,"quote_excerpt":evidence}],"source_url":format!("/episodes/{id}"),"change_count":1,"last_change":{"recorded_at":episode["captured_at"],"actor":source,"why":"Immutable captured evidence"}}),
-    ))
+    Ok(Some(json!({
+        "id":chunk.unwrap_or(id),
+        "episode_id":id,
+        "type":"raw_episode",
+        "tier":"raw",
+        "version":1,
+        "state":"raw",
+        "confirmed":false,
+        "historical":historical,
+        "text":quote,
+        "source":source,
+        "source_kind":episode["kind"],
+        "conversation_id":episode["conversation_id"],
+        "occurred_at":episode["occurred_at"],
+        "pinned":0,
+        "created_at":episode["captured_at"],
+        "valid_from":null,
+        "valid_to":null,
+        "chunk_id":chunk,
+        "evidence":[{"episode_id":id,"start":start,"end":end,"quote_excerpt":evidence}],
+        "source_url":format!("/episodes/{id}"),
+        "change_count":1,
+        "last_change": {"recorded_at":episode["captured_at"],"actor":source,"why":"Immutable captured evidence"}
+    })))
 }
 pub fn matched_passage(
     tx: &ReadTxn<'_>,
@@ -238,7 +307,8 @@ pub fn matched_passage(
     let position = hits.into_iter().min().unwrap_or(0);
     let chunk = one(
         tx.sql(),
-        "SELECT id,start,end FROM episode_chunks WHERE episode_id=? AND start<=? AND end>? ORDER BY start LIMIT 1",
+        "SELECT id,start,end FROM episode_chunks WHERE episode_id=? AND start<=? AND end>? ORDER BY \
+        start LIMIT 1",
         params![id, position, position],
     )?;
     if let Some(chunk) = chunk {
@@ -273,7 +343,17 @@ pub fn related(db: &Connection, id: &str, hops: usize, scope: Option<&str>) -> R
     // limit, including duplicate endpoints/self-edges just as in the old walk.
     // Every caller supplies its pinned read transaction, so all hops share a cut.
     let sql = format!(
-        "SELECT n.id,n.type,substr(n.text,1,160) AS one_line,n.valid_from,n.valid_to,n.scope,coalesce((SELECT importance FROM node_stats WHERE node_id=n.id),0.5) AS importance,a.rel AS relation,a.direction,a.id AS edge_id FROM (SELECT e.id,e.dst AS target,e.rel,'out' AS direction FROM edge_versions e WHERE e.src=?2 AND e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) UNION ALL SELECT e.id,e.src AS target,e.rel,'in' AS direction FROM edge_versions e WHERE e.dst=?2 AND e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id)) a JOIN node_versions n ON n.id=a.target WHERE n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?1 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?1)) ORDER BY a.id LIMIT 8",
+        "SELECT n.id,n.type,substr(n.text,1,160) AS \
+        one_line,n.valid_from,n.valid_to,n.scope,coalesce((SELECT importance FROM node_stats WHERE \
+        node_id=n.id),0.5) AS importance,a.rel AS relation,a.direction,a.id AS edge_id FROM (SELECT \
+        e.id,e.dst AS target,e.rel,'out' AS direction FROM edge_versions e WHERE e.src=?2 AND \
+        e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v WHERE v.id=e.id) \
+        UNION ALL SELECT e.id,e.src AS target,e.rel,'in' AS direction FROM edge_versions e WHERE \
+        e.dst=?2 AND e.state='active' AND e.version=(SELECT max(v.version) FROM edge_versions v \
+        WHERE v.id=e.id)) a JOIN node_versions n ON n.id=a.target WHERE n.state='active' AND \
+        n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT \
+        EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {} AND (?1 IS NULL OR \
+        EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?1)) ORDER BY a.id LIMIT 8",
         visible_sql("n.id")
     );
     let mut frontier = BTreeSet::from([id.to_owned()]);
@@ -348,11 +428,21 @@ pub fn media_sources(db: &Connection, record: &mut Value) -> Result<bool> {
         return Ok(true);
     };
     let sha = media["sha256"].as_str().unwrap();
-    let hidden:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM forgotten_targets WHERE target=?1) OR EXISTS(SELECT 1 FROM node_versions WHERE id=?1 AND version=(SELECT max(version) FROM node_versions WHERE id=?1) AND state<>'active') OR EXISTS(SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=?2)",params![id,sha],|r|r.get(0))?;
+    let hidden: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM forgotten_targets WHERE target=?1) OR EXISTS(SELECT 1 FROM \
+        node_versions WHERE id=?1 AND version=(SELECT max(version) FROM node_versions WHERE id=?1) \
+        AND state<>'active') OR EXISTS(SELECT 1 FROM media_files m JOIN forgotten_targets f ON \
+        f.target=m.node_id WHERE m.sha256=?2)",
+        params![id, sha],
+        |r| r.get(0),
+    )?;
     if hidden {
         return Ok(false);
     }
-    let select = "SELECT r.episode_id,e.source,e.conversation_id,e.occurred_at,e.captured_at,r.start,r.end,r.quote FROM captured_media_refs r JOIN episodes e ON e.id=r.episode_id WHERE r.sha256=? AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)";
+    let select = "SELECT \
+        r.episode_id,e.source,e.conversation_id,e.occurred_at,e.captured_at,r.start,r.end,r.quote \
+        FROM captured_media_refs r JOIN episodes e ON e.id=r.episode_id WHERE r.sha256=? AND NOT \
+        EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)";
     let references = rows(db, &format!("{select} ORDER BY e.seq DESC LIMIT 5"), [sha])?;
     if references.is_empty() {
         return Ok(false);
@@ -369,10 +459,25 @@ pub fn media_sources(db: &Connection, record: &mut Value) -> Result<bool> {
         record,
         details(db, &id, record["version"].as_i64().unwrap())?,
     );
-    let evidence=references.iter().map(|r|json!({"episode_id":r["episode_id"],"start":r["start"],"end":r["end"],"quote_excerpt":r["quote"].as_str().unwrap_or("").chars().take(240).collect::<String>()})).collect::<Vec<_>>();
+    let evidence = references.iter().map(|r| json!({
+        "episode_id":r["episode_id"],
+        "start":r["start"],
+        "end":r["end"],
+        "quote_excerpt":r["quote"].as_str().unwrap_or("").chars().take(240).collect::<String>()
+    })).collect::<Vec<_>>();
     merge(
         record,
-        json!({"category":"media_reference","tier":"reference","confirmed":false,"references":references,"evidence":evidence,"source":first["source"],"conversation_id":first["conversation_id"],"source_url":format!("/episodes/{}",first["episode_id"].as_str().unwrap()),"_source_occurred_at":newest.as_ref().map(|r|r["occurred_at"].clone()).unwrap_or(Value::Null)}),
+        json!({
+            "category":"media_reference",
+            "tier":"reference",
+            "confirmed":false,
+            "references":references,
+            "evidence":evidence,
+            "source":first["source"],
+            "conversation_id":first["conversation_id"],
+            "source_url":format!("/episodes/{}",first["episode_id"].as_str().unwrap()),
+            "_source_occurred_at":newest.as_ref().map(|r|r["occurred_at"].clone()).unwrap_or(Value::Null)
+        }),
     );
     Ok(true)
 }
@@ -395,7 +500,14 @@ pub fn media_pointer(db: &Connection, record: &mut Value) -> Result<()> {
     let source = if record["source"].is_string() {
         record["source"].as_str().map(str::to_owned)
     } else {
-        one(db,"SELECT e.source FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=? AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) ORDER BY julianday(e.occurred_at) DESC,e.id LIMIT 1",params![record["id"].as_str(),record["version"].as_i64()])?.and_then(|r|r["source"].as_str().map(str::to_owned))
+        one(
+            db,
+            "SELECT e.source FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? \
+                AND g.version=? AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source \
+                AND f.event_id=e.event_id) ORDER BY julianday(e.occurred_at) DESC,e.id LIMIT 1",
+            params![record["id"].as_str(), record["version"].as_i64()],
+        )?
+        .and_then(|r| r["source"].as_str().map(str::to_owned))
     };
     if let Some(source) = source {
         text.push_str(&format!(" From {}.", serde_json::to_string(&source)?));

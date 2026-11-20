@@ -225,7 +225,15 @@ impl AppState {
         let Some(cold) = self.services.as_ref().and_then(|s| s.cold()) else {
             return Ok(Vec::new());
         };
-        let refs=self.store.read(|tx|{use rusqlite::OptionalExtension;let value:Option<Option<String>>=tx.sql().query_row("SELECT text_runs FROM episodes WHERE id=coalesce((SELECT episode_id FROM episode_chunks WHERE id=?1),?1)",[id],|r|r.get(0)).optional()?;Ok(value.flatten())})?;
+        let refs = self.store.read(|tx| {
+            use rusqlite::OptionalExtension;
+            let value: Option<Option<String>> = tx
+                .sql()
+                .query_row("SELECT text_runs FROM episodes WHERE id=coalesce((SELECT episode_id FROM episode_chunks \
+                    WHERE id=?1),?1)", [id], |r| r.get(0))
+                .optional()?;
+            Ok(value.flatten())
+        })?;
         let mut leases = Vec::new();
         if let Some(refs) = refs {
             let rows: Vec<(usize, String, usize)> = serde_json::from_str(&refs)?;
@@ -282,47 +290,77 @@ impl AppState {
             return None;
         }
         let state = self.clone();
-        std::thread::Builder::new().name("recall-repair".into()).spawn(move || {
-            use sha2::{Digest, Sha256};
-            for cluster in clusters {
-                let targets = state.store.read(|tx| {
-                    let db = tx.sql();
-                    let mut targets = Vec::new();
-                    for id in &cluster {
-                        let sql = format!("SELECT n.version FROM node_versions n WHERE n.id=?1 AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND NOT EXISTS(SELECT 1 FROM entity_merges m WHERE m.source=n.id) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)) AND {}", memento_ann::eligibility::visible_sql("n.id"));
-                        use rusqlite::OptionalExtension;
-                        let version: Option<i64> = db.query_row(&sql, rusqlite::params![id, scope], |r| r.get(0)).optional()?;
-                        if let Some(version) = version {
-                            if !memento_ann::eligibility::legacy_only(db, id, version)? { targets.push(id.clone()); }
+        std::thread::Builder::new()
+            .name("recall-repair".into())
+            .spawn(move || {
+                use sha2::{Digest, Sha256};
+                for cluster in clusters {
+                    let targets = state.store.read(|tx| {
+                        let db = tx.sql();
+                        let mut targets = Vec::new();
+                        for id in &cluster {
+                            let sql =
+                                format!("SELECT n.version FROM node_versions n WHERE n.id=?1 AND n.state='active' AND \
+                                    n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT \
+                                    EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND NOT EXISTS(SELECT 1 FROM \
+                                    entity_merges m WHERE m.source=n.id) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM \
+                                    json_each(n.scope) WHERE value=?2)) AND {}", memento_ann::eligibility::visible_sql("n.id"));
+                            use rusqlite::OptionalExtension;
+                            let version: Option<i64> = db
+                                .query_row(&sql, rusqlite::params![id, scope], |r| r.get(0))
+                                .optional()?;
+                            if let Some(version) = version {
+                                if !memento_ann::eligibility::legacy_only(db, id, version)? {
+                                    targets.push(id.clone());
+                                }
+                            }
+                        }
+                        Ok(targets)
+                    });
+                    let Ok(targets) = targets else {
+                        eprintln!("recall repair: eligibility check failed");
+                        continue;
+                    };
+                    if targets.len() < 2 {
+                        continue;
+                    }
+                    for chunk in targets.chunks(48) {
+                        let mut group = chunk.to_vec();
+                        if group.len() == 1 {
+                            group.insert(0, targets[targets.len() - 2].clone());
+                        }
+                        if let Ok(mut seen) = state.recall_repairs.lock() {
+                            if seen.contains(&group) {
+                                continue;
+                            }
+                            if seen.len() >= 1024 {
+                                seen.clear();
+                            }
+                            seen.insert(group.clone());
+                        } else {
+                            continue;
+                        }
+                        let digest = Sha256::digest(serde_json::to_vec(&group).unwrap_or_default())
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>();
+                        let command = processing::Maintenance {
+                            command_id: format!("recall-duplicates-{digest}"),
+                            actor: "memento-recall".into(),
+                            why: "Review same-spelled entities or identical memories found by recall".into(),
+                            target_ids: group.clone(),
+                            origin: Some("recall".into()),
+                        };
+                        if state.processing.maintain(command).is_err() {
+                            eprintln!("recall repair: maintenance failed");
+                            if let Ok(mut seen) = state.recall_repairs.lock() {
+                                seen.remove(&group);
+                            }
                         }
                     }
-                    Ok(targets)
-                });
-                let Ok(targets) = targets else { eprintln!("recall repair: eligibility check failed"); continue };
-                if targets.len() < 2 { continue; }
-                for chunk in targets.chunks(48) {
-                    let mut group = chunk.to_vec();
-                    if group.len() == 1 { group.insert(0, targets[targets.len() - 2].clone()); }
-                    if let Ok(mut seen) = state.recall_repairs.lock() {
-                        if seen.contains(&group) { continue; }
-                        if seen.len() >= 1024 { seen.clear(); }
-                        seen.insert(group.clone());
-                    } else { continue; }
-                    let digest = Sha256::digest(serde_json::to_vec(&group).unwrap_or_default()).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-                    let command = processing::Maintenance {
-                        command_id: format!("recall-duplicates-{digest}"),
-                        actor: "memento-recall".into(),
-                        why: "Review same-spelled entities or identical memories found by recall".into(),
-                        target_ids: group.clone(),
-                        origin: Some("recall".into()),
-                    };
-                    if state.processing.maintain(command).is_err() {
-                        eprintln!("recall repair: maintenance failed");
-                        if let Ok(mut seen) = state.recall_repairs.lock() { seen.remove(&group); }
-                    }
                 }
-            }
-        }).ok()
+            })
+            .ok()
     }
     pub fn recall_memories(
         &self,
@@ -732,7 +770,17 @@ async fn work(
                 .map(|(name, n)| (name.to_owned(), json!(n)))
                 .collect();
             if matches!(action.as_str(), "claim" | "submit" | "complete" | "pool") {
-                eprintln!("{}", json!({"event":"work_timing","action":action,"ok":result.is_ok(),"total_us":started.elapsed().as_micros() as u64,"stages_us":stages,"counts":counts}));
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event":"work_timing",
+                        "action":action,
+                        "ok":result.is_ok(),
+                        "total_us":started.elapsed().as_micros() as u64,
+                        "stages_us":stages,
+                        "counts":counts
+                    })
+                );
             }
             result
         })
@@ -769,19 +817,39 @@ async fn recall(
     let (memories, timings) = blocking(move || {
         let timings = RecallTimings::default();
         timings.lap(recall_timings::Stage::Queue, started);
-        timings.count(recall_timings::Count::QueryChars, query.query.chars().count());
-        timings.count(recall_timings::Count::ContextChars, query.context.chars().count());
-        let memories = state.recall_memories_timed(&query, deadline, &timings).map(|mut rows| {
-            if query.explain {
-                // Period listings and literal raw evidence never enter semantic ranking.
-                for row in rows.iter_mut().filter(|r| r.get("explain").is_none()) {
-                    let route = if row["match"] == "period" { "period_list" } else { "literal_raw" };
-                    row["explain"] = json!({"route":route,"ordering":"route_specific","sort_key":null,"passage_validation":{"status":"not_run","reason":"route_exempt"}});
+        timings.count(
+            recall_timings::Count::QueryChars,
+            query.query.chars().count(),
+        );
+        timings.count(
+            recall_timings::Count::ContextChars,
+            query.context.chars().count(),
+        );
+        let memories = state
+            .recall_memories_timed(&query, deadline, &timings)
+            .map(|mut rows| {
+                if query.explain {
+                    // Period listings and literal raw evidence never enter semantic ranking.
+                    for row in rows.iter_mut().filter(|r| r.get("explain").is_none()) {
+                        let route = if row["match"] == "period" {
+                            "period_list"
+                        } else {
+                            "literal_raw"
+                        };
+                        row["explain"] = json!({
+                            "route":route,
+                            "ordering":"route_specific",
+                            "sort_key":null,
+                            "passage_validation":{"status":"not_run","reason":"route_exempt"}
+                        });
+                    }
                 }
-            }
-            rows
-        });
-        timings.count(recall_timings::Count::Returned, memories.as_ref().map_or(0, Vec::len));
+                rows
+            });
+        timings.count(
+            recall_timings::Count::Returned,
+            memories.as_ref().map_or(0, Vec::len),
+        );
         // Also on error: an expired deadline is when the stage split matters most.
         let value = timings.json(&query, started.elapsed());
         recall_timings::log(&value, memories.is_ok());

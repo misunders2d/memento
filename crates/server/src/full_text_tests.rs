@@ -74,9 +74,31 @@ fn synthetic_credential_tail_stays_behind_existing_guards() {
     let mut f = Fixture::new();
     let body = long_body("Synthetic quartz integration note.", &format!("Fixture key {SYNTHETIC_CREDENTIAL}."));
     // An approved new custom type is registered sensitive (owner review gate).
-    let episode = f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"private","conversation_id":"private","kind":"user","text":body,"occurred_at":"2026-10-20T00:00:00Z","metadata":{}})).unwrap()).unwrap();
-    let proposal = f.graph.remember(serde_json::from_value(json!({"command_id":"private","actor":"owner","why":"Exact synthetic evidence","type":"synthetic_private","text":body,"scope":["personal"],"evidence":[{"episode_id":episode.id,"quote":body}]})).unwrap()).unwrap();
-    f.graph.decide_review(serde_json::from_value(json!({"command_id":"private-ok","actor":"owner","why":"Explicit synthetic approval","proposal_id":proposal["id"],"decision":"approve"})).unwrap()).unwrap();
+    let episode = f.store.capture(serde_json::from_value(json!({
+        "source":"synthetic",
+        "event_id":"private",
+        "conversation_id":"private",
+        "kind":"user",
+        "text":body,
+        "occurred_at":"2026-10-20T00:00:00Z",
+        "metadata":{}
+    })).unwrap()).unwrap();
+    let proposal = f.graph.remember(serde_json::from_value(json!({
+        "command_id":"private",
+        "actor":"owner",
+        "why":"Exact synthetic evidence",
+        "type":"synthetic_private",
+        "text":body,
+        "scope":["personal"],
+        "evidence":[{"episode_id":episode.id,"quote":body}]
+    })).unwrap()).unwrap();
+    f.graph.decide_review(serde_json::from_value(json!({
+        "command_id":"private-ok",
+        "actor":"owner",
+        "why":"Explicit synthetic approval",
+        "proposal_id":proposal["id"],
+        "decision":"approve"
+    })).unwrap()).unwrap();
     let private = f.store.read(|tx| Ok(tx.sql().query_row("SELECT id FROM node_versions WHERE type='synthetic_private'", [], |r| r.get::<_, String>(0))?)).unwrap();
     hot_vector(&f, &private, VectorKind::Node, 0.9, 900);
     // Distinct wording so automatic deduplication keeps both rows.
@@ -106,13 +128,23 @@ fn synthetic_credential_tail_stays_behind_existing_guards() {
 fn parked_candidate_full_text_keeps_the_long_body_and_unverified_framing() {
     let f = Fixture::new();
     let body = long_body("Synthetic quartz historical candidate.", "Only for the archived staging fixture.");
-    let episode = f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"parked","conversation_id":"parked","kind":"user","text":body,"occurred_at":"2026-10-20T00:00:00Z","metadata":{}})).unwrap()).unwrap();
+    let episode = f.store.capture(serde_json::from_value(json!({
+        "source":"synthetic",
+        "event_id":"parked",
+        "conversation_id":"parked",
+        "kind":"user",
+        "text":body,
+        "occurred_at":"2026-10-20T00:00:00Z",
+        "metadata":{}
+    })).unwrap()).unwrap();
     let id = "c_parked_full_text_fixture";
     let context = memento_core::CommandContext {command_id:"parked".into(),actor:"fixture".into(),why:"Exact parked candidate evidence".into()};
     f.store.command(&context, &json!({"op":"fixture_parked"}), |tx, commit| {
         tx.touch_target(id)?;
-        tx.sql().execute("INSERT INTO extraction_runs VALUES('run-parked',?,?,'fixture','fixture','[]','{}','2026-10-20T00:00:00Z')", params![commit, episode.id])?;
-        tx.sql().execute("INSERT INTO candidates VALUES(?,'run-parked','memory','knowledge',?,'Synthetic extraction reason',NULL,NULL,0.9,NULL,NULL,'[\"personal\"]')", params![id, body])?;
+        tx.sql().execute("INSERT INTO extraction_runs \
+            VALUES('run-parked',?,?,'fixture','fixture','[]','{}','2026-10-20T00:00:00Z')", params![commit, episode.id])?;
+        tx.sql().execute("INSERT INTO candidates VALUES(?,'run-parked','memory','knowledge',?,'Synthetic extraction \
+            reason',NULL,NULL,0.9,NULL,NULL,'[\"personal\"]')", params![id, body])?;
         tx.sql().execute("INSERT INTO graph_evidence VALUES(?,1,?,0,?,?)", params![id, episode.id, body.chars().count() as i64, body])?;
         tx.sql().execute("INSERT INTO historical_parked_candidates(candidate_id) VALUES(?)", [id])?;
         Ok(json!({"id":id}))
@@ -138,13 +170,22 @@ fn automatic_media_pointer_is_complete_and_never_marked_truncated() {
     let f = Fixture::new();
     let id = "media-full-text";
     let text = long_body("Synthetic quartz attachment description.", "Final caption clause.");
-    let source = f.store.capture(serde_json::from_value(json!({"source":"synthetic:media","event_id":id,"conversation_id":id,"kind":"user","text":text,"occurred_at":"2020-01-01T00:00:00Z","metadata":{}})).unwrap()).unwrap();
+    let source = f.store.capture(serde_json::from_value(json!({
+        "source":"synthetic:media",
+        "event_id":id,
+        "conversation_id":id,
+        "kind":"user",
+        "text":text,
+        "occurred_at":"2020-01-01T00:00:00Z",
+        "metadata":{}
+    })).unwrap()).unwrap();
     let context = memento_core::CommandContext {command_id:id.into(),actor:"fixture".into(),why:"Exact attachment evidence".into()};
     let sha = "b".repeat(64);
     let segment = format!("{id}-segment");
     f.store.command(&context, &json!({"op":"fixture_media"}), |tx, commit| {
         tx.touch_target(id)?;
-        tx.sql().execute("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) VALUES(?,1,?,'media',?,'active',0,'[\"personal\"]')", params![id, commit, text])?;
+        tx.sql().execute("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) \
+            VALUES(?,1,?,'media',?,'active',0,'[\"personal\"]')", params![id, commit, text])?;
         tx.sql().execute("INSERT INTO media_files VALUES(?,?,'synthetic.png','image',?)", params![id, sha, commit])?;
         tx.sql().execute("INSERT INTO graph_evidence VALUES(?,1,?,0,?,?)", params![id, source.id, text.chars().count() as i64, text])?;
         tx.sql().execute("INSERT INTO segments(id,node_id,modality,text,artifact_sha256) VALUES(?,?,'image','',?)", params![segment, id, sha])?;

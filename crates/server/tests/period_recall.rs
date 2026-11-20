@@ -45,7 +45,15 @@ async fn tool(state: &AppState, arguments: Value) -> Value {
         .header("host", "127.0.0.1:8765")
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
-        .body(Body::from(serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":arguments}})).unwrap()))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{"name":"recall","arguments":arguments}
+            }))
+            .unwrap(),
+        ))
         .unwrap();
     let response = router(state.clone()).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -97,7 +105,21 @@ async fn fixture() -> Fixture {
             None,
         ),
     ] {
-        let (status, episode) = request(&state, "POST", "/episodes", Some(json!({"source":"native:synthetic:pi","event_id":event,"conversation_id":"period","kind":"user","text":text,"occurred_at":occurred_at,"metadata":{}}))).await;
+        let (status, episode) = request(
+            &state,
+            "POST",
+            "/episodes",
+            Some(json!({
+                "source":"native:synthetic:pi",
+                "event_id":event,
+                "conversation_id":"period",
+                "kind":"user",
+                "text":text,
+                "occurred_at":occurred_at,
+                "metadata":{}
+            })),
+        )
+        .await;
         assert!(status.is_success(), "{status} {episode}");
         let Some(scope) = scope else {
             ids.push(episode["id"].as_str().unwrap().to_owned());
@@ -396,7 +418,21 @@ async fn explicit_recall_marks_a_cut_summary_and_never_returns_the_tail() {
         "{}Fixture key {tail}.",
         "Synthetic long period assertion clause. ".repeat(7)
     );
-    let (status, episode) = request(&state, "POST", "/episodes", Some(json!({"source":"native:synthetic:pi","event_id":"long","conversation_id":"period","kind":"user","text":text,"occurred_at":"2026-10-20T12:00:00Z","metadata":{}}))).await;
+    let (status, episode) = request(
+        &state,
+        "POST",
+        "/episodes",
+        Some(json!({
+            "source":"native:synthetic:pi",
+            "event_id":"long",
+            "conversation_id":"period",
+            "kind":"user",
+            "text":text,
+            "occurred_at":"2026-10-20T12:00:00Z",
+            "metadata":{}
+        })),
+    )
+    .await;
     assert!(status.is_success(), "{status} {episode}");
     let (status, node) = request(
         &state,

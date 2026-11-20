@@ -6,7 +6,15 @@ fn ranking_media_point(f: &Fixture, modality: &str, cosine: f32) -> String {
     let id = format!("ranking-{modality}");
     let segment = format!("{id}-segment");
     let text = "Synthetic attachment provenance";
-    let source = f.store.capture(serde_json::from_value(json!({"source":"synthetic:media","event_id":id,"conversation_id":id,"kind":"user","text":text,"occurred_at":"2020-01-01T00:00:00Z","metadata":{}})).unwrap()).unwrap();
+    let source = f.store.capture(serde_json::from_value(json!({
+        "source":"synthetic:media",
+        "event_id":id,
+        "conversation_id":id,
+        "kind":"user",
+        "text":text,
+        "occurred_at":"2020-01-01T00:00:00Z",
+        "metadata":{}
+    })).unwrap()).unwrap();
     let context = memento_core::CommandContext {
         command_id: id.clone(), actor: "fixture".into(), why: "Exact attachment evidence".into(),
     };
@@ -16,7 +24,8 @@ fn ranking_media_point(f: &Fixture, modality: &str, cosine: f32) -> String {
     let sha = "a".repeat(64);
     f.store.command(&context,&json!({"op":"fixture_media"}),|tx,commit|{
         tx.touch_target(&id)?;
-        tx.sql().execute("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) VALUES(?,1,?,'media',?,'active',0,'[\"personal\"]')",params![id,commit,text])?;
+        tx.sql().execute("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) \
+            VALUES(?,1,?,'media',?,'active',0,'[\"personal\"]')",params![id,commit,text])?;
         tx.sql().execute("INSERT INTO media_files VALUES(?,?,'synthetic.bin',?,?)",params![id,sha,modality,commit])?;
         tx.sql().execute("INSERT INTO graph_evidence VALUES(?,1,?,0,?,?)",params![id,source.id,text.chars().count() as i64,text])?;
         tx.sql().execute("INSERT INTO segments(id,node_id,modality,text,artifact_sha256) VALUES(?,?,?,'',?)",params![segment,id,modality,sha])?;
@@ -33,11 +42,26 @@ fn relevance_first_all_discovered_raw_lexical_rows_are_scored_beyond_semantic_sh
     for n in 0..21 {
         let id = format!("lexical-{n:02}");
         let text = if n == 20 { "late raw positive".to_owned() } else { format!("raw lexical negative {n}") };
-        found.insert(id.clone(),json!({"id":id,"type":"raw_episode","tier":"raw","match":"keyword","text":text,"score":TEXT_FLOOR+0.25,"cosine":null}));
+        found.insert(id.clone(),json!({
+            "id":id,
+            "type":"raw_episode",
+            "tier":"raw",
+            "match":"keyword",
+            "text":text,
+            "score":TEXT_FLOOR+0.25,
+            "cosine":null
+        }));
     }
     for n in 0..12 {
         let id = format!("semantic-{n:02}");
-        found.insert(id.clone(),json!({"id":id,"type":"knowledge","match":"semantic","text":format!("semantic negative {n}"),"score":0.9,"cosine":0.9}));
+        found.insert(id.clone(),json!({
+            "id":id,
+            "type":"knowledge",
+            "match":"semantic",
+            "text":format!("semantic negative {n}"),
+            "score":0.9,
+            "cosine":0.9
+        }));
     }
     let expected = found["lexical-20"].clone();
     let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
@@ -63,7 +87,8 @@ fn relevance_first_raw_lexical_passages_are_validated_and_positive_history_stays
     let wrong_excerpt = format!("alpha unrelated distraction {} omega", "padding ".repeat(80));
     raw_point(&f,"wrong-lexical",("synthetic","user",&wrong_excerpt),json!({}),0.1,-2);
     f.store.write(|tx|{
-        tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) SELECT source,conversation_id,seq,seq,0 FROM episodes WHERE id=?",[&positive.episode])?;
+        tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) \
+            SELECT source,conversation_id,seq,seq,0 FROM episodes WHERE id=?",[&positive.episode])?;
         tx.touch_conversation("synthetic","positive-lexical")?;Ok(())
     }).unwrap();
     f.projection.rebuild(Tier::Hot,&AtomicBool::new(false)).unwrap();
@@ -144,7 +169,14 @@ fn raw_point(
     seq: i64,
 ) -> RawPoint {
     let (source, kind, text) = origin;
-    let episode = f.store.capture(serde_json::from_value(json!({"source":source,"event_id":event,"conversation_id":event,"kind":kind,"text":text,"metadata":metadata})).unwrap()).unwrap();
+    let episode = f.store.capture(serde_json::from_value(json!({
+        "source":source,
+        "event_id":event,
+        "conversation_id":event,
+        "kind":kind,
+        "text":text,
+        "metadata":metadata
+    })).unwrap()).unwrap();
     let chunk = format!("chunk-{event}");
     let mut vector = [0.;768]; vector[0]=cosine; vector[1]=(1.-cosine*cosine).sqrt();
     f.store.write(|tx| {
@@ -167,7 +199,8 @@ fn raw_current(f: &Fixture, automatic: bool, deep: bool, scope: Option<&str>, ar
 fn raw_pool_fresh_fallback_prefilters_forbidden_sources_and_labels_actual_parking() {
     let f=Fixture::new();
     let fresh=raw_point(&f,"fresh",("synthetic","user","Fresh salinity evidence remains unprocessed"),json!({}),0.9,-1);
-    let legacy="# AGENTS.md instructions for /fixture\n\n<INSTRUCTIONS>\nRetained developer salinity instruction body\n</INSTRUCTIONS>";
+    let legacy="# AGENTS.md instructions for /fixture\n\n<INSTRUCTIONS>\nRetained developer salinity \
+        instruction body\n</INSTRUCTIONS>";
     // More forbidden higher-scoring points than either fallback fetch limit:
     // filtering after top K would lose the eligible fresh passage.
     for n in 0..48 {
@@ -213,7 +246,8 @@ fn raw_pool_fresh_fallback_prefilters_forbidden_sources_and_labels_actual_parkin
     let citation=f.graph.cite(memento_domain::dto::Citation{event_id:"fresh-citation".into(),ids:vec![fresh.chunk.clone()],query:None,shown:vec![]}).unwrap();
     assert!(citation["demand_jobs"].as_array().unwrap().is_empty());
     f.store.write(|tx| {
-        tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) SELECT source,conversation_id,seq,seq,0 FROM episodes WHERE id=?",[&fresh.episode])?;
+        tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) \
+            SELECT source,conversation_id,seq,seq,0 FROM episodes WHERE id=?",[&fresh.episode])?;
         tx.touch_conversation("synthetic","fresh")?;Ok(())
     }).unwrap();
     let parked=raw_current(&f,true,false,None,true).0;

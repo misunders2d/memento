@@ -296,7 +296,12 @@ impl TxGraph {
                 .ok_or(Error::Validation(
                     "Quote-only evidence requires source and conversation_id",
                 ))?;
-            let row = one(tx.sql(), "SELECT id FROM episodes WHERE source=? AND conversation_id=? AND instr(text,?)>0 AND coalesce(json_extract(metadata,'$.extraction_mode'),'message')!='skip' AND coalesce(json_extract(metadata,'$.evidence_eligible'),1)!=0 AND kind NOT IN ('native_record','native_hook','native_live_record') AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=episodes.source AND f.event_id=episodes.event_id) ORDER BY seq DESC LIMIT 1", params![origin, conversation, quote])?
+            let row = one(tx.sql(), "SELECT id FROM episodes WHERE source=? AND conversation_id=? AND instr(text,?)>0 AND \
+                coalesce(json_extract(metadata,'$.extraction_mode'),'message')!='skip' AND \
+                coalesce(json_extract(metadata,'$.evidence_eligible'),1)!=0 AND kind NOT IN \
+                ('native_record','native_hook','native_live_record') AND NOT EXISTS (SELECT 1 FROM \
+                forgotten_sources f WHERE f.source=episodes.source AND f.event_id=episodes.event_id) ORDER \
+                BY seq DESC LIMIT 1", params![origin, conversation, quote])?
                 .ok_or(Error::Validation("Evidence quote was not found in the current conversation"))?;
             let mut source = source.clone();
             source["episode_id"] = row["id"].clone();
@@ -308,8 +313,14 @@ impl TxGraph {
 
     pub fn evidence(tx: &WriteTxn, target: &str, version: i64, sources: &Value) -> Result<()> {
         for (episode_id, start, end, quote) in Self::evidence_spans(tx, sources)? {
-            tx.sql().execute("INSERT INTO graph_evidence SELECT ?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM graph_evidence WHERE target=? AND version=? AND episode_id=? AND start=? AND end=?)",
-                params![target,version,episode_id,start,end,quote,target,version,episode_id,start,end])?;
+            tx.sql().execute(
+                "INSERT INTO graph_evidence SELECT ?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM \
+                    graph_evidence WHERE target=? AND version=? AND episode_id=? AND start=? AND end=?)",
+                params![
+                    target, version, episode_id, start, end, quote, target, version, episode_id,
+                    start, end
+                ],
+            )?;
         }
         tx.touch_target(target)?;
         Ok(())
@@ -588,7 +599,8 @@ impl TxGraph {
         if previous["text"] == new["text"] && previous["type"] == new["type"] {
             curation::copy_vector(tx, old, before, version)?;
         } else {
-            tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='node' AND target=?)",[old])?;
+            tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE \
+                kind='node' AND target=?)", [old])?;
         }
         let (retired, protected) = Self::retire_relations(tx, commit, old, kind, &request)?;
         tx.touch_target(old)?;
@@ -695,7 +707,8 @@ pub fn behavior(db: &Connection, target: &str) -> Result<Option<Value>> {
 pub fn behavior_at(db: &Connection, target: &str, version: i64) -> Result<Option<Value>> {
     let defining = one(
         db,
-        "SELECT r.version,r.source_id,r.source_version FROM node_revisions r WHERE r.id=?1 AND r.version<=?2 ORDER BY r.version DESC LIMIT 1",
+        "SELECT r.version,r.source_id,r.source_version FROM node_revisions r WHERE r.id=?1 AND \
+        r.version<=?2 ORDER BY r.version DESC LIMIT 1",
         params![target, version],
     )?;
     // Recovered legacy content keeps the behavior of the replacement it came from.
@@ -711,7 +724,8 @@ pub fn behavior_at(db: &Connection, target: &str, version: i64) -> Result<Option
         .unwrap_or(1);
     let record = one(
         db,
-        "SELECT g.request,g.result FROM node_versions n JOIN graph_commits g ON g.id=n.commit_id WHERE n.id=? AND n.version=?",
+        "SELECT g.request,g.result FROM node_versions n JOIN graph_commits g ON g.id=n.commit_id \
+        WHERE n.id=? AND n.version=?",
         params![target, version],
     )?;
     let Some(record) = record else {
@@ -784,7 +798,18 @@ pub fn history(db: &Connection, data_dir: &std::path::Path, target: &str) -> Res
             params![raw["source"].as_str(), raw["event_id"].as_str()],
         )?
         .is_some();
-        let parked=one(db,"SELECT 1 FROM historical_parking WHERE source=? AND conversation_id=? AND ?>=0 AND ?<=parked_through",params![raw["source"].as_str(),raw["conversation_id"].as_str(),raw["seq"].as_i64(),raw["seq"].as_i64()])?.is_some();
+        let parked = one(
+            db,
+            "SELECT 1 FROM historical_parking WHERE source=? AND conversation_id=? AND ?>=0 AND \
+                ?<=parked_through",
+            params![
+                raw["source"].as_str(),
+                raw["conversation_id"].as_str(),
+                raw["seq"].as_i64(),
+                raw["seq"].as_i64()
+            ],
+        )?
+        .is_some();
         let start = chunk
             .as_ref()
             .and_then(|row| row["start"].as_u64())
@@ -802,28 +827,45 @@ pub fn history(db: &Connection, data_dir: &std::path::Path, target: &str) -> Res
         raw.as_object_mut().unwrap().remove("text_sha256");
         raw.as_object_mut().unwrap().remove("raw_frame");
         raw["metadata"] = decode_json(get_str(&raw, "metadata")?)?;
-        for (key,value) in json!({"id":target,"episode_id":episode_id,"chunk_id":chunk.as_ref().map(|_|target),"version":1,"text":exact,
+        for (key, value) in json!({"id":target,"episode_id":episode_id,"chunk_id":chunk.as_ref().map(|_|target),"version":1,"text":exact,
             "type":"raw_episode","state":"raw","confirmed":false,"historical":parked,"actor":source,"why":"Immutable captured evidence",
             "recorded_at":captured,"recorded_until":null,"valid_from":null,"valid_to":null,"forgotten":blocked,
-            "evidence":[{"episode_id":episode_id,"start":start,"end":end,"quote":substring(&text,start,end)}]}).as_object().unwrap() { raw[key]=value.clone(); }
+            "evidence":[{"episode_id":episode_id,"start":start,"end":end,"quote":substring(&text,start,end)}]}).as_object().unwrap() {
+            raw[key] = value.clone();
+        }
         return Ok(vec![raw]);
     }
     let mut values = rows(
         db,
-        "WITH RECURSIVE lineage(id) AS (SELECT id FROM node_versions WHERE id=? UNION SELECT CASE WHEN e.src=l.id THEN e.dst ELSE e.src END FROM edge_versions e JOIN lineage l ON e.src=l.id OR e.dst=l.id WHERE e.rel='supersedes' AND e.version=1 AND NOT EXISTS (SELECT 1 FROM edge_versions x WHERE x.id=e.id AND x.state<>'active')) SELECT n.*,c.actor,c.why,c.recorded_at,lead(c.recorded_at) OVER (PARTITION BY n.id ORDER BY n.version) AS recorded_until,r.kind AS revision_kind,r.valid_at AS revision_valid_at,r.source_id AS revision_source_id,r.source_version AS revision_source_version FROM lineage l JOIN node_versions n ON n.id=l.id JOIN graph_commits c ON c.id=n.commit_id LEFT JOIN node_revisions r ON r.id=n.id AND r.version=n.version ORDER BY (SELECT v.rowid FROM node_versions v WHERE v.id=n.id ORDER BY v.version LIMIT 1),n.version",
+        "WITH RECURSIVE lineage(id) AS (SELECT id FROM node_versions WHERE id=? UNION SELECT CASE \
+        WHEN e.src=l.id THEN e.dst ELSE e.src END FROM edge_versions e JOIN lineage l ON e.src=l.id \
+        OR e.dst=l.id WHERE e.rel='supersedes' AND e.version=1 AND NOT EXISTS (SELECT 1 FROM \
+        edge_versions x WHERE x.id=e.id AND x.state<>'active')) SELECT \
+        n.*,c.actor,c.why,c.recorded_at,lead(c.recorded_at) OVER (PARTITION BY n.id ORDER BY \
+        n.version) AS recorded_until,r.kind AS revision_kind,r.valid_at AS \
+        revision_valid_at,r.source_id AS revision_source_id,r.source_version AS \
+        revision_source_version FROM lineage l JOIN node_versions n ON n.id=l.id JOIN graph_commits \
+        c ON c.id=n.commit_id LEFT JOIN node_revisions r ON r.id=n.id AND r.version=n.version ORDER \
+        BY (SELECT v.rowid FROM node_versions v WHERE v.id=n.id ORDER BY v.version LIMIT \
+        1),n.version",
         [target],
     )?;
     if values.is_empty() {
         values = rows(
             db,
-            "SELECT e.*,c.actor,c.why,c.recorded_at,lead(c.recorded_at) OVER (ORDER BY e.version) AS recorded_until FROM edge_versions e JOIN graph_commits c ON c.id=e.commit_id WHERE e.id=? ORDER BY e.version",
+            "SELECT e.*,c.actor,c.why,c.recorded_at,lead(c.recorded_at) OVER (ORDER BY e.version) AS \
+            recorded_until FROM edge_versions e JOIN graph_commits c ON c.id=e.commit_id WHERE e.id=? \
+            ORDER BY e.version",
             [target],
         )?;
     }
     if values.is_empty() {
         values = rows(
             db,
-            "SELECT p.*,1 AS version,'candidate' AS state,r.version AS extractor_version,r.requested_model,r.reported_models,r.usage,r.commit_id,c.actor,c.why AS extraction_why,c.recorded_at,NULL AS recorded_until FROM candidates p JOIN extraction_runs r ON r.id=p.run_id JOIN graph_commits c ON c.id=r.commit_id WHERE p.id=?",
+            "SELECT p.*,1 AS version,'candidate' AS state,r.version AS \
+            extractor_version,r.requested_model,r.reported_models,r.usage,r.commit_id,c.actor,c.why AS \
+            extraction_why,c.recorded_at,NULL AS recorded_until FROM candidates p JOIN extraction_runs \
+            r ON r.id=p.run_id JOIN graph_commits c ON c.id=r.commit_id WHERE p.id=?",
             [target],
         )?;
     }
@@ -843,7 +885,15 @@ pub fn history(db: &Connection, data_dir: &std::path::Path, target: &str) -> Res
             if !source.is_null() {
                 // The original revision keeps its own commit; this version's
                 // actor, reason and time describe the recovery.
-                let original = one(db, "SELECT c.id AS commit_id,c.actor,c.why,c.recorded_at FROM graph_commits c WHERE c.id=coalesce((SELECT r.commit_id FROM node_revisions r WHERE r.id=?1 AND r.version<=?2 ORDER BY r.version DESC LIMIT 1),(SELECT n.commit_id FROM node_versions n WHERE n.id=?1 AND n.version=1))", params![source.as_str(), source_version.as_i64()])?.unwrap_or(json!({}));
+                let original = one(
+                    db,
+                    "SELECT c.id AS commit_id,c.actor,c.why,c.recorded_at FROM graph_commits c WHERE \
+                        c.id=coalesce((SELECT r.commit_id FROM node_revisions r WHERE r.id=?1 AND r.version<=?2 \
+                        ORDER BY r.version DESC LIMIT 1),(SELECT n.commit_id FROM node_versions n WHERE n.id=?1 AND \
+                        n.version=1))",
+                    params![source.as_str(), source_version.as_i64()],
+                )?
+                .unwrap_or(json!({}));
                 let mut recovered = json!({"id":source,"version":source_version});
                 for key in ["commit_id", "actor", "why", "recorded_at"] {
                     recovered[key] = original[key].clone();
@@ -888,7 +938,9 @@ pub fn history(db: &Connection, data_dir: &std::path::Path, target: &str) -> Res
             value["usage"] = decode_json(get_str(value, "usage")?)?;
             value["decisions"] = Value::Array(rows(
                 db,
-                "SELECT d.decision,d.target_id,d.next_review_at,c.actor,c.why,c.recorded_at FROM candidate_decisions d JOIN graph_commits c ON c.id=d.commit_id WHERE d.candidate_id=? ORDER BY c.recorded_at,d.rowid",
+                "SELECT d.decision,d.target_id,d.next_review_at,c.actor,c.why,c.recorded_at FROM \
+                candidate_decisions d JOIN graph_commits c ON c.id=d.commit_id WHERE d.candidate_id=? ORDER \
+                BY c.recorded_at,d.rowid",
                 [&id],
             )?);
             value["entity_matches"] = Value::Array(rows(
@@ -921,19 +973,42 @@ pub fn recall_keywords(
     if literal.is_empty() {
         return Ok(vec![]);
     }
-    let columns = "n.id,n.version,n.type,substr(n.text,1,240) AS text,n.state,n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,(SELECT c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id ORDER BY v.version LIMIT 1) AS created_at,coalesce((SELECT importance FROM node_stats WHERE node_id=n.id),0.5) AS importance,coalesce((SELECT decay FROM node_stats WHERE node_id=n.id),1) AS decay,coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0) AS archived,coalesce((SELECT access_count FROM node_stats WHERE node_id=n.id),0) AS access_count,(SELECT last_cited_at FROM node_stats WHERE node_id=n.id) AS last_cited_at";
-    let visible = "n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND (NOT EXISTS (SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) OR EXISTS (SELECT 1 FROM captured_media cm JOIN captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON e.id=r.episode_id WHERE cm.node_id=n.id AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=cm.sha256))) AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?2))";
+    let columns = "n.id,n.version,n.type,substr(n.text,1,240) AS \
+        text,n.state,n.valid_from,n.valid_to,n.pinned,n.superseded_by,n.commit_id,n.scope,(SELECT \
+        c.recorded_at FROM node_versions v JOIN graph_commits c ON c.id=v.commit_id WHERE v.id=n.id \
+        ORDER BY v.version LIMIT 1) AS created_at,coalesce((SELECT importance FROM node_stats WHERE \
+        node_id=n.id),0.5) AS importance,coalesce((SELECT decay FROM node_stats WHERE \
+        node_id=n.id),1) AS decay,coalesce((SELECT archived FROM node_stats WHERE node_id=n.id),0) \
+        AS archived,coalesce((SELECT access_count FROM node_stats WHERE node_id=n.id),0) AS \
+        access_count,(SELECT last_cited_at FROM node_stats WHERE node_id=n.id) AS last_cited_at";
+    let visible = "n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id) \
+        AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND (NOT EXISTS \
+        (SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) OR EXISTS (SELECT 1 FROM \
+        captured_media cm JOIN captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON \
+        e.id=r.episode_id WHERE cm.node_id=n.id AND NOT EXISTS (SELECT 1 FROM forgotten_sources f \
+        WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM \
+        media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=cm.sha256))) \
+        AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(n.scope) WHERE value=?2))";
     let mut hits = rows(
         db,
         &format!(
-            "SELECT {columns},bm25(node_fts) AS keyword_rank FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND {visible} ORDER BY keyword_rank,n.id LIMIT ?3"
+            "SELECT {columns},bm25(node_fts) AS keyword_rank FROM node_fts JOIN node_versions n ON \
+            n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND {visible} ORDER \
+            BY keyword_rank,n.id LIMIT ?3"
         ),
         params![literal, scope, limit as i64],
     )?;
     let aliases = rows(
         db,
         &format!(
-            "WITH RECURSIVE canonical(source,target,depth) AS (SELECT source,target,0 FROM entity_merges UNION ALL SELECT c.source,m.superseded_by,c.depth+1 FROM canonical c JOIN node_versions m ON m.id=c.target AND m.state IN ('merged','refined') AND m.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=m.id) WHERE m.superseded_by IS NOT NULL AND c.depth<64) SELECT {columns},bm25(alias_fts) AS keyword_rank FROM alias_fts JOIN canonical a ON a.source=alias_fts.id JOIN node_versions n ON n.id=a.target WHERE alias_fts MATCH ?1 AND {visible} AND NOT EXISTS (SELECT 1 FROM entity_merges WHERE source=a.target) ORDER BY keyword_rank,n.id LIMIT ?3"
+            "WITH RECURSIVE canonical(source,target,depth) AS (SELECT source,target,0 FROM entity_merges \
+            UNION ALL SELECT c.source,m.superseded_by,c.depth+1 FROM canonical c JOIN node_versions m \
+            ON m.id=c.target AND m.state IN ('merged','refined') AND m.version=(SELECT max(x.version) \
+            FROM node_versions x WHERE x.id=m.id) WHERE m.superseded_by IS NOT NULL AND c.depth<64) \
+            SELECT {columns},bm25(alias_fts) AS keyword_rank FROM alias_fts JOIN canonical a ON \
+            a.source=alias_fts.id JOIN node_versions n ON n.id=a.target WHERE alias_fts MATCH ?1 AND \
+            {visible} AND NOT EXISTS (SELECT 1 FROM entity_merges WHERE source=a.target) ORDER BY \
+            keyword_rank,n.id LIMIT ?3"
         ),
         params![literal, scope, limit as i64],
     )?;
@@ -968,7 +1043,9 @@ pub fn exact_identities(db: &Connection, kind: &str, text: &str) -> Result<Vec<V
             rows(
                 db,
                 &format!(
-                    "SELECT n.id,n.version,n.text,n.commit_id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND {active}"
+                    "SELECT n.id,n.version,n.text,n.commit_id FROM node_fts JOIN node_versions n ON \
+                n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND \
+                {active}"
                 ),
                 params![phrase, kind],
             )?,
@@ -993,7 +1070,7 @@ pub fn exact_identities(db: &Connection, kind: &str, text: &str) -> Result<Vec<V
     let mut matches = std::collections::BTreeMap::new();
     for record in records {
         if identity(get_str(&record, "text")?) == key {
-            matches.insert(get_str(&record,"id")?.to_owned(),json!({"id":record["id"],"version":record["version"],"commit_id":record["commit_id"]}));
+            matches.insert(get_str(&record, "id")?.to_owned(), json!({"id":record["id"],"version":record["version"],"commit_id":record["commit_id"]}));
         }
     }
     for alias in aliases {

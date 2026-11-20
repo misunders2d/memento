@@ -7,11 +7,27 @@ fn dated_node(f: &mut Fixture, text: &str, dates: &[Option<&str>], cosine: f32, 
     for date in dates {
         f.seq += 1;
         let event = format!("period-{}", f.seq);
-        let episode = f.store.capture(serde_json::from_value(json!({"source":"synthetic:period","event_id":event,"conversation_id":event,"kind":"user","text":text,"occurred_at":date,"metadata":{}})).unwrap()).unwrap();
+        let episode = f.store.capture(serde_json::from_value(json!({
+            "source":"synthetic:period",
+            "event_id":event,
+            "conversation_id":event,
+            "kind":"user",
+            "text":text,
+            "occurred_at":date,
+            "metadata":{}
+        })).unwrap()).unwrap();
         evidence.push(json!({"episode_id":episode.id,"quote":text}));
     }
     f.seq += 1;
-    let node = f.graph.remember(serde_json::from_value(json!({"command_id":format!("period-node-{}",f.seq),"actor":"owner","why":"Exact synthetic period evidence","type":"knowledge","text":text,"scope":[scope],"evidence":evidence})).unwrap()).unwrap();
+    let node = f.graph.remember(serde_json::from_value(json!({
+        "command_id":format!("period-node-{}",f.seq),
+        "actor":"owner",
+        "why":"Exact synthetic period evidence",
+        "type":"knowledge",
+        "text":text,
+        "scope":[scope],
+        "evidence":evidence
+    })).unwrap()).unwrap();
     let id = key(&node).to_owned();
     let mut vector = [0f32; 768];
     vector[0] = cosine;
@@ -23,7 +39,15 @@ fn dated_node(f: &mut Fixture, text: &str, dates: &[Option<&str>], cosine: f32, 
 fn dated_candidate(f: &mut Fixture, id: &str, text: &str, date: &str, cosine: f32) {
     f.seq += 1;
     let event = format!("period-candidate-{}", f.seq);
-    let episode = f.store.capture(serde_json::from_value(json!({"source":"synthetic:period","event_id":event,"conversation_id":event,"kind":"user","text":text,"occurred_at":date,"metadata":{}})).unwrap()).unwrap();
+    let episode = f.store.capture(serde_json::from_value(json!({
+        "source":"synthetic:period",
+        "event_id":event,
+        "conversation_id":event,
+        "kind":"user",
+        "text":text,
+        "occurred_at":date,
+        "metadata":{}
+    })).unwrap()).unwrap();
     let context = memento_core::CommandContext { command_id: event.clone(), actor: "fixture".into(), why: "Synthetic extraction".into() };
     let mut vector = [0f32; 768];
     vector[0] = cosine;
@@ -32,7 +56,8 @@ fn dated_candidate(f: &mut Fixture, id: &str, text: &str, date: &str, cosine: f3
     f.store.command(&context, &json!({"op":"fixture_candidate"}), |tx, commit| {
         let run = format!("run-{id}");
         tx.sql().execute("INSERT INTO extraction_runs VALUES(?,?,?,'test','test','[]','{}','2026-10-30T00:00:00Z')", params![run, commit, episode.id])?;
-        tx.sql().execute("INSERT INTO candidates VALUES(?,?,'memory','knowledge',?,'Exact source',NULL,NULL,1,NULL,NULL,'[\"personal\"]')", params![id, run, text])?;
+        tx.sql().execute("INSERT INTO candidates VALUES(?,?,'memory','knowledge',?,'Exact \
+            source',NULL,NULL,1,NULL,NULL,'[\"personal\"]')", params![id, run, text])?;
         tx.sql().execute("INSERT INTO graph_evidence VALUES(?,1,?,0,?,?)", params![id, episode.id, text.chars().count() as i64, text])?;
         tx.touch_target(id)?;
         tx.put_vector(&VectorWrite{seq,target:id.into(),kind:VectorKind::Candidate,version:1,embedding:F32Blob::from_values(&vector)?,current:true,tier:Tier::Hot})?;
@@ -161,7 +186,8 @@ fn period_uses_latest_original_source_time_not_capture_import_or_citation() {
     let unknown = dated_node(&mut f, "Undated statement about the supplier contract", &[None], 0.9, "personal");
     let mixed = dated_node(&mut f, "Supplier contract mentioned in January and again in October", &[Some("2025-01-06T12:00:00Z"), None, Some("2026-10-22T12:00:00Z")], 0.9, "personal");
     // Citation renewal changes ranking only; it never moves the source date.
-    f.store.write(|tx| { tx.sql().execute("INSERT INTO node_stats(node_id,last_cited_at) VALUES(?,?) ON CONFLICT(node_id) DO UPDATE SET last_cited_at=excluded.last_cited_at", params![imported, "2026-10-25T00:00:00+00:00"])?; Ok(()) }).unwrap();
+    f.store.write(|tx| { tx.sql().execute("INSERT INTO node_stats(node_id,last_cited_at) VALUES(?,?) ON CONFLICT(node_id) DO UPDATE \
+        SET last_cited_at=excluded.last_cited_at", params![imported, "2026-10-25T00:00:00+00:00"])?; Ok(()) }).unwrap();
     let recent = period_request("", 10, Some(WEEK_START), Some(WEEK_END), None);
     let rows = listed(&f, &recent);
     assert_eq!(ids(&rows), [mixed.clone()]);
@@ -188,13 +214,30 @@ fn period_keeps_scope_forgetting_supersession_and_candidate_guards() {
     // Version 1 evidence is inside the window; the corrected current version is not.
     let revised = dated_node(&mut f, "Shipment cadence was weekly in the window", &[Some("2026-10-23T00:00:00Z")], 0.95, "personal");
     let text = "Shipment cadence is monthly.";
-    let source = f.store.capture(serde_json::from_value(json!({"source":"synthetic:period","event_id":"cadence","conversation_id":"cadence","kind":"user","text":text,"occurred_at":"2026-11-02T00:00:00Z","metadata":{}})).unwrap()).unwrap();
-    let corrected = f.graph.supersede(serde_json::from_value(json!({"command_id":"cadence","actor":"owner","why":"Corrected cadence","old":revised,"kind":"correction","new":{"type":"knowledge","text":text,"scope":["personal"]},"evidence":[{"episode_id":source.id,"quote":text}]})).unwrap()).unwrap();
+    let source = f.store.capture(serde_json::from_value(json!({
+        "source":"synthetic:period",
+        "event_id":"cadence",
+        "conversation_id":"cadence",
+        "kind":"user",
+        "text":text,
+        "occurred_at":"2026-11-02T00:00:00Z",
+        "metadata":{}
+    })).unwrap()).unwrap();
+    let corrected = f.graph.supersede(serde_json::from_value(json!({
+        "command_id":"cadence",
+        "actor":"owner",
+        "why":"Corrected cadence",
+        "old":revised,
+        "kind":"correction",
+        "new":{"type":"knowledge","text":text,"scope":["personal"]},
+        "evidence":[{"episode_id":source.id,"quote":text}]
+    })).unwrap()).unwrap();
     assert_eq!(corrected["version"], 2);
     current_vector(&f.store, &revised, 2, 7000);
     dated_candidate(&mut f, "period-pending", "Pending proposal captured inside the window", "2026-10-24T00:00:00Z", 0.85);
     dated_candidate(&mut f, "period-rejected", "Rejected proposal captured inside the window", "2026-10-25T00:00:00Z", 0.85);
-    f.store.write(|tx| { tx.sql().execute("INSERT INTO candidate_decisions VALUES('decision-rejected','period-rejected',(SELECT commit_id FROM extraction_runs WHERE id='run-period-rejected'),'reject',NULL,NULL)", [])?; Ok(()) }).unwrap();
+    f.store.write(|tx| { tx.sql().execute("INSERT INTO candidate_decisions VALUES('decision-rejected','period-rejected',(SELECT \
+        commit_id FROM extraction_runs WHERE id='run-period-rejected'),'reject',NULL,NULL)", [])?; Ok(()) }).unwrap();
     for effort in ["cheap", "normal", "deep"] {
         let mut request = period_request("", 10, Some(WEEK_START), Some(WEEK_END), None);
         request.effort = effort.into();
@@ -255,7 +298,9 @@ fn raw_history(f: &mut Fixture, count: usize, bytes: usize) {
     f.seq += count as i64;
     let context = memento_core::CommandContext { command_id: format!("raw-{first}"), actor: "fixture".into(), why: "Synthetic raw history".into() };
     f.store.command(&context, &json!({"op":"fixture_raw"}), |tx, _| {
-        let mut insert = tx.sql().prepare("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(?1,'synthetic:native',?1,'raw','native_record',?2,?3,'{\"extraction_mode\":\"skip\"}',?4)")?;
+        let mut insert = tx.sql().prepare("INSERT INTO \
+            episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+            VALUES(?1,'synthetic:native',?1,'raw','native_record',?2,?3,'{\"extraction_mode\":\"skip\"}',?4)")?;
         for n in 0..count {
             let at = format!("2026-10-{:02}T{:02}:00:00Z", 17 + n % 12, n % 24);
             insert.execute(params![format!("raw-{}", first as usize + n), text, (n % 5 != 0).then_some(&at), at])?;
@@ -324,8 +369,24 @@ fn period_lookup_cost_follows_current_memory_evidence_not_raw_history() {
     for version in 2..=12 {
         let text = format!("Warehouse lease note version {version}");
         let date = if version == 12 { "2025-03-01T00:00:00Z" } else { "2026-10-19T00:00:00Z" };
-        let source = f.store.capture(serde_json::from_value(json!({"source":"synthetic:period","event_id":format!("lease-{version}"),"conversation_id":"lease","kind":"user","text":text,"occurred_at":date,"metadata":{}})).unwrap()).unwrap();
-        f.graph.supersede(serde_json::from_value(json!({"command_id":format!("lease-{version}"),"actor":"owner","why":"Refined lease note","old":historic,"kind":"correction","new":{"type":"knowledge","text":text,"scope":["personal"]},"evidence":[{"episode_id":source.id,"quote":text}]})).unwrap()).unwrap();
+        let source = f.store.capture(serde_json::from_value(json!({
+            "source":"synthetic:period",
+            "event_id":format!("lease-{version}"),
+            "conversation_id":"lease",
+            "kind":"user",
+            "text":text,
+            "occurred_at":date,
+            "metadata":{}
+        })).unwrap()).unwrap();
+        f.graph.supersede(serde_json::from_value(json!({
+            "command_id":format!("lease-{version}"),
+            "actor":"owner",
+            "why":"Refined lease note",
+            "old":historic,
+            "kind":"correction",
+            "new":{"type":"knowledge","text":text,"scope":["personal"]},
+            "evidence":[{"episode_id":source.id,"quote":text}]
+        })).unwrap()).unwrap();
     }
     let request = period_request("", 10, Some(WEEK_START), Some(WEEK_END), None);
     let period = Period::of(&request).unwrap().unwrap();
@@ -343,7 +404,8 @@ fn period_lookup_cost_follows_current_memory_evidence_not_raw_history() {
     let (eligible, eligible_pages, listed, list_pages) = measure(&f);
     raw_history(&mut f, raw, 32 * 1024);
     let (_, more_eligible_pages, more_listed, more_list_pages) = measure(&f);
-    println!("raw={raw}: eligible pages {eligible_pages}, list pages {list_pages}; raw={}: eligible pages {more_eligible_pages}, list pages {more_list_pages}", raw * 2);
+    println!("raw={raw}: eligible pages {eligible_pages}, list pages {list_pages}; raw={}: eligible pages \
+        {more_eligible_pages}, list pages {more_list_pages}", raw * 2);
     let mut admitted = serde_json::from_str::<Vec<String>>(&eligible.ids_json).unwrap();
     admitted.sort();
     let mut expected = vec!["period-cost-candidate".to_owned(), inside.clone()];
@@ -373,8 +435,13 @@ fn period_prefilter_synthetic_scale_timing() {
     f.store.command(&context, &json!({"op":"fixture_scale"}), |tx, commit| {
         let db = tx.sql();
         let text = "x".repeat(raw_bytes);
-        let mut native = db.prepare("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(?1,'synthetic:native',?1,'raw','native_record',?2,?3,'{\"extraction_mode\":\"skip\"}',?4)")?;
-        let mut message = db.prepare("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(?1,'synthetic:scale',?1,'scale','user','Synthetic scale text',?2,'{}','2026-10-30T00:00:00Z')")?;
+        let mut native = db.prepare("INSERT INTO \
+            episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+            VALUES(?1,'synthetic:native',?1,'raw','native_record',?2,?3,'{\"extraction_mode\":\"skip\"}',?4)")?;
+        let mut message = db.prepare("INSERT INTO \
+            episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+            VALUES(?1,'synthetic:scale',?1,'scale','user','Synthetic scale \
+            text',?2,'{}','2026-10-30T00:00:00Z')")?;
         let raw_start = end - chrono::Duration::days(30);
         for n in 0..messages.max(raw) {
             if n < messages {
@@ -387,7 +454,8 @@ fn period_prefilter_synthetic_scale_timing() {
                 native.execute(params![format!("r{n}"), text, (n % 10 != 0).then_some(&at), at])?;
             }
         }
-        let mut node = db.prepare("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) VALUES(?1,?2,?3,'knowledge','Synthetic scale memory','active',0,'[\"personal\"]')")?;
+        let mut node = db.prepare("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) \
+            VALUES(?1,?2,?3,'knowledge','Synthetic scale memory','active',0,'[\"personal\"]')")?;
         let mut evidence = db.prepare("INSERT INTO graph_evidence VALUES(?1,?2,?3,?4,?4+20,'Synthetic scale text')")?;
         let mut item = db.prepare("INSERT INTO vector_items(target,kind,version) VALUES(?1,?2,?3)")?;
         for n in 0..nodes {
@@ -400,8 +468,10 @@ fn period_prefilter_synthetic_scale_timing() {
             }
             item.execute(params![id, "node", versions])?;
         }
-        db.execute("INSERT INTO extraction_runs VALUES('scale-run',?1,'e1','test','test','[]','{}','2026-10-30T00:00:00Z')", [commit])?;
-        let mut candidate = db.prepare("INSERT INTO candidates VALUES(?1,'scale-run','memory','knowledge','Synthetic scale candidate','Exact',NULL,NULL,1,NULL,NULL,'[\"personal\"]')")?;
+        db.execute("INSERT INTO extraction_runs \
+            VALUES('scale-run',?1,'e1','test','test','[]','{}','2026-10-30T00:00:00Z')", [commit])?;
+        let mut candidate = db.prepare("INSERT INTO candidates VALUES(?1,'scale-run','memory','knowledge','Synthetic scale \
+            candidate','Exact',NULL,NULL,1,NULL,NULL,'[\"personal\"]')")?;
         for n in 0..candidates {
             let id = format!("c{n}");
             candidate.execute([&id])?;
@@ -410,7 +480,8 @@ fn period_prefilter_synthetic_scale_timing() {
         }
         Ok(json!({}))
     }).unwrap();
-    println!("populated {messages} dated messages, {raw} raw native records of {raw_bytes} bytes, {nodes} nodes with history, {candidates} candidates in {:?}", begun.elapsed());
+    println!("populated {messages} dated messages, {raw} raw native records of {raw_bytes} bytes, {nodes} \
+        nodes with history, {candidates} candidates in {:?}", begun.elapsed());
     for (label, since, until) in [
         ("14 days", Some(end - chrono::Duration::days(14)), None),
         ("90 days", Some(end - chrono::Duration::days(90)), None),
@@ -431,6 +502,7 @@ fn period_prefilter_synthetic_scale_timing() {
             let listed = period::list(tx, &request, &period, Utc::now())?;
             Ok((eligible, eligible_pages, eligible_time, listed, page_fetches(tx), timed.elapsed()))
         }).unwrap();
-        println!("{label}: eligible ids={} points={} pages={eligible_pages} in {eligible_time:?}; period-only list={} pages={list_pages} in {list_time:?}", serde_json::from_str::<Vec<String>>(&eligible.ids_json).unwrap().len(), eligible.points.len(), listed.len());
+        println!("{label}: eligible ids={} points={} pages={eligible_pages} in {eligible_time:?}; period-only \
+            list={} pages={list_pages} in {list_time:?}", serde_json::from_str::<Vec<String>>(&eligible.ids_json).unwrap().len(), eligible.points.len(), listed.len());
     }
 }

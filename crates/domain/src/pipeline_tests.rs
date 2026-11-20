@@ -43,7 +43,33 @@ impl Fixture {
         date: &str,
     ) -> String {
         let id = util::id();
-        self.graph.store.write(|tx|{tx.sql().execute("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES (?,?,?,?,?,?,?,?,?)",params![id,source,event,conversation,kind,text,date,util::encode_json(&metadata)?,util::now()])?;let seq=tx.sql().last_insert_rowid();tx.sql().execute("INSERT INTO processing_progress(source,conversation_id,latest_seq,latest_at) VALUES (?,?,?,?) ON CONFLICT(source,conversation_id) DO UPDATE SET latest_seq=excluded.latest_seq,latest_at=excluded.latest_at",params![source,conversation,seq,util::now()])?;Ok(())}).unwrap();
+        self.graph
+            .store
+            .write(|tx| {
+                tx.sql().execute(
+                    "INSERT INTO \
+                        episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+                        VALUES (?,?,?,?,?,?,?,?,?)",
+                    params![
+                        id,
+                        source,
+                        event,
+                        conversation,
+                        kind,
+                        text,
+                        date,
+                        util::encode_json(&metadata)?,
+                        util::now()
+                    ],
+                )?;
+                let seq = tx.sql().last_insert_rowid();
+                tx.sql()
+                    .execute("INSERT INTO processing_progress(source,conversation_id,latest_seq,latest_at) VALUES \
+                        (?,?,?,?) ON CONFLICT(source,conversation_id) DO UPDATE SET \
+                        latest_seq=excluded.latest_seq,latest_at=excluded.latest_at", params![source, conversation, seq, util::now()])?;
+                Ok(())
+            })
+            .unwrap();
         id
     }
     fn seed(&self) -> String {
@@ -134,11 +160,58 @@ impl Fixture {
     }
 }
 fn draft(quote: &str, typ: &str, open_loop: bool) -> Value {
-    json!({"key":"fact","kind":if util::ENTITIES.contains(&typ){"entity"}else{"memory"},"type":typ,"text":quote,"why":"Explicit source-backed durable finding","quote":quote,"occurrence":null,"src_key":null,"dst_key":null,"valid_from":null,"valid_to":null,"scope":["professional"],"open_loop":open_loop,"confidence":0.8})
+    json!({
+        "key":"fact",
+        "kind":if util::ENTITIES.contains(&typ){"entity"}else{"memory"},
+        "type":typ,
+        "text":quote,
+        "why":"Explicit source-backed durable finding",
+        "quote":quote,
+        "occurrence":null,
+        "src_key":null,
+        "dst_key":null,
+        "valid_from":null,
+        "valid_to":null,
+        "scope":["professional"],
+        "open_loop":open_loop,
+        "confidence":0.8
+    })
 }
 fn action(candidate: &Value, op: &str) -> Value {
-    let evidence=candidate["evidence"].as_array().unwrap().iter().map(|reference|json!({"episode_id":reference["episode_id"],"quote":reference["quote"],"occurrence":reference["occurrence"]})).collect::<Vec<_>>();
-    json!({"candidate_id":candidate["id"],"operation":op,"type":candidate["type"],"text":candidate["text"],"scope":candidate["scope"],"open_loop":false,"closed_targets":[],"target":null,"src":null,"dst":null,"relation":null,"change_kind":null,"valid_at":null,"valid_from":null,"valid_to":null,"category":null,"sensitive":null,"behavior":null,"evidence":evidence,"why":"Preserve exact durable subject and source"})
+    let evidence = candidate["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reference| {
+            json!({
+                "episode_id":reference["episode_id"],
+                "quote":reference["quote"],
+                "occurrence":reference["occurrence"]
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "candidate_id":candidate["id"],
+        "operation":op,
+        "type":candidate["type"],
+        "text":candidate["text"],
+        "scope":candidate["scope"],
+        "open_loop":false,
+        "closed_targets":[],
+        "target":null,
+        "src":null,
+        "dst":null,
+        "relation":null,
+        "change_kind":null,
+        "valid_at":null,
+        "valid_from":null,
+        "valid_to":null,
+        "category":null,
+        "sensitive":null,
+        "behavior":null,
+        "evidence":evidence,
+        "why":"Preserve exact durable subject and source"
+    })
 }
 
 #[test]
@@ -176,7 +249,10 @@ fn shared_work_api_pages_pool_and_commits_a_larger_related_batch() {
     let mut after = 0;
     let mut ids = std::collections::BTreeSet::new();
     loop {
-        let page = f.processing.work(serde_json::from_value(json!({"action":"pool","command":{"kind":"consolidate","after":after,"limit":7}})).unwrap()).unwrap();
+        let page = f
+            .processing
+            .work(serde_json::from_value(json!({"action":"pool","command":{"kind":"consolidate","after":after,"limit":7}})).unwrap())
+            .unwrap();
         assert_eq!(page["ready_candidates"], 40);
         for item in page["items"].as_array().unwrap() {
             assert!(item.get("text").is_none());
@@ -188,11 +264,38 @@ fn shared_work_api_pages_pool_and_commits_a_larger_related_batch() {
         after = page["next"].as_i64().unwrap();
     }
     assert_eq!(ids.len(), 40);
-    let claimed = f.processing.work(serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"consolidate_now":true,"continuous":true,"batch_size":64}})).unwrap()).unwrap();
+    let claimed = f
+        .processing
+        .work(
+            serde_json::from_value(json!({
+                "action":"claim",
+                "command": {
+                    "agent":"fixture",
+                    "timezone":"UTC",
+                    "kinds":["consolidate"],
+                    "consolidate_now":true,
+                    "continuous":true,
+                    "batch_size":64
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let task = &claimed["work"][0];
     assert_eq!(task["input"]["candidates"].as_array().unwrap().len(), 40);
-    let output = json!({"actions":task["input"]["candidates"].as_array().unwrap().iter().map(|candidate| action(candidate,"reject")).collect::<Vec<_>>()});
-    let submitted = f.processing.work(serde_json::from_value(json!({"action":"submit","command":{"complete":{"id":task["id"],"owner":task["owner"],"agent":"fixture","output":output},"next":{"agent":"fixture","timezone":"No/Such_Zone"}}})).unwrap()).unwrap();
+    let output = json!({
+        "actions":task["input"]["candidates"].as_array().unwrap().iter().map(|candidate| action(candidate,"reject")).collect::<Vec<_>>()
+    });
+    let submitted = f
+        .processing
+        .work(serde_json::from_value(json!({
+            "action":"submit",
+            "command": {
+                "complete": {"id":task["id"],"owner":task["owner"],"agent":"fixture","output":output},
+                "next":{"agent":"fixture","timezone":"No/Such_Zone"}
+            }
+        })).unwrap())
+        .unwrap();
     assert_eq!(submitted["completed"], task["id"]);
     assert_eq!(submitted["next_error"], "next_claim_failed");
     let status = f
@@ -245,7 +348,23 @@ fn update_target_coverage(n: usize) -> (usize, usize) {
         .collect::<Vec<_>>();
     let mut targets = std::collections::BTreeMap::new();
     let claim = || {
-        f.processing.work(serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"consolidate_now":true,"continuous":true,"batch_size":n}})).unwrap()).unwrap()["work"][0].clone()
+        f.processing
+            .work(
+                serde_json::from_value(json!({
+                    "action":"claim",
+                    "command": {
+                        "agent":"fixture",
+                        "timezone":"UTC",
+                        "kinds":["consolidate"],
+                        "consolidate_now":true,
+                        "continuous":true,
+                        "batch_size":n
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()["work"][0]
+            .clone()
     };
     // Every supplied candidate must see its old target; returns the deferred count.
     let check = |task: &Value,
@@ -315,7 +434,9 @@ fn update_target_coverage(n: usize) -> (usize, usize) {
                 decided.len()
             );
             assert_eq!(decided.len() + deferred, n);
-            f.complete(&task, json!({"actions":decided.iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()})).unwrap();
+            f.complete(&task, json!({
+                "actions":decided.iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()
+            })).unwrap();
             if deferred > 0 {
                 // The deferred candidates continue in the next batch with their targets.
                 let (rest, again) = check(&claim(), &targets);
@@ -325,7 +446,9 @@ fn update_target_coverage(n: usize) -> (usize, usize) {
         }
         let candidates = task["input"]["candidates"].as_array().unwrap().clone();
         assert_eq!(candidates.len(), n);
-        f.complete(&task, json!({"actions":candidates.iter().map(|candidate| action(candidate, "remember")).collect::<Vec<_>>()})).unwrap();
+        f.complete(&task, json!({
+            "actions":candidates.iter().map(|candidate| action(candidate, "remember")).collect::<Vec<_>>()
+        })).unwrap();
         for (name, text) in names.iter().zip(&facts) {
             targets.insert(
                 name.clone(),
@@ -386,7 +509,21 @@ fn batch_where_no_candidate_fits_its_old_target_is_narrowed() {
     );
     let mut old = std::collections::BTreeMap::new();
     for (i, text) in targets.iter().chain(&decoys).enumerate() {
-        let node = f.graph.remember(serde_json::from_value(json!({"command_id":format!("old{i}"),"actor":"owner","why":"Source-backed save","type":"knowledge","text":text,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":text}]})).unwrap()).unwrap();
+        let node = f
+            .graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":format!("old{i}"),
+                    "actor":"owner",
+                    "why":"Source-backed save",
+                    "type":"knowledge",
+                    "text":text,
+                    "scope":["professional"],
+                    "evidence":[{"episode_id":episode,"quote":text}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         old.insert(
             text.trim_end_matches('.').to_owned(),
             node["id"].as_str().unwrap().to_owned(),
@@ -422,7 +559,23 @@ fn batch_where_no_candidate_fits_its_old_target_is_narrowed() {
     )
     .unwrap();
     let claim = || {
-        f.processing.work(serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"consolidate_now":true,"continuous":true,"batch_size":n}})).unwrap()).unwrap()["work"][0].clone()
+        f.processing
+            .work(
+                serde_json::from_value(json!({
+                    "action":"claim",
+                    "command": {
+                        "agent":"fixture",
+                        "timezone":"UTC",
+                        "kinds":["consolidate"],
+                        "consolidate_now":true,
+                        "continuous":true,
+                        "batch_size":n
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()["work"][0]
+            .clone()
     };
     let mut decided = 0;
     for _ in 0..n {
@@ -468,7 +621,9 @@ fn batch_where_no_candidate_fits_its_old_target_is_narrowed() {
             n - decided
         );
         decided += candidates.len();
-        f.complete(&task, json!({"actions":candidates.iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()})).unwrap();
+        f.complete(&task, json!({
+            "actions":candidates.iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()
+        })).unwrap();
     }
     assert_eq!(decided, n);
 }
@@ -502,7 +657,25 @@ fn lone_candidate_keeps_its_old_target_when_endpoints_fill_the_ceiling() {
     );
     let mut old = vec![];
     for (i, text) in [target, decoy].into_iter().enumerate() {
-        old.push(f.graph.remember(serde_json::from_value(json!({"command_id":format!("old{i}"),"actor":"owner","why":"Source-backed save","type":"knowledge","text":text,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":text}]})).unwrap()).unwrap()["id"].as_str().unwrap().to_owned());
+        old.push(
+            f.graph
+                .remember(
+                    serde_json::from_value(json!({
+                        "command_id":format!("old{i}"),
+                        "actor":"owner",
+                        "why":"Source-backed save",
+                        "type":"knowledge",
+                        "text":text,
+                        "scope":["professional"],
+                        "evidence":[{"episode_id":episode,"quote":text}]
+                    }))
+                    .unwrap(),
+                )
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
     }
     // 47 promoted endpoints plus the decoy fill the ceiling before the lone fact's target.
     let parts = (0..47)
@@ -546,7 +719,23 @@ fn lone_candidate_keeps_its_old_target_when_endpoints_fill_the_ceiling() {
     )
     .unwrap();
     let claim = |size: usize| {
-        f.processing.work(serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"consolidate_now":true,"continuous":true,"batch_size":size}})).unwrap()).unwrap()["work"][0].clone()
+        f.processing
+            .work(
+                serde_json::from_value(json!({
+                    "action":"claim",
+                    "command": {
+                        "agent":"fixture",
+                        "timezone":"UTC",
+                        "kinds":["consolidate"],
+                        "consolidate_now":true,
+                        "continuous":true,
+                        "batch_size":size
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()["work"][0]
+            .clone()
     };
     let first = claim(47);
     let promoted = first["input"]["candidates"].as_array().unwrap().clone();
@@ -693,7 +882,9 @@ fn admitted(f: &Fixture, continuous: bool, size: usize) -> (Value, Vec<String>, 
     (task, conversations, payload)
 }
 fn reject_all(f: &Fixture, task: &Value) {
-    f.complete(task, json!({"actions":task["input"]["candidates"].as_array().unwrap().iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()})).unwrap();
+    f.complete(task, json!({
+        "actions":task["input"]["candidates"].as_array().unwrap().iter().map(|candidate| action(candidate, "reject")).collect::<Vec<_>>()
+    })).unwrap();
 }
 fn tally(conversations: &[String]) -> Vec<(&str, usize)> {
     let mut counts: Vec<(&str, usize)> = vec![];
@@ -808,11 +999,34 @@ fn smaller_admission_repartitions_only_uncommitted_released_work() {
     let extraction = f.claim("contract", "thread", Some(vec!["extract".into()]))["work"][0].clone();
     let mut second = draft(other, "knowledge", false);
     second["key"] = json!("second");
-    f.complete(&extraction,json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false),second]}]})).unwrap();
+    f.complete(
+        &extraction,
+        json!({
+            "windows": [
+                {
+                    "id":extraction["input"]["windows"][0]["id"],
+                    "candidates":[draft(FACT,"knowledge",false),second]
+                }
+            ]
+        }),
+    )
+    .unwrap();
     let old = f.consolidate_work();
     assert_eq!(old["input"]["candidates"].as_array().unwrap().len(), 2);
     let request = |exclude: Value| {
-        serde_json::from_value(json!({"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["consolidate"],"continuous":true,"consolidate_now":true,"batch_size":1,"exclude":exclude}})).unwrap()
+        serde_json::from_value(json!({
+            "action":"claim",
+            "command": {
+                "agent":"fixture",
+                "timezone":"UTC",
+                "kinds":["consolidate"],
+                "continuous":true,
+                "consolidate_now":true,
+                "batch_size":1,
+                "exclude":exclude
+            }
+        }))
+        .unwrap()
     };
     assert!(
         f.processing.work(request(json!([]))).unwrap()["work"]
@@ -851,7 +1065,13 @@ fn smaller_admission_repartitions_only_uncommitted_released_work() {
         .unwrap();
     assert_eq!(retained["state"], "failed");
     assert_eq!(retained["error"], "rebatch_requested");
-    assert_eq!(serde_json::from_str::<Value>(retained["payload"].as_str().unwrap()).unwrap()["candidate_ids"].as_array().unwrap().len(),2);
+    assert_eq!(
+        serde_json::from_str::<Value>(retained["payload"].as_str().unwrap()).unwrap()["candidate_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         f.stored::<i64>("SELECT count(*) FROM candidate_decisions"),
         0
@@ -968,7 +1188,13 @@ fn automatic_role_uses_eligible_subset_of_mixed_fact_evidence() {
     );
     let evidence =
         json!([{"episode_id":trace_id,"quote":trace},{"episode_id":human_id,"quote":human}]);
-    let request = json!({"op":"remember","type":"knowledge","text":"Passport renewal is pending.","scope":["professional"],"evidence":evidence});
+    let request = json!({
+        "op":"remember",
+        "type":"knowledge",
+        "text":"Passport renewal is pending.",
+        "scope":["professional"],
+        "evidence":evidence
+    });
     let result = f
         .graph
         .store
@@ -1226,7 +1452,9 @@ fn claim_backlog_reports_other_kind_claimability_after_scheduling() {
     );
     assert_eq!(claimable(&first, "consolidate"), 0);
     let work = first["work"][0].clone();
-    f.complete(&work, json!({"windows":[{"id":work["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false)]}]})).unwrap();
+    f.complete(&work, json!({
+        "windows": [{"id":work["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false)]}]
+    })).unwrap();
     // New candidates stay unclaimable while the window is closed.
     assert_eq!(
         claimable(&claim("extract", false, vec![]), "consolidate"),
@@ -1272,7 +1500,14 @@ fn failed_consolidation_preparation_never_leaves_a_blocking_lease() {
     f.seed();
     f.extract("contract", "thread", FACT, "knowledge", false);
     // Test-only corruption so preparation fails after the queue leased the batch.
-    f.graph.store.write(|tx| { tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE target IN (SELECT id FROM candidates)")?; Ok(()) }).unwrap();
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE \
+                target IN (SELECT id FROM candidates)")?;
+            Ok(())
+        })
+        .unwrap();
     let failure = f.processing.claim(Claim {
         agent: "fixture".into(),
         timezone_name: "UTC".into(),
@@ -1318,13 +1553,26 @@ fn scheduled_continuous_claim_rebuilds_a_batch_whose_job_already_ended() {
             batch_size: 16,
         })
     };
-    let quotes: Vec<(i64, String)> = f.graph.store.read(|tx| {
-        let mut statement = tx.sql().prepare("SELECT rowid,quote FROM graph_evidence WHERE target IN (SELECT id FROM candidates)")?;
-        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }).unwrap();
+    let quotes: Vec<(i64, String)> = f
+        .graph
+        .store
+        .read(|tx| {
+            let mut statement = tx.sql().prepare("SELECT rowid,quote FROM graph_evidence WHERE target IN (SELECT id FROM candidates)")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap();
     // Test-only corruption so the first preparation ends its job as failed.
-    f.graph.store.write(|tx| { tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE target IN (SELECT id FROM candidates)")?; Ok(()) }).unwrap();
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE \
+                target IN (SELECT id FROM candidates)")?;
+            Ok(())
+        })
+        .unwrap();
     assert!(matches!(claim(), Err(Error::Conflict(_))));
     let failed: String =
         f.stored("SELECT id FROM jobs WHERE kind='consolidate' AND state='failed'");
@@ -1357,7 +1605,14 @@ fn failed_mixed_claim_returns_every_withheld_lease() {
     f.seed();
     f.extract("contract", "thread", FACT, "knowledge", false);
     let done = f.stored::<i64>("SELECT count(*) FROM jobs WHERE kind='extract' AND state='done'");
-    f.graph.store.write(|tx| { tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE target IN (SELECT id FROM candidates)")?; Ok(()) }).unwrap();
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute_batch("DROP TRIGGER graph_evidence_no_UPDATE; UPDATE graph_evidence SET quote='corrupted' WHERE \
+                target IN (SELECT id FROM candidates)")?;
+            Ok(())
+        })
+        .unwrap();
     f.capture(
         "two",
         "other",
@@ -1388,7 +1643,13 @@ fn failed_mixed_claim_returns_every_withheld_lease() {
         f.stored::<i64>("SELECT count(*) FROM jobs WHERE state='leased'"),
         0
     );
-    assert_eq!(f.stored::<String>("SELECT state||':'||attempts||':'||ifnull(error,'') FROM jobs WHERE kind='extract' AND state<>'done'"), "pending:0:");
+    assert_eq!(
+        f.stored::<String>(
+            "SELECT state||':'||attempts||':'||ifnull(error,'') FROM jobs WHERE kind='extract' AND \
+        state<>'done'"
+        ),
+        "pending:0:"
+    );
     assert_eq!(
         f.stored::<String>("SELECT state||':'||error FROM jobs WHERE kind='consolidate'"),
         "failed:ConflictError"
@@ -1410,14 +1671,49 @@ fn failed_mixed_claim_returns_every_withheld_lease() {
 fn human_forget_after_claim_fences_extraction_without_erasing_original() {
     let f = Fixture::new();
     let episode = f.seed();
-    let node=f.graph.remember(serde_json::from_value(json!({"command_id":"save","actor":"owner","why":"Source-backed save","type":"knowledge","text":FACT,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":FACT}]})).unwrap()).unwrap();
+    let node = f
+        .graph
+        .remember(
+            serde_json::from_value(json!({
+                "command_id":"save",
+                "actor":"owner",
+                "why":"Source-backed save",
+                "type":"knowledge",
+                "text":FACT,
+                "scope":["professional"],
+                "evidence":[{"episode_id":episode,"quote":FACT}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let claimed = f.claim("contract", "thread", Some(vec!["extract".into()]));
     let preview = f
         .graph
         .forget_preview(node["id"].as_str().unwrap())
         .unwrap();
-    f.graph.forget(serde_json::from_value(json!({"command_id":"forget","actor":"owner","why":"Explicit active-memory exclusion","target":node["id"],"token":preview["token"]})).unwrap()).unwrap();
-    assert!(f.processing.work(serde_json::from_value(json!({"action":"read","command":{"id":claimed["work"][0]["id"],"owner":claimed["work"][0]["owner"]}})).unwrap()).is_err());
+    f.graph
+        .forget(
+            serde_json::from_value(json!({
+                "command_id":"forget",
+                "actor":"owner",
+                "why":"Explicit active-memory exclusion",
+                "target":node["id"],
+                "token":preview["token"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(
+        f.processing
+            .work(
+                serde_json::from_value(json!({
+                    "action":"read",
+                    "command":{"id":claimed["work"][0]["id"],"owner":claimed["work"][0]["owner"]}
+                }))
+                .unwrap()
+            )
+            .is_err()
+    );
     let result = f
         .complete(
             &claimed["work"][0],
@@ -1523,7 +1819,13 @@ fn historical_parking_keeps_prefix_fixed_and_raw_citation_admits_one_span() {
 fn internal_model_scope_normalizes_before_node_and_review_publication() {
     let f = Fixture::new();
     let episode = f.seed();
-    let request = json!({"op":"remember","type":"person","text":"Synthetic person","scope":["professional","personal"],"evidence":[{"episode_id":episode,"quote":FACT}]});
+    let request = json!({
+        "op":"remember",
+        "type":"person",
+        "text":"Synthetic person",
+        "scope":["professional","personal"],
+        "evidence":[{"episode_id":episode,"quote":FACT}]
+    });
     let result = f
         .graph
         .store
@@ -1547,7 +1849,21 @@ fn internal_model_scope_normalizes_before_node_and_review_publication() {
 fn stale_consolidation_graph_snapshot_is_atomic_and_retains_candidate_for_retry() {
     let f = Fixture::new();
     let episode = f.seed();
-    let existing=f.graph.remember(serde_json::from_value(json!({"command_id":"existing","actor":"owner","why":"Original pending fact","type":"knowledge","text":FACT,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":FACT}]})).unwrap()).unwrap();
+    let existing = f
+        .graph
+        .remember(
+            serde_json::from_value(json!({
+                "command_id":"existing",
+                "actor":"owner",
+                "why":"Original pending fact",
+                "type":"knowledge",
+                "text":FACT,
+                "scope":["professional"],
+                "evidence":[{"episode_id":episode,"quote":FACT}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     f.extract("contract", "thread", FACT, "knowledge", false);
     let work = f.consolidate_work();
     assert!(
@@ -1560,7 +1876,24 @@ fn stale_consolidation_graph_snapshot_is_atomic_and_retains_candidate_for_retry(
     let candidate = &work["input"]["candidates"][0];
     let mut duplicate = action(candidate, "duplicate");
     duplicate["target"] = existing["id"].clone();
-    f.graph.supersede(serde_json::from_value(json!({"command_id":"correction","actor":"owner","why":"Supported wording change","old":existing["id"],"kind":"refinement","new":{"type":"knowledge","text":format!("{FACT} It is source-backed."),"scope":["professional"]},"evidence":[{"episode_id":episode,"quote":FACT}]})).unwrap()).unwrap();
+    f.graph
+        .supersede(
+            serde_json::from_value(json!({
+                "command_id":"correction",
+                "actor":"owner",
+                "why":"Supported wording change",
+                "old":existing["id"],
+                "kind":"refinement",
+                "new": {
+                    "type":"knowledge",
+                    "text":format!("{FACT} It is source-backed."),
+                    "scope":["professional"]
+                },
+                "evidence":[{"episode_id":episode,"quote":FACT}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     assert!(matches!(
         f.complete(&work, json!({"actions":[duplicate]})),
         Err(Error::Conflict(_))
@@ -1639,9 +1972,16 @@ fn inferred_technical_selection_uses_actual_attempt_and_result_before_later_repo
     let candidate = &work["input"]["candidates"][0];
     let mut learned = action(candidate, "remember");
     learned["text"] = json!(
-        "When a broad source search yields irrelevant matches, narrow to the exact phrase before concluding no evidence exists."
+        "When a broad source search yields irrelevant matches, narrow to the exact phrase before \
+            concluding no evidence exists."
     );
-    learned["behavior"] = json!({"applicability":"Source search with irrelevant broad matches","conduct":"Try the exact source phrase before concluding evidence is absent.","rationale":"The observed narrower query found the original note.","exceptions":[],"authority":"inferred"});
+    learned["behavior"] = json!({
+        "applicability":"Source search with irrelevant broad matches",
+        "conduct":"Try the exact source phrase before concluding evidence is absent.",
+        "rationale":"The observed narrower query found the original note.",
+        "exceptions":[],
+        "authority":"inferred"
+    });
     learned["evidence"].as_array_mut().unwrap().extend([
         json!({"episode_id":attempt_id,"quote":attempt,"occurrence":null}),
         json!({"episode_id":result_id,"quote":result,"occurrence":null}),
@@ -1691,7 +2031,13 @@ fn exposure_receipt_uploaded_after_feedback_remains_advisory_not_evidence() {
     let work = f.consolidate_work();
     let candidate = &work["input"]["candidates"][0];
     let mut saved = action(candidate, "remember");
-    saved["behavior"] = json!({"applicability":"Saving source facts","conduct":"Keep exact source quotes and their original context.","rationale":"The owner directly requested this saved-source practice.","exceptions":[],"authority":"explicit_user"});
+    saved["behavior"] = json!({
+        "applicability":"Saving source facts",
+        "conduct":"Keep exact source quotes and their original context.",
+        "rationale":"The owner directly requested this saved-source practice.",
+        "exceptions":[],
+        "authority":"explicit_user"
+    });
     let committed = f.complete(&work, json!({"actions":[saved]})).unwrap();
     let node = committed["results"][candidate["id"].as_str().unwrap()]["id"]
         .as_str()
@@ -1751,9 +2097,34 @@ fn lifecycle_evidence_rejects_stale_completion_then_closes_only_after_manual_bou
         json!({}),
         "2020-01-01T00:00:00Z",
     );
-    let saved=f.graph.remember(serde_json::from_value(json!({"command_id":"pending-save","actor":"owner","why":"Outstanding signed report","type":"knowledge","text":FACT,"scope":["professional"],"evidence":[{"episode_id":pending,"quote":FACT}]})).unwrap()).unwrap();
+    let saved = f
+        .graph
+        .remember(
+            serde_json::from_value(json!({
+                "command_id":"pending-save",
+                "actor":"owner",
+                "why":"Outstanding signed report",
+                "type":"knowledge",
+                "text":FACT,
+                "scope":["professional"],
+                "evidence":[{"episode_id":pending,"quote":FACT}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let target = saved["id"].as_str().unwrap().to_owned();
-    f.graph.loop_command(serde_json::from_value(json!({"action":"open","id":target,"command_id":"manual-open","actor":"owner","why":"This report remains outstanding"})).unwrap()).unwrap();
+    f.graph
+        .loop_command(
+            serde_json::from_value(json!({
+                "action":"open",
+                "id":target,
+                "command_id":"manual-open",
+                "actor":"owner",
+                "why":"This report remains outstanding"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     f.graph
         .store
         .write(|tx| {
@@ -1815,7 +2186,21 @@ fn maintenance_context_stays_bounded_and_unchanged_page_does_not_repeat_forever(
     );
     let mut targets = vec![];
     for (index, text) in texts.iter().enumerate() {
-        let saved=f.graph.remember(serde_json::from_value(json!({"command_id":format!("facet-{index}"),"actor":"owner","why":"Original explicit source fact","type":"knowledge","text":text,"scope":["professional"],"evidence":[{"episode_id":source,"quote":text}]})).unwrap()).unwrap();
+        let saved = f
+            .graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":format!("facet-{index}"),
+                    "actor":"owner",
+                    "why":"Original explicit source fact",
+                    "type":"knowledge",
+                    "text":text,
+                    "scope":["professional"],
+                    "evidence":[{"episode_id":source,"quote":text}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         targets.push(saved["id"].as_str().unwrap().to_owned());
     }
     f.graph
@@ -1950,7 +2335,8 @@ fn worker_finishes_one_unit_and_releases_writer_while_shutdown_preserves_pending
 #[test]
 fn stored_legacy_instruction_candidate_stays_searchable_but_never_enters_model_work() {
     let f = Fixture::new();
-    let text = "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nNever turn this native policy into a remembered user preference.\n</INSTRUCTIONS>";
+    let text = "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nNever turn this native policy into a remembered \
+        user preference.\n</INSTRUCTIONS>";
     let source = f.capture(
         "old-legacy",
         "legacy",
@@ -1961,7 +2347,28 @@ fn stored_legacy_instruction_candidate_stays_searchable_but_never_enters_model_w
         "2020-01-01T00:00:00Z",
     );
     let quote = "Never turn this native policy into a remembered user preference.";
-    f.graph.store.command(&context("old-legacy-extraction".into(),"legacy-extractor".into(),"Synthetic pre-exclusion stored candidate".into()),&json!({"op":"extract","output":{}}),|tx,commit|{tx.sql().execute("INSERT INTO extraction_runs VALUES ('legacy-run',?,?,'extract-v2','connected-harness-default','[]','null',?)",params![commit,source,util::now()])?;tx.sql().execute("INSERT INTO candidates(id,run_id,kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope) VALUES ('c_legacy','legacy-run','memory','knowledge',?,'Historical fixture',NULL,NULL,0.8,NULL,NULL,'[\"professional\"]')",[quote])?;TxGraph::evidence(tx,"c_legacy",1,&json!([{"episode_id":source,"quote":quote}]))?;Ok(json!({"candidate_count":1}))}).unwrap();
+    f.graph
+        .store
+        .command(
+            &context(
+                "old-legacy-extraction".into(),
+                "legacy-extractor".into(),
+                "Synthetic pre-exclusion stored candidate".into(),
+            ),
+            &json!({"op":"extract","output":{}}),
+            |tx, commit| {
+                tx.sql()
+                    .execute("INSERT INTO extraction_runs VALUES \
+                        ('legacy-run',?,?,'extract-v2','connected-harness-default','[]','null',?)", params![commit, source, util::now()])?;
+                tx.sql().execute("INSERT INTO \
+                    candidates(id,run_id,kind,type,text,why,src,dst,confidence,valid_from,valid_to,scope) \
+                    VALUES ('c_legacy','legacy-run','memory','knowledge',?,'Historical \
+                    fixture',NULL,NULL,0.8,NULL,NULL,'[\"professional\"]')", [quote])?;
+                TxGraph::evidence(tx, "c_legacy", 1, &json!([{"episode_id":source,"quote":quote}]))?;
+                Ok(json!({"candidate_count":1}))
+            },
+        )
+        .unwrap();
     let history = f.graph.history("c_legacy").unwrap();
     assert_eq!(history[0]["state"], "candidate");
     assert_eq!(history[0]["evidence"][0]["quote"], quote);
@@ -2019,7 +2426,20 @@ fn continuity_repair_rechecks_loops_and_folds_only_the_frozen_identity_relation(
         "2020-01-01T00:00:00Z",
     );
     let save = |key: &str, kind: &str, text: &str, quote: &str| {
-        f.graph.remember(serde_json::from_value(json!({"command_id":key,"actor":"owner","why":"Explicit original identity source","type":kind,"text":text,"scope":["professional"],"evidence":[{"episode_id":source,"quote":quote}]})).unwrap()).unwrap()
+        f.graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":key,
+                    "actor":"owner",
+                    "why":"Explicit original identity source",
+                    "type":kind,
+                    "text":text,
+                    "scope":["professional"],
+                    "evidence":[{"episode_id":source,"quote":quote}]
+                }))
+                .unwrap(),
+            )
+            .unwrap()
     };
     let old = save(
         "old-org",
@@ -2028,12 +2448,50 @@ fn continuity_repair_rechecks_loops_and_folds_only_the_frozen_identity_relation(
         "Vega is the organization's short name.",
     );
     let project = save("project", "project", "Orion", "Orion belongs to Vega.");
-    f.graph.link(serde_json::from_value(json!({"command_id":"original-edge","actor":"owner","why":"Explicit directional membership","a":project["id"],"rel":"belongs_to","b":old["id"],"evidence":[{"episode_id":source,"quote":"Orion belongs to Vega."}]})).unwrap()).unwrap();
+    f.graph
+        .link(
+            serde_json::from_value(json!({
+                "command_id":"original-edge",
+                "actor":"owner",
+                "why":"Explicit directional membership",
+                "a":project["id"],
+                "rel":"belongs_to",
+                "b":old["id"],
+                "evidence":[{"episode_id":source,"quote":"Orion belongs to Vega."}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     // Continuity repair serves identities already split by the retired
     // replacement-ID supersede path.
-    let refined=crate::recovery::legacy_supersede(&f.graph,json!({"command_id":"full-name","old":old["id"],"kind":"refinement","new":{"type":"organization","text":"Vega Incorporated","scope":["professional"]},"evidence":[{"episode_id":source,"quote":"Vega Incorporated is its full name."}]})).unwrap();
+    let refined = crate::recovery::legacy_supersede(
+        &f.graph,
+        json!({
+            "command_id":"full-name",
+            "old":old["id"],
+            "kind":"refinement",
+            "new":{"type":"organization","text":"Vega Incorporated","scope":["professional"]},
+            "evidence":[{"episode_id":source,"quote":"Vega Incorporated is its full name."}]
+        }),
+    )
+    .unwrap();
     let target = refined["superseded_by"].as_str().unwrap().to_owned();
-    f.graph.store.command(&context("legacy-orphan-import".into(),"fixture".into(),"Synthetic legacy orphan relation for continuity recovery".into()),&json!({"op":"fixture"}),|tx,commit|{tx.sql().execute("INSERT INTO edge_versions VALUES ('legacy-orphan',1,?,?, 'belongs_to',?,'active')",params![commit,project["id"].as_str(),old["id"].as_str()])?;TxGraph::evidence(tx,"legacy-orphan",1,&json!([{"episode_id":source,"quote":"Orion belongs to Vega."}]))?;tx.sql().execute("UPDATE processing_progress SET seq=latest_seq",[])?;Ok(json!({"seeded":true}))}).unwrap();
+    f.graph
+        .store
+        .command(
+            &context("legacy-orphan-import".into(), "fixture".into(), "Synthetic legacy orphan relation for continuity recovery".into()),
+            &json!({"op":"fixture"}),
+            |tx, commit| {
+                tx.sql().execute(
+                    "INSERT INTO edge_versions VALUES ('legacy-orphan',1,?,?, 'belongs_to',?,'active')",
+                    params![commit, project["id"].as_str(), old["id"].as_str()],
+                )?;
+                TxGraph::evidence(tx, "legacy-orphan", 1, &json!([{"episode_id":source,"quote":"Orion belongs to Vega."}]))?;
+                tx.sql().execute("UPDATE processing_progress SET seq=latest_seq", [])?;
+                Ok(json!({"seeded":true}))
+            },
+        )
+        .unwrap();
     f.processing
         .maintain(processing::Maintenance {
             command_id: "maintain-continuity".into(),
@@ -2044,7 +2502,18 @@ fn continuity_repair_rechecks_loops_and_folds_only_the_frozen_identity_relation(
         })
         .unwrap();
     let work = f.consolidate_work();
-    f.graph.loop_command(serde_json::from_value(json!({"action":"open","id":target,"command_id":"manual-after-prepare","actor":"owner","why":"Preserve a current chosen marker"})).unwrap()).unwrap();
+    f.graph
+        .loop_command(
+            serde_json::from_value(json!({
+                "action":"open",
+                "id":target,
+                "command_id":"manual-after-prepare",
+                "actor":"owner",
+                "why":"Preserve a current chosen marker"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     assert!(matches!(
         f.complete(&work, json!({"actions":[]})),
         Err(Error::Conflict(_))
@@ -2089,7 +2558,21 @@ fn continuity_repair_rechecks_loops_and_folds_only_the_frozen_identity_relation(
 fn missing_retirement_fence_keeps_fixed_code_and_target_only_feedback() {
     let f = Fixture::new();
     let source = f.seed();
-    let saved=f.graph.remember(serde_json::from_value(json!({"command_id":"retire-source","actor":"owner","why":"Source-backed inspection subject","type":"knowledge","text":FACT,"scope":["professional"],"evidence":[{"episode_id":source,"quote":FACT}]})).unwrap()).unwrap();
+    let saved = f
+        .graph
+        .remember(
+            serde_json::from_value(json!({
+                "command_id":"retire-source",
+                "actor":"owner",
+                "why":"Source-backed inspection subject",
+                "type":"knowledge",
+                "text":FACT,
+                "scope":["professional"],
+                "evidence":[{"episode_id":source,"quote":FACT}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let target = saved["id"].as_str().unwrap().to_owned();
     f.graph
         .store
@@ -2127,7 +2610,12 @@ fn missing_retirement_fence_keeps_fixed_code_and_target_only_feedback() {
             Ok(())
         })
         .unwrap();
-    let repair = json!({"operation":"retire","target":target,"evidence":[{"episode_id":source,"quote":FACT,"occurrence":null}],"why":"Synthetic noise qualification"});
+    let repair = json!({
+        "operation":"retire",
+        "target":target,
+        "evidence":[{"episode_id":source,"quote":FACT,"occurrence":null}],
+        "why":"Synthetic noise qualification"
+    });
     let error = f
         .complete(&work, json!({"actions":[],"repairs":[repair]}))
         .unwrap_err();
@@ -2212,7 +2700,8 @@ fn cooperative_stop_commits_current_media_unit_and_keeps_unfinished_job_pending(
 #[test]
 fn committed_usage_and_query_feedback_transfer_once_through_refinement_and_reviewed_merge() {
     let f = Fixture::new();
-    let original = "Vega Incorporated and Vega are the same organization. The launch report is pending. The launch report is pending legal approval.";
+    let original = "Vega Incorporated and Vega are the same organization. The launch report is pending. The \
+        launch report is pending legal approval.";
     let episode = f.capture(
         "usage-source",
         "thread",
@@ -2223,7 +2712,20 @@ fn committed_usage_and_query_feedback_transfer_once_through_refinement_and_revie
         "2026-10-18T12:00:00Z",
     );
     let save = |key: &str, kind: &str, text: &str, quote: &str| {
-        f.graph.remember(serde_json::from_value(json!({"command_id":key,"actor":"owner","why":"Explicit original source","type":kind,"text":text,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":quote}]})).unwrap()).unwrap()
+        f.graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":key,
+                    "actor":"owner",
+                    "why":"Explicit original source",
+                    "type":kind,
+                    "text":text,
+                    "scope":["professional"],
+                    "evidence":[{"episode_id":episode,"quote":quote}]
+                }))
+                .unwrap(),
+            )
+            .unwrap()
     };
     let quote = "Vega Incorporated and Vega are the same organization.";
     let a = save("usage-a", "organization", "Vega Incorporated", quote);
@@ -2304,7 +2806,20 @@ fn committed_usage_and_query_feedback_transfer_once_through_refinement_and_revie
             shown: vec![pending.clone()],
         })
         .unwrap();
-    let refinement:dto::Supersede=serde_json::from_value(json!({"command_id":"usage-refine","actor":"owner","why":"Supported additional legal condition","old":pending,"kind":"refinement","new":{"type":"knowledge","text":"The launch report is pending legal approval.","scope":["professional"]},"evidence":[{"episode_id":episode,"quote":"The launch report is pending legal approval."}]})).unwrap();
+    let refinement: dto::Supersede = serde_json::from_value(json!({
+        "command_id":"usage-refine",
+        "actor":"owner",
+        "why":"Supported additional legal condition",
+        "old":pending,
+        "kind":"refinement",
+        "new": {
+            "type":"knowledge",
+            "text":"The launch report is pending legal approval.",
+            "scope":["professional"]
+        },
+        "evidence":[{"episode_id":episode,"quote":"The launch report is pending legal approval."}]
+    }))
+    .unwrap();
     let refined = f.graph.supersede(refinement.clone()).unwrap();
     assert_eq!(f.graph.supersede(refinement).unwrap(), refined);
     let current = refined["id"].as_str().unwrap();
@@ -2345,7 +2860,21 @@ fn one_consolidation_plan_revises_the_same_memory_twice() {
         json!({}),
         "2026-10-18T12:00:00Z",
     );
-    let existing=f.graph.remember(serde_json::from_value(json!({"command_id":"existing","actor":"owner","why":"Original pending fact","type":"knowledge","text":FACT,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":FACT}]})).unwrap()).unwrap();
+    let existing = f
+        .graph
+        .remember(
+            serde_json::from_value(json!({
+                "command_id":"existing",
+                "actor":"owner",
+                "why":"Original pending fact",
+                "type":"knowledge",
+                "text":FACT,
+                "scope":["professional"],
+                "evidence":[{"episode_id":episode,"quote":FACT}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let target = existing["id"].as_str().unwrap();
     let extraction = f.claim("contract", "thread", Some(vec!["extract".into()]))["work"][0].clone();
     let candidates = [signed, filed]
@@ -2413,7 +2942,18 @@ fn pre_revision_policy_lease_is_refused_and_rederived_without_losing_candidates(
     let f = Fixture::new();
     f.seed();
     let extraction = f.claim("contract", "thread", Some(vec!["extract".into()]))["work"][0].clone();
-    f.complete(&extraction, json!({"windows":[{"id":extraction["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false)]}]})).unwrap();
+    f.complete(
+        &extraction,
+        json!({
+            "windows": [
+                {
+                    "id":extraction["input"]["windows"][0]["id"],
+                    "candidates":[draft(FACT,"knowledge",false)]
+                }
+            ]
+        }),
+    )
+    .unwrap();
     let work = f.consolidate_work();
     let ids = |work: &Value| {
         work["input"]["candidates"]
@@ -2425,7 +2965,14 @@ fn pre_revision_policy_lease_is_refused_and_rederived_without_losing_candidates(
     };
     assert_eq!(ids(&work).len(), 1);
     // A lease prepared under replacement-ID semantics cannot complete now.
-    f.graph.store.write(|tx| { tx.sql().execute("UPDATE jobs SET context=json_set(context,'$.loop_policy_version','consolidate-v8') WHERE kind='consolidate' AND state='leased'", [])?; Ok(()) }).unwrap();
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute("UPDATE jobs SET context=json_set(context,'$.loop_policy_version','consolidate-v8') WHERE \
+                kind='consolidate' AND state='leased'", [])?;
+            Ok(())
+        })
+        .unwrap();
     let error = f.complete(&work, json!({"actions":[]})).unwrap_err();
     assert_eq!(
         error.to_string(),
@@ -2455,7 +3002,8 @@ fn pre_revision_policy_lease_is_refused_and_rederived_without_losing_candidates(
         .unwrap();
     let retry = f.consolidate_work();
     assert_eq!((&retry["id"], ids(&retry)), (&work["id"], ids(&work)));
-    assert_eq!(f.stored::<String>("SELECT json_extract(context,'$.loop_policy_version') FROM jobs WHERE kind='consolidate' AND state='leased'"), consolidation::VERSION);
+    assert_eq!(f.stored::<String>("SELECT json_extract(context,'$.loop_policy_version') FROM jobs WHERE kind='consolidate' AND \
+        state='leased'"), consolidation::VERSION);
     let actions = retry["input"]["candidates"]
         .as_array()
         .unwrap()
@@ -2547,16 +3095,75 @@ fn later_context_supplies_only_bounded_communicated_follow_up_for_open_loops() {
         "2026-10-18T12:00:00Z",
     );
     for (event, conversation, kind, text, metadata, eligible) in [
-        ("tool", "thread", "tool", "report.pdf uploaded".to_owned(), json!({"extraction_mode":"tool_output"}), false),
-        ("attempt", "thread", "assistant", "[{\"type\":\"toolCall\",\"name\":\"send\"}]".to_owned(), json!({"evidence_eligible":false}), false),
-        ("thinking", "thread", "assistant", "[{\"type\":\"thinking\",\"thinking\":\"Lena has the report.\"}]".to_owned(), json!({}), false),
-        ("hook", "thread", "native_hook", "hook output".to_owned(), json!({}), false),
-        ("other", "elsewhere", "user", DONE.to_owned(), json!({}), false),
-        ("reply", "thread", "assistant", "[{\"type\":\"thinking\",\"thinking\":\"plan\"},{\"type\":\"text\",\"text\":\"Sending it.\"}]".to_owned(), json!({}), true),
-        ("long", "thread", "assistant", long.clone(), json!({}), true),
+        (
+            "tool",
+            "thread",
+            "tool",
+            "report.pdf uploaded".to_owned(),
+            json!({"extraction_mode":"tool_output"}),
+            false,
+        ),
+        (
+            "attempt",
+            "thread",
+            "assistant",
+            "[{\"type\":\"toolCall\",\"name\":\"send\"}]".to_owned(),
+            json!({"evidence_eligible":false}),
+            false,
+        ),
+        (
+            "thinking",
+            "thread",
+            "assistant",
+            "[{\"type\":\"thinking\",\"thinking\":\"Lena has the report.\"}]".to_owned(),
+            json!({}),
+            false,
+        ),
+        (
+            "hook",
+            "thread",
+            "native_hook",
+            "hook output".to_owned(),
+            json!({}),
+            false,
+        ),
+        (
+            "other",
+            "elsewhere",
+            "user",
+            DONE.to_owned(),
+            json!({}),
+            false,
+        ),
+        (
+            "reply",
+            "thread",
+            "assistant",
+            "[{\"type\":\"thinking\",\"thinking\":\"plan\"},{\"type\":\"text\",\"text\":\"Sending it.\"}]".to_owned(),
+            json!({}),
+            true,
+        ),
+        (
+            "long",
+            "thread",
+            "assistant",
+            long.clone(),
+            json!({}),
+            true,
+        ),
     ] {
-        let id = f.capture(event, conversation, &text, kind, "contract", metadata, "2026-10-18T12:10:00Z");
-        if eligible { expected.push(id); }
+        let id = f.capture(
+            event,
+            conversation,
+            &text,
+            kind,
+            "contract",
+            metadata,
+            "2026-10-18T12:10:00Z",
+        );
+        if eligible {
+            expected.push(id);
+        }
     }
     for index in 0..8 {
         let id = f.capture(
@@ -2684,7 +3291,18 @@ fn later_context_cannot_freshen_or_self_block_a_pending_obligation() {
         .unwrap()
         .to_owned();
     assert!(!premise_episodes(&f, &target).contains(&done));
-    let closed = f.graph.loop_command(serde_json::from_value(json!({"action":"close","id":target,"command_id":"later-close","evidence":[{"episode_id":done,"quote":DONE}]})).unwrap()).unwrap();
+    let closed = f
+        .graph
+        .loop_command(
+            serde_json::from_value(json!({
+                "action":"close",
+                "id":target,
+                "command_id":"later-close",
+                "evidence":[{"episode_id":done,"quote":DONE}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     assert_eq!(closed["status"], "closed");
 }
 
@@ -2728,7 +3346,18 @@ fn later_context_closure_keeps_chronology_and_manual_choice_protection() {
     );
     g.extract("contract", "thread", PENDING, "knowledge", true);
     let id = g.stored::<String>("SELECT id FROM candidates");
-    g.graph.loop_command(serde_json::from_value(json!({"action":"open","id":id,"command_id":"manual-open","actor":"owner","why":"Still outstanding"})).unwrap()).unwrap();
+    g.graph
+        .loop_command(
+            serde_json::from_value(json!({
+                "action":"open",
+                "id":id,
+                "command_id":"manual-open",
+                "actor":"owner",
+                "why":"Still outstanding"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let work = g.consolidate_work();
     let candidate = work["input"]["candidates"][0].clone();
     let committed = g
@@ -2757,9 +3386,34 @@ fn later_completion_redirected_to_existing_loop_rechecks_its_manual_choice() {
         json!({}),
         "2026-10-18T11:00:00Z",
     );
-    let saved=f.graph.remember(serde_json::from_value(json!({"command_id":"pending-save","actor":"owner","why":"Outstanding signed report","type":"knowledge","text":PENDING,"scope":["professional"],"evidence":[{"episode_id":noted,"quote":PENDING}]})).unwrap()).unwrap();
+    let saved = f
+        .graph
+        .remember(
+            serde_json::from_value(json!({
+                "command_id":"pending-save",
+                "actor":"owner",
+                "why":"Outstanding signed report",
+                "type":"knowledge",
+                "text":PENDING,
+                "scope":["professional"],
+                "evidence":[{"episode_id":noted,"quote":PENDING}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let existing = saved["id"].as_str().unwrap().to_owned();
-    f.graph.loop_command(serde_json::from_value(json!({"action":"open","id":existing,"command_id":"manual-open","actor":"owner","why":"Still outstanding"})).unwrap()).unwrap();
+    f.graph
+        .loop_command(
+            serde_json::from_value(json!({
+                "action":"open",
+                "id":existing,
+                "command_id":"manual-open",
+                "actor":"owner",
+                "why":"Still outstanding"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     f.graph
         .store
         .write(|tx| {
@@ -2852,7 +3506,12 @@ fn revise_with_decline(work: &Value, operation: &str, target: &str, flagged: &st
     if operation == "supersede" {
         revise["change_kind"] = json!("refinement");
     }
-    let decline = json!({"operation":"decline_loop","target":target,"evidence":[{"episode_id":flagged,"quote":FLAGGED,"occurrence":null}],"why":"Synthetic: the automatic marker is not a concrete obligation"});
+    let decline = json!({
+        "operation":"decline_loop",
+        "target":target,
+        "evidence":[{"episode_id":flagged,"quote":FLAGGED,"occurrence":null}],
+        "why":"Synthetic: the automatic marker is not a concrete obligation"
+    });
     json!({"actions":[revise],"repairs":[decline]})
 }
 
@@ -2892,7 +3551,18 @@ fn same_plan_decline_keeps_protections_and_concurrent_loop_fence() {
         let f = Fixture::new();
         let (target, flagged) = automatic_loop(&f);
         if protection == "manual" {
-            f.graph.loop_command(serde_json::from_value(json!({"action":"open","id":target,"command_id":"manual-open","actor":"owner","why":"Still outstanding"})).unwrap()).unwrap();
+            f.graph
+                .loop_command(
+                    serde_json::from_value(json!({
+                        "action":"open",
+                        "id":target,
+                        "command_id":"manual-open",
+                        "actor":"owner",
+                        "why":"Still outstanding"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
         } else {
             f.graph
                 .store
@@ -2931,7 +3601,19 @@ fn same_plan_decline_keeps_protections_and_concurrent_loop_fence() {
     let f = Fixture::new();
     let (target, flagged) = automatic_loop(&f);
     let work = candidate_work(&f, &target, REVISED, "2026-10-18T13:00:00Z");
-    f.graph.loop_command(serde_json::from_value(json!({"action":"later","id":target,"command_id":"manual-later","actor":"owner","why":"Not now","days":7})).unwrap()).unwrap();
+    f.graph
+        .loop_command(
+            serde_json::from_value(json!({
+                "action":"later",
+                "id":target,
+                "command_id":"manual-later",
+                "actor":"owner",
+                "why":"Not now",
+                "days":7
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let error = f
         .complete(
             &work,
@@ -2950,7 +3632,20 @@ fn same_plan_decline_keeps_protections_and_concurrent_loop_fence() {
     // The owner's explicit decline still uses the unchanged single-version check.
     let g = Fixture::new();
     let (target, flagged) = automatic_loop(&g);
-    let declined = g.graph.loop_command(serde_json::from_value(json!({"action":"decline","id":target,"command_id":"owner-decline","actor":"owner","why":"Not an obligation","evidence":[{"episode_id":flagged,"quote":FLAGGED}]})).unwrap()).unwrap();
+    let declined = g
+        .graph
+        .loop_command(
+            serde_json::from_value(json!({
+                "action":"decline",
+                "id":target,
+                "command_id":"owner-decline",
+                "actor":"owner",
+                "why":"Not an obligation",
+                "evidence":[{"episode_id":flagged,"quote":FLAGGED}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     assert_eq!(declined["status"], "declined_not_obligation");
     assert_eq!(
         g.graph.history(&target).unwrap()[0]["loop"]["state"],

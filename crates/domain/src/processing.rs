@@ -18,9 +18,12 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub const PARKED_ERROR: &str = "historical_parked";
-const PROGRESS: &str = "FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND h.conversation_id=p.conversation_id";
+const PROGRESS: &str = "FROM processing_progress p LEFT JOIN historical_parking h ON h.source=p.source AND \
+    h.conversation_id=p.conversation_id";
 /// Episode rows (alias `e`) that extraction reads: the one shared input predicate.
-pub const EXTRACTION_INPUT: &str = "coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')!='skip' AND NOT legacy_native_context(e.source,e.kind,e.text,e.metadata) AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)";
+pub const EXTRACTION_INPUT: &str = "coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')!='skip' AND NOT \
+    legacy_native_context(e.source,e.kind,e.text,e.metadata) AND NOT EXISTS (SELECT 1 FROM \
+    forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)";
 /// Last sequence extraction may admit now for one progress row (`latest_seq`,
 /// `latest_at`, `compact_through`): everything after 30 idle minutes, otherwise
 /// through the latest compaction marker.
@@ -176,12 +179,14 @@ impl Processing {
                 }
                 let policy = |kind: &str| -> Result<Value> {
                     match kind {
-                        "extract" => Ok(
-                            json!({"instruction":pipeline_schema::EXTRACTION_INSTRUCTION,"schema":*pipeline_schema::EXTRACTION}),
-                        ),
-                        "consolidate" => Ok(
-                            json!({"instruction":pipeline_schema::CONSOLIDATION_INSTRUCTION,"schema":*pipeline_schema::CONSOLIDATION}),
-                        ),
+                        "extract" => Ok(json!({
+                            "instruction":pipeline_schema::EXTRACTION_INSTRUCTION,
+                            "schema":*pipeline_schema::EXTRACTION
+                        })),
+                        "consolidate" => Ok(json!({
+                            "instruction":pipeline_schema::CONSOLIDATION_INSTRUCTION,
+                            "schema":*pipeline_schema::CONSOLIDATION
+                        })),
                         _ => Err(Error::Validation("Invalid processing policy")),
                     }
                 };
@@ -196,21 +201,38 @@ impl Processing {
                     };
                     let (job, context) = self.leased(id, owner)?;
                     self.graph.store.read(|tx| {
-                        let mut episodes=std::collections::BTreeSet::new();
-                        for window in context[if job.kind=="extract" {"windows"} else {"raw_windows"}].as_array().into_iter().flatten() {
-                            episodes.insert(get_str(window,"episode_id")?.to_owned());
+                        let mut episodes = std::collections::BTreeSet::new();
+                        for window in context[if job.kind == "extract" {
+                            "windows"
+                        } else {
+                            "raw_windows"
+                        }]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        {
+                            episodes.insert(get_str(window, "episode_id")?.to_owned());
                         }
-                        for section in ["candidates","existing_nodes","existing_relations"] {
+                        for section in ["candidates", "existing_nodes", "existing_relations"] {
                             for item in context[section].as_array().into_iter().flatten() {
-                                for reference in item["evidence"].as_array().into_iter().flatten() { episodes.insert(get_str(reference,"episode_id")?.to_owned()); }
+                                for reference in item["evidence"].as_array().into_iter().flatten() {
+                                    episodes.insert(get_str(reference, "episode_id")?.to_owned());
+                                }
                             }
                         }
                         for episode in episodes {
-                            if one(tx.sql(),"SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=?",[episode])?.is_some() { return Err(Error::Conflict("Processing source changed; reclaim work")); }
+                            if one(tx.sql(), "SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND \
+                                f.event_id=e.event_id WHERE e.id=?", [episode])?.is_some() {
+                                return Err(Error::Conflict("Processing source changed; reclaim work"));
+                            }
                         }
                         Ok(())
                     })?;
-                    json!({"id":job.id,"kind":job.kind,"input":if job.kind=="extract" { Extractor::model_input(&context) } else { Consolidator::model_input(&context) }})
+                    json!({
+                        "id":job.id,
+                        "kind":job.kind,
+                        "input":if job.kind=="extract" { Extractor::model_input(&context) } else { Consolidator::model_input(&context) }
+                    })
                 };
                 let text = encode_json(&payload)?;
                 let total = text.chars().count();
@@ -218,9 +240,14 @@ impl Processing {
                     return Err(Error::Validation("Invalid work page cursor"));
                 }
                 let end = command.after.saturating_add(command.limit).min(total);
-                Ok(
-                    json!({"text":substring(&text,command.after,end),"after":command.after,"total_characters":total,"next":if end<total {json!(end)}else{Value::Null},"encoding":"json-utf8","cursor_unit":"characters"}),
-                )
+                Ok(json!({
+                    "text":substring(&text,command.after,end),
+                    "after":command.after,
+                    "total_characters":total,
+                    "next":if end<total {json!(end)}else{Value::Null},
+                    "encoding":"json-utf8",
+                    "cursor_unit":"characters"
+                }))
             }
             "pool" => self.pool(decode(request.command)?),
             "claim" => self.claim(decode(request.command)?),
@@ -236,9 +263,13 @@ impl Processing {
                 if !["extract", "consolidate"].contains(&job["kind"].as_str().unwrap_or("")) {
                     return Err(Error::Validation("Unknown processing job"));
                 }
-                Ok(
-                    json!({"id":job["id"],"kind":job["kind"],"state":job["state"],"result":job["result"],"error":job["error"]}),
-                )
+                Ok(json!({
+                    "id":job["id"],
+                    "kind":job["kind"],
+                    "state":job["state"],
+                    "result":job["result"],
+                    "error":job["error"]
+                }))
             }
             "submit" => {
                 let command: Submit = decode(request.command)?;
@@ -268,22 +299,91 @@ impl Processing {
         self.graph.store.read(|tx| {
             let db = tx.sql();
             let mut items = match request.kind.as_str() {
-                "extract" => rows(db, &format!("SELECT p.rowid AS position,p.source,p.conversation_id,p.latest_at,p.latest_seq,p.compact_through,coalesce(h.live_seq,p.seq) AS processed_through {PROGRESS} WHERE p.rowid>? AND p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY p.rowid LIMIT ?"), params![request.after, request.limit as i64 + 1])?,
-                "consolidate" => consolidation::pending_in(db, request.limit + 1, request.after, i64::MAX, false)?.into_iter().map(|item| json!({"position":item["position"],"id":item["id"],"kind":item["kind"],"type":item["type"],"scope":item["scope"]})).collect(),
-                _ => rows(db,"SELECT rowid AS position,id,origin,created_at FROM repair_groups WHERE state='pending' AND rowid>? ORDER BY rowid LIMIT ?",params![request.after,request.limit as i64 + 1])?,
+                "extract" => rows(
+                    db,
+                    &format!("SELECT p.rowid AS \
+                        position,p.source,p.conversation_id,p.latest_at,p.latest_seq,p.compact_through,coalesce(h.live_seq,p.seq) \
+                        AS processed_through {PROGRESS} WHERE p.rowid>? AND p.latest_seq>p.seq AND \
+                        p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY p.rowid LIMIT ?"),
+                    params![request.after, request.limit as i64 + 1],
+                )?,
+                "consolidate" => consolidation::pending_in(
+                    db,
+                    request.limit + 1,
+                    request.after,
+                    i64::MAX,
+                    false,
+                )?
+                .into_iter()
+                .map(|item| json!({
+                    "position":item["position"],
+                    "id":item["id"],
+                    "kind":item["kind"],
+                    "type":item["type"],
+                    "scope":item["scope"]
+                }))
+                .collect(),
+                _ => rows(
+                    db,
+                    "SELECT rowid AS position,id,origin,created_at FROM repair_groups WHERE state='pending' AND \
+                        rowid>? ORDER BY rowid LIMIT ?",
+                    params![request.after, request.limit as i64 + 1],
+                )?,
             };
             let more = items.len() > request.limit;
             items.truncate(request.limit);
-            let next = if more { items.last().map(|item| item["position"].clone()).unwrap_or(Value::Null) } else { Value::Null };
-            let ready = db.query_row(&format!("SELECT count(*) FROM candidates c WHERE {ACTIVE_CANDIDATE} AND {} AND {} AND NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {})",consolidation::ELIGIBLE,consolidation::UNPARKED,consolidation::AWAITING),params![rusqlite::types::Null,rusqlite::types::Null,timestamp()],|row|row.get::<_,i64>(0))?;
-            let jobs = rows(db,"SELECT kind,state,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND state IN ('pending','leased') GROUP BY kind,state",[])?;
-            let mut result = json!({"worker_protocol":1,"kind":request.kind,"items":items,"next":next,"ready_candidates":ready,"pending_extract_conversations":pending_conversations(db,None)?,"jobs":jobs,"historical":historical_status(db)?,"pending_maintenance_groups":db.query_row("SELECT count(*) FROM repair_groups WHERE state='pending'",[],|row|row.get::<_,i64>(0))?});
+            let next = if more {
+                items
+                    .last()
+                    .map(|item| item["position"].clone())
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            let ready = db.query_row(
+                &format!(
+                    "SELECT count(*) FROM candidates c WHERE {ACTIVE_CANDIDATE} AND {} AND {} AND NOT EXISTS \
+                        (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT \
+                        max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {})",
+                    consolidation::ELIGIBLE,
+                    consolidation::UNPARKED,
+                    consolidation::AWAITING
+                ),
+                params![rusqlite::types::Null, rusqlite::types::Null, timestamp()],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let jobs = rows(db, "SELECT kind,state,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND \
+                state IN ('pending','leased') GROUP BY kind,state", [])?;
+            let mut result = json!({
+                "worker_protocol":1,
+                "kind":request.kind,
+                "items":items,
+                "next":next,
+                "ready_candidates":ready,
+                "pending_extract_conversations":pending_conversations(db,None)?,
+                "jobs":jobs,
+                "historical":historical_status(db)?,
+                "pending_maintenance_groups":db.query_row("SELECT count(*) FROM repair_groups WHERE state='pending'",[],|row|row.get::<_,i64>(0))?
+            });
             if request.policies {
-                result["policies"] = json!({"extract":{"instruction":pipeline_schema::EXTRACTION_INSTRUCTION,"schema":*pipeline_schema::EXTRACTION},"consolidate":{"instruction":pipeline_schema::CONSOLIDATION_INSTRUCTION,"schema":*pipeline_schema::CONSOLIDATION}});
+                result["policies"] = json!({
+                    "extract": {
+                        "instruction":pipeline_schema::EXTRACTION_INSTRUCTION,
+                        "schema":*pipeline_schema::EXTRACTION
+                    },
+                    "consolidate": {
+                        "instruction":pipeline_schema::CONSOLIDATION_INSTRUCTION,
+                        "schema":*pipeline_schema::CONSOLIDATION
+                    }
+                });
             }
             result["lease_seconds"] = json!(self.queue.lease_seconds);
-            result["eligible_extract_conversations"] = json!(db.query_row(&format!("SELECT count(*) {PROGRESS} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) AND (p.compact_through>coalesce(h.live_seq,p.seq) OR julianday(p.latest_at)<=julianday(?))"),[format_time(Utc::now()-Duration::minutes(30))],|row|row.get::<_,i64>(0))?);
-            result["ready_jobs"] = json!(rows(db,"SELECT kind,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND ((state='pending' AND available_at<=?1) OR (state='leased' AND lease_until<=?1)) GROUP BY kind",[timestamp()])?);
+            result["eligible_extract_conversations"] = json!(db.query_row(&format!("SELECT count(*) {PROGRESS} WHERE p.latest_seq>p.seq AND \
+                p.latest_seq>coalesce(h.live_seq,p.seq) AND (p.compact_through>coalesce(h.live_seq,p.seq) \
+                OR julianday(p.latest_at)<=julianday(?))"),[format_time(Utc::now()-Duration::minutes(30))],|row|row.get::<_,i64>(0))?);
+            result["ready_jobs"] = json!(rows(db,"SELECT kind,count(*) AS count FROM jobs WHERE kind IN ('extract','consolidate') AND \
+                ((state='pending' AND available_at<=?1) OR (state='leased' AND lease_until<=?1)) GROUP BY \
+                kind",[timestamp()])?);
             Ok(result)
         })
     }
@@ -302,7 +402,21 @@ impl Processing {
     pub fn compact(&self, command: Compaction) -> Result<Value> {
         required(&command.source, 256, "Invalid source")?;
         required(&command.conversation_id, 512, "Invalid conversation_id")?;
-        self.graph.store.write(|tx|{tx.sql().execute("INSERT INTO processing_progress(source,conversation_id,compact_through) VALUES (?,?,coalesce((SELECT max(seq) FROM episodes WHERE source=? AND conversation_id=?),0)) ON CONFLICT(source,conversation_id) DO UPDATE SET compact_through=max(compact_through,excluded.compact_through)",params![command.source,command.conversation_id,command.source,command.conversation_id])?;Ok(json!({"status":"noted"}))})
+        self.graph.store.write(|tx| {
+            tx.sql().execute(
+                "INSERT INTO processing_progress(source,conversation_id,compact_through) VALUES \
+                    (?,?,coalesce((SELECT max(seq) FROM episodes WHERE source=? AND conversation_id=?),0)) ON \
+                    CONFLICT(source,conversation_id) DO UPDATE SET \
+                    compact_through=max(compact_through,excluded.compact_through)",
+                params![
+                    command.source,
+                    command.conversation_id,
+                    command.source,
+                    command.conversation_id
+                ],
+            )?;
+            Ok(json!({"status":"noted"}))
+        })
     }
     pub fn history_status(&self) -> Result<Value> {
         self.graph.store.read(|tx| historical_status(tx.sql()))
@@ -311,9 +425,35 @@ impl Processing {
         self.park_history_at(Utc::now())
     }
     pub fn park_history_at(&self, instant: DateTime<Utc>) -> Result<Value> {
-        self.graph.store.write(|tx|{if one(tx.sql(),"SELECT 1 FROM historical_activation",[])?.is_none(){tx.sql().execute("INSERT INTO historical_activation(singleton,activated_at) VALUES (1,?)",[format_time(instant)])?;tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) SELECT p.source,p.conversation_id,p.latest_seq,p.latest_seq,0 FROM processing_progress p WHERE p.latest_seq>p.seq",[])?;tx.sql().execute("UPDATE jobs SET state='failed',error='historical_parked',owner=NULL,lease_until=NULL WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.mode') IS NULL AND json_extract(payload,'$.cursor') IS NULL AND EXISTS (SELECT 1 FROM historical_parking h WHERE h.source=json_extract(jobs.payload,'$.source') AND h.conversation_id=json_extract(jobs.payload,'$.conversation_id') AND json_extract(jobs.payload,'$.next_seq')<=h.parked_through)",[])?;tx.sql().execute("UPDATE jobs SET state='failed',error='historical_parked',owner=NULL,lease_until=NULL WHERE kind='consolidate' AND state IN ('pending','leased')",[])?;tx.sql().execute(&format!("INSERT INTO historical_parked_candidates(candidate_id) SELECT c.id FROM candidates c WHERE {ACTIVE_CANDIDATE}"),[])?;for row in rows(tx.sql(),"SELECT source,conversation_id FROM historical_parking",[])?{tx.touch_conversation(get_str(&row,"source")?,get_str(&row,"conversation_id")?)?;}for row in rows(tx.sql(),"SELECT candidate_id FROM historical_parked_candidates WHERE released_at IS NULL",[])?{tx.touch_target(get_str(&row,"candidate_id")?)?;}
-            // Native header5 is never lowered to the older Python parkingheader3.
-        }historical_status(tx.sql())})
+        self.graph.store.write(|tx| {
+            if one(tx.sql(), "SELECT 1 FROM historical_activation", [])?.is_none() {
+                tx.sql().execute("INSERT INTO historical_activation(singleton,activated_at) VALUES (1,?)", [format_time(instant)])?;
+                tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) \
+                    SELECT p.source,p.conversation_id,p.latest_seq,p.latest_seq,0 FROM processing_progress p \
+                    WHERE p.latest_seq>p.seq", [])?;
+                tx.sql().execute("UPDATE jobs SET state='failed',error='historical_parked',owner=NULL,lease_until=NULL WHERE \
+                    kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.mode') IS NULL \
+                    AND json_extract(payload,'$.cursor') IS NULL AND EXISTS (SELECT 1 FROM historical_parking h \
+                    WHERE h.source=json_extract(jobs.payload,'$.source') AND \
+                    h.conversation_id=json_extract(jobs.payload,'$.conversation_id') AND \
+                    json_extract(jobs.payload,'$.next_seq')<=h.parked_through)", [])?;
+                tx.sql().execute("UPDATE jobs SET state='failed',error='historical_parked',owner=NULL,lease_until=NULL WHERE \
+                    kind='consolidate' AND state IN ('pending','leased')", [])?;
+                tx.sql().execute(&format!("INSERT INTO historical_parked_candidates(candidate_id) SELECT c.id FROM candidates c WHERE \
+                    {ACTIVE_CANDIDATE}"), [])?;
+                for row in rows(tx.sql(), "SELECT source,conversation_id FROM historical_parking", [])? {
+                    tx.touch_conversation(
+                        get_str(&row, "source")?,
+                        get_str(&row, "conversation_id")?,
+                    )?;
+                }
+                for row in rows(tx.sql(), "SELECT candidate_id FROM historical_parked_candidates WHERE released_at IS NULL", [])? {
+                    tx.touch_target(get_str(&row, "candidate_id")?)?;
+                }
+                // Native header5 is never lowered to the older Python parkingheader3.
+            }
+            historical_status(tx.sql())
+        })
     }
     /// Explicit owner admission of already extracted historical candidates; no raw replay.
     pub fn release_history_candidates(&self) -> Result<Value> {
@@ -363,7 +503,26 @@ impl Processing {
         targets.sort();
         let request = json!({"op":"maintenance","target_ids":targets,"origin":command.origin});
         let ctx = context(command.command_id, command.actor, command.why);
-        self.graph.store.command(&ctx,&request,|tx,_commit|{for target in &targets{if !visible_active(tx.sql(),target)?{return Err(Error::Validation("Maintenance requires active visible existing nodes"));}}let serialized=encode_json(&json!(targets))?;if let Some(existing)=one(tx.sql(),"SELECT id,state FROM repair_groups WHERE seed_ids=? AND state='pending' LIMIT 1",[&serialized])?{return Ok(json!({"repair_group_id":existing["id"],"status":existing["state"],"target_ids":targets}));}let group=format!("r_{}",&id()[..24]);let stamp=now();tx.sql().execute("INSERT INTO repair_groups(id,seed_ids,frontier,reviewed_ids,state,origin,created_at,updated_at) VALUES (?,?,?,'[]','pending',?,?,?)",params![group,serialized,serialized,command.origin,stamp,stamp])?;Ok(json!({"repair_group_id":group,"status":"pending","target_ids":targets}))})
+        self.graph.store.command(&ctx, &request, |tx, _commit| {
+            for target in &targets {
+                if !visible_active(tx.sql(), target)? {
+                    return Err(Error::Validation("Maintenance requires active visible existing nodes"));
+                }
+            }
+            let serialized = encode_json(&json!(targets))?;
+            if let Some(existing) = one(tx.sql(), "SELECT id,state FROM repair_groups WHERE seed_ids=? AND state='pending' LIMIT 1", [&serialized])? {
+                return Ok(json!({"repair_group_id":existing["id"],"status":existing["state"],"target_ids":targets}));
+            }
+            let group = format!("r_{}", &id()[..24]);
+            let stamp = now();
+            tx.sql().execute(
+                "INSERT INTO \
+                    repair_groups(id,seed_ids,frontier,reviewed_ids,state,origin,created_at,updated_at) VALUES \
+                    (?,?,?,'[]','pending',?,?,?)",
+                params![group, serialized, serialized, command.origin, stamp, stamp],
+            )?;
+            Ok(json!({"repair_group_id":group,"status":"pending","target_ids":targets}))
+        })
     }
     pub fn claim(&self, command: Claim) -> Result<Value> {
         self.claim_at(command, Utc::now())
@@ -515,9 +674,9 @@ impl Processing {
                             .iter()
                             .all(|window| window["text"].as_str().is_none_or(str::is_empty))
                     {
-                        Some(
-                            json!({"windows":input["windows"].as_array().unwrap().iter().map(|window|json!({"id":window["id"],"candidates":[]})).collect::<Vec<_>>()}),
-                        )
+                        Some(json!({
+                            "windows":input["windows"].as_array().unwrap().iter().map(|window|json!({"id":window["id"],"candidates":[]})).collect::<Vec<_>>()
+                        }))
                     } else if kind == "consolidate"
                         && prepared["candidates"].as_array().unwrap().is_empty()
                         && prepared["maintenance_ids"].as_array().unwrap().is_empty()
@@ -553,7 +712,8 @@ impl Processing {
                     }
                     let instruction = if kind == "extract" {
                         format!(
-                            "{}\nReturn windows with exactly the supplied ids and candidates for each. Entity keys are local to each window.",
+                            "{}\nReturn windows with exactly the supplied ids and candidates for each. Entity keys are \
+                            local to each window.",
                             pipeline_schema::EXTRACTION_INSTRUCTION
                         )
                     } else {
@@ -564,9 +724,14 @@ impl Processing {
                     } else {
                         pipeline_schema::CONSOLIDATION.clone()
                     };
-                    Ok(Some(
-                        json!({"id":job.id,"owner":job.owner,"kind":kind,"instruction":instruction,"input":input,"schema":schema}),
-                    ))
+                    Ok(Some(json!({
+                        "id":job.id,
+                        "owner":job.owner,
+                        "kind":kind,
+                        "instruction":instruction,
+                        "input":input,
+                        "schema":schema
+                    })))
                 })();
                 lap = std::time::Instant::now();
                 match step {
@@ -597,9 +762,28 @@ impl Processing {
         // own predicate; consolidation only inside its window or an explicit force run.
         lap = std::time::Instant::now();
         let claimable = |db: &Connection, kind: &str| -> Result<i64> {
-            Ok(db.query_row("SELECT count(*) FROM jobs WHERE kind=?1 AND ((state='pending' AND available_at<=?2) OR (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value FROM json_each(?3)) AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE live.kind='consolidate' AND live.state='leased' AND live.lease_until>?2))",params![kind,timestamp(),encode_json(&json!(command.exclude))?],|row|row.get(0))?)
+            Ok(db.query_row(
+                "SELECT count(*) FROM jobs WHERE kind=?1 AND ((state='pending' AND available_at<=?2) OR \
+                    (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value FROM json_each(?3)) AND \
+                    NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE live.kind='consolidate' \
+                    AND live.state='leased' AND live.lease_until>?2))",
+                params![kind, timestamp(), encode_json(&json!(command.exclude))?],
+                |row| row.get(0),
+            )?)
         };
-        let backlog=self.graph.store.read(|tx|Ok(json!({"pending_extract_conversations":pending_conversations(tx.sql(),None)?,"pending_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='pending' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"leased_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='leased' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"claimable":{"extract":claimable(tx.sql(),"extract")?,"consolidate":if night_due {claimable(tx.sql(),"consolidate")?} else {0}}}))).inspect_err(|_| withhold(&held))?;
+        let backlog = self
+            .graph
+            .store
+            .read(|tx| Ok(json!({
+                "pending_extract_conversations":pending_conversations(tx.sql(),None)?,
+                "pending_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='pending' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,
+                "leased_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='leased' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,
+                "claimable": {
+                    "extract":claimable(tx.sql(),"extract")?,
+                    "consolidate":if night_due {claimable(tx.sql(),"consolidate")?} else {0}
+                }
+            })))
+            .inspect_err(|_| withhold(&held))?;
         crate::work_timing::lap("claim_backlog", &mut lap);
         Ok(json!({"lease_seconds":self.queue.lease_seconds,"work":work,"backlog":backlog}))
     }
@@ -681,11 +865,23 @@ impl Processing {
                         .binary_search_by(|value| value.as_str().cmp(code))
                         .is_ok()
                     {
-                        let feedback = json!({"code":code,"attempt":job.attempts,"references":error.references,"note":"Server validation of this job's previous output. Quoted text is failed model output, not evidence."});
+                        let feedback = json!({
+                            "code":code,
+                            "attempt":job.attempts,
+                            "references":error.references,
+                            "note":"Server validation of this job's previous output. Quoted text is failed model output, not evidence."
+                        });
                         let mut updated = context.clone();
                         updated["previous_rejection"] = feedback;
-                        if let Err(failure)=self.graph.store.write(|tx|{tx.sql().execute("UPDATE jobs SET context=? WHERE id=? AND owner=? AND state='leased' AND lease_until>? AND kind IN ('extract','consolidate')",params![encode_json(&updated)?,job.id,job.owner,timestamp()])?;Ok(())}) {
-                            eprintln!("Rejection feedback not stored ({})",crate::jobs::error_category(&failure));
+                        if let Err(failure) = self.graph.store.write(|tx| {
+                            tx.sql().execute(
+                                "UPDATE jobs SET context=? WHERE id=? AND owner=? AND state='leased' AND lease_until>? AND \
+                                    kind IN ('extract','consolidate')",
+                                params![encode_json(&updated)?, job.id, job.owner, timestamp()],
+                            )?;
+                            Ok(())
+                        }) {
+                            eprintln!("Rejection feedback not stored ({})", crate::jobs::error_category(&failure));
                         }
                     }
                 }
@@ -699,7 +895,20 @@ impl Processing {
         if !["cli_failed", "invalid_output", "service_rejected"].contains(&command.error.as_str()) {
             return Err(Error::Validation("Invalid work release category"));
         }
-        self.graph.store.write(|tx|{let changed=tx.sql().execute("UPDATE jobs SET state='pending',available_at=?,error=?,owner=NULL,lease_until=NULL WHERE id=? AND owner=? AND state='leased' AND lease_until>? AND kind IN ('extract','consolidate')",params![timestamp()+30.0,command.error,command.id,command.owner,timestamp()])?;Ok(json!({"released":changed!=0}))})
+        self.graph.store.write(|tx| {
+            let changed = tx.sql().execute(
+                "UPDATE jobs SET state='pending',available_at=?,error=?,owner=NULL,lease_until=NULL WHERE \
+                    id=? AND owner=? AND state='leased' AND lease_until>? AND kind IN ('extract','consolidate')",
+                params![
+                    timestamp() + 30.0,
+                    command.error,
+                    command.id,
+                    command.owner,
+                    timestamp()
+                ],
+            )?;
+            Ok(json!({"released":changed!=0}))
+        })
     }
 }
 
@@ -744,18 +953,55 @@ pub fn night_window(start: Option<&str>, end: Option<&str>) -> Result<(u32, u32)
     Ok((start, end))
 }
 pub fn pending_conversations(db: &Connection, source: Option<&str>) -> Result<i64> {
-    Ok(db.query_row(&format!("SELECT count(*) {PROGRESS} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) AND (?1 IS NULL OR p.source=?1)"),[source],|row|row.get(0))?)
+    Ok(db.query_row(
+        &format!(
+            "SELECT count(*) {PROGRESS} WHERE p.latest_seq>p.seq AND \
+        p.latest_seq>coalesce(h.live_seq,p.seq) AND (?1 IS NULL OR p.source=?1)"
+        ),
+        [source],
+        |row| row.get(0),
+    )?)
 }
 pub fn historical_status(db: &Connection) -> Result<Value> {
     let activation = one(db, "SELECT activated_at FROM historical_activation", [])?;
-    let parking=one(db,"SELECT count(*) AS parked_conversations,coalesce(sum(p.latest_seq>h.live_seq),0) AS live_pending_conversations FROM historical_parking h JOIN processing_progress p ON p.source=h.source AND p.conversation_id=h.conversation_id",[])?.unwrap();
-    let candidates=one(db,"SELECT coalesce(sum(released_at IS NULL),0) AS parked_candidates,coalesce(sum(released_at IS NOT NULL),0) AS released_candidates FROM historical_parked_candidates",[])?.unwrap();
-    Ok(
-        json!({"active":activation.is_some(),"activated_at":activation.as_ref().map(|row|row["activated_at"].clone()),"header":db.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0))?,"parked_conversations":parking["parked_conversations"],"live_pending_conversations":parking["live_pending_conversations"],"parked_candidates":candidates["parked_candidates"],"released_candidates":candidates["released_candidates"]}),
-    )
+    let parking = one(
+        db,
+        "SELECT count(*) AS parked_conversations,coalesce(sum(p.latest_seq>h.live_seq),0) AS \
+        live_pending_conversations FROM historical_parking h JOIN processing_progress p ON \
+        p.source=h.source AND p.conversation_id=h.conversation_id",
+        [],
+    )?
+    .unwrap();
+    let candidates = one(
+        db,
+        "SELECT coalesce(sum(released_at IS NULL),0) AS parked_candidates,coalesce(sum(released_at \
+        IS NOT NULL),0) AS released_candidates FROM historical_parked_candidates",
+        [],
+    )?
+    .unwrap();
+    Ok(json!({
+        "active":activation.is_some(),
+        "activated_at":activation.as_ref().map(|row|row["activated_at"].clone()),
+        "header":db.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0))?,
+        "parked_conversations":parking["parked_conversations"],
+        "live_pending_conversations":parking["live_pending_conversations"],
+        "parked_candidates":candidates["parked_candidates"],
+        "released_candidates":candidates["released_candidates"]
+    }))
 }
 fn visible_active(db: &Connection, target: &str) -> Result<bool> {
-    Ok(one(db,"SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND (NOT EXISTS (SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) OR EXISTS (SELECT 1 FROM captured_media cm JOIN captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON e.id=r.episode_id WHERE cm.node_id=n.id AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=cm.sha256)))",[target])?.is_some())
+    Ok(one(
+        db,
+        "SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT \
+        max(x.version) FROM node_versions x WHERE x.id=n.id) AND (NOT EXISTS (SELECT 1 FROM \
+        captured_media cm WHERE cm.node_id=n.id) OR EXISTS (SELECT 1 FROM captured_media cm JOIN \
+        captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON e.id=r.episode_id WHERE \
+        cm.node_id=n.id AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source \
+        AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN \
+        forgotten_targets f ON f.target=m.node_id WHERE m.sha256=cm.sha256)))",
+        [target],
+    )?
+    .is_some())
 }
 fn ascii_json(value: &Value) -> Result<String> {
     let canonical = encode_json(value)?;
@@ -775,7 +1021,8 @@ fn ascii_json(value: &Value) -> Result<String> {
 fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
     let last = one(
         tx.sql(),
-        "SELECT json_extract(payload,'$.order') AS admission_order FROM jobs WHERE kind='extract' ORDER BY rowid DESC LIMIT 1",
+        "SELECT json_extract(payload,'$.order') AS admission_order FROM jobs WHERE kind='extract' \
+        ORDER BY rowid DESC LIMIT 1",
         [],
     )?;
     let order = if last
@@ -789,19 +1036,35 @@ fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
     let ordering = if order == "newest" {
         "p.latest_seq DESC"
     } else {
-        "(SELECT e.seq FROM episodes e WHERE e.source=p.source AND e.conversation_id=p.conversation_id AND e.seq>coalesce(h.live_seq,p.seq) ORDER BY e.seq LIMIT 1)"
+        "(SELECT e.seq FROM episodes e WHERE e.source=p.source AND \
+            e.conversation_id=p.conversation_id AND e.seq>coalesce(h.live_seq,p.seq) ORDER BY e.seq \
+            LIMIT 1)"
     };
     let groups = rows(
         tx.sql(),
         &format!(
-            "SELECT p.source,p.conversation_id,p.latest_seq,p.latest_at,p.compact_through,coalesce(h.live_seq,p.seq) AS cursor,coalesce(h.live_offset,p.offset) AS offset,(h.source IS NOT NULL) AS live {PROGRESS} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY {ordering}"
+            "SELECT \
+        p.source,p.conversation_id,p.latest_seq,p.latest_at,p.compact_through,coalesce(h.live_seq,p.seq) \
+        AS cursor,coalesce(h.live_offset,p.offset) AS offset,(h.source IS NOT NULL) AS live \
+        {PROGRESS} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY \
+        {ordering}"
         ),
         [],
     )?;
     for group in groups {
         let source = get_str(&group, "source")?;
         let conversation = get_str(&group, "conversation_id")?;
-        if one(tx.sql(),"SELECT 1 FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND json_extract(payload,'$.source')=? AND json_extract(payload,'$.conversation_id')=? AND json_extract(payload,'$.mode') IS NULL LIMIT 1",params![source,conversation])?.is_some(){continue;}
+        if one(
+            tx.sql(),
+            "SELECT 1 FROM jobs WHERE kind='extract' AND state IN ('pending','leased') AND \
+            json_extract(payload,'$.source')=? AND json_extract(payload,'$.conversation_id')=? AND \
+            json_extract(payload,'$.mode') IS NULL LIMIT 1",
+            params![source, conversation],
+        )?
+        .is_some()
+        {
+            continue;
+        }
         let through = admissible_through(&group, instant)?;
         let cursor = get_i64(&group, "cursor")?;
         if through < cursor || through == 0 {
@@ -810,13 +1073,15 @@ fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
         let selected = rows(
             tx.sql(),
             &format!(
-                "SELECT id,seq,text,kind,metadata FROM episodes e WHERE source=? AND conversation_id=? AND seq<=? AND seq>? AND {EXTRACTION_INPUT} ORDER BY seq LIMIT 65"
+                "SELECT id,seq,text,kind,metadata FROM episodes e WHERE source=? AND conversation_id=? AND \
+                seq<=? AND seq>? AND {EXTRACTION_INPUT} ORDER BY seq LIMIT 65"
             ),
             params![source, conversation, through, cursor],
         )?;
         let offset = get_i64(&group, "offset")? as usize;
         let partial = if offset != 0 {
-            one(tx.sql(),"SELECT seq FROM episodes WHERE source=? AND conversation_id=? AND seq>? ORDER BY seq LIMIT 1",params![source,conversation,cursor])?.and_then(|row|row["seq"].as_i64())
+            one(tx.sql(), "SELECT seq FROM episodes WHERE source=? AND conversation_id=? AND seq>? ORDER BY seq LIMIT 1", params![source, conversation, cursor])?
+                .and_then(|row| row["seq"].as_i64())
         } else {
             None
         };
@@ -845,7 +1110,11 @@ fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
                         end - start
                     };
                     if windows.len() == 64 || characters + projected > 48000 {
-                        next_seq=tx.sql().query_row("SELECT coalesce(max(seq),0) FROM episodes WHERE source=? AND conversation_id=? AND seq<?",params![source,conversation,row_seq],|row|row.get(0))?;
+                        next_seq = tx.sql().query_row(
+                            "SELECT coalesce(max(seq),0) FROM episodes WHERE source=? AND conversation_id=? AND seq<?",
+                            params![source, conversation, row_seq],
+                            |row| row.get(0),
+                        )?;
                         next_offset = start;
                         stopped = true;
                         break;
@@ -874,10 +1143,20 @@ fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
         }
         let live = group["live"].as_i64().unwrap_or(0) != 0;
         if windows.is_empty() {
-            tx.sql().execute(if live{"UPDATE historical_parking SET live_seq=?,live_offset=? WHERE source=? AND conversation_id=?"}else{"UPDATE processing_progress SET seq=?,offset=? WHERE source=? AND conversation_id=?"},params![next_seq,next_offset as i64,source,conversation])?;
+            tx.sql().execute(
+                if live { "UPDATE historical_parking SET live_seq=?,live_offset=? WHERE source=? AND conversation_id=?" } else { "UPDATE processing_progress SET seq=?,offset=? WHERE source=? AND conversation_id=?" },
+                params![next_seq, next_offset as i64, source, conversation],
+            )?;
             continue;
         }
-        let mut payload = json!({"version":crate::extraction::VERSION,"source":source,"conversation_id":conversation,"windows":windows,"next_seq":next_seq,"next_offset":next_offset});
+        let mut payload = json!({
+            "version":crate::extraction::VERSION,
+            "source":source,
+            "conversation_id":conversation,
+            "windows":windows,
+            "next_seq":next_seq,
+            "next_offset":next_offset
+        });
         if live {
             payload["cursor"] = json!("live");
         }
@@ -907,7 +1186,11 @@ fn enqueue_repair(tx: &WriteTxn) -> Result<bool> {
             {
                 continue;
             }
-            tx.sql().execute("UPDATE repair_groups SET active_job=NULL,generation=generation+1,available_at=?,updated_at=? WHERE id=?",params![timestamp()+900.0,now(),group_id])?;
+            tx.sql().execute(
+                "UPDATE repair_groups SET \
+                    active_job=NULL,generation=generation+1,available_at=?,updated_at=? WHERE id=?",
+                params![timestamp() + 900.0, now(), group_id],
+            )?;
             continue;
         }
         if group["available_at"].as_f64().unwrap_or(0.0) > timestamp() {
@@ -929,7 +1212,15 @@ fn enqueue_repair(tx: &WriteTxn) -> Result<bool> {
         } else {
             8
         };
-        let payload = json!({"version":consolidation::VERSION,"night":null,"candidate_ids":[],"next_cursor":0,"repair_group_id":group_id,"maintenance_ids":frontier.into_iter().take(limit).collect::<Vec<_>>(),"reviewed_ids":reviewed});
+        let payload = json!({
+            "version":consolidation::VERSION,
+            "night":null,
+            "candidate_ids":[],
+            "next_cursor":0,
+            "repair_group_id":group_id,
+            "maintenance_ids":frontier.into_iter().take(limit).collect::<Vec<_>>(),
+            "reviewed_ids":reviewed
+        });
         let job = Queue::insert(
             tx,
             &format!(
@@ -974,14 +1265,27 @@ fn enqueue_night(
         )
     };
     let night = format!("{zone_name}/{anchor}");
-    tx.sql().execute("UPDATE jobs SET state='failed',error='night_window_closed',owner=NULL,lease_until=NULL WHERE kind='consolidate' AND (state='pending' OR (state='leased' AND lease_until<=?)) AND json_extract(payload,'$.night') IS NOT NULL AND (json_extract(payload,'$.night')<>? OR ?=0)",params![instant.timestamp_micros() as f64/1e6,night,i64::from(within)])?;
+    tx.sql().execute(
+        "UPDATE jobs SET state='failed',error='night_window_closed',owner=NULL,lease_until=NULL \
+            WHERE kind='consolidate' AND (state='pending' OR (state='leased' AND lease_until<=?)) AND \
+            json_extract(payload,'$.night') IS NOT NULL AND (json_extract(payload,'$.night')<>? OR ?=0)",
+        params![
+            instant.timestamp_micros() as f64 / 1e6,
+            night,
+            i64::from(within)
+        ],
+    )?;
     if !within && !force {
         return Ok(false);
     }
     // batch_size is an admission maximum, including a released oversized unit.
     // Keep its original payload/context for audit; untouched candidates become
     // available to smaller fresh jobs. Never retire a live or committed unit.
-    tx.sql().execute("UPDATE jobs SET state='failed',error='rebatch_requested',owner=NULL,lease_until=NULL WHERE kind='consolidate' AND (state='pending' OR (state='leased' AND lease_until<=?1)) AND json_array_length(json_extract(payload,'$.candidate_ids'))>?2 AND NOT EXISTS (SELECT 1 FROM graph_commits g WHERE g.command_id='consolidate/'||jobs.id)",params![timestamp(),batch_size as i64])?;
+    tx.sql()
+        .execute("UPDATE jobs SET state='failed',error='rebatch_requested',owner=NULL,lease_until=NULL WHERE \
+            kind='consolidate' AND (state='pending' OR (state='leased' AND lease_until<=?1)) AND \
+            json_array_length(json_extract(payload,'$.candidate_ids'))>?2 AND NOT EXISTS (SELECT 1 FROM \
+            graph_commits g WHERE g.command_id='consolidate/'||jobs.id)", params![timestamp(), batch_size as i64])?;
     if one(
         tx.sql(),
         "SELECT 1 FROM jobs WHERE kind='consolidate' AND state='leased' AND lease_until>? LIMIT 1",
@@ -991,7 +1295,10 @@ fn enqueue_night(
     {
         return Ok(true);
     }
-    if one(tx.sql(),"SELECT 1 FROM jobs WHERE kind='consolidate' AND state IN ('pending','leased') AND id NOT IN (SELECT value FROM json_each(?)) LIMIT 1",[encode_json(&json!(exclude))?])?.is_some(){return Ok(true);}
+    if one(tx.sql(), "SELECT 1 FROM jobs WHERE kind='consolidate' AND state IN ('pending','leased') AND id NOT IN \
+        (SELECT value FROM json_each(?)) LIMIT 1", [encode_json(&json!(exclude))?])?.is_some() {
+        return Ok(true);
+    }
     let reserved = one(
         tx.sql(),
         "SELECT 1 FROM jobs WHERE kind='consolidate' AND state IN ('pending','leased') LIMIT 1",
@@ -1066,7 +1373,8 @@ fn enqueue_night(
         let subject = |candidate: &Value| -> Result<Option<Value>> {
             one(
                 tx.sql(),
-                "SELECT e.source,e.conversation_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=1 ORDER BY e.seq LIMIT 1",
+                "SELECT e.source,e.conversation_id FROM graph_evidence g JOIN episodes e ON \
+                e.id=g.episode_id WHERE g.target=? AND g.version=1 ORDER BY e.seq LIMIT 1",
                 [get_str(candidate, "id")?],
             )
         };
@@ -1117,7 +1425,12 @@ fn enqueue_night(
         .filter_map(|candidate| candidate["position"].as_i64())
         .max()
         .unwrap();
-    let payload = json!({"version":consolidation::VERSION,"night":night,"candidate_ids":candidates.iter().map(|candidate|candidate["id"].clone()).collect::<Vec<_>>(),"next_cursor":next});
+    let payload = json!({
+        "version":consolidation::VERSION,
+        "night":night,
+        "candidate_ids":candidates.iter().map(|candidate|candidate["id"].clone()).collect::<Vec<_>>(),
+        "next_cursor":next
+    });
     let key = if force {
         format!("consolidate/manual/{}", id())
     } else {

@@ -2,7 +2,9 @@ use super::*;
 use memento_core::{VectorKind, VectorWrite};
 use rusqlite::{Connection, StatementStatus};
 
-const ORIGINAL: &str = "SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND (?2 IS NULL OR i.seq>?2) ORDER BY i.seq LIMIT ?3";
+const ORIGINAL: &str = "SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current,b.generation FROM vector_items \
+    i JOIN vector_blobs b ON b.seq=i.seq WHERE b.tier=?1 AND (?2 IS NULL OR i.seq>?2) ORDER BY \
+    i.seq LIMIT ?3";
 
 fn signature(row: &ProjectionRow) -> (i64, String, String, i64, Vec<u8>, bool, i64) {
     (
@@ -109,7 +111,9 @@ fn measured_page(db: &Connection, sql: &str, after: Option<i64>) -> (Vec<i64>, i
 #[test]
 fn late_keyset_page_work_is_independent_of_already_visited_prefix() {
     let mut db = Connection::open_in_memory().unwrap();
-    db.execute_batch("CREATE TABLE vector_items(seq INTEGER PRIMARY KEY,target TEXT NOT NULL,kind TEXT NOT NULL,version INTEGER NOT NULL); CREATE TABLE vector_blobs(seq INTEGER PRIMARY KEY,embedding BLOB NOT NULL,current INTEGER NOT NULL,generation INTEGER NOT NULL,tier TEXT NOT NULL);").unwrap();
+    db.execute_batch("CREATE TABLE vector_items(seq INTEGER PRIMARY KEY,target TEXT NOT NULL,kind TEXT NOT \
+        NULL,version INTEGER NOT NULL); CREATE TABLE vector_blobs(seq INTEGER PRIMARY KEY,embedding \
+        BLOB NOT NULL,current INTEGER NOT NULL,generation INTEGER NOT NULL,tier TEXT NOT NULL);").unwrap();
     let mut bytes = vec![0; 3072];
     bytes[..4].copy_from_slice(&1f32.to_le_bytes());
     let tx = db.transaction().unwrap();

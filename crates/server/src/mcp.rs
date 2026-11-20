@@ -13,7 +13,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 const LATEST: &str = "2026-07-28";
-const INSTRUCTIONS: &str = "Routine capture and passive recall belong to the harness. Use recall(deep) when passive context is insufficient; cite memory ids. Remember only explicit saves. Every assertion cites an exact source episode quote. Correct beliefs with one atomic supersede; history explains when, why, and evidence. Reuse command_id only when retrying the identical command. Tools cannot approve sensitive changes or forget data.";
+const INSTRUCTIONS: &str = "Routine capture and passive recall belong to the harness. Use recall(deep) when passive \
+    context is insufficient; cite memory ids. Remember only explicit saves. Every assertion \
+    cites an exact source episode quote. Correct beliefs with one atomic supersede; history \
+    explains when, why, and evidence. Reuse command_id only when retrying the identical \
+    command. Tools cannot approve sensitive changes or forget data.";
 pub async fn redirect(request: Request) -> Response {
     let location = match request.uri().query() {
         Some(query) => format!("/mcp/?{query}"),
@@ -79,7 +83,10 @@ fn refuse(status: StatusCode) -> Response {
     }
 }
 pub async fn unsupported(State(state): State<AppState>, request: Request) -> Response {
-    match admit(&state,request.headers(),false){Err(status)=>refuse(status),Ok(())=>(StatusCode::METHOD_NOT_ALLOWED,Json(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Method not allowed"}}))).into_response()}
+    match admit(&state, request.headers(), false) {
+        Err(status) => refuse(status),
+        Ok(()) => (StatusCode::METHOD_NOT_ALLOWED, Json(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Method not allowed"}}))).into_response(),
+    }
 }
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
@@ -160,12 +167,17 @@ pub async fn request(State(state): State<AppState>, request: Request) -> Respons
             } else {
                 LATEST
             };
-            json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"Memento","version":env!("CARGO_PKG_VERSION")},"instructions":INSTRUCTIONS})
+            json!({
+                "protocolVersion":version,
+                "capabilities":{"tools":{"listChanged":false}},
+                "serverInfo":{"name":"Memento","version":env!("CARGO_PKG_VERSION")},
+                "instructions":INSTRUCTIONS
+            })
         }
         "ping" => json!({}),
-        "tools/list" => {
-            json!({"tools":serde_json::from_str::<Value>(include_str!("protocol-tools.json")).expect("frozen public tool schemas")})
-        }
+        "tools/list" => json!({
+            "tools":serde_json::from_str::<Value>(include_str!("protocol-tools.json")).expect("frozen public tool schemas")
+        }),
         "tools/call" => {
             let Some(name) = params["name"].as_str() else {
                 return Json(rpc_error(id, -32602, "Invalid tool name")).into_response();
@@ -178,9 +190,16 @@ pub async fn request(State(state): State<AppState>, request: Request) -> Respons
                 Ok((mut value, text)) => {
                     if processing_tool {
                         processing_view(&mut value);
-                        json!({"content":[{"type":"text","text":serde_json::to_string(&value).unwrap()}],"isError":false})
+                        json!({
+                            "content": [{"type":"text","text":serde_json::to_string(&value).unwrap()}],
+                            "isError":false
+                        })
                     } else {
-                        json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":false})
+                        json!({
+                            "content":[{"type":"text","text":text}],
+                            "structuredContent":value,
+                            "isError":false
+                        })
                     }
                 }
                 Err(error) => {

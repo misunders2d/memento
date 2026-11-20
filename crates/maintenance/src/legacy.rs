@@ -248,53 +248,155 @@ fn import_with_policy(
             allowed_gaps,
         )?;
         let store = Store::open(&stage)?;
-        let (tables,authority_rows,vectors)=store.write(|tx|{
+        let (tables, authority_rows, vectors) = store.write(|tx| {
             init(tx.sql())?;
             // SQLite encodes this as a read-only ATTACH, independently of source permissions.
-            let uri=source_uri(&source);
-            tx.sql().execute("ATTACH DATABASE ? AS legacy",[uri])?;
-            if unsafe{ffi::sqlite3_db_readonly(tx.sql().handle(),c"legacy".as_ptr())}!=1{return Err(Error::Unavailable("Legacy source attachment is not read-only"))}
-            let triggers={let mut q=tx.sql().prepare("SELECT name,sql FROM sqlite_schema WHERE type='trigger'")?;q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
-            for (name,_) in &triggers{tx.sql().execute_batch(&format!("DROP TRIGGER {}",quote(name)))?;}
-            let source_tables={let mut q=tx.sql().prepare("PRAGMA legacy.table_list")?;q.query_map([],|r|Ok((r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
-            let mut copied=Vec::new();let mut table_count=0;let mut row_count=0;
-            for (table,kind) in source_tables{
-                if kind=="shadow"||table.starts_with("sqlite_")||["memory_vectors", "memory_vectors_vector_chunks00","search_state","search_outbox","episodes_fts"].contains(&table.as_str()){continue}
-                if !["table","virtual"].contains(&kind.as_str()){continue}
-                let from=columns(tx.sql(),"legacy",&table)?;let to=columns(tx.sql(),"main",&table)?;
-                if to.is_empty()||from.iter().any(|c|!to.contains(c)){return Err(Error::Validation("Legacy authority table or column is unsupported; no source data was discarded"))}
-                let names=from.iter().map(|s|quote(s)).collect::<Vec<_>>().join(",");
-                tx.sql().execute_batch(&format!("DELETE FROM main.{table}; INSERT INTO main.{table}(rowid,{names}) SELECT rowid,{names} FROM legacy.{table} ORDER BY rowid",table=quote(&table)))?;
-                let original=digest_rows(tx.sql(),"legacy",&table,&from)?;let imported=digest_rows(tx.sql(),"main",&table,&from)?;if original!=imported{return Err(Error::Unavailable("Imported authority differs from its original source"))}table_count+=1;row_count+=original.1;copied.push(table);
+            let uri = source_uri(&source);
+            tx.sql().execute("ATTACH DATABASE ? AS legacy", [uri])?;
+            if unsafe { ffi::sqlite3_db_readonly(tx.sql().handle(), c"legacy".as_ptr()) } != 1 {
+                return Err(Error::Unavailable("Legacy source attachment is not read-only"));
             }
-            if !copied.iter().any(|t|t=="vector_items"){return Err(Error::Validation("Legacy vector authority is missing"))}
+            let triggers = {
+                let mut q = tx.sql().prepare("SELECT name,sql FROM sqlite_schema WHERE type='trigger'")?;
+                q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (name, _) in &triggers {
+                tx.sql()
+                    .execute_batch(&format!("DROP TRIGGER {}", quote(name)))?;
+            }
+            let source_tables = {
+                let mut q = tx.sql().prepare("PRAGMA legacy.table_list")?;
+                q.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            let mut copied = Vec::new();
+            let mut table_count = 0;
+            let mut row_count = 0;
+            for (table, kind) in source_tables {
+                if kind == "shadow"
+                    || table.starts_with("sqlite_")
+                    || [
+                        "memory_vectors",
+                        "memory_vectors_vector_chunks00",
+                        "search_state",
+                        "search_outbox",
+                        "episodes_fts",
+                    ]
+                    .contains(&table.as_str())
+                {
+                    continue;
+                }
+                if !["table", "virtual"].contains(&kind.as_str()) {
+                    continue;
+                }
+                let from = columns(tx.sql(), "legacy", &table)?;
+                let to = columns(tx.sql(), "main", &table)?;
+                if to.is_empty() || from.iter().any(|c| !to.contains(c)) {
+                    return Err(Error::Validation("Legacy authority table or column is unsupported; no source data was discarded"));
+                }
+                let names = from.iter().map(|s| quote(s)).collect::<Vec<_>>().join(",");
+                tx.sql()
+                    .execute_batch(&format!("DELETE FROM main.{table}; INSERT INTO main.{table}(rowid,{names}) SELECT rowid,{names} FROM \
+                        legacy.{table} ORDER BY rowid", table = quote(&table)))?;
+                let original = digest_rows(tx.sql(), "legacy", &table, &from)?;
+                let imported = digest_rows(tx.sql(), "main", &table, &from)?;
+                if original != imported {
+                    return Err(Error::Unavailable("Imported authority differs from its original source"));
+                }
+                table_count += 1;
+                row_count += original.1;
+                copied.push(table);
+            }
+            if !copied.iter().any(|t| t == "vector_items") {
+                return Err(Error::Validation("Legacy vector authority is missing"));
+            }
             // FTS5's external-content table enumerates ALL episodes, even rows never indexed.
             // Rebuild its derived postings with the exact capture predicate, not SELECT *.
-            tx.sql().execute_batch("INSERT INTO episodes_fts(episodes_fts) VALUES('delete-all'); INSERT INTO episodes_fts(rowid,text) SELECT seq,text FROM episodes WHERE kind NOT IN ('native_record','native_live_record','native_hook') AND coalesce(json_extract(metadata,'$.extraction_mode'),'message')<>'skip';")?;
-            let mut vector_count=0;
-            {let mut query=tx.sql().prepare("SELECT v.rowid,v.embedding,v.current,i.kind,i.target FROM legacy.memory_vectors v LEFT JOIN legacy.vector_items i ON i.seq=v.rowid")?;let mut rows=query.query([])?;
-                while let Some(row)=rows.next()?{let seq:i64=row.get(0)?;let bytes:Vec<u8>=row.get(1)?;if bytes.len()!=3072{return Err(Error::Validation("Legacy FP32 vector has the wrong byte length"))}let current:i64=row.get(2)?;let kind:Option<String>=row.get(3)?;let target:Option<String>=row.get(4)?;
-                    let historical=if kind.as_deref()==Some("episode"){tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id JOIN historical_parking h ON h.source=e.source AND h.conversation_id=e.conversation_id WHERE x.id=? AND e.seq<=h.parked_through)",[target],|r|r.get::<_,bool>(0))?}else{kind.is_none()};
-                    tx.sql().execute("INSERT INTO vector_blobs VALUES(?,?,?,0,?)",params![seq,bytes,current,if historical{"cold"}else{"hot"}])?;vector_count+=1;
+            tx.sql().execute_batch("INSERT INTO episodes_fts(episodes_fts) VALUES('delete-all'); INSERT INTO \
+                episodes_fts(rowid,text) SELECT seq,text FROM episodes WHERE kind NOT IN \
+                ('native_record','native_live_record','native_hook') AND \
+                coalesce(json_extract(metadata,'$.extraction_mode'),'message')<>'skip';")?;
+            let mut vector_count = 0;
+            {
+                let mut query = tx.sql().prepare("SELECT v.rowid,v.embedding,v.current,i.kind,i.target FROM legacy.memory_vectors v LEFT JOIN \
+                    legacy.vector_items i ON i.seq=v.rowid")?;
+                let mut rows = query.query([])?;
+                while let Some(row) = rows.next()? {
+                    let seq: i64 = row.get(0)?;
+                    let bytes: Vec<u8> = row.get(1)?;
+                    if bytes.len() != 3072 {
+                        return Err(Error::Validation("Legacy FP32 vector has the wrong byte length"));
+                    }
+                    let current: i64 = row.get(2)?;
+                    let kind: Option<String> = row.get(3)?;
+                    let target: Option<String> = row.get(4)?;
+                    let historical = if kind.as_deref() == Some("episode") {
+                        tx.sql()
+                            .query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id JOIN \
+                                historical_parking h ON h.source=e.source AND h.conversation_id=e.conversation_id WHERE \
+                                x.id=? AND e.seq<=h.parked_through)", [target], |r| r.get::<_, bool>(0))?
+                    } else {
+                        kind.is_none()
+                    };
+                    tx.sql().execute(
+                        "INSERT INTO vector_blobs VALUES(?,?,?,0,?)",
+                        params![seq, bytes, current, if historical { "cold" } else { "hot" }],
+                    )?;
+                    vector_count += 1;
                 }
             }
-            let difference:bool=tx.sql().query_row("SELECT EXISTS(SELECT v.rowid FROM legacy.memory_vectors v LEFT JOIN vector_blobs b ON b.seq=v.rowid WHERE b.seq IS NULL OR b.embedding IS NOT v.embedding OR b.current IS NOT v.current) OR (SELECT count(*) FROM legacy.memory_vectors)<>(SELECT count(*) FROM vector_blobs)",[],|r|r.get(0))?;if difference{return Err(Error::Unavailable("Legacy vector IDs or bytes changed during import"))}
-            for (_,sql) in &triggers{tx.sql().execute_batch(sql)?;}
-            Ok((table_count,row_count,vector_count))
+            let difference: bool = tx.sql().query_row("SELECT EXISTS(SELECT v.rowid FROM legacy.memory_vectors v LEFT JOIN vector_blobs b ON \
+                b.seq=v.rowid WHERE b.seq IS NULL OR b.embedding IS NOT v.embedding OR b.current IS NOT \
+                v.current) OR (SELECT count(*) FROM legacy.memory_vectors)<>(SELECT count(*) FROM \
+                vector_blobs)", [], |r| r.get(0))?;
+            if difference {
+                return Err(Error::Unavailable("Legacy vector IDs or bytes changed during import"));
+            }
+            for (_, sql) in &triggers {
+                tx.sql().execute_batch(sql)?;
+            }
+            Ok((table_count, row_count, vector_count))
         })?;
         let mut raw_rows_with_missing_artifacts = 0;
-        store.read(|tx|{let integrity:String=tx.sql().query_row("PRAGMA integrity_check",[],|r|r.get(0))?;if integrity!="ok"{return Err(Error::Unavailable("Imported authority integrity check failed"))}
-            let refs="SELECT sha256 FROM media_files UNION SELECT artifact_sha256 FROM segments UNION SELECT source_sha256 FROM segments WHERE source_sha256 IS NOT NULL";if tx.sql().query_row(&format!("SELECT EXISTS(SELECT 1 FROM ({refs}) r WHERE NOT EXISTS(SELECT 1 FROM blobs b WHERE b.sha256=r.sha256))"),[],|r|r.get::<_,bool>(0))?{return Err(Error::Validation("Imported authority references unregistered artifacts"))}
-            raw::validate_frames(tx.sql())?;
-            let mut q=tx.sql().prepare("SELECT id,raw_frame,text_runs FROM episodes WHERE raw_frame IS NOT NULL OR text_runs IS NOT NULL")?;
-            for row in q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?)))?{
-                let (id,frame,runs)=row?;
-                if frame.is_some()&&runs.is_some(){return Err(Error::Validation("Raw episode has conflicting storage references"))}
-                if let Some(runs)=runs{let refs:Vec<(usize,String,usize)>=serde_json::from_str(&runs)?;
-                    if refs.iter().any(|r|missing.contains(&r.1)){raw_rows_with_missing_artifacts+=1;continue;}}
-                raw::read_original(tx.sql(),&stage,&id)?;
+        store.read(|tx| {
+            let integrity: String = tx.sql().query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            if integrity != "ok" {
+                return Err(Error::Unavailable("Imported authority integrity check failed"));
             }
-            Ok(())})?;
+            let refs = "SELECT sha256 FROM media_files UNION SELECT artifact_sha256 FROM segments UNION SELECT \
+                source_sha256 FROM segments WHERE source_sha256 IS NOT NULL";
+            if tx
+                .sql()
+                .query_row(&format!("SELECT EXISTS(SELECT 1 FROM ({refs}) r WHERE NOT EXISTS(SELECT 1 FROM blobs b WHERE \
+                    b.sha256=r.sha256))"), [], |r| r.get::<_, bool>(0))?
+            {
+                return Err(Error::Validation("Imported authority references unregistered artifacts"));
+            }
+            raw::validate_frames(tx.sql())?;
+            let mut q = tx.sql().prepare("SELECT id,raw_frame,text_runs FROM episodes WHERE raw_frame IS NOT NULL OR text_runs IS NOT NULL")?;
+            for row in q.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })? {
+                let (id, frame, runs) = row?;
+                if frame.is_some() && runs.is_some() {
+                    return Err(Error::Validation("Raw episode has conflicting storage references"));
+                }
+                if let Some(runs) = runs {
+                    let refs: Vec<(usize, String, usize)> = serde_json::from_str(&runs)?;
+                    if refs.iter().any(|r| missing.contains(&r.1)) {
+                        raw_rows_with_missing_artifacts += 1;
+                        continue;
+                    }
+                }
+                raw::read_original(tx.sql(), &stage, &id)?;
+            }
+            Ok(())
+        })?;
         drop(store);
         drop(source_db);
         if hash_file(&source)?.0 != source_hash {
@@ -354,25 +456,73 @@ mod tests {
         let parent = dir.path().join("blobs").join(&sha[..2]);
         std::fs::create_dir_all(&parent).unwrap();
         std::fs::write(parent.join(&sha[2..]), artifact).unwrap();
-        store.write(|tx|{
-            tx.sql().execute("INSERT INTO graph_commits VALUES('commit','command','{\"actor\": \"Сергей\"}','{}','owner','source reason','2026-01-01T00:00:00+00:00')",[])?;
-            tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES(1,'episode','fixture','event','thread','user',?,'2026-01-01T00:00:00+00:00','{}','2026-01-02T00:00:00+00:00')",[text])?;
-            for version in [1,2]{tx.sql().execute("INSERT INTO node_versions VALUES('node',?,'commit','knowledge',?,'active',NULL,NULL,NULL,0,'[\"personal\"]')",params![version,format!("assertion{version}")])?;tx.sql().execute("INSERT INTO graph_evidence VALUES('node',?,'episode',1,3,'🧠б')",[version])?;}
-            tx.sql().execute("INSERT INTO loop_events VALUES('loop','node','commit','open',NULL,NULL)",[])?;
-            tx.sql().execute("INSERT INTO blobs VALUES(?,?,'text/plain','hot',NULL,'2026')",params![sha,artifact.len()])?;
-            tx.sql().execute("INSERT INTO media_files VALUES('node',?,'fixture.txt','document','commit')",[&sha])?;
-            if header>=2{let original="compressed raw Ω😀";let mut encoder=ZlibEncoder::new(Vec::new(),Compression::default());encoder.write_all(original.as_bytes())?;let compressed=encoder.finish()?;let hash=raw::sha256(original.as_bytes());tx.sql().execute("INSERT INTO raw_frames VALUES(7,'fixture','thread',?,1,?,?)",params![original.len(),hash,compressed])?;tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at,text_sha256,raw_frame) VALUES(2,'frame','fixture','native','thread','native_record','','{\"extraction_mode\":\"skip\"}','2026',?,?)",params![hash,json!([[7,0,original.len()]]).to_string()])?;}
-            tx.sql().execute("INSERT INTO vector_model VALUES(1,'google/embeddinggemma-2','914f7f89142e33e77833254d9c9b90c3cef7303b',768,1)",[])?;
-            for (seq,current) in [(i64::MIN,false),(-1,true),(0,true),(i64::MAX,true)]{let mut values=[0.0;768];values[0]=1.;values[1]=-0.;values[2]=f32::from_bits(1);tx.put_vector(&VectorWrite{seq,target:if seq==0{"node".into()}else{format!("target{seq}")},kind:VectorKind::Node,version:1,current,tier:Tier::Hot,embedding:F32Blob::from_values(&values)?})?;}
-            tx.sql().execute("INSERT INTO vector_items VALUES(8,'metadata-only','candidate',1)",[])?;Ok(())
-        }).unwrap();
+        store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO graph_commits VALUES('commit','command','{\"actor\": \
+                    \"Сергей\"}','{}','owner','source reason','2026-01-01T00:00:00+00:00')", [])?;
+                tx.sql().execute("INSERT INTO \
+                    episodes(seq,id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+                    VALUES(1,'episode','fixture','event','thread','user',?,'2026-01-01T00:00:00+00:00','{}','2026-01-02T00:00:00+00:00')", [text])?;
+                for version in [1, 2] {
+                    tx.sql()
+                        .execute("INSERT INTO node_versions \
+                            VALUES('node',?,'commit','knowledge',?,'active',NULL,NULL,NULL,0,'[\"personal\"]')", params![version, format!("assertion{version}")])?;
+                    tx.sql().execute("INSERT INTO graph_evidence VALUES('node',?,'episode',1,3,'🧠б')", [version])?;
+                }
+                tx.sql().execute("INSERT INTO loop_events VALUES('loop','node','commit','open',NULL,NULL)", [])?;
+                tx.sql()
+                    .execute("INSERT INTO blobs VALUES(?,?,'text/plain','hot',NULL,'2026')", params![sha, artifact.len()])?;
+                tx.sql().execute("INSERT INTO media_files VALUES('node',?,'fixture.txt','document','commit')", [&sha])?;
+                if header >= 2 {
+                    let original = "compressed raw Ω😀";
+                    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(original.as_bytes())?;
+                    let compressed = encoder.finish()?;
+                    let hash = raw::sha256(original.as_bytes());
+                    tx.sql()
+                        .execute("INSERT INTO raw_frames VALUES(7,'fixture','thread',?,1,?,?)", params![original.len(), hash, compressed])?;
+                    tx.sql()
+                        .execute("INSERT INTO \
+                            episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at,text_sha256,raw_frame) \
+                            VALUES(2,'frame','fixture','native','thread','native_record','','{\"extraction_mode\":\"skip\"}','2026',?,?)", params![hash, json!([[7,0,original.len()]]).to_string()])?;
+                }
+                tx.sql().execute("INSERT INTO vector_model \
+                    VALUES(1,'google/embeddinggemma-2','914f7f89142e33e77833254d9c9b90c3cef7303b',768,1)", [])?;
+                for (seq, current) in [(i64::MIN, false), (-1, true), (0, true), (i64::MAX, true)] {
+                    let mut values = [0.0; 768];
+                    values[0] = 1.;
+                    values[1] = -0.;
+                    values[2] = f32::from_bits(1);
+                    tx.put_vector(&VectorWrite {
+                        seq,
+                        target: if seq == 0 {
+                            "node".into()
+                        } else {
+                            format!("target{seq}")
+                        },
+                        kind: VectorKind::Node,
+                        version: 1,
+                        current,
+                        tier: Tier::Hot,
+                        embedding: F32Blob::from_values(&values)?,
+                    })?;
+                }
+                tx.sql().execute("INSERT INTO vector_items VALUES(8,'metadata-only','candidate',1)", [])?;
+                Ok(())
+            })
+            .unwrap();
         drop(store);
         let db = Connection::open(dir.path().join("memory.sqlite")).unwrap();
         init(&db).unwrap();
         // Reconstruct the original legacy layout, before comparison-only status
         // indexes existed (header1 also lacks their text_runs expression column).
-        db.execute_batch("DROP INDEX vector_blobs_status_current_v1; DROP INDEX episodes_status_indexable_v2; DROP INDEX episodes_status_raw_v1;").unwrap();
-        db.execute_batch("CREATE VIRTUAL TABLE memory_vectors USING vec0(embedding float[768] distance_metric=cosine,current boolean); INSERT INTO memory_vectors(rowid,embedding,current) SELECT seq,embedding,current FROM vector_blobs; DROP TABLE vector_blobs; DROP TABLE projection_events; DROP TABLE projection_ack; DROP TABLE runtime_state; DROP TABLE media_stage_units;").unwrap();
+        db.execute_batch("DROP INDEX vector_blobs_status_current_v1; DROP INDEX episodes_status_indexable_v2; DROP \
+            INDEX episodes_status_raw_v1;").unwrap();
+        db.execute_batch("CREATE VIRTUAL TABLE memory_vectors USING vec0(embedding float[768] \
+            distance_metric=cosine,current boolean); INSERT INTO \
+            memory_vectors(rowid,embedding,current) SELECT seq,embedding,current FROM vector_blobs; \
+            DROP TABLE vector_blobs; DROP TABLE projection_events; DROP TABLE projection_ack; DROP \
+            TABLE runtime_state; DROP TABLE media_stage_units;").unwrap();
         let mut vector = vec![0_u8; 3072];
         vector[..4].copy_from_slice(&1f32.to_le_bytes());
         db.execute(
@@ -381,7 +531,9 @@ mod tests {
         )
         .unwrap();
         if header == 1 {
-            db.execute_batch("DROP TRIGGER episodes_no_update; DROP INDEX episodes_status_cover_v1; ALTER TABLE episodes DROP COLUMN text_runs; ALTER TABLE episodes DROP COLUMN text_sha256; ALTER TABLE episodes DROP COLUMN raw_frame; DROP TABLE raw_frames;").unwrap();
+            db.execute_batch("DROP TRIGGER episodes_no_update; DROP INDEX episodes_status_cover_v1; ALTER TABLE episodes \
+                DROP COLUMN text_runs; ALTER TABLE episodes DROP COLUMN text_sha256; ALTER TABLE episodes \
+                DROP COLUMN raw_frame; DROP TABLE raw_frames;").unwrap();
         }
         db.pragma_update(None, "user_version", header).unwrap();
         drop(db);

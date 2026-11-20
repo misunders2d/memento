@@ -16,7 +16,9 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-pub const HELP: &str = "Restore an owner archive or personal Drive backup\nUsage: memento-restore (--archive PATH --destination PATH | --connection PATH [--backup-id ID --destination PATH] [--allow-incomplete])\n";
+pub const HELP: &str = "Restore an owner archive or personal Drive backup\nUsage: memento-restore (--archive PATH \
+    --destination PATH | --connection PATH [--backup-id ID --destination PATH] \
+    [--allow-incomplete])\n";
 #[derive(Debug)]
 pub struct RestoreArgs {
     pub archive: Option<PathBuf>,

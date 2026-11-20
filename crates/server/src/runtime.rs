@@ -576,11 +576,24 @@ mod startup_tests {
         let projection = Projection::open(store.clone(), ModelSignature::pinned()).unwrap();
         let mut vector = [0.; 768];
         vector[0] = 1.;
-        store.write(|tx|{
-            tx.sql().execute("INSERT INTO graph_commits VALUES('test','test','{}','{}','owner','Synthetic startup catch-up','2026-10-26T00:00:00Z')",[])?;
-            tx.sql().execute("INSERT INTO node_versions VALUES('node',1,'test','knowledge','A stable synthetic remembered fact','active',NULL,NULL,NULL,0,'[\"personal\"]')",[])?;
-            tx.put_vector(&VectorWrite{seq:0,target:"node".into(),kind:VectorKind::Node,version:1,current:true,tier:Tier::Hot,embedding:F32Blob::from_values(&vector)?})?;Ok(())
-        }).unwrap();
+        store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO graph_commits VALUES('test','test','{}','{}','owner','Synthetic startup \
+                    catch-up','2026-10-26T00:00:00Z')", [])?;
+                tx.sql().execute("INSERT INTO node_versions VALUES('node',1,'test','knowledge','A stable synthetic remembered \
+                    fact','active',NULL,NULL,NULL,0,'[\"personal\"]')", [])?;
+                tx.put_vector(&VectorWrite {
+                    seq: 0,
+                    target: "node".into(),
+                    kind: VectorKind::Node,
+                    version: 1,
+                    current: true,
+                    tier: Tier::Hot,
+                    embedding: F32Blob::from_values(&vector)?,
+                })?;
+                Ok(())
+            })
+            .unwrap();
         let stop = AtomicBool::new(false);
         projection.rebuild(Tier::Hot, &stop).unwrap();
         let hot = store.data_dir().join("search/hot");

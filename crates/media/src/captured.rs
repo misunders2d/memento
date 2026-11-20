@@ -28,20 +28,24 @@ impl CapturedMedia {
     pub fn discover(&self) -> Result<bool> {
         let (last, projected) = self.queue.graph.store.read(|tx| {
             let cursor: i64 = tx.sql().query_row("SELECT seq FROM captured_media_progress WHERE singleton=1", [], |r| r.get(0))?;
-            let mut statement = tx.sql().prepare("SELECT seq,id,source,kind,CASE WHEN kind IN ('user','assistant','tool') THEN substr(text,1,?2) END,CASE WHEN kind IN ('user','assistant','tool') THEN metadata END FROM episodes WHERE seq>?1 ORDER BY seq LIMIT ?3")?;
+            let mut statement = tx.sql().prepare("SELECT seq,id,source,kind,CASE WHEN kind IN ('user','assistant','tool') THEN \
+                substr(text,1,?2) END,CASE WHEN kind IN ('user','assistant','tool') THEN metadata END FROM \
+                episodes WHERE seq>?1 ORDER BY seq LIMIT ?3")?;
             let mut rows = statement.query(params![cursor, MAX_PROJECTED_CHARS + 1, BATCH])?;
             let mut last = None;
             let mut projected = Vec::new();
             while let Some(row) = rows.next()? {
                 last = Some(row.get::<_, i64>(0)?);
-                let Some(metadata) = row.get::<_, Option<String>>(5)? else { continue };
+                let Some(metadata) = row.get::<_, Option<String>>(5)? else {
+                    continue;
+                };
                 // Only source/kind/text/metadata are consumed by the sole parser.
                 let input: EpisodeInput = serde_json::from_value(json!({
                     "source":row.get::<_,String>(2)?, "kind":row.get::<_,String>(3)?,
                     "text":row.get::<_,String>(4)?, "metadata":serde_json::from_str::<Value>(&metadata)?,
                     "event_id":"", "conversation_id":""
                 }))?;
-                projected.push((row.get::<_,String>(1)?, captured_references(&input)?));
+                projected.push((row.get::<_, String>(1)?, captured_references(&input)?));
             }
             Ok((last, projected))
         })?;
@@ -63,16 +67,30 @@ impl CapturedMedia {
     /// that checks source/target forgetting and the pinned representation identity.
     pub fn admit(&self) -> Result<bool> {
         self.queue.graph.store.write(|tx| {
-            let mut outstanding: i64 = tx.sql().query_row("SELECT count(*) FROM captured_media cm JOIN jobs j ON j.id=cm.job_id WHERE j.state IN ('pending','leased')", [], |r| r.get(0))?;
-            if outstanding >= MAX_AUTOMATIC_JOBS { return Ok(false) }
+            let mut outstanding: i64 = tx.sql().query_row("SELECT count(*) FROM captured_media cm JOIN jobs j ON j.id=cm.job_id WHERE j.state IN \
+                ('pending','leased')", [], |r| r.get(0))?;
+            if outstanding >= MAX_AUTOMATIC_JOBS {
+                return Ok(false);
+            }
             let rows = {
                 let mut statement = tx.sql().prepare("SELECT sha256,kind,filename FROM captured_media WHERE state='ready' ORDER BY rowid LIMIT ?")?;
-                statement.query_map([BATCH], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?
+                statement
+                    .query_map([BATCH], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
             };
             let mut admitted = false;
             for (sha, kind, filename) in rows {
-                if outstanding >= MAX_AUTOMATIC_JOBS { break }
-                let forgotten: bool = tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=?)", [&sha], |r| r.get(0))?;
+                if outstanding >= MAX_AUTOMATIC_JOBS {
+                    break;
+                }
+                let forgotten: bool = tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id \
+                    WHERE m.sha256=?)", [&sha], |r| r.get(0))?;
                 if forgotten {
                     tx.sql().execute("UPDATE captured_media SET state='forgotten',error='forgotten_target' WHERE sha256=?", [&sha])?;
                     continue;
@@ -86,7 +104,16 @@ impl CapturedMedia {
                     Err(error) => return Err(error),
                 };
                 let identity = stage::representation_db(tx.sql(), &kind, &filename)?;
-                let payload = json!({"actor":"memento:captured-media","why":"Index a captured attachment reference","sha256":sha,"kind":kind,"filename":filename,"evidence":[],"scope":[],"captured":true});
+                let payload = json!({
+                    "actor":"memento:captured-media",
+                    "why":"Index a captured attachment reference",
+                    "sha256":sha,
+                    "kind":kind,
+                    "filename":filename,
+                    "evidence":[],
+                    "scope":[],
+                    "captured":true
+                });
                 let job = Queue::insert(tx, &job_key(&sha, &identity)?, "media", &payload)?;
                 // The current active occurrence is checked again by each ingest
                 // unit/final publication; admission records exact quote evidence.

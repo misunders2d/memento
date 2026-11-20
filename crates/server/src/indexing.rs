@@ -13,10 +13,14 @@ use std::{
     },
     time::{Duration, Instant},
 };
-const NODE: &str = "SELECT n.id,'node' AS kind,n.version,n.text,n.type,NULL AS episode_id,NULL AS start,NULL AS end,n.rowid AS position FROM node_versions n WHERE n.state='active' AND n.type<>'media' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id)";
+const NODE: &str = "SELECT n.id,'node' AS kind,n.version,n.text,n.type,NULL AS episode_id,NULL AS start,NULL AS \
+    end,n.rowid AS position FROM node_versions n WHERE n.state='active' AND n.type<>'media' AND \
+    n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT \
+    EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id)";
 fn candidate_source() -> String {
     format!(
-        "SELECT c.id,'candidate' AS kind,1 AS version,c.text,c.type,NULL AS episode_id,NULL AS start,NULL AS end,c.rowid AS position FROM candidates c WHERE {ACTIVE_CANDIDATE}"
+        "SELECT c.id,'candidate' AS kind,1 AS version,c.text,c.type,NULL AS episode_id,NULL AS \
+        start,NULL AS end,c.rowid AS position FROM candidates c WHERE {ACTIVE_CANDIDATE}"
     )
 }
 /// Communicated user/assistant messages: the only raw episodes given vectors.
@@ -37,19 +41,31 @@ macro_rules! message {
 /// Newest message episode in `(?1, ?2]` that still needs chunks or a vector. Episodes
 /// are scanned by seq; membership uses the message index, so no body is read.
 const WALK: &str = concat!(
-    "SELECT e.id,e.seq,EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) AS chunked FROM episodes e WHERE e.seq>?1 AND e.seq<=?2 AND EXISTS(SELECT 1 FROM episodes m INDEXED BY episodes_status_indexable_v2 WHERE m.id=e.id AND ",
+    "SELECT e.id,e.seq,EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) AS chunked \
+    FROM episodes e WHERE e.seq>?1 AND e.seq<=?2 AND EXISTS(SELECT 1 FROM episodes m INDEXED BY \
+    episodes_status_indexable_v2 WHERE m.id=e.id AND ",
     message!("m"),
-    ") AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND (NOT EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) OR EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=x.id AND i.kind='episode' AND i.version=1) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=x.id AND f.version=1 AND f.resolved=0))) ORDER BY e.seq DESC LIMIT 1"
+    ") AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND \
+    f.event_id=e.event_id) AND (NOT EXISTS(SELECT 1 FROM episode_chunks x WHERE \
+    x.episode_id=e.id) OR EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id AND NOT \
+    EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=x.id \
+    AND i.kind='episode' AND i.version=1) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE \
+    f.target=x.id AND f.version=1 AND f.resolved=0))) ORDER BY e.seq DESC LIMIT 1"
 );
 const EPISODE: &str = concat!(
-    "SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,x.episode_id,x.start,x.end,x.rowid AS position FROM episode_chunks x JOIN episodes e INDEXED BY episodes_status_indexable_v2 ON e.id=x.episode_id WHERE ",
+    "SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS \
+    type,x.episode_id,x.start,x.end,x.rowid AS position FROM episode_chunks x JOIN episodes e \
+    INDEXED BY episodes_status_indexable_v2 ON e.id=x.episode_id WHERE ",
     message!("e"),
-    " AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)"
+    " AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND \
+    f.event_id=e.event_id)"
 );
 /// Excluded raw chunks whose vectors predate the message-only rule. Only embeddings
 /// are removed here; `UNUSED` then removes the vectorless chunk rows.
 const RETIRED: &str = concat!(
-    "SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target WHERE i.kind='episode' AND i.seq BETWEEN ?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM episodes e INDEXED BY episodes_status_indexable_v2 WHERE e.id=x.episode_id AND ",
+    "SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target WHERE \
+    i.kind='episode' AND i.seq BETWEEN ?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM episodes e \
+    INDEXED BY episodes_status_indexable_v2 WHERE e.id=x.episode_id AND ",
     message!("e"),
     ")"
 );
@@ -57,9 +73,13 @@ const RETIRED: &str = concat!(
 /// Literal hits fall back to an episode span; cited or shown chunks stay references.
 /// Mirrors the `episode_chunks_no_DELETE_v2` trigger, which refuses every other delete.
 const UNUSED: &str = concat!(
-    "SELECT x.id FROM episode_chunks x WHERE x.rowid BETWEEN ?1 AND ?2 AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=x.episode_id) AND NOT EXISTS(SELECT 1 FROM episodes m INDEXED BY episodes_status_indexable_v2 WHERE m.id=x.episode_id AND ",
+    "SELECT x.id FROM episode_chunks x WHERE x.rowid BETWEEN ?1 AND ?2 AND EXISTS(SELECT 1 FROM \
+    episodes e WHERE e.id=x.episode_id) AND NOT EXISTS(SELECT 1 FROM episodes m INDEXED BY \
+    episodes_status_indexable_v2 WHERE m.id=x.episode_id AND ",
     message!("m"),
-    ") AND NOT EXISTS(SELECT 1 FROM vector_items i WHERE i.target=x.id) AND NOT EXISTS(SELECT 1 FROM node_stats s WHERE s.node_id=x.id) AND x.id NOT IN (SELECT q.target FROM query_feedback q WHERE q.target IS NOT NULL)"
+    ") AND NOT EXISTS(SELECT 1 FROM vector_items i WHERE i.target=x.id) AND NOT EXISTS(SELECT 1 \
+    FROM node_stats s WHERE s.node_id=x.id) AND x.id NOT IN (SELECT q.target FROM \
+    query_feedback q WHERE q.target IS NOT NULL)"
 );
 const RETIRE_BATCH: i64 = 512;
 pub(crate) fn sources() -> [(String, &'static str); 3] {
@@ -127,7 +147,20 @@ impl Indexer {
         if spans.is_empty() {
             spans.push((0, 0));
         }
-        self.store.write(|tx|{let exists:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks WHERE episode_id=?1) OR EXISTS(SELECT 1 FROM episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE e.id=?1)",[id],|r|r.get(0))?;if !exists{for(start,end)in &spans{let chunk=format!("e_{}",&raw::sha256(format!("{id}:{start}:{end}").as_bytes())[..32]);tx.sql().execute("INSERT INTO episode_chunks VALUES(?,?,?,?)",params![chunk,id,start,end])?;}}Ok(())})?;
+        self.store.write(|tx| {
+            let exists: bool = tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM episode_chunks WHERE episode_id=?1) OR EXISTS(SELECT 1 FROM \
+                episodes e JOIN forgotten_sources f ON f.source=e.source AND f.event_id=e.event_id WHERE \
+                e.id=?1)", [id], |r| r.get(0))?;
+            if !exists {
+                for (start, end) in &spans {
+                    let chunk =
+                        format!("e_{}", &raw::sha256(format!("{id}:{start}:{end}").as_bytes())[..32]);
+                    tx.sql()
+                        .execute("INSERT INTO episode_chunks VALUES(?,?,?,?)", params![chunk, id, start, end])?;
+                }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
     /// Next raw chunk, newest message episode first.
@@ -146,9 +179,12 @@ impl Indexer {
             if !chunked {
                 self.prepare(&id)?;
             }
-            let chunk = self.store.read(|tx| {
-                records::one(tx.sql(), &format!("SELECT a.* FROM ({EPISODE}) a WHERE a.episode_id=? AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND f.version=a.version AND f.resolved=0) ORDER BY a.start LIMIT 1"), [&id])
-            })?;
+            let chunk = self
+                .store
+                .read(|tx| records::one(tx.sql(), &format!("SELECT a.* FROM ({EPISODE}) a WHERE a.episode_id=? AND NOT EXISTS(SELECT 1 FROM \
+                    vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND \
+                    i.version=a.version) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND \
+                    f.version=a.version AND f.resolved=0) ORDER BY a.start LIMIT 1"), [&id]))?;
             if chunk.is_some() {
                 return Ok(chunk);
             }
@@ -185,9 +221,27 @@ impl Indexer {
             .cursors
             .lock()
             .map_err(|_| Error::Unavailable("Index cursor is unavailable"))?;
-        let ordered = self.store.read(|tx|{
-            for(source,_)in sources(){if let Some(row)=records::one(tx.sql(),&format!("SELECT a.* FROM ({source}) a JOIN index_failures f ON f.target=a.id AND f.version=a.version WHERE f.resolved=0 AND f.next_attempt<=? AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version) ORDER BY f.next_attempt LIMIT 1"),[timestamp()])?{return Ok(Some(row));}}
-            for(index,(source,table))in sources().iter().take(2).enumerate(){let row=records::one(tx.sql(),&format!("SELECT a.* FROM ({source}) a WHERE a.position>? AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND i.version=a.version) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND f.version=a.version AND f.resolved=0) ORDER BY a.position LIMIT 1"),[cursors[index]])?;if let Some(row)=row{return Ok(Some(row));}cursors[index]=tx.sql().query_row(&format!("SELECT coalesce(max(rowid),0) FROM {table}"),[],|r|r.get(0))?;}
+        let ordered = self.store.read(|tx| {
+            for (source, _) in sources() {
+                if let Some(row) = records::one(tx.sql(), &format!("SELECT a.* FROM ({source}) a JOIN index_failures f ON f.target=a.id AND f.version=a.version \
+                    WHERE f.resolved=0 AND f.next_attempt<=? AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN \
+                    vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND \
+                    i.version=a.version) ORDER BY f.next_attempt LIMIT 1"), [timestamp()])? {
+                    return Ok(Some(row));
+                }
+            }
+            for (index, (source, table)) in sources().iter().take(2).enumerate() {
+                let row = records::one(tx.sql(), &format!("SELECT a.* FROM ({source}) a WHERE a.position>? AND NOT EXISTS(SELECT 1 FROM vector_items i \
+                    JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=a.id AND i.kind=a.kind AND \
+                    i.version=a.version) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=a.id AND \
+                    f.version=a.version AND f.resolved=0) ORDER BY a.position LIMIT 1"), [cursors[index]])?;
+                if let Some(row) = row {
+                    return Ok(Some(row));
+                }
+                cursors[index] = tx
+                    .sql()
+                    .query_row(&format!("SELECT coalesce(max(rowid),0) FROM {table}"), [], |r| r.get(0))?;
+            }
             Ok(None)
         })?;
         drop(cursors);
@@ -260,18 +314,108 @@ impl Indexer {
         Ok(true)
     }
     fn failed(&self, row: &Value) -> Result<()> {
-        self.store.write(|tx|{let attempts=tx.sql().query_row("SELECT attempts FROM index_failures WHERE target=? AND version=?",params![row["id"].as_str(),row["version"].as_i64()],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(0)+1;let next=timestamp()+(5.*2f64.powi((attempts-1).min(10)as i32)).min(3600.);tx.sql().execute("INSERT INTO index_failures VALUES(?,?,?,?,?,0) ON CONFLICT(target,version) DO UPDATE SET attempts=excluded.attempts,error=excluded.error,next_attempt=excluded.next_attempt,resolved=0",params![row["id"].as_str(),row["version"].as_i64(),attempts,"NativeEncodingError",next])?;Ok(())})
+        self.store.write(|tx| {
+            let attempts = tx
+                .sql()
+                .query_row(
+                    "SELECT attempts FROM index_failures WHERE target=? AND version=?",
+                    params![row["id"].as_str(), row["version"].as_i64()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0)
+                + 1;
+            let next = timestamp() + (5. * 2f64.powi((attempts - 1).min(10) as i32)).min(3600.);
+            tx.sql().execute(
+                "INSERT INTO index_failures VALUES(?,?,?,?,?,0) ON CONFLICT(target,version) DO UPDATE SET \
+                    attempts=excluded.attempts,error=excluded.error,next_attempt=excluded.next_attempt,resolved=0",
+                params![
+                    row["id"].as_str(),
+                    row["version"].as_i64(),
+                    attempts,
+                    "NativeEncodingError",
+                    next
+                ],
+            )?;
+            Ok(())
+        })
     }
     fn entity_hints(&self, row: &Value, vector: &[f32; 768]) -> Result<Vec<Value>> {
-        let eligible=self.store.read(|tx|Ok(tx.sql().query_row(&format!("SELECT EXISTS(SELECT 1 FROM candidates c WHERE c.id=? AND c.kind='entity' AND {ACTIVE_CANDIDATE})"),[row["id"].as_str()],|r|r.get::<_,bool>(0))?))?;
+        let eligible = self.store.read(|tx| {
+            Ok(tx
+                .sql()
+                .query_row(&format!("SELECT EXISTS(SELECT 1 FROM candidates c WHERE c.id=? AND c.kind='entity' AND {ACTIVE_CANDIDATE})"), [row["id"].as_str()], |r| {
+                    r.get::<_, bool>(0)
+                })?)
+        })?;
         if !eligible {
             return Ok(Vec::new());
         }
-        let result=self.projection.snapshot_until(true,false,Instant::now()+Duration::from_secs(2),|tx,view|{
-            let mut found=Vec::new();for node in domain::recall_keywords(tx.sql(),row["text"].as_str().unwrap(),20,None)?{if node["type"]!=row["type"] {continue;}let bytes:Option<Vec<u8>>=tx.sql().query_row("SELECT b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind='node' AND i.version=? AND b.current=1",params![node["id"].as_str(),node["version"].as_i64()],|r|r.get(0)).optional()?;let cosine=bytes.map(F32Blob::from_bytes).transpose()?.map(|b|b.values().iter().zip(vector).map(|(a,b)|*a as f64* *b as f64).sum::<f64>().clamp(-1.,1.));found.push(json!({"target":node["id"],"version":node["version"],"cosine":cosine,"name_match":1}));}
-            for hit in view.search(Tier::Hot,vector,5,"node",Pool::Entity,None,row["type"].as_str())? {if hit.cosine>=0.78&&!found.iter().any(|v|v["target"]==hit.target){found.push(json!({"target":hit.target,"version":hit.version,"cosine":hit.cosine,"name_match":0}));}}
-            found.sort_by(|a,b|b["name_match"].as_i64().cmp(&a["name_match"].as_i64()).then_with(||b["cosine"].as_f64().unwrap_or(-1.).total_cmp(&a["cosine"].as_f64().unwrap_or(-1.))).then_with(||a["target"].as_str().cmp(&b["target"].as_str())));found.truncate(5);Ok(found)
-        });
+        let result = self.projection.snapshot_until(
+            true,
+            false,
+            Instant::now() + Duration::from_secs(2),
+            |tx, view| {
+                let mut found = Vec::new();
+                for node in
+                    domain::recall_keywords(tx.sql(), row["text"].as_str().unwrap(), 20, None)?
+                {
+                    if node["type"] != row["type"] {
+                        continue;
+                    }
+                    let bytes: Option<Vec<u8>> = tx
+                        .sql()
+                        .query_row(
+                            "SELECT b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? \
+                                AND i.kind='node' AND i.version=? AND b.current=1",
+                            params![node["id"].as_str(), node["version"].as_i64()],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let cosine = bytes.map(F32Blob::from_bytes).transpose()?.map(|b| {
+                        b.values()
+                            .iter()
+                            .zip(vector)
+                            .map(|(a, b)| *a as f64 * *b as f64)
+                            .sum::<f64>()
+                            .clamp(-1., 1.)
+                    });
+                    found.push(json!({"target":node["id"],"version":node["version"],"cosine":cosine,"name_match":1}));
+                }
+                for hit in view.search(
+                    Tier::Hot,
+                    vector,
+                    5,
+                    "node",
+                    Pool::Entity,
+                    None,
+                    row["type"].as_str(),
+                )? {
+                    if hit.cosine >= 0.78 && !found.iter().any(|v| v["target"] == hit.target) {
+                        found.push(json!({
+                            "target":hit.target,
+                            "version":hit.version,
+                            "cosine":hit.cosine,
+                            "name_match":0
+                        }));
+                    }
+                }
+                found.sort_by(|a, b| {
+                    b["name_match"]
+                        .as_i64()
+                        .cmp(&a["name_match"].as_i64())
+                        .then_with(|| {
+                            b["cosine"]
+                                .as_f64()
+                                .unwrap_or(-1.)
+                                .total_cmp(&a["cosine"].as_f64().unwrap_or(-1.))
+                        })
+                        .then_with(|| a["target"].as_str().cmp(&b["target"].as_str()))
+                });
+                found.truncate(5);
+                Ok(found)
+            },
+        );
         match result {
             Err(Error::Unavailable(_)) => Ok(Vec::new()),
             other => other,
@@ -328,11 +472,12 @@ fn retire_batch(store: &Store, from: i64) -> Result<(i64, Option<i64>)> {
     // Episode kind/metadata and chunk rows are immutable, so a read scan stays
     // valid for the write; the writer is taken only to delete.
     let (scanned, last, seqs) = store.read(|tx| {
-        let (scanned, last) = tx.sql().query_row(
-            "SELECT count(*),max(seq) FROM (SELECT i.seq FROM vector_items i WHERE i.kind='episode' AND i.seq>=?1 ORDER BY i.seq LIMIT ?2)",
-            params![from, RETIRE_BATCH],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
-        )?;
+        let (scanned, last) =
+            tx.sql()
+                .query_row("SELECT count(*),max(seq) FROM (SELECT i.seq FROM vector_items i WHERE i.kind='episode' AND \
+                    i.seq>=?1 ORDER BY i.seq LIMIT ?2)", params![from, RETIRE_BATCH], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+                })?;
         let Some(last) = last else {
             return Ok((0, from, Vec::new()));
         };
@@ -368,11 +513,12 @@ fn retire_batch(store: &Store, from: i64) -> Result<(i64, Option<i64>)> {
 /// start; deleted rows are simply gone. Same cursor contract as `retire_batch`.
 fn retire_chunks(store: &Store, from: i64) -> Result<(i64, Option<i64>)> {
     let (scanned, last, ids) = store.read(|tx| {
-        let (scanned, last) = tx.sql().query_row(
-            "SELECT count(*),max(rowid) FROM (SELECT rowid FROM episode_chunks WHERE rowid>=?1 ORDER BY rowid LIMIT ?2)",
-            params![from, RETIRE_BATCH],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
-        )?;
+        let (scanned, last) =
+            tx.sql()
+                .query_row("SELECT count(*),max(rowid) FROM (SELECT rowid FROM episode_chunks WHERE rowid>=?1 ORDER BY \
+                    rowid LIMIT ?2)", params![from, RETIRE_BATCH], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+                })?;
         let Some(last) = last else {
             return Ok((0, from, Vec::new()));
         };
@@ -387,7 +533,8 @@ fn retire_chunks(store: &Store, from: i64) -> Result<(i64, Option<i64>)> {
         // a citation committed since the scan keeps its chunk.
         store.write(|tx| {
             for id in &ids {
-                if tx.sql().execute("DELETE FROM episode_chunks WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM node_stats s WHERE s.node_id=?1) AND NOT EXISTS(SELECT 1 FROM vector_items i WHERE i.target=?1)", [id])? == 1 {
+                if tx.sql().execute("DELETE FROM episode_chunks WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM node_stats s WHERE \
+                    s.node_id=?1) AND NOT EXISTS(SELECT 1 FROM vector_items i WHERE i.target=?1)", [id])? == 1 {
                     tx.sql().execute("DELETE FROM index_failures WHERE target=?", [id])?;
                 }
             }
@@ -402,20 +549,120 @@ fn retire_chunks(store: &Store, from: i64) -> Result<(i64, Option<i64>)> {
     Ok((scanned, next))
 }
 fn commit_index(store: &Store, row: &Value, vector: &[f32; 768], hints: &[Value]) -> Result<()> {
-    store.write(|tx|{
-            if !still_indexable(tx.sql(),row)? {return Ok(());}
-            let exists:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind=? AND i.version=?)",params![row["id"].as_str(),row["kind"].as_str(),row["version"].as_i64()],|r|r.get(0))?;
-            if !exists {let existing:Option<i64>=tx.sql().query_row("SELECT seq FROM vector_items WHERE target=? AND kind=? AND version=?",params![row["id"].as_str(),row["kind"].as_str(),row["version"].as_i64()],|r|r.get(0)).optional()?;let seq=match existing{Some(seq)=>seq,None=>{tx.sql().execute("INSERT INTO vector_items(target,kind,version) VALUES(?,?,?)",params![row["id"].as_str(),row["kind"].as_str(),row["version"].as_i64()])?;tx.sql().last_insert_rowid()}};
-                let tier=if row["kind"]=="episode"{Tier::Cold}else{Tier::Hot};
-                tx.put_vector(&VectorWrite{seq,target:row["id"].as_str().unwrap().into(),kind:match row["kind"].as_str(){Some("node")=>VectorKind::Node,Some("candidate")=>VectorKind::Candidate,_=>VectorKind::Episode},version:row["version"].as_i64().unwrap(),embedding:F32Blob::from_values(vector)?,current:true,tier})?;
+    store.write(|tx| {
+        if !still_indexable(tx.sql(), row)? {
+            return Ok(());
+        }
+        let exists: bool = tx.sql().query_row(
+            "SELECT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE \
+                i.target=? AND i.kind=? AND i.version=?)",
+            params![
+                row["id"].as_str(),
+                row["kind"].as_str(),
+                row["version"].as_i64()
+            ],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            let existing: Option<i64> = tx
+                .sql()
+                .query_row(
+                    "SELECT seq FROM vector_items WHERE target=? AND kind=? AND version=?",
+                    params![
+                        row["id"].as_str(),
+                        row["kind"].as_str(),
+                        row["version"].as_i64()
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let seq = match existing {
+                Some(seq) => seq,
+                None => {
+                    tx.sql().execute(
+                        "INSERT INTO vector_items(target,kind,version) VALUES(?,?,?)",
+                        params![
+                            row["id"].as_str(),
+                            row["kind"].as_str(),
+                            row["version"].as_i64()
+                        ],
+                    )?;
+                    tx.sql().last_insert_rowid()
+                }
+            };
+            let tier = if row["kind"] == "episode" {
+                Tier::Cold
+            } else {
+                Tier::Hot
+            };
+            tx.put_vector(&VectorWrite {
+                seq,
+                target: row["id"].as_str().unwrap().into(),
+                kind: match row["kind"].as_str() {
+                    Some("node") => VectorKind::Node,
+                    Some("candidate") => VectorKind::Candidate,
+                    _ => VectorKind::Episode,
+                },
+                version: row["version"].as_i64().unwrap(),
+                embedding: F32Blob::from_values(vector)?,
+                current: true,
+                tier,
+            })?;
+        }
+        if row["kind"] == "candidate" {
+            for hint in hints {
+                let valid: bool = tx.sql().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM node_versions n WHERE n.id=? AND n.version=? AND n.type=? AND \
+                        n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) \
+                        AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id))",
+                    params![
+                        hint["target"].as_str(),
+                        hint["version"].as_i64(),
+                        row["type"].as_str()
+                    ],
+                    |r| r.get(0),
+                )?;
+                if valid {
+                    tx.sql().execute(
+                        "INSERT OR IGNORE INTO candidate_entity_matches VALUES(?,?,?,?,?,?,?,?)",
+                        params![
+                            row["id"].as_str(),
+                            hint["target"].as_str(),
+                            hint["version"].as_i64(),
+                            hint["cosine"].as_f64(),
+                            hint["name_match"].as_i64(),
+                            format!(
+                                "native-indexer/{}@{}",
+                                memento_core::MODEL_ID,
+                                memento_core::MODEL_REVISION
+                            ),
+                            "Tentative name/vector association only; no identity merge or primary assertion",
+                            memento_core::now_utc()
+                        ],
+                    )?;
+                }
             }
-            if row["kind"]=="candidate" {for hint in hints{let valid:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM node_versions n WHERE n.id=? AND n.version=? AND n.type=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id))",params![hint["target"].as_str(),hint["version"].as_i64(),row["type"].as_str()],|r|r.get(0))?;if valid{tx.sql().execute("INSERT OR IGNORE INTO candidate_entity_matches VALUES(?,?,?,?,?,?,?,?)",params![row["id"].as_str(),hint["target"].as_str(),hint["version"].as_i64(),hint["cosine"].as_f64(),hint["name_match"].as_i64(),format!("native-indexer/{}@{}",memento_core::MODEL_ID,memento_core::MODEL_REVISION),"Tentative name/vector association only; no identity merge or primary assertion",memento_core::now_utc()])?;}}}
-            tx.sql().execute("UPDATE index_failures SET resolved=1 WHERE target=? AND version=?",params![row["id"].as_str(),row["version"].as_i64()])?;Ok(())
-        })
+        }
+        tx.sql().execute(
+            "UPDATE index_failures SET resolved=1 WHERE target=? AND version=?",
+            params![row["id"].as_str(), row["version"].as_i64()],
+        )?;
+        Ok(())
+    })
 }
 fn still_indexable(db: &Connection, row: &Value) -> Result<bool> {
     for (source, _) in sources() {
-        let eligible=db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM ({source}) a WHERE a.id=? AND a.kind=? AND a.version=? AND (a.text IS NULL OR a.text=?))"),params![row["id"].as_str(),row["kind"].as_str(),row["version"].as_i64(),row["text"].as_str()],|r|r.get::<_,bool>(0))?;
+        let eligible = db.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM ({source}) a WHERE a.id=? AND a.kind=? AND a.version=? AND \
+                (a.text IS NULL OR a.text=?))"),
+            params![
+                row["id"].as_str(),
+                row["kind"].as_str(),
+                row["version"].as_i64(),
+                row["text"].as_str()
+            ],
+            |r| r.get::<_, bool>(0),
+        )?;
         if eligible {
             return Ok(true);
         }
@@ -430,7 +677,19 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Arc<Store>, Graph, String) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
-        let source=store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"one","conversation_id":"thread","kind":"user","text":"Original exact source for revision tests","metadata":{}})).unwrap()).unwrap();
+        let source = store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"one",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":"Original exact source for revision tests",
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let graph = Graph::new(store.clone());
         (dir, store, graph, source.id)
     }
@@ -455,17 +714,40 @@ mod tests {
             &[],
         )
         .unwrap();
-        store.read(|tx|{
-            let (tier,bytes):(String,Vec<u8>)=tx.sql().query_row("SELECT b.tier,b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target='fresh-chunk'",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            assert_eq!(tier,"cold");assert_eq!(bytes,F32Blob::from_values(&vector)?.as_bytes());
-            assert_eq!(tx.sql().query_row("SELECT count(*) FROM historical_parking",[],|r|r.get::<_,i64>(0))?,0);
-            Ok(())
-        }).unwrap();
+        store
+            .read(|tx| {
+                let (tier, bytes): (String, Vec<u8>) =
+                    tx.sql()
+                        .query_row("SELECT b.tier,b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE \
+                            i.target='fresh-chunk'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                assert_eq!(tier, "cold");
+                assert_eq!(bytes, F32Blob::from_values(&vector)?.as_bytes());
+                assert_eq!(
+                    tx.sql()
+                        .query_row("SELECT count(*) FROM historical_parking", [], |r| r.get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
     }
     #[test]
     fn native_index_commit_is_idempotent_and_revalidates_old_version_after_encoding() {
         let (_dir, store, graph, episode) = fixture();
-        let saved=graph.remember(serde_json::from_value(json!({"command_id":"save","actor":"owner","why":"Grounded source","type":"knowledge","text":"Original assertion","scope":["personal"],"evidence":[{"episode_id":episode,"quote":"Original exact source"}]})).unwrap()).unwrap();
+        let saved = graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":"save",
+                    "actor":"owner",
+                    "why":"Grounded source",
+                    "type":"knowledge",
+                    "text":"Original assertion",
+                    "scope":["personal"],
+                    "evidence":[{"episode_id":episode,"quote":"Original exact source"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let row = json!({"id":saved["id"],"kind":"node","version":1,"text":"Original assertion"});
         let mut vector = [0f32; 768];
         vector[0] = 1.;
@@ -487,7 +769,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(bytes, F32Blob::from_values(&vector).unwrap().as_bytes());
-        graph.supersede(serde_json::from_value(json!({"command_id":"correct","actor":"owner","why":"Exact supported correction","old":saved["id"],"kind":"correction","new":{"type":"knowledge","text":"Corrected assertion","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":"revision tests"}]})).unwrap()).unwrap();
+        graph
+            .supersede(
+                serde_json::from_value(json!({
+                    "command_id":"correct",
+                    "actor":"owner",
+                    "why":"Exact supported correction",
+                    "old":saved["id"],
+                    "kind":"correction",
+                    "new":{"type":"knowledge","text":"Corrected assertion","scope":["personal"]},
+                    "evidence":[{"episode_id":episode,"quote":"revision tests"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         // A vector encoded before the replacement cannot overwrite/recreate a stale unit.
         let stale = json!({"id":saved["id"],"kind":"node","version":1,"text":"Original assertion"});
         let mut changed = [0f32; 768];
@@ -507,13 +802,58 @@ mod tests {
     #[test]
     fn forgotten_source_before_index_commit_excludes_candidate_without_creating_a_vector() {
         let (_dir, store, graph, episode) = fixture();
-        store.command(&domain::context("extract".into(),"model-fixture".into(),"Synthetic candidate".into()),&json!({"kind":"fixture"}),|tx,commit|{tx.sql().execute("INSERT INTO extraction_runs VALUES('run',?,?,'extract-v2','native','[]','{}',?)",params![commit,episode,memento_core::now_utc()])?;tx.sql().execute("INSERT INTO candidates(id,run_id,kind,type,text,confidence,why,scope) VALUES('candidate','run','memory','knowledge','Tentative source fact',0.8,'Exact synthetic source','[\"personal\"]')",[])?;Ok(json!({}))}).unwrap();
-        let row = json!({"id":"candidate","kind":"candidate","version":1,"text":"Tentative source fact","type":"knowledge"});
-        let carrier=graph.remember(serde_json::from_value(json!({"command_id":"carrier","actor":"owner","why":"Exact carrier evidence","type":"knowledge","text":"Source carrier assertion","scope":["personal"],"evidence":[{"episode_id":episode,"quote":"Original exact source"}]})).unwrap()).unwrap();
+        store
+            .command(
+                &domain::context("extract".into(), "model-fixture".into(), "Synthetic candidate".into()),
+                &json!({"kind":"fixture"}),
+                |tx, commit| {
+                    tx.sql().execute(
+                        "INSERT INTO extraction_runs VALUES('run',?,?,'extract-v2','native','[]','{}',?)",
+                        params![commit, episode, memento_core::now_utc()],
+                    )?;
+                    tx.sql().execute("INSERT INTO candidates(id,run_id,kind,type,text,confidence,why,scope) \
+                        VALUES('candidate','run','memory','knowledge','Tentative source fact',0.8,'Exact synthetic \
+                        source','[\"personal\"]')", [])?;
+                    Ok(json!({}))
+                },
+            )
+            .unwrap();
+        let row = json!({
+            "id":"candidate",
+            "kind":"candidate",
+            "version":1,
+            "text":"Tentative source fact",
+            "type":"knowledge"
+        });
+        let carrier = graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":"carrier",
+                    "actor":"owner",
+                    "why":"Exact carrier evidence",
+                    "type":"knowledge",
+                    "text":"Source carrier assertion",
+                    "scope":["personal"],
+                    "evidence":[{"episode_id":episode,"quote":"Original exact source"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let preview = graph
             .forget_preview(carrier["id"].as_str().unwrap())
             .unwrap();
-        graph.forget(serde_json::from_value(json!({"command_id":"forget","actor":"owner","why":"Explicit synthetic privacy fence","target":carrier["id"],"token":preview["token"]})).unwrap()).unwrap();
+        graph
+            .forget(
+                serde_json::from_value(json!({
+                    "command_id":"forget",
+                    "actor":"owner",
+                    "why":"Explicit synthetic privacy fence",
+                    "target":carrier["id"],
+                    "token":preview["token"]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let mut vector = [0f32; 768];
         vector[0] = 1.;
         commit_index(&store, &row, &vector, &[]).unwrap();
@@ -542,9 +882,12 @@ pub fn status(
     // episode branch is qualified before chunk expansion, while segment source
     // membership belongs to its parent node. DISTINCT keeps unit counts exact.
     let prefix = if source.is_some() {
-        "source_targets AS MATERIALIZED (SELECT DISTINCT g.target FROM episodes e INDEXED BY episodes_status_cover_v1 CROSS JOIN graph_evidence g WHERE e.source=?1 AND g.episode_id=e.id)"
+        "source_targets AS MATERIALIZED (SELECT DISTINCT g.target FROM episodes e INDEXED BY \
+            episodes_status_cover_v1 CROSS JOIN graph_evidence g WHERE e.source=?1 AND \
+            g.episode_id=e.id)"
     } else {
-        "forgotten_episode_ids AS MATERIALIZED (SELECT DISTINCT e.id FROM forgotten_sources f CROSS JOIN episodes e WHERE e.source=f.source AND e.event_id=f.event_id)"
+        "forgotten_episode_ids AS MATERIALIZED (SELECT DISTINCT e.id FROM forgotten_sources f CROSS \
+            JOIN episodes e WHERE e.source=f.source AND e.event_id=f.event_id)"
     };
     let membership = |target: &str| {
         if source.is_some() {
@@ -559,7 +902,8 @@ pub fn status(
             concat!(
                 "e.source=?1 AND ",
                 message!("e"),
-                " AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)"
+                " AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND \
+                f.event_id=e.event_id)"
             ),
         )
     } else {
@@ -576,7 +920,23 @@ pub fn status(
     // unprepared_episodes; absent/current=0 embeddings remain pending or failed.
     // No intermediate per-unit state table or repeated episode anti-join is needed.
     let sql = format!(
-        "WITH {prefix},indexable AS (SELECT n.id,'node' AS kind,n.version,n.id AS rank_target FROM node_versions n WHERE n.state='active' AND n.type<>'media' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {nodes} UNION ALL SELECT c.id,'candidate',1,c.id FROM candidates c WHERE {ACTIVE_CANDIDATE} AND {candidates} UNION ALL SELECT x.id,'episode',1,x.id FROM episodes e INDEXED BY {episode_index} LEFT JOIN episode_chunks x ON x.episode_id=e.id WHERE {episode_filter} UNION ALL SELECT s.id,'segment',1,n.id FROM segments s JOIN node_versions n ON n.id=s.node_id WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {visible} AND {nodes}) SELECT count(a.id) AS total,coalesce(sum(b.seq IS NOT NULL),0) AS indexed,coalesce(sum(a.id IS NOT NULL AND b.seq IS NULL AND f.target IS NULL),0) AS pending,coalesce(sum(a.id IS NOT NULL AND b.seq IS NULL AND f.target IS NOT NULL),0) AS failed,coalesce(sum(a.id IS NULL),0) AS unprepared_episodes FROM indexable a LEFT JOIN vector_items i ON i.target=a.id AND i.kind=a.kind AND i.version=a.version LEFT JOIN vector_blobs b INDEXED BY vector_blobs_status_current_v1 ON b.seq=i.seq AND b.current=1 LEFT JOIN index_failures f ON f.target=a.id AND f.version=a.version AND f.resolved=0",
+        "WITH {prefix},indexable AS (SELECT n.id,'node' AS kind,n.version,n.id AS rank_target FROM \
+            node_versions n WHERE n.state='active' AND n.type<>'media' AND n.version=(SELECT \
+            max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM \
+            forgotten_targets f WHERE f.target=n.id) AND {nodes} UNION ALL SELECT \
+            c.id,'candidate',1,c.id FROM candidates c WHERE {ACTIVE_CANDIDATE} AND {candidates} UNION \
+            ALL SELECT x.id,'episode',1,x.id FROM episodes e INDEXED BY {episode_index} LEFT JOIN \
+            episode_chunks x ON x.episode_id=e.id WHERE {episode_filter} UNION ALL SELECT \
+            s.id,'segment',1,n.id FROM segments s JOIN node_versions n ON n.id=s.node_id WHERE \
+            n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) \
+            AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {visible} AND \
+            {nodes}) SELECT count(a.id) AS total,coalesce(sum(b.seq IS NOT NULL),0) AS \
+            indexed,coalesce(sum(a.id IS NOT NULL AND b.seq IS NULL AND f.target IS NULL),0) AS \
+            pending,coalesce(sum(a.id IS NOT NULL AND b.seq IS NULL AND f.target IS NOT NULL),0) AS \
+            failed,coalesce(sum(a.id IS NULL),0) AS unprepared_episodes FROM indexable a LEFT JOIN \
+            vector_items i ON i.target=a.id AND i.kind=a.kind AND i.version=a.version LEFT JOIN \
+            vector_blobs b INDEXED BY vector_blobs_status_current_v1 ON b.seq=i.seq AND b.current=1 \
+            LEFT JOIN index_failures f ON f.target=a.id AND f.version=a.version AND f.resolved=0",
         nodes = membership("n.id"),
         candidates = membership("c.id"),
         visible = memento_ann::eligibility::visible_sql("n.id")
@@ -588,7 +948,16 @@ pub fn status(
 }
 /// Live worker/search readiness, independent of the unit counts.
 pub fn live_fields(error: bool, hot_ready: bool, cold_ready: bool) -> Value {
-    json!({"available":true,"error":if error {Some("NativeIndexingError")}else{None},"search":{"engine":"qdrant-edge","ready":hot_ready,"cold_ready":cold_ready,"error":if hot_ready {None}else{Some("not_ready")}}})
+    json!({
+        "available":true,
+        "error":if error {Some("NativeIndexingError")}else{None},
+        "search": {
+            "engine":"qdrant-edge",
+            "ready":hot_ready,
+            "cold_ready":cold_ready,
+            "error":if hot_ready {None}else{Some("not_ready")}
+        }
+    })
 }
 #[cfg(test)]
 mod status_tests {
@@ -599,14 +968,41 @@ mod status_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         let graph = Graph::new(store.clone());
-        let source=store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"status","conversation_id":"thread","kind":"user","text":"Known source quote","metadata":{}})).unwrap()).unwrap();
+        let source = store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"status",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":"Known source quote",
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let mut saved = Vec::new();
         for key in ["indexed", "pending"] {
-            saved.push(graph.remember(serde_json::from_value(json!({"command_id":key,"actor":"owner","why":"Exact status fixture","type":"knowledge","text":format!("{key} source assertion"),"scope":["personal"],"evidence":[{"episode_id":source.id,"quote":"Known source quote"}]})).unwrap()).unwrap());
+            saved.push(
+                graph
+                    .remember(
+                        serde_json::from_value(json!({
+                            "command_id":key,
+                            "actor":"owner",
+                            "why":"Exact status fixture",
+                            "type":"knowledge",
+                            "text":format!("{key} source assertion"),
+                            "scope":["personal"],
+                            "evidence":[{"episode_id":source.id,"quote":"Known source quote"}]
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap(),
+            );
         }
         let mut vector = [0f32; 768];
         vector[0] = 1.;
-        commit_index(&store,&json!({"id":saved[0]["id"],"kind":"node","version":1,"text":"indexed source assertion"}),&vector,&[]).unwrap();
+        commit_index(&store, &json!({"id":saved[0]["id"],"kind":"node","version":1,"text":"indexed source assertion"}), &vector, &[]).unwrap();
         store
             .read(|tx| {
                 let actual = status(tx.sql(), Some("synthetic"), false, true, false)?;
@@ -629,7 +1025,20 @@ mod status_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         let capture = |event: &str, kind: &str, metadata: Value| {
-            store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":event,"conversation_id":"thread","kind":kind,"text":format!("Text {event}"),"metadata":metadata})).unwrap()).unwrap().id
+            store
+                .capture(
+                    serde_json::from_value(json!({
+                        "source":"synthetic",
+                        "event_id":event,
+                        "conversation_id":"thread",
+                        "kind":kind,
+                        "text":format!("Text {event}"),
+                        "metadata":metadata
+                    }))
+                    .unwrap(),
+                )
+                .unwrap()
+                .id
         };
         let old = capture("old", "user", json!({}));
         let mid = capture("mid", "assistant", json!({}));
@@ -728,7 +1137,20 @@ mod status_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         let capture = |event: &str, kind: &str, text: &str, metadata: Value| {
-            store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":event,"conversation_id":"thread","kind":kind,"text":text,"metadata":metadata})).unwrap()).unwrap().id
+            store
+                .capture(
+                    serde_json::from_value(json!({
+                        "source":"synthetic",
+                        "event_id":event,
+                        "conversation_id":"thread",
+                        "kind":kind,
+                        "text":text,
+                        "metadata":metadata
+                    }))
+                    .unwrap(),
+                )
+                .unwrap()
+                .id
         };
         let episodes = [
             capture("user", "user", "Human message", json!({})),
@@ -824,14 +1246,26 @@ mod status_tests {
         };
         let before = events(&store);
         assert_eq!(retire_batch(&store, i64::MIN).unwrap(), (5, None));
-        store.read(|tx| {
-            let mut query = tx.sql().prepare("SELECT i.target FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq ORDER BY i.target")?;
-            let kept = query.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
-            assert_eq!(kept, ["chunk-0", "chunk-1"]);
-            assert_eq!(tx.sql().query_row("SELECT count(*) FROM vector_items",[],|r|r.get::<_,i64>(0))?, 2);
-            assert_eq!(tx.sql().query_row("SELECT count(*) FROM episode_chunks",[],|r|r.get::<_,i64>(0))?, 5);
-            Ok(())
-        }).unwrap();
+        store
+            .read(|tx| {
+                let mut query = tx.sql().prepare("SELECT i.target FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq ORDER BY i.target")?;
+                let kept = query
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(kept, ["chunk-0", "chunk-1"]);
+                assert_eq!(
+                    tx.sql()
+                        .query_row("SELECT count(*) FROM vector_items", [], |r| r.get::<_, i64>(0))?,
+                    2
+                );
+                assert_eq!(
+                    tx.sql()
+                        .query_row("SELECT count(*) FROM episode_chunks", [], |r| r.get::<_, i64>(0))?,
+                    5
+                );
+                Ok(())
+            })
+            .unwrap();
         // Each removed seq notifies both tiers, so the projection drops its points.
         assert_eq!(events(&store) - before, 6);
         assert_eq!(counts(&store), (2, 2));
@@ -843,7 +1277,20 @@ mod status_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         let capture = |event: &str, kind: &str, text: &str, metadata: Value| {
-            store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":event,"conversation_id":"thread","kind":kind,"text":text,"metadata":metadata})).unwrap()).unwrap().id
+            store
+                .capture(
+                    serde_json::from_value(json!({
+                        "source":"synthetic",
+                        "event_id":event,
+                        "conversation_id":"thread",
+                        "kind":kind,
+                        "text":text,
+                        "metadata":metadata
+                    }))
+                    .unwrap(),
+                )
+                .unwrap()
+                .id
         };
         let user = capture("user", "user", "Human message", json!({}));
         let tool = capture(
@@ -877,18 +1324,41 @@ mod status_tests {
         ];
         let mut vector = [0f32; 768];
         vector[0] = 1.;
-        store.write(|tx| {
-            for (name, episode, start) in chunks {
-                tx.sql().execute("INSERT INTO episode_chunks VALUES(?,?,?,?)", params![format!("chunk-{name}"), episode, start, start + 4])?;
-            }
-            for (seq, name) in [(1, "message"), (2, "vector")] {
-                tx.put_vector(&VectorWrite{seq,target:format!("chunk-{name}"),kind:VectorKind::Episode,version:1,current:true,tier:Tier::Cold,embedding:F32Blob::from_values(&vector)?})?;
-            }
-            tx.sql().execute("INSERT INTO node_stats(node_id,access_count,last_cited_at) VALUES('chunk-cited',1,'2026-11-01T00:00:00+00:00')", [])?;
-            tx.sql().execute("INSERT INTO query_feedback VALUES('query','chunk-shown',1,0)", [])?;
-            tx.sql().execute("INSERT INTO index_failures VALUES('chunk-tool',1,1,'Fixture',0,0)", [])?;
-            Ok(())
-        }).unwrap();
+        store
+            .write(|tx| {
+                for (name, episode, start) in chunks {
+                    tx.sql().execute(
+                        "INSERT INTO episode_chunks VALUES(?,?,?,?)",
+                        params![format!("chunk-{name}"), episode, start, start + 4],
+                    )?;
+                }
+                for (seq, name) in [(1, "message"), (2, "vector")] {
+                    tx.put_vector(&VectorWrite {
+                        seq,
+                        target: format!("chunk-{name}"),
+                        kind: VectorKind::Episode,
+                        version: 1,
+                        current: true,
+                        tier: Tier::Cold,
+                        embedding: F32Blob::from_values(&vector)?,
+                    })?;
+                }
+                tx.sql().execute(
+                    "INSERT INTO node_stats(node_id,access_count,last_cited_at) \
+                    VALUES('chunk-cited',1,'2026-11-01T00:00:00+00:00')",
+                    [],
+                )?;
+                tx.sql().execute(
+                    "INSERT INTO query_feedback VALUES('query','chunk-shown',1,0)",
+                    [],
+                )?;
+                tx.sql().execute(
+                    "INSERT INTO index_failures VALUES('chunk-tool',1,1,'Fixture',0,0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let remaining = |store: &Store| {
             store
                 .read(|tx| {
@@ -969,7 +1439,20 @@ mod status_tests {
     fn chunk_retirement_takes_bounded_batches_and_resumes_by_rescanning() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
-        let tool = store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"tool","conversation_id":"thread","kind":"tool","text":"x".repeat(700),"metadata":{"extraction_mode":"tool_output"}})).unwrap()).unwrap().id;
+        let tool = store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"tool",
+                    "conversation_id":"thread",
+                    "kind":"tool",
+                    "text":"x".repeat(700),
+                    "metadata":{"extraction_mode":"tool_output"}
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .id;
         let total = RETIRE_BATCH + 100;
         store
             .write(|tx| {
@@ -997,7 +1480,19 @@ mod status_tests {
         let (scanned, next) = retire_chunks(&store, i64::MIN).unwrap();
         assert_eq!(scanned, RETIRE_BATCH);
         assert_eq!(count(&store), 100);
-        store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"between","conversation_id":"thread","kind":"user","text":"Captured between batches","metadata":{}})).unwrap()).unwrap();
+        store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"synthetic",
+                    "event_id":"between",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":"Captured between batches",
+                    "metadata":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         // An interruption restarts from the beginning; deleted rows are not revisited.
         assert_eq!(retire_chunks(&store, i64::MIN).unwrap(), (100, None));
         assert_eq!(count(&store), 0);
@@ -1009,12 +1504,39 @@ mod status_tests {
 // The ordinary worker alone resolves stale/already-complete failures. Metadata-only
 // vectors remain due until their actual embedding is durably committed.
 pub(crate) fn resolve_due_failures(store: &Store) -> Result<()> {
-    let due=store.read(|tx|{let mut q=tx.sql().prepare("SELECT target,version FROM index_failures WHERE resolved=0 AND next_attempt<=? ORDER BY next_attempt LIMIT 16")?;Ok(q.query_map([timestamp()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>()? )})?;
+    let due = store.read(|tx| {
+        let mut q = tx.sql().prepare("SELECT target,version FROM index_failures WHERE resolved=0 AND next_attempt<=? ORDER BY \
+            next_attempt LIMIT 16")?;
+        Ok(q.query_map([timestamp()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+    })?;
     if due.is_empty() {
         return Ok(());
     }
-    store.write(|tx|{
- for(target,version)in due{let mut eligible=false;for(source,_)in sources(){if tx.sql().query_row(&format!("SELECT EXISTS(SELECT 1 FROM ({source}) a WHERE a.id=? AND a.version=?)"),params![target,version],|r|r.get::<_,bool>(0))?{eligible=true;break;}}
- let complete:bool=tx.sql().query_row("SELECT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.version=?)",params![target,version],|r|r.get(0))?;if !eligible||complete{tx.sql().execute("UPDATE index_failures SET resolved=1 WHERE target=? AND version=?",params![target,version])?;}}
- Ok(())})
+    store.write(|tx| {
+        for (target, version) in due {
+            let mut eligible = false;
+            for (source, _) in sources() {
+                if tx
+                    .sql()
+                    .query_row(&format!("SELECT EXISTS(SELECT 1 FROM ({source}) a WHERE a.id=? AND a.version=?)"), params![target, version], |r| {
+                        r.get::<_, bool>(0)
+                    })?
+                {
+                    eligible = true;
+                    break;
+                }
+            }
+            let complete: bool =
+                tx.sql()
+                    .query_row("SELECT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE \
+                        i.target=? AND i.version=?)", params![target, version], |r| r.get(0))?;
+            if !eligible || complete {
+                tx.sql().execute("UPDATE index_failures SET resolved=1 WHERE target=? AND version=?", params![target, version])?;
+            }
+        }
+        Ok(())
+    })
 }

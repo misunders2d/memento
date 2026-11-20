@@ -52,7 +52,14 @@ impl Client {
         })
     }
     fn desktop(&self) -> Value {
-        json!({"installed":{"client_id":self.id,"client_secret":self.secret,"auth_uri":AUTH_URI,"token_uri":TOKEN_URI}})
+        json!({
+            "installed": {
+                "client_id":self.id,
+                "client_secret":self.secret,
+                "auth_uri":AUTH_URI,
+                "token_uri":TOKEN_URI
+            }
+        })
     }
 }
 #[derive(Clone)]
@@ -84,9 +91,14 @@ impl ConnectionGrant {
                 "A renewable drive.file-only grant is required",
             ));
         }
-        let client = Client::from_desktop(
-            &json!({"installed":{"client_id":value["client_id"],"client_secret":value["client_secret"],"auth_uri":AUTH_URI,"token_uri":TOKEN_URI}}),
-        )?;
+        let client = Client::from_desktop(&json!({
+            "installed": {
+                "client_id":value["client_id"],
+                "client_secret":value["client_secret"],
+                "auth_uri":AUTH_URI,
+                "token_uri":TOKEN_URI
+            }
+        }))?;
         let public = PublicBinding {
             client_id: client.id.clone(),
             account: value["memento"]["account"].as_str().unwrap_or("").into(),
@@ -113,7 +125,17 @@ impl ConnectionGrant {
         })
     }
     fn private_json(&self) -> Value {
-        json!({"type":"authorized_user","token":self.access_token,"refresh_token":self.refresh_token,"token_uri":TOKEN_URI,"client_id":self.binding.client.id,"client_secret":self.binding.client.secret,"scopes":[SCOPE],"expiry":self.expires_at.to_rfc3339(),"memento":{"account":self.binding.public.account,"folder_id":self.binding.public.folder_id}})
+        json!({
+            "type":"authorized_user",
+            "token":self.access_token,
+            "refresh_token":self.refresh_token,
+            "token_uri":TOKEN_URI,
+            "client_id":self.binding.client.id,
+            "client_secret":self.binding.client.secret,
+            "scopes":[SCOPE],
+            "expiry":self.expires_at.to_rfc3339(),
+            "memento": {"account":self.binding.public.account,"folder_id":self.binding.public.folder_id}
+        })
     }
     pub fn publish(&self, data: &Path) -> Result<()> {
         binding::check_binding(data, &self.binding.public)?;

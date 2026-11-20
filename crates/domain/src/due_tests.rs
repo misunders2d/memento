@@ -1,7 +1,9 @@
 //! Automatic loop due dates from explicit source dates; no model calls.
 use super::*;
 
-const ASK: &str = "'first steps' should be added as a project under the video production initiative. I'll create a google drive folder for videos specifically and we'll be uploading assets there (tomorrow)";
+const ASK: &str = "'first steps' should be added as a project under the video production initiative. I'll \
+    create a google drive folder for videos specifically and we'll be uploading assets there \
+    (tomorrow)";
 const UPLOAD: &str = "we'll be uploading assets there (tomorrow)";
 
 fn claim_in(f: &Fixture, zone: &str, kind: &str) -> Value {
@@ -224,8 +226,34 @@ fn newer_explicit_date_updates_automatic_due_but_manual_choices_win() {
         let target = promoted(&f, "UTC");
         assert_eq!(marker(&f, &target)["due_at"], "2026-11-02T23:59:59+00:00");
         match manual {
-            Some("remind") => f.graph.loop_command(serde_json::from_value(json!({"action":"remind","id":target,"command_id":"manual-due","actor":"owner","why":"Owner date","due_at":"2026-11-20T09:00:00Z"})).unwrap()).unwrap(),
-            Some(_) => f.graph.loop_command(serde_json::from_value(json!({"action":"later","id":target,"command_id":"manual-later","actor":"owner","why":"Not now","days":7})).unwrap()).unwrap(),
+            Some("remind") => f
+                .graph
+                .loop_command(
+                    serde_json::from_value(json!({
+                        "action":"remind",
+                        "id":target,
+                        "command_id":"manual-due",
+                        "actor":"owner",
+                        "why":"Owner date",
+                        "due_at":"2026-11-20T09:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap(),
+            Some(_) => f
+                .graph
+                .loop_command(
+                    serde_json::from_value(json!({
+                        "action":"later",
+                        "id":target,
+                        "command_id":"manual-later",
+                        "actor":"owner",
+                        "why":"Not now",
+                        "days":7
+                    }))
+                    .unwrap(),
+                )
+                .unwrap(),
             None => Value::Null,
         };
         let expected = marker(&f, &target)["due_at"].clone();
@@ -371,8 +399,20 @@ fn pre_due_extraction_lease_is_refused_and_rederived() {
     let f = Fixture::new();
     f.seed();
     let work = claim_in(&f, "UTC", "extract");
-    f.graph.store.write(|tx| { tx.sql().execute("UPDATE jobs SET context=json_set(context,'$.policy_version','extract-v2') WHERE kind='extract' AND state='leased'", [])?; Ok(()) }).unwrap();
-    let output = json!({"windows":[{"id":work["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false)]}]});
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute(
+                "UPDATE jobs SET context=json_set(context,'$.policy_version','extract-v2') WHERE \
+                kind='extract' AND state='leased'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let output = json!({
+        "windows": [{"id":work["input"]["windows"][0]["id"],"candidates":[draft(FACT,"knowledge",false)]}]
+    });
     assert_eq!(
         f.complete(&work, output.clone()).unwrap_err().to_string(),
         "Extraction policy changed; derive a fresh plan"

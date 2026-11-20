@@ -33,7 +33,26 @@ fn node(
     current: bool,
     tier: Tier,
 ) {
-    store.write(|tx|{tx.sql().execute("INSERT INTO graph_commits SELECT 'test','test','{}','{}','test','test','2026-01-01T00:00:00+00:00' WHERE NOT EXISTS(SELECT 1 FROM graph_commits WHERE id='test')",[])?;tx.sql().execute("INSERT INTO node_versions VALUES(?,1,'test',?,'A meaningful stored assertion','active',NULL,NULL,NULL,0,?)",params![id,kind,format!("[\"{scope}\"]")])?;tx.put_vector(&VectorWrite{seq,target:id.into(),kind:VectorKind::Node,version:1,current,tier,embedding:vector(cos)})?;Ok(())}).unwrap()
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO graph_commits SELECT \
+                'test','test','{}','{}','test','test','2026-01-01T00:00:00+00:00' WHERE NOT EXISTS(SELECT 1 \
+                FROM graph_commits WHERE id='test')", [])?;
+            tx.sql()
+                .execute("INSERT INTO node_versions VALUES(?,1,'test',?,'A meaningful stored \
+                    assertion','active',NULL,NULL,NULL,0,?)", params![id, kind, format!("[\"{scope}\"]")])?;
+            tx.put_vector(&VectorWrite {
+                seq,
+                target: id.into(),
+                kind: VectorKind::Node,
+                version: 1,
+                current,
+                tier,
+                embedding: vector(cos),
+            })?;
+            Ok(())
+        })
+        .unwrap()
 }
 fn hits(index: &Projection, tier: Tier) -> Vec<String> {
     index
@@ -77,7 +96,15 @@ fn filters_apply_before_top_k_and_unoptimized_mutations_are_immediately_visible(
         let id = format!("forbidden{i}");
         node(&store, i, &id, 0.99, scope, kind, current, Tier::Hot);
         if i % 4 == 3 {
-            store.write(|tx|{tx.touch_target(&id)?;tx.sql().execute("INSERT INTO node_versions SELECT id,version+1,commit_id,type,text,'retired',valid_from,valid_to,superseded_by,pinned,scope FROM node_versions WHERE id=?",[&id])?;Ok(())}).unwrap();
+            store
+                .write(|tx| {
+                    tx.touch_target(&id)?;
+                    tx.sql().execute("INSERT INTO node_versions SELECT \
+                        id,version+1,commit_id,type,text,'retired',valid_from,valid_to,superseded_by,pinned,scope \
+                        FROM node_versions WHERE id=?", [&id])?;
+                    Ok(())
+                })
+                .unwrap();
         }
     }
     index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
@@ -369,7 +396,12 @@ fn overlapping_requests_wait_within_existing_budget_and_capture_remains_free() {
     });
     recv.recv().unwrap();
     let start = std::time::Instant::now();
-    store.write(|tx|{tx.sql().execute("INSERT INTO graph_commits VALUES('capture','capture','{}','{}','test','test','2026')",[])?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO graph_commits VALUES('capture','capture','{}','{}','test','test','2026')", [])?;
+            Ok(())
+        })
+        .unwrap();
     assert!(start.elapsed() < std::time::Duration::from_millis(100));
     assert_eq!(hits(&index, Tier::Hot), ["fact"]);
     first.join().unwrap().unwrap();
@@ -480,9 +512,24 @@ fn caught_up_read_does_not_acquire_held_capture_writer() {
 #[test]
 fn parking_moves_raw_point_between_shards_without_changing_bytes() {
     let (_dir, store, index) = fixture();
-    store.write(|tx|{
-        tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at) VALUES(1,'episode','fixture','event','conversation','user','A preserved historical passage','{}','2026')",[])?;
-        tx.sql().execute("INSERT INTO episode_chunks VALUES('chunk','episode',0,30)",[])?;tx.put_vector(&VectorWrite{seq:30,target:"chunk".into(),kind:VectorKind::Episode,version:1,current:true,tier:Tier::Hot,embedding:vector(0.9)})?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at) \
+                VALUES(1,'episode','fixture','event','conversation','user','A preserved historical \
+                passage','{}','2026')", [])?;
+            tx.sql().execute("INSERT INTO episode_chunks VALUES('chunk','episode',0,30)", [])?;
+            tx.put_vector(&VectorWrite {
+                seq: 30,
+                target: "chunk".into(),
+                kind: VectorKind::Episode,
+                version: 1,
+                current: true,
+                tier: Tier::Hot,
+                embedding: vector(0.9),
+            })?;
+            Ok(())
+        })
+        .unwrap();
     index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
     index.rebuild(Tier::Cold, &AtomicBool::new(false)).unwrap();
     let original = store
@@ -494,7 +541,14 @@ fn parking_moves_raw_point_between_shards_without_changing_bytes() {
             )?)
         })
         .unwrap();
-    store.write(|tx|{tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) VALUES('fixture','conversation',1,1,0)",[])?;tx.touch_conversation("fixture","conversation")?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO historical_parking(source,conversation_id,parked_through,live_seq,live_offset) \
+                VALUES('fixture','conversation',1,1,0)", [])?;
+            tx.touch_conversation("fixture", "conversation")?;
+            Ok(())
+        })
+        .unwrap();
     index
         .snapshot(true, true, |_, view| {
             assert!(
@@ -554,20 +608,48 @@ fn raw_pool_upgrade_retiers_in_batches_preserves_rows_and_rebuilds_old_payload_f
         .chain(0..255)
         .chain(std::iter::once(i64::MAX))
         .collect::<Vec<_>>();
-    store.write(|tx| {
-        tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at) VALUES(1,'raw-source','fixture','raw-source','raw-source','user',?,'{}','2026')",["Retained raw source passage ".repeat(300)])?;
-        for (position,seq) in ids.iter().enumerate() {
-            let chunk=format!("raw-{position}");
-            tx.sql().execute("INSERT INTO episode_chunks VALUES(?,'raw-source',?,?)",params![chunk,position as i64,position as i64+1])?;
-            tx.put_vector(&VectorWrite{seq:*seq,target:chunk,kind:VectorKind::Episode,version:1,current:*seq!=0,tier:Tier::Hot,embedding:vector(0.9)})?;
-        }
-        Ok(())
-    }).unwrap();
+    store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO episodes(seq,id,source,event_id,conversation_id,kind,text,metadata,captured_at) \
+                VALUES(1,'raw-source','fixture','raw-source','raw-source','user',?,'{}','2026')", ["Retained raw source passage ".repeat(300)])?;
+            for (position, seq) in ids.iter().enumerate() {
+                let chunk = format!("raw-{position}");
+                tx.sql().execute(
+                    "INSERT INTO episode_chunks VALUES(?,'raw-source',?,?)",
+                    params![chunk, position as i64, position as i64 + 1],
+                )?;
+                tx.put_vector(&VectorWrite {
+                    seq: *seq,
+                    target: chunk,
+                    kind: VectorKind::Episode,
+                    version: 1,
+                    current: *seq != 0,
+                    tier: Tier::Hot,
+                    embedding: vector(0.9),
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
     let preserved = || -> Vec<(i64, String, String, i64, Vec<u8>, bool)> {
-        store.read(|tx| {
-            let mut query=tx.sql().prepare("SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq ORDER BY i.seq")?;
-            Ok(query.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
-        }).unwrap()
+        store
+            .read(|tx| {
+                let mut query = tx.sql().prepare("SELECT i.seq,i.target,i.kind,i.version,b.embedding,b.current FROM vector_items i JOIN \
+                    vector_blobs b ON b.seq=i.seq ORDER BY i.seq")?;
+                Ok(query
+                    .query_map([], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap()
     };
     let state = || -> (i64, i64) {
         store

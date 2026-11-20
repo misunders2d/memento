@@ -5,14 +5,39 @@ const LESSON: &str = "For stockq lookups, always use --ledger archive.";
 
 fn approve(f: &Fixture, key: &str, result: Value) -> Value {
     if result["status"] == "pending_review" {
-        f.graph.decide_review(serde_json::from_value(json!({"command_id":key,"actor":"owner","why":"Explicit synthetic owner approval","proposal_id":result["id"],"decision":"approve"})).unwrap()).unwrap()
+        f.graph
+            .decide_review(
+                serde_json::from_value(json!({
+                    "command_id":key,
+                    "actor":"owner",
+                    "why":"Explicit synthetic owner approval",
+                    "proposal_id":result["id"],
+                    "decision":"approve"
+                }))
+                .unwrap(),
+            )
+            .unwrap()
     } else {
         result
     }
 }
 
 fn existing(f: &Fixture, key: &str, typ: &str, text: &str, episode: &str, quote: &str) -> String {
-    let result = f.graph.remember(serde_json::from_value(json!({"command_id":key,"actor":"owner","why":"Original synthetic assertion","type":typ,"text":text,"scope":["professional"],"evidence":[{"episode_id":episode,"quote":quote}]})).unwrap()).unwrap();
+    let result = f
+        .graph
+        .remember(
+            serde_json::from_value(json!({
+                "command_id":key,
+                "actor":"owner",
+                "why":"Original synthetic assertion",
+                "type":typ,
+                "text":text,
+                "scope":["professional"],
+                "evidence":[{"episode_id":episode,"quote":quote}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     approve(f, &format!("approve-{key}"), result)["id"]
         .as_str()
         .unwrap()
@@ -35,7 +60,13 @@ fn tool(f: &Fixture, key: &str, name: &str, line: &str) -> (String, String) {
 fn remember_lesson(f: &Fixture, work: &Value, conduct: &str) -> String {
     let candidate = &work["input"]["candidates"][0];
     let mut lesson = action(candidate, "remember");
-    lesson["behavior"] = json!({"applicability":"Inventory lookups","conduct":conduct,"rationale":"The owner directly stated this lookup practice.","exceptions":[],"authority":"explicit_user"});
+    lesson["behavior"] = json!({
+        "applicability":"Inventory lookups",
+        "conduct":conduct,
+        "rationale":"The owner directly stated this lookup practice.",
+        "exceptions":[],
+        "authority":"explicit_user"
+    });
     let result = f.complete(work, json!({"actions":[lesson]})).unwrap();
     result["results"][candidate["id"].as_str().unwrap()]["id"]
         .as_str()
@@ -133,7 +164,17 @@ fn new_lesson_sees_named_tools_then_links_through_seeded_maintenance() {
         "a partial name is never a match"
     );
     assert!(named.iter().all(|id| supplied(&work).contains(id)));
-    let repair = json!({"operation":"link","target":lesson,"dst":stockq,"relation":"mentions","evidence":[{"episode_id":episode,"quote":LESSON,"occurrence":null},{"episode_id":tool_episode,"quote":"Stockq","occurrence":null}],"why":"The lesson's conduct is about the stockq inventory CLI"});
+    let repair = json!({
+        "operation":"link",
+        "target":lesson,
+        "dst":stockq,
+        "relation":"mentions",
+        "evidence": [
+            {"episode_id":episode,"quote":LESSON,"occurrence":null},
+            {"episode_id":tool_episode,"quote":"Stockq","occurrence":null}
+        ],
+        "why":"The lesson's conduct is about the stockq inventory CLI"
+    });
     let result = f
         .complete(&work, json!({"actions":[],"repairs":[repair]}))
         .unwrap();

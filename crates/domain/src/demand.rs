@@ -121,7 +121,9 @@ pub fn demand_extract(
     let id = get_str(episode, "id")?;
     let row = one(
         tx.sql(),
-        "SELECT p.seq AS cursor,h.parked_through FROM historical_parking h JOIN processing_progress p ON p.source=h.source AND p.conversation_id=h.conversation_id WHERE h.source=? AND h.conversation_id=?",
+        "SELECT p.seq AS cursor,h.parked_through FROM historical_parking h JOIN processing_progress \
+        p ON p.source=h.source AND p.conversation_id=h.conversation_id WHERE h.source=? AND \
+        h.conversation_id=?",
         params![source, conversation],
     )?;
     let Some(row) = row else {
@@ -183,7 +185,16 @@ pub fn demand_extract(
     if windows.is_empty() {
         return Ok((None, true));
     }
-    let payload = json!({"version":"extract-v2","mode":"demand","source":source,"conversation_id":conversation,"episode_id":id,"start":start,"end":end,"windows":windows});
+    let payload = json!({
+        "version":"extract-v2",
+        "mode":"demand",
+        "source":source,
+        "conversation_id":conversation,
+        "episode_id":id,
+        "start":start,
+        "end":end,
+        "windows":windows
+    });
     // Legacy job key uses Python ensure_ascii=True, unlike graph commands.
     let canonical = encode_json(&payload)?;
     let mut ascii = String::new();
@@ -215,6 +226,10 @@ pub fn demand_extract(
     }
     let job = crate::util::id();
     let available = chrono::Utc::now().timestamp_micros() as f64 / 1e6;
-    tx.sql().execute("INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) VALUES (?,?,?,?,'pending',?,0)",params![job,key,"extract",encode_json(&payload)?,available])?;
+    tx.sql().execute(
+        "INSERT INTO jobs(id,job_key,kind,payload,state,available_at,attempts) VALUES \
+            (?,?,?,?,'pending',?,0)",
+        params![job, key, "extract", encode_json(&payload)?, available],
+    )?;
     Ok((Some(job), false))
 }

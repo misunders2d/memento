@@ -13,7 +13,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-pub const HELP: &str = "Authorize the original Desktop app and personal Drive account\nUsage: memento-drive connect --client-json PATH --account EMAIL --output PATH [--folder-id EXISTING_FOLDER_ID] [--data-dir RESTORED_DATA_DIR] [--no-browser] [--port 8766]\n";
+pub const HELP: &str = "Authorize the original Desktop app and personal Drive account\nUsage: memento-drive connect \
+    --client-json PATH --account EMAIL --output PATH [--folder-id EXISTING_FOLDER_ID] \
+    [--data-dir RESTORED_DATA_DIR] [--no-browser] [--port 8766]\n";
 pub struct Arguments {
     pub options: ConnectOptions,
     pub no_browser: bool,
@@ -69,7 +71,9 @@ pub fn parse(args: &[String]) -> CliResult<Arguments> {
 fn respond(stream: &mut TcpStream, status: u16, body: &str) {
     let reason = if status == 200 { "OK" } else { "Bad Request" };
     let message = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: \
+        no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: \
+        nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(message.as_bytes());

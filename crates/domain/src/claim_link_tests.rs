@@ -80,7 +80,8 @@ fn memory_entity_relation_extracts_and_promotes_in_one_consolidation_commit() {
             json!(["personal"])
         );
     }
-    assert_eq!(f.stored::<i64>("SELECT count(DISTINCT commit_id) FROM (SELECT commit_id FROM node_versions UNION ALL SELECT commit_id FROM edge_versions)"), 1);
+    assert_eq!(f.stored::<i64>("SELECT count(DISTINCT commit_id) FROM (SELECT commit_id FROM node_versions UNION ALL SELECT \
+        commit_id FROM edge_versions)"), 1);
 }
 
 #[test]
@@ -100,7 +101,18 @@ fn relation_candidate_cannot_be_an_extraction_endpoint_and_batch_rolls_back() {
 
 fn approve(f: &Fixture, key: &str, result: Value) -> Value {
     if result["status"] == "pending_review" {
-        f.graph.decide_review(serde_json::from_value(json!({"command_id":key,"actor":"owner","why":"Explicit synthetic owner approval","proposal_id":result["id"],"decision":"approve"})).unwrap()).unwrap()
+        f.graph
+            .decide_review(
+                serde_json::from_value(json!({
+                    "command_id":key,
+                    "actor":"owner",
+                    "why":"Explicit synthetic owner approval",
+                    "proposal_id":result["id"],
+                    "decision":"approve"
+                }))
+                .unwrap(),
+            )
+            .unwrap()
     } else {
         result
     }
@@ -117,7 +129,21 @@ fn existing_pair(f: &Fixture, sensitive: bool) -> (String, String, String) {
         "2026-10-18T12:00:00Z",
     );
     let remember = |key: &str, typ: &str, text: &str| {
-        let result = f.graph.remember(serde_json::from_value(json!({"command_id":key,"actor":"owner","why":"Original synthetic assertion","type":typ,"text":text,"scope":["personal"],"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap()).unwrap();
+        let result = f
+            .graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":key,
+                    "actor":"owner",
+                    "why":"Original synthetic assertion",
+                    "type":typ,
+                    "text":text,
+                    "scope":["personal"],
+                    "evidence":[{"episode_id":episode,"quote":CLAIM}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         approve(f, &format!("approve-{key}"), result)["id"]
             .as_str()
             .unwrap()
@@ -166,7 +192,14 @@ fn maintained_work(f: &Fixture, claim: &str, entity: &str) -> Value {
 }
 
 fn repair(episode: &str, claim: &str, entity: &str) -> Value {
-    json!({"operation":"link","target":claim,"dst":entity,"relation":"mentions","evidence":[{"episode_id":episode,"quote":CLAIM,"occurrence":null}],"why":"Original claim explicitly identifies its subject"})
+    json!({
+        "operation":"link",
+        "target":claim,
+        "dst":entity,
+        "relation":"mentions",
+        "evidence":[{"episode_id":episode,"quote":CLAIM,"occurrence":null}],
+        "why":"Original claim explicitly identifies its subject"
+    })
 }
 
 fn pin(f: &Fixture, target: &str) {
@@ -279,7 +312,15 @@ fn open_predicate_existing_repair_and_explicit_link_keep_authority_fences() {
     .iter()
     .enumerate()
     {
-        let request = json!({"command_id":format!("invalid-open-{index}"),"actor":"owner","why":"Invalid predicate must not mutate graph","a":claim,"rel":rel,"b":entity,"evidence":[{"episode_id":episode,"quote":CLAIM}]});
+        let request = json!({
+            "command_id":format!("invalid-open-{index}"),
+            "actor":"owner",
+            "why":"Invalid predicate must not mutate graph",
+            "a":claim,
+            "rel":rel,
+            "b":entity,
+            "evidence":[{"episode_id":episode,"quote":CLAIM}]
+        });
         assert!(
             f.graph
                 .link(serde_json::from_value(request).unwrap())
@@ -291,7 +332,21 @@ fn open_predicate_existing_repair_and_explicit_link_keep_authority_fences() {
         );
     }
     pin(&f, &entity);
-    let linked = f.graph.link(serde_json::from_value(json!({"command_id":"protected-new-predicate","actor":"owner","why":"New predicate cannot bypass existing protection","a":claim,"rel":"is_about","b":entity,"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap()).unwrap();
+    let linked = f
+        .graph
+        .link(
+            serde_json::from_value(json!({
+                "command_id":"protected-new-predicate",
+                "actor":"owner",
+                "why":"New predicate cannot bypass existing protection",
+                "a":claim,
+                "rel":"is_about",
+                "b":entity,
+                "evidence":[{"episode_id":episode,"quote":CLAIM}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     assert_eq!(linked["status"], "pending_review");
     assert_eq!(
         f.stored::<i64>("SELECT count(*) FROM edge_versions WHERE rel='is_about'"),
@@ -315,7 +370,23 @@ fn existing_link_rejects_unsupplied_evidence_scope_forgetting_and_stale_versions
         let f = Fixture::new();
         let (episode, claim, entity) = existing_pair(&f, false);
         let edge = if defect == "relation-endpoint" {
-            Some(f.graph.link(serde_json::from_value(json!({"command_id":"existing-edge","actor":"owner","why":"Synthetic original relation","a":claim,"rel":"related_to","b":entity,"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap()).unwrap()["id"].clone())
+            Some(
+                f.graph
+                    .link(
+                        serde_json::from_value(json!({
+                            "command_id":"existing-edge",
+                            "actor":"owner",
+                            "why":"Synthetic original relation",
+                            "a":claim,
+                            "rel":"related_to",
+                            "b":entity,
+                            "evidence":[{"episode_id":episode,"quote":CLAIM}]
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap()["id"]
+                    .clone(),
+            )
         } else {
             None
         };
@@ -331,7 +402,18 @@ fn existing_link_rejects_unsupplied_evidence_scope_forgetting_and_stale_versions
             "scope" => proposed["scope"] = json!(["professional"]),
             "forgotten" => {
                 let preview = f.graph.forget_preview(&entity).unwrap();
-                f.graph.forget(serde_json::from_value(json!({"command_id":"forget-subject","actor":"owner","why":"Explicit synthetic forgetting","target":entity,"token":preview["token"]})).unwrap()).unwrap();
+                f.graph
+                    .forget(
+                        serde_json::from_value(json!({
+                            "command_id":"forget-subject",
+                            "actor":"owner",
+                            "why":"Explicit synthetic forgetting",
+                            "target":entity,
+                            "token":preview["token"]
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
             }
             "stale-version" => pin(&f, &entity),
             "missing-dst" => {
@@ -374,7 +456,21 @@ fn link_and_duplicate_evidence_preserve_pin_and_sensitive_review_paths() {
             let f = Fixture::new();
             let (episode, claim, entity) = existing_pair(&f, protection == "sensitive");
             let edge = if duplicate {
-                let result = f.graph.link(serde_json::from_value(json!({"command_id":"existing-mentions","actor":"owner","why":"Original exact subject relation","a":claim,"rel":"mentions","b":entity,"evidence":[{"episode_id":episode,"quote":SUBJECT}]})).unwrap()).unwrap();
+                let result = f
+                    .graph
+                    .link(
+                        serde_json::from_value(json!({
+                            "command_id":"existing-mentions",
+                            "actor":"owner",
+                            "why":"Original exact subject relation",
+                            "a":claim,
+                            "rel":"mentions",
+                            "b":entity,
+                            "evidence":[{"episode_id":episode,"quote":SUBJECT}]
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
                 Some(
                     approve(&f, "approve-existing-mentions", result)["id"]
                         .as_str()
@@ -435,7 +531,17 @@ fn same_plan_link_reaches_the_same_identity_after_every_revision_kind() {
         let f = Fixture::new();
         let (episode, claim, entity) = existing_pair(&f, false);
         let work = maintained_work(&f, &claim, &entity);
-        let replacement = json!({"operation":"supersede","target":entity,"type":"project","text":SUBJECT,"scope":["personal"],"change_kind":kind,"valid_at":if kind=="change" {json!("2026-10-18T12:00:00Z")} else {Value::Null},"evidence":[{"episode_id":episode,"quote":CLAIM,"occurrence":null}],"why":"Synthetic same-plan lifecycle control"});
+        let replacement = json!({
+            "operation":"supersede",
+            "target":entity,
+            "type":"project",
+            "text":SUBJECT,
+            "scope":["personal"],
+            "change_kind":kind,
+            "valid_at":if kind=="change" {json!("2026-10-18T12:00:00Z")} else {Value::Null},
+            "evidence":[{"episode_id":episode,"quote":CLAIM,"occurrence":null}],
+            "why":"Synthetic same-plan lifecycle control"
+        });
         let result = f
             .complete(
                 &work,
@@ -477,7 +583,26 @@ fn revision_keeps_supported_links_and_retires_only_named_mistaken_ones() {
         .as_str()
         .unwrap()
         .to_owned();
-    let changed = f.graph.supersede(serde_json::from_value(json!({"command_id":"world","actor":"owner","why":"The archive moved","old":claim,"kind":"change","valid_at":"2026-10-20T00:00:00Z","new":{"type":"knowledge","text":"Orion expedition now preserves digital archives.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap()).unwrap();
+    let changed = f
+        .graph
+        .supersede(
+            serde_json::from_value(json!({
+                "command_id":"world",
+                "actor":"owner",
+                "why":"The archive moved",
+                "old":claim,
+                "kind":"change",
+                "valid_at":"2026-10-20T00:00:00Z",
+                "new": {
+                    "type":"knowledge",
+                    "text":"Orion expedition now preserves digital archives.",
+                    "scope":["personal"]
+                },
+                "evidence":[{"episode_id":episode,"quote":CLAIM}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     assert_eq!(changed["id"], claim.as_str());
     assert_eq!(changed["retired_relations"], json!([]));
     assert_eq!(
@@ -487,14 +612,61 @@ fn revision_keeps_supported_links_and_retires_only_named_mistaken_ones() {
         "active"
     );
     // A refinement never retires links.
-    let refused = f.graph.supersede(serde_json::from_value(json!({"command_id":"refine-drop","actor":"owner","why":"Detail","old":claim,"kind":"refinement","retire_relations":[edge],"new":{"type":"knowledge","text":"Orion expedition now preserves signed digital archives.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap());
+    let refused = f.graph.supersede(
+        serde_json::from_value(json!({
+            "command_id":"refine-drop",
+            "actor":"owner",
+            "why":"Detail",
+            "old":claim,
+            "kind":"refinement",
+            "retire_relations":[edge],
+            "new": {
+                "type":"knowledge",
+                "text":"Orion expedition now preserves signed digital archives.",
+                "scope":["personal"]
+            },
+            "evidence":[{"episode_id":episode,"quote":CLAIM}]
+        }))
+        .unwrap(),
+    );
     assert!(matches!(refused, Err(Error::Validation(_))));
     // Unknown or non-incident relations are rejected before any write.
-    let foreign = f.graph.supersede(serde_json::from_value(json!({"command_id":"foreign","actor":"owner","why":"Wrong subject","old":entity,"kind":"correction","retire_relations":["missing-edge"],"new":{"type":"project","text":"Vega expedition","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap());
+    let foreign = f.graph.supersede(
+        serde_json::from_value(json!({
+            "command_id":"foreign",
+            "actor":"owner",
+            "why":"Wrong subject",
+            "old":entity,
+            "kind":"correction",
+            "retire_relations":["missing-edge"],
+            "new":{"type":"project","text":"Vega expedition","scope":["personal"]},
+            "evidence":[{"episode_id":episode,"quote":CLAIM}]
+        }))
+        .unwrap(),
+    );
     assert!(matches!(foreign, Err(Error::Validation(_))));
     assert_eq!(f.graph.history(&entity).unwrap().len(), 1);
     // Correction of a mistaken referent: the named link is retired with audit evidence.
-    let corrected = f.graph.supersede(serde_json::from_value(json!({"command_id":"referent","actor":"owner","why":"The claim was about a different expedition","old":claim,"kind":"correction","retire_relations":[edge],"new":{"type":"knowledge","text":"Vega expedition preserves digital archives.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":CLAIM}]})).unwrap()).unwrap();
+    let corrected = f
+        .graph
+        .supersede(
+            serde_json::from_value(json!({
+                "command_id":"referent",
+                "actor":"owner",
+                "why":"The claim was about a different expedition",
+                "old":claim,
+                "kind":"correction",
+                "retire_relations":[edge],
+                "new": {
+                    "type":"knowledge",
+                    "text":"Vega expedition preserves digital archives.",
+                    "scope":["personal"]
+                },
+                "evidence":[{"episode_id":episode,"quote":CLAIM}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     assert_eq!(corrected["id"], claim.as_str());
     assert_eq!(corrected["version"], 3);
     assert_eq!(

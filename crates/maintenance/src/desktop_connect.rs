@@ -353,9 +353,11 @@ impl PendingConnect {
                             "application/json".into(),
                         )))
                         .collect(),
-                    body: serde_json::to_vec(
-                        &json!({"name":"Memento","mimeType":"application/vnd.google-apps.folder","appProperties":{"memento":"cold-storage"}}),
-                    )?,
+                    body: serde_json::to_vec(&json!({
+                        "name":"Memento",
+                        "mimeType":"application/vnd.google-apps.folder",
+                        "appProperties":{"memento":"cold-storage"}
+                    }))?,
                 },
             )?;
             if response.status != 200 && response.status != 201 {

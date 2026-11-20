@@ -37,15 +37,66 @@ fn actual_compact_cli_reclaims_database_without_tty_and_preserves_authority_vect
     let store = Store::open(dir.path()).unwrap();
     let graph = Graph::new(store.clone());
     let raw_text = "Ω exact raw source\r\n".repeat(25_000);
-    let captured=store.capture(serde_json::from_value(json!({"source":"owner-runtime","event_id":"raw","conversation_id":"thread","kind":"native_record","text":raw_text,"metadata":{"extraction_mode":"skip"}})).unwrap()).unwrap();
-    let user=store.capture(serde_json::from_value(json!({"source":"owner-runtime","event_id":"projected","conversation_id":"thread","kind":"user","text":"Exact searchable source."})).unwrap()).unwrap();
-    let node=graph.remember(serde_json::from_value(json!({"command_id":"saved","actor":"fixture","why":"Exact source","type":"knowledge","text":"Exact searchable source.","scope":["personal"],"evidence":[{"episode_id":user.id,"quote":"Exact searchable source."}]})).unwrap()).unwrap();
+    let captured = store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"owner-runtime",
+                "event_id":"raw",
+                "conversation_id":"thread",
+                "kind":"native_record",
+                "text":raw_text,
+                "metadata":{"extraction_mode":"skip"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let user = store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"owner-runtime",
+                "event_id":"projected",
+                "conversation_id":"thread",
+                "kind":"user",
+                "text":"Exact searchable source."
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let node = graph
+        .remember(
+            serde_json::from_value(json!({
+                "command_id":"saved",
+                "actor":"fixture",
+                "why":"Exact source",
+                "type":"knowledge",
+                "text":"Exact searchable source.",
+                "scope":["personal"],
+                "evidence":[{"episode_id":user.id,"quote":"Exact searchable source."}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let history = graph.history(node["id"].as_str().unwrap()).unwrap();
     let mut values = [0.; 768];
     values[0] = 1.;
     let vector = F32Blob::from_values(&values).unwrap();
     let bytes = vector.as_bytes().to_owned();
-    store.write(|tx|{tx.put_vector(&VectorWrite{seq:101,target:node["id"].as_str().unwrap().into(),kind:VectorKind::Node,version:1,current:true,tier:Tier::Hot,embedding:vector})?;tx.sql().execute_batch("CREATE TABLE disposable(payload BLOB); INSERT INTO disposable VALUES(zeroblob(2097152)); DROP TABLE disposable;")?;Ok(())}).unwrap();
+    store
+        .write(|tx| {
+            tx.put_vector(&VectorWrite {
+                seq: 101,
+                target: node["id"].as_str().unwrap().into(),
+                kind: VectorKind::Node,
+                version: 1,
+                current: true,
+                tier: Tier::Hot,
+                embedding: vector,
+            })?;
+            tx.sql().execute_batch("CREATE TABLE disposable(payload BLOB); INSERT INTO disposable VALUES(zeroblob(2097152)); \
+                DROP TABLE disposable;")?;
+            Ok(())
+        })
+        .unwrap();
     let checkpoint = rusqlite::Connection::open(dir.path().join("memory.sqlite")).unwrap();
     checkpoint
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -161,7 +212,18 @@ fn actual_cli_tty_export_requires_exact_confirmation_before_native_archive_publi
     let dir = private();
     let store = Store::open(dir.path()).unwrap();
     let graph = Graph::new(store.clone());
-    store.capture(serde_json::from_value(json!({"source":"owner-runtime","event_id":"one","conversation_id":"thread","kind":"user","text":"Synthetic exact export source Ω."})).unwrap()).unwrap();
+    store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"owner-runtime",
+                "event_id":"one",
+                "conversation_id":"thread",
+                "kind":"user",
+                "text":"Synthetic exact export source Ω."
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let server = OwnerServer::start(services(&graph)).unwrap();
     for accepted in [false, true] {
         let archive = dir.path().join(if accepted {

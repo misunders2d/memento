@@ -3,7 +3,14 @@ fn semantic_text_filter_preserves_literal_entity_behavior_media_and_public_score
     let f = Fixture::new();
     let lesson = "validated-fixture-lesson".to_owned();
     let text = "Use distinct fixture identifiers for independent operations.";
-    let source = f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"behavior-provenance","conversation_id":"behavior-provenance","kind":"user","text":text,"metadata":{}})).unwrap()).unwrap();
+    let source = f.store.capture(serde_json::from_value(json!({
+        "source":"synthetic",
+        "event_id":"behavior-provenance",
+        "conversation_id":"behavior-provenance",
+        "kind":"user",
+        "text":text,
+        "metadata":{}
+    })).unwrap()).unwrap();
     // Append the first version and its exact evidence through the command store;
     // never retrofit behavior by updating immutable history created by remember.
     let context = memento_core::CommandContext {
@@ -13,10 +20,29 @@ fn semantic_text_filter_preserves_literal_entity_behavior_media_and_public_score
     };
     // Store::command supplies the actor/why/command envelope, exactly as the
     // consolidation writer does; the supplied request is the bare command.
-    let request = json!({"op":"consolidate","output":{"actions":[{"candidate_id":"lesson","operation":"remember","type":"experience","behavior":{"authority":"explicit_user","applicability":"Independent persisted fixture operations","conduct":text,"exceptions":[],"rationale":"Exact fixture user instruction"}}]}});
+    let request = json!({
+        "op":"consolidate",
+        "output": {
+            "actions": [
+                {
+                    "candidate_id":"lesson",
+                    "operation":"remember",
+                    "type":"experience",
+                    "behavior": {
+                        "authority":"explicit_user",
+                        "applicability":"Independent persisted fixture operations",
+                        "conduct":text,
+                        "exceptions":[],
+                        "rationale":"Exact fixture user instruction"
+                    }
+                }
+            ]
+        }
+    });
     f.store.command(&context,&request,|tx,commit| {
         tx.touch_target(&lesson)?;
-        tx.sql().execute("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) VALUES(?,1,?,'experience',?,'active',0,'[\"personal\"]')",params![lesson,commit,text])?;
+        tx.sql().execute("INSERT INTO node_versions(id,version,commit_id,type,text,state,pinned,scope) \
+            VALUES(?,1,?,'experience',?,'active',0,'[\"personal\"]')",params![lesson,commit,text])?;
         tx.sql().execute("INSERT INTO graph_evidence(target,version,episode_id,start,end,quote) VALUES(?,1,?,0,?,?)",params![lesson,source.id,text.chars().count() as i64,text])?;
         Ok(json!({"results":{"lesson":{"id":lesson}}}))
     }).unwrap();
@@ -76,7 +102,14 @@ fn semantic_text_filter_preserves_literal_entity_behavior_media_and_public_score
         records::merge(&mut row, extra);
         rows.insert(id.to_owned(), row);
     }
-    rows.insert(lesson.clone(),json!({"id":lesson,"type":"experience","text":"Validated behavior before finish","match":"semantic","score":0.8,"cosine":0.8}));
+    rows.insert(lesson.clone(),json!({
+        "id":lesson,
+        "type":"experience",
+        "text":"Validated behavior before finish",
+        "match":"semantic",
+        "score":0.8,
+        "cosine":0.8
+    }));
     let before = rows.clone();
     let calls = std::cell::RefCell::new(Vec::<String>::new());
     let score = |documents: &[&str], _: Instant| {
@@ -642,7 +675,14 @@ fn semantic_text_scoring_holds_read_snapshot_without_holding_capture_writer() {
             .unwrap();
         let store = f.store.clone();
         let writer=scope.spawn(move|| {
-            let captured=store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"during-text-score","conversation_id":"capture","kind":"user","text":"Capture commits while the semantic scorer holds a reader","metadata":{}})).unwrap()).unwrap();
+            let captured=store.capture(serde_json::from_value(json!({
+                "source":"synthetic",
+                "event_id":"during-text-score",
+                "conversation_id":"capture",
+                "kind":"user",
+                "text":"Capture commits while the semantic scorer holds a reader",
+                "metadata":{}
+            })).unwrap()).unwrap();
             captured_tx.send(captured.id).unwrap();
         });
         let capture = captured_rx.recv_timeout(std::time::Duration::from_secs(1));

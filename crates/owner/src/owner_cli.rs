@@ -49,7 +49,13 @@ impl Console for Stdio {
     }
 }
 pub type Requester<'a> = dyn Fn(&Path, &Value) -> Result<Value> + 'a;
-pub const HELP: &str = "Human-only Memento review and portable export console\nUsage: memento-admin --data-dir PATH {list|inventory|backup|compact|history|export|approve|reject|merge|forget|revisions|recover-revisions}\n  history {park|status|release-candidates}\n  export --output PATH\n  approve|reject PROPOSAL --why TEXT [--command-id ID]\n  merge CLUSTER [--into ID] [--exclude ID] [--include ID] --why TEXT [--command-id ID]\n  forget TARGET --why TEXT [--command-id ID]\n  revisions [--limit N] [--exclude ROOT] [--protected ROOT]\n  recover-revisions [--limit N] [--exclude ROOT] [--protected ROOT] --why TEXT [--command-id ID]\n";
+pub const HELP: &str = "Human-only Memento review and portable export console\nUsage: memento-admin --data-dir PATH \
+    {list|inventory|backup|compact|history|export|approve|reject|merge|forget|revisions|recover-revisions}\n  \
+    history {park|status|release-candidates}\n  export --output PATH\n  approve|reject PROPOSAL \
+    --why TEXT [--command-id ID]\n  merge CLUSTER [--into ID] [--exclude ID] [--include ID] \
+    --why TEXT [--command-id ID]\n  forget TARGET --why TEXT [--command-id ID]\n  revisions \
+    [--limit N] [--exclude ROOT] [--protected ROOT]\n  recover-revisions [--limit N] [--exclude \
+    ROOT] [--protected ROOT] --why TEXT [--command-id ID]\n";
 #[derive(Debug)]
 pub struct AdminArgs {
     pub data: PathBuf,
@@ -227,7 +233,8 @@ pub fn run(args: &[String], console: &mut dyn Console, request: &Requester<'_>) 
                 .ok_or(usage("Archive path must be valid UTF-8"))?;
             let expected = format!("export private archive to {path}");
             let prompt = format!(
-                "This plaintext archive contains private memory and Drive references; remote files stay on Drive. Type {expected:?} to confirm: "
+                "This plaintext archive contains private memory and Drive references; remote files stay on \
+                Drive. Type {expected:?} to confirm: "
             );
             if !confirm(console, &prompt, &expected)? {
                 return Ok(1);
@@ -238,7 +245,12 @@ pub fn run(args: &[String], console: &mut dyn Console, request: &Requester<'_>) 
             command["operation"] = json!(format!("history_{}", args.positional.as_ref().unwrap()))
         }
         "revisions" => {
-            command = json!({"operation":"revision_plan","limit":args.limit.unwrap_or(32),"exclude":args.exclude,"protected":args.protected})
+            command = json!({
+                "operation":"revision_plan",
+                "limit":args.limit.unwrap_or(32),
+                "exclude":args.exclude,
+                "protected":args.protected
+            })
         }
         "approve" | "reject" | "merge" | "forget" | "recover-revisions" => {
             if !console.interactive() {
@@ -248,7 +260,17 @@ pub fn run(args: &[String], console: &mut dyn Console, request: &Requester<'_>) 
             }
             let expected = match args.operation.as_str() {
                 "merge" => {
-                    let preview=request(&args.data,&json!({"operation":"merge_preview","cluster":args.positional,"into":args.into,"exclude":args.exclude,"include":args.include})).map_err(|_|unavailable())?;
+                    let preview = request(
+                        &args.data,
+                        &json!({
+                            "operation":"merge_preview",
+                            "cluster":args.positional,
+                            "into":args.into,
+                            "exclude":args.exclude,
+                            "include":args.include
+                        }),
+                    )
+                    .map_err(|_| unavailable())?;
                     if preview.get("error").is_some() {
                         return Err(CliError {
                             status: 1,
@@ -268,7 +290,11 @@ pub fn run(args: &[String], console: &mut dyn Console, request: &Requester<'_>) 
                     format!("merge {} into {survivor}", absorbed.len())
                 }
                 "recover-revisions" => {
-                    let selection = json!({"limit":args.limit.unwrap_or(32),"exclude":args.exclude,"protected":args.protected});
+                    let selection = json!({
+                        "limit":args.limit.unwrap_or(32),
+                        "exclude":args.exclude,
+                        "protected":args.protected
+                    });
                     let mut query = selection.clone();
                     query["operation"] = json!("revision_plan");
                     let preview = request(&args.data, &query).map_err(|_| unavailable())?;

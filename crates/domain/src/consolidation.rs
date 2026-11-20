@@ -10,9 +10,20 @@ mod apply;
 #[path = "consolidation_context.rs"]
 mod context_builder;
 pub const VERSION: &str = "consolidate-v15";
-pub const ELIGIBLE: &str = "EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND g.version=1 AND NOT (CASE WHEN e.kind='developer' THEN legacy_native_context(e.source,e.kind,NULL,NULL) WHEN e.kind='user' AND e.source GLOB 'native:*:codex' THEN legacy_native_context(e.source,e.kind,e.text,e.metadata) ELSE 0 END))";
-pub const UNPARKED: &str = "NOT EXISTS (SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL)";
-pub const AWAITING: &str = "(d.next_review_at>?3 OR (d.decision='review' AND NOT EXISTS (SELECT 1 FROM review_proposals p WHERE p.id=d.target_id AND NOT EXISTS (SELECT 1 FROM review_decisions r WHERE r.proposal_id=p.id) AND ((json_extract(p.command,'$.identity.status')='exact_matches_not_supplied' AND EXISTS (SELECT 1 FROM json_each(p.base_versions) j WHERE j.value<>(SELECT max(n.version) FROM node_versions n WHERE n.id=j.key))) OR (json_extract(p.command,'$.op')='remember' AND json_extract(p.command,'$.type')='person' AND json_type(p.command,'$.identity') IS NULL)))))";
+pub const ELIGIBLE: &str = "EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE \
+    g.target=c.id AND g.version=1 AND NOT (CASE WHEN e.kind='developer' THEN \
+    legacy_native_context(e.source,e.kind,NULL,NULL) WHEN e.kind='user' AND e.source GLOB \
+    'native:*:codex' THEN legacy_native_context(e.source,e.kind,e.text,e.metadata) ELSE 0 END))";
+pub const UNPARKED: &str = "NOT EXISTS (SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND \
+    h.released_at IS NULL)";
+pub const AWAITING: &str = "(d.next_review_at>?3 OR (d.decision='review' AND NOT EXISTS (SELECT 1 FROM review_proposals \
+    p WHERE p.id=d.target_id AND NOT EXISTS (SELECT 1 FROM review_decisions r WHERE \
+    r.proposal_id=p.id) AND \
+    ((json_extract(p.command,'$.identity.status')='exact_matches_not_supplied' AND EXISTS \
+    (SELECT 1 FROM json_each(p.base_versions) j WHERE j.value<>(SELECT max(n.version) FROM \
+    node_versions n WHERE n.id=j.key))) OR (json_extract(p.command,'$.op')='remember' AND \
+    json_extract(p.command,'$.type')='person' AND json_type(p.command,'$.identity') IS \
+    NULL)))))";
 
 /// Advisory ANN lookup runs outside every writer transaction. Authority failures
 /// propagate; the provider itself labels an unavailable derived search pending.
@@ -118,7 +129,15 @@ pub fn pending_in(
     rows(
         db,
         &format!(
-            "SELECT c.*,c.rowid AS position,r.recorded_at AS extracted_at,(SELECT d.id FROM candidate_decisions d WHERE d.candidate_id=c.id ORDER BY d.rowid DESC LIMIT 1) AS decision_id FROM candidates c JOIN extraction_runs r ON r.id=c.run_id WHERE {ACTIVE_CANDIDATE} AND {ELIGIBLE} AND {UNPARKED} AND c.rowid>?1 AND c.rowid<=?2 AND (?5=0 OR NOT EXISTS (SELECT 1 FROM jobs j,json_each(j.payload,'$.candidate_ids') held WHERE j.kind='consolidate' AND j.state IN ('pending','leased') AND held.value=c.id)) AND NOT EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {AWAITING}) ORDER BY c.rowid LIMIT ?4"
+            "SELECT c.*,c.rowid AS position,r.recorded_at AS extracted_at,(SELECT d.id FROM \
+            candidate_decisions d WHERE d.candidate_id=c.id ORDER BY d.rowid DESC LIMIT 1) AS \
+            decision_id FROM candidates c JOIN extraction_runs r ON r.id=c.run_id WHERE \
+            {ACTIVE_CANDIDATE} AND {ELIGIBLE} AND {UNPARKED} AND c.rowid>?1 AND c.rowid<=?2 AND (?5=0 \
+            OR NOT EXISTS (SELECT 1 FROM jobs j,json_each(j.payload,'$.candidate_ids') held WHERE \
+            j.kind='consolidate' AND j.state IN ('pending','leased') AND held.value=c.id)) AND NOT \
+            EXISTS (SELECT 1 FROM candidate_decisions d WHERE d.candidate_id=c.id AND d.rowid=(SELECT \
+            max(x.rowid) FROM candidate_decisions x WHERE x.candidate_id=c.id) AND {AWAITING}) ORDER BY \
+            c.rowid LIMIT ?4"
         ),
         params![
             after,
@@ -133,7 +152,17 @@ pub fn ineligible(db: &Connection, ids: &[String]) -> Result<Vec<String>> {
     if ids.is_empty() {
         return Ok(vec![]);
     }
-    Ok(rows(db,&format!("SELECT c.id FROM candidates c WHERE c.id IN (SELECT value FROM json_each(?)) AND NOT ({ELIGIBLE} AND {UNPARKED})"),[encode_json(&json!(ids))?])?.into_iter().map(|row|row["id"].as_str().unwrap().to_owned()).collect())
+    Ok(rows(
+        db,
+        &format!(
+            "SELECT c.id FROM candidates c WHERE c.id IN (SELECT value FROM json_each(?)) AND NOT \
+            ({ELIGIBLE} AND {UNPARKED})"
+        ),
+        [encode_json(&json!(ids))?],
+    )?
+    .into_iter()
+    .map(|row| row["id"].as_str().unwrap().to_owned())
+    .collect())
 }
 pub(super) fn strings(value: &Value) -> Result<Vec<String>> {
     value
@@ -217,7 +246,7 @@ pub(super) fn continuation(db: &Connection, target: &str) -> Result<Option<Vec<S
             return Ok(None);
         };
         let proven = if n["state"] == "refined" {
-            one(db,"SELECT 1 FROM edge_versions WHERE src=? AND rel='supersedes' AND dst=? AND version=1",params![next,n["id"].as_str()])?.is_some()
+            one(db, "SELECT 1 FROM edge_versions WHERE src=? AND rel='supersedes' AND dst=? AND version=1", params![next, n["id"].as_str()])?.is_some()
         } else if n["state"] == "merged" {
             one(
                 db,

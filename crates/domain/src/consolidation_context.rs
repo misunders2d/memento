@@ -14,11 +14,23 @@ use std::{
     path::Path,
 };
 
-pub(super) const VISIBLE: &str = "(NOT EXISTS (SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) OR EXISTS (SELECT 1 FROM captured_media cm JOIN captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON e.id=r.episode_id WHERE cm.node_id=n.id AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=cm.sha256)))";
+pub(super) const VISIBLE: &str = "(NOT EXISTS (SELECT 1 FROM captured_media cm WHERE cm.node_id=n.id) OR EXISTS (SELECT 1 \
+    FROM captured_media cm JOIN captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON \
+    e.id=r.episode_id WHERE cm.node_id=n.id AND NOT EXISTS (SELECT 1 FROM forgotten_sources f \
+    WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM \
+    media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=cm.sha256)))";
 /// Communicated follow-up for a loop-flagged candidate: eligible user/assistant message
 /// projections after its newest source, excluding tool calls/output, hooks, instruction
 /// envelopes, forgotten sources and assistant records holding only private reasoning blocks.
-const LATER_MESSAGES: &str = "SELECT e.id FROM episodes e WHERE e.source=?1 AND e.conversation_id=?2 AND e.seq>?3 AND e.kind IN ('user','assistant') AND coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')='message' AND coalesce(json_extract(e.metadata,'$.evidence_eligible'),1)<>0 AND NOT legacy_native_context(e.source,e.kind,e.text,e.metadata) AND NOT (e.kind='assistant' AND json_valid(e.text) AND json_type(e.text)='array' AND NOT EXISTS (SELECT 1 FROM json_each(e.text) j WHERE json_extract(e.text,'$['||j.key||'].type')='text')) AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) ORDER BY e.seq LIMIT ?4";
+const LATER_MESSAGES: &str = "SELECT e.id FROM episodes e WHERE e.source=?1 AND e.conversation_id=?2 AND e.seq>?3 AND \
+    e.kind IN ('user','assistant') AND \
+    coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')='message' AND \
+    coalesce(json_extract(e.metadata,'$.evidence_eligible'),1)<>0 AND NOT \
+    legacy_native_context(e.source,e.kind,e.text,e.metadata) AND NOT (e.kind='assistant' AND \
+    json_valid(e.text) AND json_type(e.text)='array' AND NOT EXISTS (SELECT 1 FROM \
+    json_each(e.text) j WHERE json_extract(e.text,'$['||j.key||'].type')='text')) AND NOT \
+    EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND \
+    f.event_id=e.event_id) ORDER BY e.seq LIMIT ?4";
 // Measured on a real Pi install/enroll request: its completion report was the fifth such
 // message (~13 minutes later) and its statement sat ~1.1k characters from the record's end.
 const LATER_MESSAGES_PER_CANDIDATE: i64 = 8;
@@ -83,7 +95,11 @@ impl<'a> Builder<'a> {
             self.db,
             // Bounded founding and latest original evidence (four each), chronological;
             // undated sources sort last so a dated decisive correction is never displaced.
-            "WITH ranked AS (SELECT g.*,row_number() OVER (ORDER BY julianday(e.occurred_at) IS NULL,julianday(e.occurred_at),g.episode_id,g.start) AS early,row_number() OVER (ORDER BY julianday(e.occurred_at) IS NULL,julianday(e.occurred_at) DESC,g.episode_id DESC,g.start DESC) AS late FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?) SELECT * FROM ranked WHERE early<=4 OR late<=4 ORDER BY early",
+            "WITH ranked AS (SELECT g.*,row_number() OVER (ORDER BY julianday(e.occurred_at) IS \
+                NULL,julianday(e.occurred_at),g.episode_id,g.start) AS early,row_number() OVER (ORDER BY \
+                julianday(e.occurred_at) IS NULL,julianday(e.occurred_at) DESC,g.episode_id DESC,g.start \
+                DESC) AS late FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? \
+                AND g.version=?) SELECT * FROM ranked WHERE early<=4 OR late<=4 ORDER BY early",
             params![target, version],
         )? {
             let episode_id = get_str(&row, "episode_id")?;
@@ -114,9 +130,37 @@ impl<'a> Builder<'a> {
             if add_window {
                 let left = start.saturating_sub(400);
                 let right = (end + 400).min(raw.chars().count());
-                self.window((episode_id.into(),left,right),json!({"episode_id":episode_id,"start":left,"end":right,"kind":episode["kind"],"text":substring(raw,left,right),"occurred_at":episode["occurred_at"],"source":episode["source"],"event_id":episode["event_id"],"conversation_id":episode["conversation_id"],"native_id":episode["metadata"]["native_id"],"behavior_ground_truth":behavior_ground_truth(&episode,None,None)}));
+                self.window(
+                    (episode_id.into(), left, right),
+                    json!({
+                        "episode_id":episode_id,
+                        "start":left,
+                        "end":right,
+                        "kind":episode["kind"],
+                        "text":substring(raw,left,right),
+                        "occurred_at":episode["occurred_at"],
+                        "source":episode["source"],
+                        "event_id":episode["event_id"],
+                        "conversation_id":episode["conversation_id"],
+                        "native_id":episode["metadata"]["native_id"],
+                        "behavior_ground_truth":behavior_ground_truth(&episode,None,None)
+                    }),
+                );
             }
-            let mut reference = json!({"episode_id":episode_id,"quote":quote,"occurrence":occurrence,"start":start,"end":end,"source":episode["source"],"kind":episode["kind"],"occurred_at":episode["occurred_at"],"conversation_id":episode["conversation_id"],"event_id":episode["event_id"],"native_id":episode["metadata"]["native_id"],"behavior_ground_truth":behavior_ground_truth(&episode,Some(start),Some(end))});
+            let mut reference = json!({
+                "episode_id":episode_id,
+                "quote":quote,
+                "occurrence":occurrence,
+                "start":start,
+                "end":end,
+                "source":episode["source"],
+                "kind":episode["kind"],
+                "occurred_at":episode["occurred_at"],
+                "conversation_id":episode["conversation_id"],
+                "event_id":episode["event_id"],
+                "native_id":episode["metadata"]["native_id"],
+                "behavior_ground_truth":behavior_ground_truth(&episode,Some(start),Some(end))
+            });
             if matches!(native_trace(&episode), Some("attempt" | "result")) {
                 reference["sequence"] = episode["seq"].clone();
                 reference["native_trace"] = json!(native_trace(&episode));
@@ -196,7 +240,13 @@ impl<'a> Builder<'a> {
                 .push(json!(target));
             let ancestors = rows(
                 self.db,
-                "WITH RECURSIVE ancestors(id,depth) AS (SELECT ?,0 UNION ALL SELECT n.id,a.depth+1 FROM ancestors a JOIN node_versions n ON n.superseded_by=a.id WHERE a.depth<64 AND n.state IN ('refined','merged') AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)) SELECT DISTINCT a.id FROM ancestors a WHERE a.depth>0 AND EXISTS (SELECT 1 FROM edge_versions e WHERE (e.src=a.id OR e.dst=a.id) AND e.state='active' AND e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id)) ORDER BY a.id LIMIT 49",
+                "WITH RECURSIVE ancestors(id,depth) AS (SELECT ?,0 UNION ALL SELECT n.id,a.depth+1 FROM \
+                ancestors a JOIN node_versions n ON n.superseded_by=a.id WHERE a.depth<64 AND n.state IN \
+                ('refined','merged') AND n.version=(SELECT max(x.version) FROM node_versions x WHERE \
+                x.id=n.id)) SELECT DISTINCT a.id FROM ancestors a WHERE a.depth>0 AND EXISTS (SELECT 1 FROM \
+                edge_versions e WHERE (e.src=a.id OR e.dst=a.id) AND e.state='active' AND \
+                e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE \
+                x.id=e.id)) ORDER BY a.id LIMIT 49",
                 [&target],
             )?;
             if ancestors.len() > 48 {
@@ -216,7 +266,9 @@ impl<'a> Builder<'a> {
                 }
                 let edges = rows(
                     self.db,
-                    "SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active' AND e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id LIMIT 49",
+                    "SELECT e.* FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.state='active' AND \
+                    e.rel<>'supersedes' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE \
+                    x.id=e.id) ORDER BY e.id LIMIT 49",
                     params![old, old],
                 )?;
                 if edges.len() > 48 {
@@ -239,7 +291,9 @@ impl<'a> Builder<'a> {
                     } else {
                         rows(
                             self.db,
-                            "SELECT e.* FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.id<>? AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id LIMIT 49",
+                            "SELECT e.* FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.id<>? AND \
+                                e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) \
+                                ORDER BY e.id LIMIT 49",
                             params![src, edge["rel"].as_str(), dst, edge["id"].as_str()],
                         )?
                     };
@@ -319,7 +373,9 @@ impl<'a> Builder<'a> {
             }
             let edges = rows(
                 self.db,
-                "SELECT e.id,e.version FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND e.rel<>'supersedes' AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id LIMIT 49",
+                "SELECT e.id,e.version FROM edge_versions e WHERE (e.src=? OR e.dst=?) AND \
+                e.rel<>'supersedes' AND e.state='active' AND e.version=(SELECT max(x.version) FROM \
+                edge_versions x WHERE x.id=e.id) ORDER BY e.id LIMIT 49",
                 params![target, target],
             )?;
             let mut required = self.budget.clone();
@@ -374,7 +430,19 @@ impl<'a> Builder<'a> {
                 if !nearby.contains_key(&key) {
                     let mut records = vec![];
                     for (comparison, order) in [("<", "DESC"), (">", "ASC")] {
-                        records.extend(rows(self.db,&format!("SELECT id,seq,source,event_id,conversation_id,kind,occurred_at,CASE WHEN kind='assistant' THEN substr(text,-2000) WHEN kind='tool' THEN substr(text,1,2000) END AS text,CASE WHEN kind='assistant' THEN max(0,length(text)-2000) ELSE 0 END AS start,CASE WHEN kind IN ('assistant','tool') THEN metadata END AS metadata FROM episodes WHERE source=? AND conversation_id=? AND seq{comparison}? ORDER BY seq {order} LIMIT 32"),params![episode["source"].as_str(),episode["conversation_id"].as_str(),position])?);
+                        records.extend(rows(
+                            self.db,
+                            &format!("SELECT id,seq,source,event_id,conversation_id,kind,occurred_at,CASE WHEN kind='assistant' \
+                                THEN substr(text,-2000) WHEN kind='tool' THEN substr(text,1,2000) END AS text,CASE WHEN \
+                                kind='assistant' THEN max(0,length(text)-2000) ELSE 0 END AS start,CASE WHEN kind IN \
+                                ('assistant','tool') THEN metadata END AS metadata FROM episodes WHERE source=? AND \
+                                conversation_id=? AND seq{comparison}? ORDER BY seq {order} LIMIT 32"),
+                            params![
+                                episode["source"].as_str(),
+                                episode["conversation_id"].as_str(),
+                                position
+                            ],
+                        )?);
                     }
                     nearby.insert(key.clone(), records);
                 }
@@ -454,7 +522,24 @@ impl<'a> Builder<'a> {
                 );
                 let length = exact.chars().count();
                 let start = start + left;
-                self.window((id.into(),start,start+length),json!({"episode_id":id,"start":start,"end":start+length,"kind":episode["kind"],"text":exact,"occurred_at":episode["occurred_at"],"source":episode["source"],"event_id":episode["event_id"],"conversation_id":episode["conversation_id"],"native_id":episode["metadata"]["native_id"],"behavior_ground_truth":false,"sequence":episode["seq"],"native_trace":marker}));
+                self.window(
+                    (id.into(), start, start + length),
+                    json!({
+                        "episode_id":id,
+                        "start":start,
+                        "end":start+length,
+                        "kind":episode["kind"],
+                        "text":exact,
+                        "occurred_at":episode["occurred_at"],
+                        "source":episode["source"],
+                        "event_id":episode["event_id"],
+                        "conversation_id":episode["conversation_id"],
+                        "native_id":episode["metadata"]["native_id"],
+                        "behavior_ground_truth":false,
+                        "sequence":episode["seq"],
+                        "native_trace":marker
+                    }),
+                );
                 count += 1;
                 chars += length;
                 added_rows += 1;
@@ -486,7 +571,11 @@ impl<'a> Builder<'a> {
             let Some(anchor) = anchor else { continue };
             anchors.insert(
                 get_str(candidate, "id")?.into(),
-                json!({"source":anchor["source"],"conversation_id":anchor["conversation_id"],"after_seq":anchor["seq"]}),
+                json!({
+                    "source":anchor["source"],
+                    "conversation_id":anchor["conversation_id"],
+                    "after_seq":anchor["seq"]
+                }),
             );
             let mut chars = 0;
             for row in rows(
@@ -523,7 +612,25 @@ impl<'a> Builder<'a> {
                 }
                 chars += end - start;
                 added += end - start;
-                self.window((id.into(),start,end),json!({"episode_id":id,"start":start,"end":end,"kind":episode["kind"],"text":substring(raw,start,end),"occurred_at":episode["occurred_at"],"source":episode["source"],"event_id":episode["event_id"],"conversation_id":episode["conversation_id"],"native_id":episode["metadata"]["native_id"],"behavior_ground_truth":false,"sequence":episode["seq"],"native_trace":null,"later_context":true}));
+                self.window(
+                    (id.into(), start, end),
+                    json!({
+                        "episode_id":id,
+                        "start":start,
+                        "end":end,
+                        "kind":episode["kind"],
+                        "text":substring(raw,start,end),
+                        "occurred_at":episode["occurred_at"],
+                        "source":episode["source"],
+                        "event_id":episode["event_id"],
+                        "conversation_id":episode["conversation_id"],
+                        "native_id":episode["metadata"]["native_id"],
+                        "behavior_ground_truth":false,
+                        "sequence":episode["seq"],
+                        "native_trace":null,
+                        "later_context":true
+                    }),
+                );
             }
         }
         Ok(Value::Object(anchors))
@@ -535,12 +642,22 @@ fn push_unique(values: &mut Value, value: Value) {
     }
 }
 fn neighbors(db: &Connection, target: &str, limit: usize) -> Result<Vec<String>> {
-    Ok(rows(db,"SELECT n.id FROM edge_versions e JOIN node_versions n ON n.id=CASE WHEN e.src=?1 THEN e.dst ELSE e.src END WHERE (e.src=?1 OR e.dst=?1) AND e.rel<>'supersedes' AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY n.id LIMIT ?2",params![target,limit as i64])?.into_iter().map(|row|row["id"].as_str().unwrap().into()).collect())
+    Ok(rows(db, "SELECT n.id FROM edge_versions e JOIN node_versions n ON n.id=CASE WHEN e.src=?1 THEN e.dst \
+        ELSE e.src END WHERE (e.src=?1 OR e.dst=?1) AND e.rel<>'supersedes' AND e.state='active' \
+        AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) AND \
+        n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) \
+        ORDER BY n.id LIMIT ?2", params![target, limit as i64])?
+        .into_iter()
+        .map(|row| row["id"].as_str().unwrap().into())
+        .collect())
 }
 /// Typed BM25 hints. Each FTS row sits at its identity's `node_fts_documents.seq` and
 /// holds that identity's current version (schema trigger), so ids resolve through the
 /// small mapping instead of reading every match's stored columns.
-const LEXICAL: &str = "SELECT n.id FROM node_fts CROSS JOIN node_fts_documents d ON d.seq=node_fts.rowid CROSS JOIN node_versions n ON n.id=d.id AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=d.id) WHERE node_fts MATCH ?1 AND n.type=?2 AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?3)) ORDER BY bm25(node_fts),n.id LIMIT ?4";
+const LEXICAL: &str = "SELECT n.id FROM node_fts CROSS JOIN node_fts_documents d ON d.seq=node_fts.rowid CROSS \
+    JOIN node_versions n ON n.id=d.id AND n.version=(SELECT max(x.version) FROM node_versions x \
+    WHERE x.id=d.id) WHERE node_fts MATCH ?1 AND n.type=?2 AND n.state='active' AND n.id NOT IN \
+    (SELECT value FROM json_each(?3)) ORDER BY bm25(node_fts),n.id LIMIT ?4";
 /// Discovery lookups for one claim, including its narrowed re-preparations, share one
 /// read snapshot; each distinct lookup is answered once.
 type DiscoveryCache = HashMap<String, Vec<String>>;
@@ -627,7 +744,8 @@ fn lexical(
 }
 /// Named entities supplied per experience lesson (candidate or maintenance target).
 pub(super) const LESSON_SUBJECTS: usize = 3;
-const ENTITY: &str = "(n.type IN ('person','organization','project','concept','place','tool') OR EXISTS(SELECT 1 FROM memory_types t WHERE t.name=n.type AND t.category='entity'))";
+const ENTITY: &str = "(n.type IN ('person','organization','project','concept','place','tool') OR EXISTS(SELECT 1 \
+    FROM memory_types t WHERE t.name=n.type AND t.category='entity'))";
 /// Lesson fields that state what it is about: text, then behavior applicability/conduct.
 pub(super) fn lesson_texts<'v>(text: &'v Value, behavior: &'v Value) -> Vec<&'v str> {
     [text, &behavior["applicability"], &behavior["conduct"]]
@@ -658,7 +776,12 @@ pub(super) fn named_entities(db: &Connection, texts: &[&str], limit: usize) -> R
     for row in rows(
         db,
         &format!(
-            "SELECT n.id,n.text FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND {ENTITY} AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS (SELECT 1 FROM entity_merges m WHERE m.source=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {VISIBLE} ORDER BY bm25(node_fts),n.id LIMIT 128"
+            "SELECT n.id,n.text FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND \
+        n.version=node_fts.version WHERE node_fts MATCH ? AND {ENTITY} AND n.state='active' AND \
+        n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS \
+        (SELECT 1 FROM entity_merges m WHERE m.source=n.id) AND NOT EXISTS (SELECT 1 FROM \
+        forgotten_targets f WHERE f.target=n.id) AND {VISIBLE} ORDER BY bm25(node_fts),n.id LIMIT \
+        128"
         ),
         [terms.join(" OR ")],
     )? {
@@ -679,7 +802,16 @@ fn hinted(db: &Connection, hint: Option<&Value>, kind: &str) -> Result<Vec<Strin
         .into_iter()
         .flatten()
     {
-        if one(db,"SELECT 1 FROM node_versions n WHERE n.id=? AND n.version=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)",params![row["target"].as_str(),row["version"].as_i64()])?.is_some(){result.push(get_str(row,"target")?.into());}
+        if one(
+            db,
+            "SELECT 1 FROM node_versions n WHERE n.id=? AND n.version=? AND n.state='active' AND \
+                n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)",
+            params![row["target"].as_str(), row["version"].as_i64()],
+        )?
+        .is_some()
+        {
+            result.push(get_str(row, "target")?.into());
+        }
     }
     Ok(result)
 }
@@ -746,7 +878,10 @@ fn prepare_cached(
     let mut candidates = rows(
         db,
         &format!(
-            "SELECT c.*,c.rowid AS position,(SELECT d.id FROM candidate_decisions d WHERE d.candidate_id=c.id ORDER BY d.rowid DESC LIMIT 1) AS decision_id FROM candidates c WHERE c.id IN (SELECT value FROM json_each(?)) AND {ACTIVE_CANDIDATE} AND {ELIGIBLE} AND {UNPARKED} ORDER BY c.rowid"
+            "SELECT c.*,c.rowid AS position,(SELECT d.id FROM candidate_decisions d WHERE \
+        d.candidate_id=c.id ORDER BY d.rowid DESC LIMIT 1) AS decision_id FROM candidates c WHERE \
+        c.id IN (SELECT value FROM json_each(?)) AND {ACTIVE_CANDIDATE} AND {ELIGIBLE} AND \
+        {UNPARKED} ORDER BY c.rowid"
         ),
         [encode_json(&json!(ids))?],
     )?;
@@ -760,7 +895,8 @@ fn prepare_cached(
             if let Some(endpoint) = candidate[key].as_str() {
                 if let Some(decision) = one(
                     db,
-                    "SELECT decision,target_id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1",
+                    "SELECT decision,target_id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC \
+                    LIMIT 1",
                     [endpoint],
                 )? {
                     if decision["decision"] == "promote" {
@@ -792,7 +928,10 @@ fn prepare_cached(
     for candidate in &candidates {
         let id = get_str(candidate, "id")?;
         let mut queue = vec![];
-        let vector=db.query_row("SELECT v.embedding FROM vector_items i JOIN vector_blobs v ON v.seq=i.seq WHERE i.target=? AND i.kind='candidate' AND v.current=1",[id],|row|row.get::<_,Vec<u8>>(0)).optional()?;
+        let vector = db
+            .query_row("SELECT v.embedding FROM vector_items i JOIN vector_blobs v ON v.seq=i.seq WHERE i.target=? \
+                AND i.kind='candidate' AND v.current=1", [id], |row| row.get::<_, Vec<u8>>(0))
+            .optional()?;
         let hint = discovery
             .and_then(|value| value["candidates"].get(id))
             .filter(|hint| {
@@ -994,7 +1133,10 @@ fn prepare_cached(
         let mut uncovered = BTreeSet::new();
         for (id, targets) in &relevant {
             for target in targets {
-                if !builder.nodes.contains_key(target) && one(db,&format!("SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND {VISIBLE}"),[target])?.is_some() {
+                if !builder.nodes.contains_key(target)
+                    && one(db, &format!("SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT \
+                        max(x.version) FROM node_versions x WHERE x.id=n.id) AND {VISIBLE}"), [target])?.is_some()
+                {
                     uncovered.insert(id.clone());
                 }
             }
@@ -1068,7 +1210,11 @@ fn prepare_cached(
         if let Some((_, exact, similar)) =
             identities.iter().find(|(id, _, _)| candidate["id"] == *id)
         {
-            candidate["identity"] = json!({"exact":exact.iter().filter(|id|builder.nodes.contains_key(*id)).collect::<Vec<_>>(),"exact_total":exact.len(),"similar":similar.iter().filter(|id|builder.nodes.contains_key(*id)).collect::<Vec<_>>()});
+            candidate["identity"] = json!({
+                "exact":exact.iter().filter(|id|builder.nodes.contains_key(*id)).collect::<Vec<_>>(),
+                "exact_total":exact.len(),
+                "similar":similar.iter().filter(|id|builder.nodes.contains_key(*id)).collect::<Vec<_>>()
+            });
         }
     }
     for (lesson, named) in &mentioned {
@@ -1089,7 +1235,9 @@ fn prepare_cached(
     if !node_ids.is_empty() {
         for mut edge in rows(
             db,
-            "SELECT e.* FROM edge_versions e WHERE e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) AND e.src IN (SELECT value FROM json_each(?1)) AND e.dst IN (SELECT value FROM json_each(?1)) LIMIT 64",
+            "SELECT e.* FROM edge_versions e WHERE e.state='active' AND e.version=(SELECT max(x.version) \
+            FROM edge_versions x WHERE x.id=e.id) AND e.src IN (SELECT value FROM json_each(?1)) AND \
+            e.dst IN (SELECT value FROM json_each(?1)) LIMIT 64",
             [encode_json(&json!(node_ids))?],
         )? {
             let id = get_str(&edge, "id")?.to_owned();
@@ -1177,9 +1325,24 @@ fn prepare_cached(
         .keys()
         .cloned()
         .collect::<Vec<_>>();
-    Ok(
-        json!({"loop_policy_version":VERSION,"candidates":candidates,"existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),"existing_relations":builder.edges.into_values().collect::<Vec<_>>(),"raw_windows":windows,"resolved_candidates":resolutions,"loop_snapshots":snapshots,"behavior_exposures":exposures,"maintenance_ids":maintenance_ids,"context_truncated":pending,"retirement_ready":ready,"_unchecked":unchecked,"_deferred":deferred,"_continuity":builder.continuity,"_retirement":builder.retirement,"_later_context":later}),
-    )
+    Ok(json!({
+        "loop_policy_version":VERSION,
+        "candidates":candidates,
+        "existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),
+        "existing_relations":builder.edges.into_values().collect::<Vec<_>>(),
+        "raw_windows":windows,
+        "resolved_candidates":resolutions,
+        "loop_snapshots":snapshots,
+        "behavior_exposures":exposures,
+        "maintenance_ids":maintenance_ids,
+        "context_truncated":pending,
+        "retirement_ready":ready,
+        "_unchecked":unchecked,
+        "_deferred":deferred,
+        "_continuity":builder.continuity,
+        "_retirement":builder.retirement,
+        "_later_context":later
+    }))
 }
 
 /// Exact union of overlapping source spans with identical provenance/authority.
@@ -1265,16 +1428,34 @@ mod overlap_tests {
             "2026-01-08",
             "2026-01-09",
         ];
-        store.write(|tx| {
-            for (index, day) in days.iter().enumerate() {
-                let text = if index == 8 { "Correction: the launch moved to Friday." } else { "The launch is on Monday." };
-                tx.sql().execute("INSERT INTO episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                    params![format!("e{index}"), "fixture", format!("event{index}"), "thread", "user", text, format!("{day}T12:00:00Z"), "{}", "2026-02-01T00:00:00Z"])?;
-                tx.sql().execute("INSERT INTO graph_evidence(target,version,episode_id,start,end,quote) VALUES ('n1',1,?,0,?,?)",
-                    params![format!("e{index}"), text.chars().count() as i64, text])?;
-            }
-            Ok(())
-        }).unwrap();
+        store
+            .write(|tx| {
+                for (index, day) in days.iter().enumerate() {
+                    let text = if index == 8 { "Correction: the launch moved to Friday." } else { "The launch is on Monday." };
+                    tx.sql().execute(
+                        "INSERT INTO \
+                            episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+                            VALUES (?,?,?,?,?,?,?,?,?)",
+                        params![
+                            format!("e{index}"),
+                            "fixture",
+                            format!("event{index}"),
+                            "thread",
+                            "user",
+                            text,
+                            format!("{day}T12:00:00Z"),
+                            "{}",
+                            "2026-02-01T00:00:00Z"
+                        ],
+                    )?;
+                    tx.sql().execute(
+                        "INSERT INTO graph_evidence(target,version,episode_id,start,end,quote) VALUES ('n1',1,?,0,?,?)",
+                        params![format!("e{index}"), text.chars().count() as i64, text],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
         let ids = store
             .read(|tx| Builder::new(tx.sql(), dir.path()).evidence("n1", 1, false))
             .unwrap()
@@ -1300,18 +1481,36 @@ mod overlap_tests {
             "Old memento plan",
             "Memento",
         ];
-        store.write(|tx| {
-            for (index, text) in texts.iter().enumerate() {
-                let (kind, state) = if index == 2 { ("person", "active") } else if index == 4 { ("fact", "merged") } else { ("fact", "active") };
-                for version in 1..=(index as i64 % 3 + 1) {
-                    // Earlier versions say something else; only the current text is indexed.
-                    let body = if version == index as i64 % 3 + 1 { text.to_string() } else { format!("stale garden {version}") };
-                    tx.sql().execute("INSERT INTO node_versions VALUES (?,?,'c',?,?,?,NULL,NULL,NULL,0,'[\"personal\"]')", params![format!("n{index}"), version, kind, body, state])?;
+        store
+            .write(|tx| {
+                for (index, text) in texts.iter().enumerate() {
+                    let (kind, state) = if index == 2 {
+                        ("person", "active")
+                    } else if index == 4 {
+                        ("fact", "merged")
+                    } else {
+                        ("fact", "active")
+                    };
+                    for version in 1..=(index as i64 % 3 + 1) {
+                        // Earlier versions say something else; only the current text is indexed.
+                        let body = if version == index as i64 % 3 + 1 {
+                            text.to_string()
+                        } else {
+                            format!("stale garden {version}")
+                        };
+                        tx.sql().execute(
+                            "INSERT INTO node_versions VALUES (?,?,'c',?,?,?,NULL,NULL,NULL,0,'[\"personal\"]')",
+                            params![format!("n{index}"), version, kind, body, state],
+                        )?;
+                    }
                 }
-            }
-            Ok(())
-        }).unwrap();
-        let old = "SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?)) AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY bm25(node_fts),n.id LIMIT ?";
+                Ok(())
+            })
+            .unwrap();
+        let old = "SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND \
+            n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND n.state='active' AND \
+            n.id NOT IN (SELECT value FROM json_each(?)) AND n.version=(SELECT max(x.version) FROM \
+            node_versions x WHERE x.id=n.id) ORDER BY bm25(node_fts),n.id LIMIT ?";
         store
             .read(|tx| {
                 let mut cache = DiscoveryCache::new();
@@ -1380,7 +1579,17 @@ fn offers(db: &Connection, episode: &Value) -> Result<Vec<Value>> {
     };
     let mut records = vec![];
     for (comparison, order, limit) in [("<", "DESC", 1024), (">", "ASC", 64)] {
-        records.extend(rows(db,&format!("SELECT id,kind,CASE WHEN kind='native_hook' THEN metadata END AS metadata,CASE WHEN kind='native_hook' THEN occurred_at END AS occurred_at FROM episodes WHERE source=? AND conversation_id=? AND seq{comparison}? ORDER BY seq {order} LIMIT {limit}"),params![episode["source"].as_str(),episode["conversation_id"].as_str(),episode["seq"].as_i64()])?);
+        records.extend(rows(
+            db,
+            &format!("SELECT id,kind,CASE WHEN kind='native_hook' THEN metadata END AS metadata,CASE WHEN \
+                kind='native_hook' THEN occurred_at END AS occurred_at FROM episodes WHERE source=? AND \
+                conversation_id=? AND seq{comparison}? ORDER BY seq {order} LIMIT {limit}"),
+            params![
+                episode["source"].as_str(),
+                episode["conversation_id"].as_str(),
+                episode["seq"].as_i64()
+            ],
+        )?);
     }
     let mut result = vec![];
     for row in records {
@@ -1551,7 +1760,16 @@ fn exposures(builder: &mut Builder<'_>, candidates: &[Value]) -> Result<Vec<Valu
                     } else {
                         None
                     };
-                    exposures.push((key.clone(),json!({"receipt_episode_id":offer["episode_id"],"shown_at":offer["occurred_at"],"shown":shown,"current_target":current_target,"candidate_ids":[]})));
+                    exposures.push((
+                        key.clone(),
+                        json!({
+                            "receipt_episode_id":offer["episode_id"],
+                            "shown_at":offer["occurred_at"],
+                            "shown":shown,
+                            "current_target":current_target,
+                            "candidate_ids":[]
+                        }),
+                    ));
                 }
                 let exposure = &mut exposures
                     .iter_mut()

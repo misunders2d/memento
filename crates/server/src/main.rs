@@ -80,7 +80,8 @@ fn run() -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "memento --data-dir PATH [--host 127.0.0.1] [--port 8765]\nOwner operations: memento-admin; offline restore: memento-restore"
+                    "memento --data-dir PATH [--host 127.0.0.1] [--port 8765]\nOwner operations: memento-admin; \
+                    offline restore: memento-restore"
                 );
                 return Ok(());
             }

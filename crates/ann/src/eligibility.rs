@@ -41,7 +41,9 @@ pub fn automatic_content(text: &str) -> bool {
         && !REL.is_match(text)
 }
 pub fn legacy_only(db: &Connection, id: &str, version: i64) -> Result<bool> {
-    let mut query=db.prepare("SELECT e.source,e.kind,e.text,e.metadata FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?")?;
+    let mut query = db.prepare(
+        "SELECT e.source,e.kind,e.text,e.metadata FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=?",
+    )?;
     let rows = query.query_map(params![id, version], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -71,14 +73,96 @@ struct Record {
     parked: bool,
 }
 pub fn payload(db: &Connection, row: &ProjectionRow) -> Result<Value> {
-    let mut flags = json!({"kind":row.kind,"type":"","current":row.current,"ordinary":false,"automatic":false,"historical":false,"raw_fallback":false,"parked_candidate":false,"entity":false,"personal":false,"professional":false,"target":row.target,"version":row.version,"generation":row.generation});
-    let record=match row.kind.as_str(){
-        "node"=>db.query_row(&format!("SELECT n.id,n.version,n.type,substr(n.text,1,240),n.scope FROM node_versions n WHERE n.id=? AND n.version=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}",visible_sql("n.id")),params![row.target,row.version],|r|Ok(Record{id:r.get(0)?,version:r.get(1)?,kind:r.get(2)?,text:r.get(3)?,scope:r.get(4)?,candidate_kind:None,parked:false})).optional()?,
-        "candidate"=>db.query_row(&format!("SELECT c.id,c.type,substr(c.text,1,240),c.scope,c.kind,EXISTS(SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL) FROM candidates c JOIN extraction_runs r ON r.id=c.run_id WHERE c.id=? AND {ACTIVE_CANDIDATE}"),[&row.target],|r|Ok(Record{id:r.get(0)?,version:1,kind:r.get(1)?,text:r.get(2)?,scope:r.get(3)?,candidate_kind:r.get(4)?,parked:r.get(5)?})).optional()?,
-        "segment"=>db.query_row(&format!("SELECT n.id,n.version,n.type,substr(n.text,1,240),n.scope FROM segments s JOIN media_files f ON f.node_id=s.node_id JOIN node_versions n ON n.id=s.node_id WHERE s.id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}",visible_sql("n.id")),[&row.target],|r|Ok(Record{id:r.get(0)?,version:r.get(1)?,kind:r.get(2)?,text:r.get(3)?,scope:r.get(4)?,candidate_kind:None,parked:false})).optional()?,
-        "episode"=>{let episode=db.query_row(&format!("SELECT e.source,e.kind,e.text,e.metadata,coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip' AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id),({HISTORICAL}),({RAW_FALLBACK}) FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id WHERE x.id=?"),[&row.target],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?,r.get::<_,bool>(4)?,r.get::<_,bool>(5)?,r.get::<_,bool>(6)?))).optional()?;
-            if let Some((source,kind,text,metadata,ordinary,historical,fallback))=episode{let metadata:Value=serde_json::from_str(&metadata)?;let legacy=legacy_native_context(&source,&kind,text.as_deref(),Some(&metadata));flags["type"]=json!("raw_episode");flags["ordinary"]=json!(ordinary);flags["historical"]=json!(historical&&!legacy);flags["raw_fallback"]=json!(fallback&&!legacy);}None},
-        _=>None
+    let mut flags = json!({
+        "kind":row.kind,
+        "type":"",
+        "current":row.current,
+        "ordinary":false,
+        "automatic":false,
+        "historical":false,
+        "raw_fallback":false,
+        "parked_candidate":false,
+        "entity":false,
+        "personal":false,
+        "professional":false,
+        "target":row.target,
+        "version":row.version,
+        "generation":row.generation
+    });
+    let record = match row.kind.as_str() {
+        "node" => db
+            .query_row(
+                &format!("SELECT n.id,n.version,n.type,substr(n.text,1,240),n.scope FROM node_versions n WHERE n.id=? AND n.version=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}", visible_sql("n.id")),
+                params![row.target, row.version],
+                |r| {
+                    Ok(Record {
+                        id: r.get(0)?,
+                        version: r.get(1)?,
+                        kind: r.get(2)?,
+                        text: r.get(3)?,
+                        scope: r.get(4)?,
+                        candidate_kind: None,
+                        parked: false,
+                    })
+                },
+            )
+            .optional()?,
+        "candidate" => db
+            .query_row(&format!("SELECT c.id,c.type,substr(c.text,1,240),c.scope,c.kind,EXISTS(SELECT 1 FROM historical_parked_candidates h WHERE h.candidate_id=c.id AND h.released_at IS NULL) FROM candidates c JOIN extraction_runs r ON r.id=c.run_id WHERE c.id=? AND {ACTIVE_CANDIDATE}"), [&row.target], |r| {
+                Ok(Record {
+                    id: r.get(0)?,
+                    version: 1,
+                    kind: r.get(1)?,
+                    text: r.get(2)?,
+                    scope: r.get(3)?,
+                    candidate_kind: r.get(4)?,
+                    parked: r.get(5)?,
+                })
+            })
+            .optional()?,
+        "segment" => db
+            .query_row(
+                &format!("SELECT n.id,n.version,n.type,substr(n.text,1,240),n.scope FROM segments s JOIN media_files f ON f.node_id=s.node_id JOIN node_versions n ON n.id=s.node_id WHERE s.id=? AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {}", visible_sql("n.id")),
+                [&row.target],
+                |r| {
+                    Ok(Record {
+                        id: r.get(0)?,
+                        version: r.get(1)?,
+                        kind: r.get(2)?,
+                        text: r.get(3)?,
+                        scope: r.get(4)?,
+                        candidate_kind: None,
+                        parked: false,
+                    })
+                },
+            )
+            .optional()?,
+        "episode" => {
+            let episode = db
+                .query_row(&format!("SELECT e.source,e.kind,e.text,e.metadata,coalesce(json_extract(e.metadata,'$.extraction_mode'),'message')<>'skip' AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id),({HISTORICAL}),({RAW_FALLBACK}) FROM episode_chunks x JOIN episodes e ON e.id=x.episode_id WHERE x.id=?"), [&row.target], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, bool>(4)?,
+                        r.get::<_, bool>(5)?,
+                        r.get::<_, bool>(6)?,
+                    ))
+                })
+                .optional()?;
+            if let Some((source, kind, text, metadata, ordinary, historical, fallback)) = episode {
+                let metadata: Value = serde_json::from_str(&metadata)?;
+                let legacy =
+                    legacy_native_context(&source, &kind, text.as_deref(), Some(&metadata));
+                flags["type"] = json!("raw_episode");
+                flags["ordinary"] = json!(ordinary);
+                flags["historical"] = json!(historical&&!legacy);
+                flags["raw_fallback"] = json!(fallback&&!legacy);
+            }
+            None
+        }
+        _ => None,
     };
     if let Some(record) = record {
         flags["type"] = json!(record.kind);

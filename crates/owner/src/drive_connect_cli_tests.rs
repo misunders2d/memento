@@ -33,7 +33,13 @@ impl Transport for Provider {
             0 => {
                 assert_eq!(request.method, "POST");
                 assert_eq!(request.url, TOKEN_URI);
-                json!({"access_token":"SYNTHETIC ACCESS","refresh_token":"SYNTHETIC REFRESH","scope":SCOPE,"expires_in":3600,"token_type":"Bearer"})
+                json!({
+                    "access_token":"SYNTHETIC ACCESS",
+                    "refresh_token":"SYNTHETIC REFRESH",
+                    "scope":SCOPE,
+                    "expires_in":3600,
+                    "token_type":"Bearer"
+                })
             }
             1 | 2 => {
                 assert_eq!(request.method, "GET");
@@ -43,7 +49,12 @@ impl Transport for Provider {
             3 => {
                 assert_eq!(request.method, "GET");
                 assert!(request.url.contains("/files/original_folder?"));
-                json!({"id":"original_folder","mimeType":"application/vnd.google-apps.folder","ownedByMe":true,"trashed":false})
+                json!({
+                    "id":"original_folder",
+                    "mimeType":"application/vnd.google-apps.folder",
+                    "ownedByMe":true,
+                    "trashed":false
+                })
             }
             _ => panic!("Unexpected controlled provider call"),
         };
@@ -60,7 +71,19 @@ fn fixture(no_browser: bool) -> (tempfile::TempDir, Arguments) {
         .tempdir()
         .unwrap();
     let client = dir.path().join("client.json");
-    fs_safe::atomic_private(&client,&serde_json::to_vec(&json!({"installed":{"client_id":"original-client","client_secret":"SYNTHETIC SECRET","auth_uri":AUTH_URI,"token_uri":TOKEN_URI}})).unwrap()).unwrap();
+    fs_safe::atomic_private(
+        &client,
+        &serde_json::to_vec(&json!({
+            "installed": {
+                "client_id":"original-client",
+                "client_secret":"SYNTHETIC SECRET",
+                "auth_uri":AUTH_URI,
+                "token_uri":TOKEN_URI
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);

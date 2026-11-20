@@ -2,23 +2,63 @@ use memento_core::{CommandContext, Error, F32Blob, Store, Tier, VectorKind, Vect
 use rusqlite::Connection;
 use serde_json::json;
 
-const DROP: &str = "DROP INDEX vector_blobs_status_current_v1;DROP INDEX episodes_status_indexable_v2;DROP INDEX episodes_status_raw_v1;";
-const COUNT: &str = "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('vector_blobs_status_current_v1','episodes_status_indexable_v2','episodes_status_raw_v1')";
+const DROP: &str = "DROP INDEX vector_blobs_status_current_v1;DROP INDEX episodes_status_indexable_v2;DROP \
+    INDEX episodes_status_raw_v1;";
+const COUNT: &str = "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN \
+    ('vector_blobs_status_current_v1','episodes_status_indexable_v2','episodes_status_raw_v1')";
 
 #[test]
 fn additive_status_indexes_preserve_authority_and_respect_writer_and_reopen_fences() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let store = Store::open(&data).unwrap();
-    let episode=store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"event","conversation_id":"thread","kind":"user","text":"Ω😀 exact original source","metadata":{}})).unwrap()).unwrap();
+    let episode = store
+        .capture(
+            serde_json::from_value(json!({
+                "source":"synthetic",
+                "event_id":"event",
+                "conversation_id":"thread",
+                "kind":"user",
+                "text":"Ω😀 exact original source",
+                "metadata":{}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     let mut values = [0.; 768];
     values[0] = -0.;
     values[1] = 1.;
-    store.command(&CommandContext{command_id:"seed".into(),actor:"owner".into(),why:"Index upgrade preservation fixture".into()},&json!({"seed":true}),|tx,commit|{
-        tx.sql().execute("INSERT INTO node_versions VALUES('node',1,?,'knowledge','Exact assertion','active',NULL,NULL,NULL,0,'[\"personal\"]')",[commit])?;
-        tx.sql().execute("INSERT INTO graph_evidence VALUES('node',1,?,0,2,'Ω😀')",[&episode.id])?;
-        tx.put_vector(&VectorWrite{seq:0,target:"node".into(),kind:VectorKind::Node,version:1,current:true,tier:Tier::Hot,embedding:F32Blob::from_values(&values)?})?;Ok(json!({}))
-    }).unwrap();
+    store
+        .command(
+            &CommandContext {
+                command_id: "seed".into(),
+                actor: "owner".into(),
+                why: "Index upgrade preservation fixture".into(),
+            },
+            &json!({"seed":true}),
+            |tx, commit| {
+                tx.sql().execute(
+                    "INSERT INTO node_versions VALUES('node',1,?,'knowledge','Exact \
+                    assertion','active',NULL,NULL,NULL,0,'[\"personal\"]')",
+                    [commit],
+                )?;
+                tx.sql().execute(
+                    "INSERT INTO graph_evidence VALUES('node',1,?,0,2,'Ω😀')",
+                    [&episode.id],
+                )?;
+                tx.put_vector(&VectorWrite {
+                    seq: 0,
+                    target: "node".into(),
+                    kind: VectorKind::Node,
+                    version: 1,
+                    current: true,
+                    tier: Tier::Hot,
+                    embedding: F32Blob::from_values(&values)?,
+                })?;
+                Ok(json!({}))
+            },
+        )
+        .unwrap();
     let snapshot = |s: &Store| {
         s.read(|tx| {
             Ok((

@@ -159,11 +159,29 @@ fn captured_source_forgetting_blocks_more_stages_and_final_publication() {
     payload["scope"] = json!([]);
     payload["evidence"] = json!([]);
     let episode = f.job.payload["evidence"][0]["episode_id"].as_str().unwrap();
-    let id=f.store.write(|tx|{tx.sql().execute("INSERT INTO captured_media_refs(sha256,episode_id,start,end,quote) VALUES (?,?,0,35,?)",rusqlite::params![f.blob.sha256,episode,"Exact synthetic media evidence Ω😀"])?;Queue::insert(tx,"captured-control","media",&payload)}).unwrap();
+    let id = f
+        .store
+        .write(|tx| {
+            tx.sql().execute(
+                "INSERT INTO captured_media_refs(sha256,episode_id,start,end,quote) VALUES (?,?,0,35,?)",
+                rusqlite::params![f.blob.sha256, episode, "Exact synthetic media evidence Ω😀"],
+            )?;
+            Queue::insert(tx, "captured-control", "media", &payload)
+        })
+        .unwrap();
     let captured = f.queue.claim(&["media".into()], &[]).unwrap().unwrap();
     assert_eq!(captured.id, id);
     stage::persist(&f.store, &captured, &f.identity, 0, f.unit(0)).unwrap();
-    f.store.write(|tx|{tx.sql().execute("INSERT INTO forgotten_sources(source,event_id,target,commit_id) VALUES ('media-test','one','control-target','control-commit')",[])?;Ok(())}).unwrap();
+    f.store
+        .write(|tx| {
+            tx.sql().execute(
+                "INSERT INTO forgotten_sources(source,event_id,target,commit_id) VALUES \
+                ('media-test','one','control-target','control-commit')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     assert!(stage::persist(&f.store, &captured, &f.identity, 1, f.unit(1)).is_err());
     assert!(stage::finish(&f.store, &captured, &f.identity, 1).is_err());
     let model = Arc::new(Synthetic::new());

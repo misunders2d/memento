@@ -43,7 +43,8 @@ fn current_vector(store: &Store, target: &str, version: i64, seq: i64) {
 }
 fn node_vectors(store: &Store, target: &str) -> Vec<(i64, i64)> {
     store.read(|tx| {
-        let mut statement = tx.sql().prepare("SELECT i.version,b.current FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=? AND i.kind='node' ORDER BY i.version")?;
+        let mut statement = tx.sql().prepare("SELECT i.version,b.current FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE \
+            i.target=? AND i.kind='node' ORDER BY i.version")?;
         let values = statement.query_map([target], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(values)
     }).unwrap()
@@ -56,18 +57,59 @@ fn same_id_revisions_flow_through_http_history_and_recall_across_restart() {
         .build()
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let text = "Quartz launch report is pending. Quartz launch report is pending legal approval. Quartz launch report was approved on Friday.";
+    let text = "Quartz launch report is pending. Quartz launch report is pending legal approval. Quartz \
+        launch report was approved on Friday.";
     let (a, episode) = runtime.block_on(async {
         let store = Store::open(dir.path().join("data")).unwrap();
-        let episode=store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"revision-api","conversation_id":"revision-api","kind":"user","text":text,"metadata":{}})).unwrap()).unwrap().id;
+        let episode=store.capture(serde_json::from_value(json!({
+            "source":"synthetic",
+            "event_id":"revision-api",
+            "conversation_id":"revision-api",
+            "kind":"user",
+            "text":text,
+            "metadata":{}
+        })).unwrap()).unwrap().id;
         let state = crate::AppState::new(store).unwrap();
-        let created = call(&state,"POST","/remember",Some(json!({"command_id":"api-v1","actor":"owner","why":"Original state","type":"knowledge","text":"Quartz launch report is pending.","scope":["personal"],"evidence":[{"episode_id":episode,"quote":"Quartz launch report is pending."}]}))).await;
+        let created = call(&state,"POST","/remember",Some(json!({
+            "command_id":"api-v1",
+            "actor":"owner",
+            "why":"Original state",
+            "type":"knowledge",
+            "text":"Quartz launch report is pending.",
+            "scope":["personal"],
+            "evidence":[{"episode_id":episode,"quote":"Quartz launch report is pending."}]
+        }))).await;
         let a = created["id"].as_str().unwrap().to_owned();
-        let refine = json!({"command_id":"api-v2","actor":"owner","why":"Legal condition","old":a,"kind":"refinement","new":{"type":"knowledge","text":"Quartz launch report is pending legal approval.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":"Quartz launch report is pending legal approval."}]});
+        let refine = json!({
+            "command_id":"api-v2",
+            "actor":"owner",
+            "why":"Legal condition",
+            "old":a,
+            "kind":"refinement",
+            "new": {
+                "type":"knowledge",
+                "text":"Quartz launch report is pending legal approval.",
+                "scope":["personal"]
+            },
+            "evidence": [{"episode_id":episode,"quote":"Quartz launch report is pending legal approval."}]
+        });
         let v2 = call(&state, "POST", "/supersede", Some(refine.clone())).await;
         assert_eq!((v2["id"].as_str(), v2["version"].as_i64()), (Some(a.as_str()), Some(2)));
         assert_eq!(call(&state, "POST", "/supersede", Some(refine)).await, v2);
-        let v3 = call(&state,"POST","/supersede",Some(json!({"command_id":"api-v3","actor":"owner","why":"Approved on Friday","old":a,"kind":"change","valid_at":"2026-10-23T09:00:00+03:00","new":{"type":"knowledge","text":"Quartz launch report was approved on Friday.","scope":["personal"]},"evidence":[{"episode_id":episode,"quote":"Quartz launch report was approved on Friday."}]}))).await;
+        let v3 = call(&state,"POST","/supersede",Some(json!({
+            "command_id":"api-v3",
+            "actor":"owner",
+            "why":"Approved on Friday",
+            "old":a,
+            "kind":"change",
+            "valid_at":"2026-10-23T09:00:00+03:00",
+            "new": {
+                "type":"knowledge",
+                "text":"Quartz launch report was approved on Friday.",
+                "scope":["personal"]
+            },
+            "evidence": [{"episode_id":episode,"quote":"Quartz launch report was approved on Friday."}]
+        }))).await;
         assert_eq!((v3["id"].as_str(), v3["version"].as_i64()), (Some(a.as_str()), Some(3)));
         (a, episode)
     });
@@ -87,7 +129,14 @@ fn same_id_revisions_flow_through_http_history_and_recall_across_restart() {
         assert_eq!(versions[2]["valid_from"], "2026-10-23T06:00:00+00:00");
         assert_eq!(versions[2]["why"], "Approved on Friday");
         assert_eq!(versions[2]["actor"], "owner");
-        assert_eq!(versions[2]["evidence"], json!([{"episode_id":episode,"start":81,"end":125,"quote":"Quartz launch report was approved on Friday."}]));
+        assert_eq!(versions[2]["evidence"], json!([
+            {
+                "episode_id":episode,
+                "start":81,
+                "end":125,
+                "quote":"Quartz launch report was approved on Friday."
+            }
+        ]));
         assert!(versions[2]["diff"].to_string().contains("Friday"));
         // Prior vectors are retired; the indexer embeds only the current version.
         assert!(node_vectors(&store, &a).is_empty());
@@ -105,8 +154,23 @@ fn revision_rebinds_node_vectors_to_the_current_version() {
     let mut f = Fixture::new();
     let a = f.add("Quartz cache rotation is weekly.", "knowledge", "2026-10-01T00:00:00Z", 0.5, 0.9, "personal");
     let text = "Quartz cache rotation is daily.";
-    let source=f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"rotation","conversation_id":"rotation","kind":"user","text":text,"metadata":{}})).unwrap()).unwrap();
-    let correct = |key: &str, scope: &str| f.graph.supersede(serde_json::from_value(json!({"command_id":key,"actor":"owner","why":"Corrected rotation","old":a,"kind":"correction","new":{"type":"knowledge","text":text,"scope":[scope]},"evidence":[{"episode_id":source.id,"quote":text}]})).unwrap()).unwrap();
+    let source=f.store.capture(serde_json::from_value(json!({
+        "source":"synthetic",
+        "event_id":"rotation",
+        "conversation_id":"rotation",
+        "kind":"user",
+        "text":text,
+        "metadata":{}
+    })).unwrap()).unwrap();
+    let correct = |key: &str, scope: &str| f.graph.supersede(serde_json::from_value(json!({
+        "command_id":key,
+        "actor":"owner",
+        "why":"Corrected rotation",
+        "old":a,
+        "kind":"correction",
+        "new":{"type":"knowledge","text":text,"scope":[scope]},
+        "evidence":[{"episode_id":source.id,"quote":text}]
+    })).unwrap()).unwrap();
     assert_eq!(correct("daily", "personal")["version"], 2);
     // Changed text retires the old vector; recall never serves stale content.
     assert_eq!(node_vectors(&f.store, &a), vec![(1, 0)]);

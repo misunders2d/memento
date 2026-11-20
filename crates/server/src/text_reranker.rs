@@ -235,10 +235,15 @@ impl TextReranker {
                         .iter()
                         .map(|v| i64::from(*v))
                         .collect();
-                    let outputs = session.run_with_options(ort::inputs![
-                        "input_ids" => Tensor::from_array(([1, n], ids)).map_err(|_| unavailable())?,
-                        "attention_mask" => Tensor::from_array(([1, n], mask)).map_err(|_| unavailable())?
-                    ], &*options).map_err(|_| unavailable())?;
+                    let outputs = session
+                        .run_with_options(
+                            ort::inputs![
+                                "input_ids" => Tensor::from_array(([1, n], ids)).map_err(|_| unavailable())?,
+                                "attention_mask" => Tensor::from_array(([1, n], mask)).map_err(|_| unavailable())?
+                            ],
+                            &*options,
+                        )
+                        .map_err(|_| unavailable())?;
                     let (shape, values) = outputs["logits"]
                         .try_extract_tensor::<f32>()
                         .map_err(|_| unavailable())?;
@@ -300,7 +305,8 @@ mod tests {
         let scorer = TextReranker::load(Path::new(&root), Path::new(&runtime), 1).unwrap();
         let query = "How many people live in Berlin?";
         let documents = [
-            "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
+            "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square \
+            kilometers.",
             "New York City is famous for the Metropolitan Museum of Art.",
         ];
         let before = scorer

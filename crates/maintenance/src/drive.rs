@@ -379,7 +379,16 @@ impl ColdStore for DriveColdStore {
             }
         }
         if completed.is_none() && !sessions.contains_key(&sha) {
-            let(response,_)=self.json("POST",UPLOAD.into(),vec![("Content-Type".into(),"application/json; charset=UTF-8".into()),("X-Upload-Content-Type".into(),mime.into()),("X-Upload-Content-Length".into(),size.to_string())],serde_json::to_vec(&json!({"name":name,"parents":[self.binding.folder_id],"appProperties":{"sha256":sha}}))?)?;
+            let (response, _) = self.json(
+                "POST",
+                UPLOAD.into(),
+                vec![
+                    ("Content-Type".into(), "application/json; charset=UTF-8".into()),
+                    ("X-Upload-Content-Type".into(), mime.into()),
+                    ("X-Upload-Content-Length".into(), size.to_string()),
+                ],
+                serde_json::to_vec(&json!({"name":name,"parents":[self.binding.folder_id],"appProperties":{"sha256":sha}}))?,
+            )?;
             if ![200, 201].contains(&response.status) {
                 return Err(unavailable());
             }

@@ -48,7 +48,19 @@ fn health(port: u16) -> bool {
 fn seed(path: &Path) {
     let store = Store::open(path).unwrap();
     for n in 0..512 {
-        store.capture(serde_json::from_value(json!({"source":"native:synthetic:pi","event_id":format!("shutdown-{n}"),"conversation_id":format!("shutdown-{n}"),"kind":"native_record","text":format!("Synthetic native source {n}"),"metadata":{"extraction_mode":"skip"}})).unwrap()).unwrap();
+        store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"native:synthetic:pi",
+                    "event_id":format!("shutdown-{n}"),
+                    "conversation_id":format!("shutdown-{n}"),
+                    "kind":"native_record",
+                    "text":format!("Synthetic native source {n}"),
+                    "metadata":{"extraction_mode":"skip"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
     }
 }
 #[test]
@@ -89,7 +101,12 @@ fn sigterm_stops_new_background_units_before_existing_http_request_finishes() {
         thread::sleep(Duration::from_millis(5));
     }
     let mut pending = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(pending,"POST /episodes HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{{").unwrap();
+    write!(
+        pending,
+        "POST /episodes HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: \
+        application/json\r\nContent-Length: 100000\r\n\r\n{{"
+    )
+    .unwrap();
     pending.flush().unwrap();
     // A writer lock holds the CURRENT bounded compression unit at commit. This
     // changes no source row and leaves the HTTP request incomplete across SIGTERM.

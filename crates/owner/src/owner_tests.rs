@@ -45,7 +45,18 @@ impl Fixture {
     fn new() -> Self {
         let dir = private();
         let store = Store::open(dir.path()).unwrap();
-        let captured=store.capture(serde_json::from_value(json!({"source":"owner-fixture","event_id":"one","conversation_id":"thread","kind":"user","text":TEXT})).unwrap()).unwrap();
+        let captured = store
+            .capture(
+                serde_json::from_value(json!({
+                    "source":"owner-fixture",
+                    "event_id":"one",
+                    "conversation_id":"thread",
+                    "kind":"user",
+                    "text":TEXT
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let graph = Graph::new(store);
         let processing = Arc::new(Processing::new(graph.clone()));
         Self {
@@ -69,7 +80,20 @@ impl Fixture {
         .unwrap()
     }
     fn save(&self, key: &str, kind: &str, text: &str) -> Value {
-        self.graph.remember(serde_json::from_value(json!({"command_id":key,"actor":"synthetic-agent","why":"Exact synthetic source","type":kind,"text":text,"scope":["professional"],"evidence":[{"episode_id":self.episode,"quote":"Exact source Ω😀."}]})).unwrap()).unwrap()
+        self.graph
+            .remember(
+                serde_json::from_value(json!({
+                    "command_id":key,
+                    "actor":"synthetic-agent",
+                    "why":"Exact synthetic source",
+                    "type":kind,
+                    "text":text,
+                    "scope":["professional"],
+                    "evidence":[{"episode_id":self.episode,"quote":"Exact source Ω😀."}]
+                }))
+                .unwrap(),
+            )
+            .unwrap()
     }
     fn call(&self, value: Value) -> Value {
         owner::request(self.dir.path(), &value).unwrap()
@@ -93,7 +117,14 @@ fn real_socket_mode_wrappers_and_owner_review_actor_retry_conflict() {
     );
     let listed = f.call(json!({"operation":"list"}));
     assert_eq!(listed["result"].as_array().unwrap().len(), 1);
-    let request = json!({"operation":"approve","proposal_id":proposal["id"],"command_id":"owner-approval","why":"Human exact review","actor":"forged-client-actor","uid":0});
+    let request = json!({
+        "operation":"approve",
+        "proposal_id":proposal["id"],
+        "command_id":"owner-approval",
+        "why":"Human exact review",
+        "actor":"forged-client-actor",
+        "uid":0
+    });
     let approved = f.call(request.clone());
     assert!(approved.get("error").is_none());
     let id = approved["result"]["id"].as_str().unwrap();
@@ -132,16 +163,37 @@ fn owner_merge_include_and_forget_preserve_original_raw_history() {
     let server = OwnerServer::start(f.services()).unwrap();
     let inventory = f.call(json!({"operation":"inventory"}));
     let cluster = inventory["result"]["clusters"][0]["cluster"].clone();
-    let preview=f.call(json!({"operation":"merge_preview","cluster":cluster,"into":null,"exclude":[],"include":[ids[2]]}));
+    let preview = f.call(json!({"operation":"merge_preview","cluster":cluster,"into":null,"exclude":[],"include":[ids[2]]}));
     assert_eq!(preview["result"]["included"], json!([ids[2]]));
     let survivor = preview["result"]["survivor"]["id"].clone();
-    let result=f.call(json!({"operation":"merge","cluster":cluster,"into":survivor,"exclude":[],"include":[ids[2]],"token":preview["result"]["token"],"why":"Owner confirms identity","command_id":"reviewed-merge"}));
+    let result = f.call(json!({
+        "operation":"merge",
+        "cluster":cluster,
+        "into":survivor,
+        "exclude":[],
+        "include":[ids[2]],
+        "token":preview["result"]["token"],
+        "why":"Owner confirms identity",
+        "command_id":"reviewed-merge"
+    }));
     assert!(result.get("error").is_none(), "{result}");
     let target = survivor.as_str().unwrap();
     let preview = f.call(json!({"operation":"forget_preview","target":target}));
-    let invalid=f.call(json!({"operation":"forget","target":target,"token":"changed-token","why":"Owner request","command_id":"bad-forget"}));
+    let invalid = f.call(json!({
+        "operation":"forget",
+        "target":target,
+        "token":"changed-token",
+        "why":"Owner request",
+        "command_id":"bad-forget"
+    }));
     assert!(invalid.get("error").is_some());
-    let valid=f.call(json!({"operation":"forget","target":target,"token":preview["result"]["token"],"why":"Owner request","command_id":"confirmed-forget"}));
+    let valid = f.call(json!({
+        "operation":"forget",
+        "target":target,
+        "token":preview["result"]["token"],
+        "why":"Owner request",
+        "command_id":"confirmed-forget"
+    }));
     assert!(valid.get("error").is_none());
     assert_eq!(
         f.graph
@@ -166,10 +218,13 @@ fn owner_history_cutover_idempotent_and_export_is_complete_native_archive() {
     let first = f.call(json!({"operation":"history_park"}));
     assert!(first.get("error").is_none());
     assert_eq!(f.call(json!({"operation":"history_park"})), first);
-    f.graph.store.write(|tx| {
-        tx.sql().execute("INSERT INTO historical_parked_candidates(candidate_id) VALUES ('preserved-candidate')",[])?;
-        Ok(())
-    }).unwrap();
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO historical_parked_candidates(candidate_id) VALUES ('preserved-candidate')", [])?;
+            Ok(())
+        })
+        .unwrap();
     let released = f.call(json!({"operation":"history_release-candidates"}));
     assert_eq!(released["result"]["released_now"], 1);
     assert_eq!(released["result"]["parked_candidates"], 0);
@@ -505,7 +560,21 @@ fn cli_merge_pins_preview_survivor_token_and_included_variants_before_confirmed_
         "--command-id",
         "stable-id",
     ]);
-    let status=owner_cli::run(&args,&mut console,&|_,v|{requests.borrow_mut().push(v.clone());if v["operation"]=="merge_preview"{Ok(json!({"result":{"survivor":{"id":"fixed-survivor"},"absorbed":["a","b"],"token":"frozen-preview-token"}}))}else{Ok(json!({"result":{"id":"fixed-survivor"}}))}}).unwrap();
+    let status = owner_cli::run(&args, &mut console, &|_, v| {
+        requests.borrow_mut().push(v.clone());
+        if v["operation"] == "merge_preview" {
+            Ok(json!({
+                "result": {
+                    "survivor":{"id":"fixed-survivor"},
+                    "absorbed":["a","b"],
+                    "token":"frozen-preview-token"
+                }
+            }))
+        } else {
+            Ok(json!({"result":{"id":"fixed-survivor"}}))
+        }
+    })
+    .unwrap();
     assert_eq!(status, 0);
     let requests = requests.borrow();
     assert_eq!(requests.len(), 2);
@@ -634,7 +703,12 @@ impl Transport for DriveProbe {
         let value = if request.url.contains("/about?") {
             json!({"user":{"emailAddress":"owner@example.test"}})
         } else if request.url.contains("/files/original_folder?") {
-            json!({"id":"original_folder","mimeType":"application/vnd.google-apps.folder","ownedByMe":true,"trashed":false})
+            json!({
+                "id":"original_folder",
+                "mimeType":"application/vnd.google-apps.folder",
+                "ownedByMe":true,
+                "trashed":false
+            })
         } else {
             assert!(request.url.contains("/files?q="));
             json!({"files":[]})
@@ -652,7 +726,16 @@ fn restore_cli_uses_only_explicit_private_original_connection_file() {
     let dir = private();
     let path = dir.path().join("chosen-original.json");
     let scope = "https://www.googleapis.com/auth/drive.file";
-    let config = json!({"type":"authorized_user","client_id":"synthetic-client","client_secret":"SYNTHETIC SECRET","refresh_token":"SYNTHETIC REFRESH","token":"SYNTHETIC TOKEN","expiry":"2099-01-01T00:00:00+00:00","scopes":[scope],"memento":{"account":"owner@example.test","folder_id":"original_folder"}});
+    let config = json!({
+        "type":"authorized_user",
+        "client_id":"synthetic-client",
+        "client_secret":"SYNTHETIC SECRET",
+        "refresh_token":"SYNTHETIC REFRESH",
+        "token":"SYNTHETIC TOKEN",
+        "expiry":"2099-01-01T00:00:00+00:00",
+        "scopes":[scope],
+        "memento":{"account":"owner@example.test","folder_id":"original_folder"}
+    });
     fs_safe::atomic_private(&path, &serde_json::to_vec(&config).unwrap()).unwrap();
     fs_safe::atomic_private(
         &dir.path().join("drive-oauth.json"),
@@ -726,17 +809,42 @@ fn legacy_replace(f: &Fixture, key: &str, old: &str, text: &str, pinned: bool) -
     let evidence = json!([{"episode_id":f.episode,"quote":"Exact source Ω😀."}]);
     let context = memento_domain::context(key.into(), "legacy".into(), "Legacy fixture".into());
     let result = f.graph.store.command(&context, &json!({"legacy":key}), |tx, commit| {
-        let (version, kind, prior, scope, pin): (i64, String, String, String, i64) = tx.sql().query_row(
-            "SELECT version,type,text,scope,pinned FROM node_versions WHERE id=? ORDER BY version DESC LIMIT 1",
-            [old],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )?;
-        let replacement = TxGraph::insert_node(tx, commit, &json!({"type":kind,"text":text,"scope":serde_json::from_str::<Value>(&scope)?,"valid_from":null,"valid_to":null,"evidence":evidence,"pinned":pinned}))?;
+        let (version, kind, prior, scope, pin): (i64, String, String, String, i64) =
+            tx.sql().query_row("SELECT version,type,text,scope,pinned FROM node_versions WHERE id=? ORDER BY version DESC LIMIT 1", [old], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+        let replacement = TxGraph::insert_node(tx, commit, &json!({
+            "type":kind,
+            "text":text,
+            "scope":serde_json::from_str::<Value>(&scope)?,
+            "valid_from":null,
+            "valid_to":null,
+            "evidence":evidence,
+            "pinned":pinned
+        }))?;
         let id = replacement["id"].as_str().unwrap();
-        tx.sql().execute("INSERT INTO node_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)", rusqlite::params![old, version + 1, commit, kind, prior, "refined", None::<&str>, None::<&str>, id, pin, scope])?;
+        tx.sql().execute(
+            "INSERT INTO node_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            rusqlite::params![
+                old,
+                version + 1,
+                commit,
+                kind,
+                prior,
+                "refined",
+                None::<&str>,
+                None::<&str>,
+                id,
+                pin,
+                scope
+            ],
+        )?;
         TxGraph::evidence(tx, old, version + 1, &evidence)?;
         let edge = format!("edge-{key}");
-        tx.sql().execute("INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)", rusqlite::params![edge, 1, commit, id, "supersedes", old, "active"])?;
+        tx.sql().execute(
+            "INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)",
+            rusqlite::params![edge, 1, commit, id, "supersedes", old, "active"],
+        )?;
         TxGraph::evidence(tx, &edge, 1, &evidence)?;
         Ok(replacement)
     });
@@ -766,7 +874,15 @@ fn owner_revision_recovery_applies_protected_chains_only_when_named() {
         json!([{"root":d,"members":[d,e],"reasons":["pinned"]}])
     );
     let recover = |key: &str, token: &Value, protected: Value| {
-        f.call(json!({"operation":"recover_revisions","limit":8,"exclude":[],"protected":protected,"token":token,"why":"Owner reviewed plan","command_id":key}))
+        f.call(json!({
+            "operation":"recover_revisions",
+            "limit":8,
+            "exclude":[],
+            "protected":protected,
+            "token":token,
+            "why":"Owner reviewed plan",
+            "command_id":key
+        }))
     };
     // Naming a protected root changes the plan, so the generic token cannot apply it.
     assert!(
@@ -774,7 +890,14 @@ fn owner_revision_recovery_applies_protected_chains_only_when_named() {
             .get("error")
             .is_some()
     );
-    let missing = f.call(json!({"operation":"recover_revisions","limit":8,"exclude":[],"token":plan["token"],"why":"Owner reviewed plan","command_id":"missing"}));
+    let missing = f.call(json!({
+        "operation":"recover_revisions",
+        "limit":8,
+        "exclude":[],
+        "token":plan["token"],
+        "why":"Owner reviewed plan",
+        "command_id":"missing"
+    }));
     assert!(missing.get("error").is_some());
     let generic = recover("generic", &plan["token"], json!([]));
     assert_eq!(
@@ -842,7 +965,12 @@ fn owner_revision_recovery_applies_protected_chains_only_when_named() {
 }
 #[test]
 fn cli_revision_recovery_requires_named_protected_roots_in_the_typed_confirmation() {
-    let plan = json!({"result":{"chains":[{"root":"a","protected_reasons":[]},{"root":"d","protected_reasons":["pinned"]}],"token":"plan-token"}});
+    let plan = json!({
+        "result": {
+            "chains": [{"root":"a","protected_reasons":[]},{"root":"d","protected_reasons":["pinned"]}],
+            "token":"plan-token"
+        }
+    });
     for (answer, status) in [
         ("recover 2 revision chains", 1),
         ("recover 2 revision chains including protected d", 0),
@@ -887,7 +1015,15 @@ fn cli_revision_recovery_requires_named_protected_roots_in_the_typed_confirmatio
         if status == 0 {
             assert_eq!(
                 requests[1],
-                json!({"limit":8,"exclude":["x"],"protected":["d"],"operation":"recover_revisions","token":"plan-token","why":"Human choice","command_id":"stable-id"})
+                json!({
+                    "limit":8,
+                    "exclude":["x"],
+                    "protected":["d"],
+                    "operation":"recover_revisions",
+                    "token":"plan-token",
+                    "why":"Human choice",
+                    "command_id":"stable-id"
+                })
             );
         }
         assert!(console.prompts[0].contains("including protected d"));

@@ -16,7 +16,9 @@ cur(id,version,kind) AS (SELECT n.id,n.version,'node' FROM node_versions n JOIN 
 SELECT c.id,c.version,c.kind FROM cur c WHERE EXISTS (SELECT 1 FROM graph_evidence g WHERE g.target=c.id AND g.version=c.version)
  AND NOT EXISTS (SELECT 1 FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND g.version=c.version AND NOT EXISTS (SELECT 1 FROM gone WHERE gone.source=e.source AND gone.event_id=e.event_id))
  ORDER BY c.id";
-const INCIDENT: &str = "SELECT e.id,e.version FROM edge_versions e WHERE (e.src IN (SELECT value FROM json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id";
+const INCIDENT: &str = "SELECT e.id,e.version FROM edge_versions e WHERE (e.src IN (SELECT value FROM \
+    json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND \
+    e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id";
 
 pub fn preview(db: &Connection, target: &str) -> Result<Value> {
     let existing = one(
@@ -44,7 +46,10 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
         }
         let family = rows(
             db,
-            "WITH RECURSIVE family(id) AS (SELECT ? UNION SELECT n.id FROM node_versions n JOIN family f ON n.superseded_by=f.id WHERE n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)) SELECT n.id,n.version FROM node_versions n JOIN family f ON f.id=n.id WHERE n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY n.id",
+            "WITH RECURSIVE family(id) AS (SELECT ? UNION SELECT n.id FROM node_versions n JOIN family f \
+            ON n.superseded_by=f.id WHERE n.version=(SELECT max(x.version) FROM node_versions x WHERE \
+            x.id=n.id)) SELECT n.id,n.version FROM node_versions n JOIN family f ON f.id=n.id WHERE \
+            n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY n.id",
             [target],
         )?;
         let mut nodes = json!({});
@@ -58,7 +63,9 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
         let mut edge_ids = vec![];
         for row in rows(
             db,
-            "SELECT e.id,e.version FROM edge_versions e WHERE (e.src IN (SELECT value FROM json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id",
+            "SELECT e.id,e.version FROM edge_versions e WHERE (e.src IN (SELECT value FROM \
+            json_each(?1)) OR e.dst IN (SELECT value FROM json_each(?1))) AND e.state='active' AND \
+            e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) ORDER BY e.id",
             [encode_json(&json!(ids))?],
         )? {
             let id = get_str(&row, "id")?;
@@ -85,7 +92,10 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
             vec![target.into()],
         )
     } else if let Some(candidate) = candidate {
-        if one(db,"SELECT target_id FROM candidate_decisions WHERE candidate_id=? AND decision='promote' AND rowid=(SELECT max(rowid) FROM candidate_decisions WHERE candidate_id=?)",params![target,target])?.is_some(){return Err(Error::Validation("Candidate was promoted; choose its active target"));}
+        if one(db, "SELECT target_id FROM candidate_decisions WHERE candidate_id=? AND decision='promote' AND \
+            rowid=(SELECT max(rowid) FROM candidate_decisions WHERE candidate_id=?)", params![target, target])?.is_some() {
+            return Err(Error::Validation("Candidate was promoted; choose its active target"));
+        }
         (
             "candidate",
             excerpt(get_str(&candidate, "text")?, 240),
@@ -126,10 +136,25 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
     }
     let sources = rows(
         db,
-        "SELECT DISTINCT e.source,e.event_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target IN (SELECT value FROM json_each(?)) ORDER BY e.source,e.event_id",
+        "SELECT DISTINCT e.source,e.event_id FROM graph_evidence g JOIN episodes e ON \
+        e.id=g.episode_id WHERE g.target IN (SELECT value FROM json_each(?)) ORDER BY \
+        e.source,e.event_id",
         [encode_json(&json!(targets))?],
     )?;
-    let mut record = json!({"target":target,"kind":kind,"label":label,"nodes":nodes,"edges":edges,"targets":targets,"dependents":dependents,"sources":sources,"already_forgotten":existing,"policy":"active_memory_only","raw_history":"retained","backups":"retained"});
+    let mut record = json!({
+        "target":target,
+        "kind":kind,
+        "label":label,
+        "nodes":nodes,
+        "edges":edges,
+        "targets":targets,
+        "dependents":dependents,
+        "sources":sources,
+        "already_forgotten":existing,
+        "policy":"active_memory_only",
+        "raw_history":"retained",
+        "backups":"retained"
+    });
     record["token"] = json!(hash_json(&record)?);
     Ok(record)
 }
@@ -144,20 +169,41 @@ pub fn exclude(tx: &WriteTxn, commit: &str, record: &Value) -> Result<()> {
     kinds.insert(get_str(record, "target")?, get_str(record, "kind")?);
     for target in record["targets"].as_array().unwrap() {
         let target = target.as_str().unwrap();
-        tx.sql().execute("INSERT INTO forgotten_targets SELECT ?,?,? WHERE NOT EXISTS (SELECT 1 FROM forgotten_targets WHERE target=?)",params![target,commit,kinds[target],target])?;
+        tx.sql().execute(
+            "INSERT INTO forgotten_targets SELECT ?,?,? WHERE NOT EXISTS (SELECT 1 FROM \
+                forgotten_targets WHERE target=?)",
+            params![target, commit, kinds[target], target],
+        )?;
         tx.touch_forgotten_target(target)?;
         if kinds[target] == "candidate" {
-            tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE kind='candidate' AND target=?)",[target])?;
+            tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE \
+                kind='candidate' AND target=?)", [target])?;
             tx.touch_target(target)?;
         }
     }
     for source in record["sources"].as_array().unwrap() {
         let origin = get_str(source, "source")?;
         let event = get_str(source, "event_id")?;
-        tx.sql().execute("INSERT INTO forgotten_sources SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM forgotten_sources WHERE source=? AND event_id=? AND target=?)",params![origin,event,record["target"].as_str(),commit,origin,event,record["target"].as_str()])?;
+        tx.sql().execute(
+            "INSERT INTO forgotten_sources SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM \
+                forgotten_sources WHERE source=? AND event_id=? AND target=?)",
+            params![
+                origin,
+                event,
+                record["target"].as_str(),
+                commit,
+                origin,
+                event,
+                record["target"].as_str()
+            ],
+        )?;
         // Existing authority's source-wide semantic exclusion includes raw chunks,
         // candidates and every assertion/segment supported by that source event.
-        tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target JOIN episodes e ON e.id=x.episode_id WHERE i.kind='episode' AND e.source=?1 AND e.event_id=?2 UNION SELECT i.seq FROM vector_items i JOIN candidates c ON c.id=i.target JOIN extraction_runs r ON r.id=c.run_id JOIN episodes e ON e.id=r.episode_id WHERE i.kind='candidate' AND e.source=?1 AND e.event_id=?2)",params![origin,event])?;
+        tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT i.seq FROM vector_items i JOIN \
+            episode_chunks x ON x.id=i.target JOIN episodes e ON e.id=x.episode_id WHERE \
+            i.kind='episode' AND e.source=?1 AND e.event_id=?2 UNION SELECT i.seq FROM vector_items i \
+            JOIN candidates c ON c.id=i.target JOIN extraction_runs r ON r.id=c.run_id JOIN episodes e \
+            ON e.id=r.episode_id WHERE i.kind='candidate' AND e.source=?1 AND e.event_id=?2)", params![origin, event])?;
         tx.touch_source(origin, event)?;
     }
     for target in record["nodes"].as_object().unwrap().keys() {
@@ -180,7 +226,9 @@ pub fn exclude(tx: &WriteTxn, commit: &str, record: &Value) -> Result<()> {
                     n["scope"].as_str()
                 ],
             )?;
-            tx.sql().execute("INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote FROM graph_evidence WHERE target=? AND version=?",params![version+1,target,version])?;
+            tx.sql()
+                .execute("INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote FROM graph_evidence \
+                    WHERE target=? AND version=?", params![version + 1, target, version])?;
         }
         curation::invalidate_vectors(tx, target)?;
         tx.touch_target(target)?;
@@ -205,7 +253,9 @@ pub fn exclude(tx: &WriteTxn, commit: &str, record: &Value) -> Result<()> {
                         "forgotten"
                     ],
                 )?;
-                tx.sql().execute("INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote FROM graph_evidence WHERE target=? AND version=?",params![version+1,target,version])?;
+                tx.sql()
+                    .execute("INSERT INTO graph_evidence SELECT target,?,episode_id,start,end,quote FROM graph_evidence \
+                        WHERE target=? AND version=?", params![version + 1, target, version])?;
                 tx.touch_target(target)?;
             }
         }
@@ -215,5 +265,21 @@ pub fn exclude(tx: &WriteTxn, commit: &str, record: &Value) -> Result<()> {
 pub fn forget(graph: &Graph, command: dto::Forget) -> Result<Value> {
     let request = json!({"op":"forget_active","target":command.target});
     let context = context(command.command_id, command.actor, command.why);
-    graph.store.command(&context,&request,|tx,commit|{let record=preview(tx.sql(),&command.target)?;if record["token"]!=command.token{return Err(Error::Conflict("Forget preview is stale; inspect and confirm the current scope"));}if record["already_forgotten"]==true{return Ok(json!({"id":command.target,"status":"already_forgotten","policy":"active_memory_only"}));}exclude(tx,commit,&record)?;Ok(json!({"id":command.target,"status":"forgotten","policy":"active_memory_only","raw_history":"retained","backups":"retained"}))})
+    graph.store.command(&context, &request, |tx, commit| {
+        let record = preview(tx.sql(), &command.target)?;
+        if record["token"] != command.token {
+            return Err(Error::Conflict("Forget preview is stale; inspect and confirm the current scope"));
+        }
+        if record["already_forgotten"] == true {
+            return Ok(json!({"id":command.target,"status":"already_forgotten","policy":"active_memory_only"}));
+        }
+        exclude(tx, commit, &record)?;
+        Ok(json!({
+            "id":command.target,
+            "status":"forgotten",
+            "policy":"active_memory_only",
+            "raw_history":"retained",
+            "backups":"retained"
+        }))
+    })
 }
