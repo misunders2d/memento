@@ -516,8 +516,22 @@ mod tests {
         init(&db).unwrap();
         // Reconstruct the original legacy layout, before comparison-only status
         // indexes existed (header1 also lacks their text_runs expression column).
-        db.execute_batch("DROP INDEX vector_blobs_status_current_v1; DROP INDEX episodes_status_indexable_v2; DROP \
-            INDEX episodes_status_raw_v1;").unwrap();
+        // The native chunk guard names the native-only message index, so it goes
+        // with it: a Python database only ever had the unconditional guard
+        // (`{table}_no_DELETE` in src/memento/schema.py), restored here verbatim.
+        db.execute_batch("DROP TRIGGER episode_chunks_no_DELETE_v2; CREATE TRIGGER episode_chunks_no_DELETE BEFORE DELETE ON \
+            episode_chunks BEGIN SELECT RAISE(ABORT, 'graph history is immutable'); END; DROP INDEX \
+            vector_blobs_status_current_v1; DROP INDEX episodes_status_indexable_v2; DROP INDEX \
+            episodes_status_raw_v1;").unwrap();
+        let native_only: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('episode_chunks_no_DELETE_v2',\
+                'vector_blobs_status_current_v1','episodes_status_indexable_v2','episodes_status_raw_v1')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_only, 0);
         db.execute_batch("CREATE VIRTUAL TABLE memory_vectors USING vec0(embedding float[768] \
             distance_metric=cosine,current boolean); INSERT INTO \
             memory_vectors(rowid,embedding,current) SELECT seq,embedding,current FROM vector_blobs; \
@@ -606,6 +620,17 @@ mod tests {
                             .is_err()
                     );
                     assert!(tx.sql().execute("DELETE FROM graph_evidence", []).is_err());
+                    // The destination keeps the native chunk guard and the index it names.
+                    assert_eq!(
+                        tx.sql().query_row(
+                            "SELECT (SELECT count(*) FROM sqlite_schema WHERE name IN \
+                            ('episode_chunks_no_DELETE_v2','episodes_status_indexable_v2')),(SELECT count(*) FROM \
+                            sqlite_schema WHERE name='episode_chunks_no_DELETE')",
+                            [],
+                            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                        )?,
+                        (2, 0)
+                    );
                     assert_eq!(
                         tx.sql().query_row(
                             "SELECT count(*) FROM episodes_fts WHERE episodes_fts MATCH 'evidence'",
