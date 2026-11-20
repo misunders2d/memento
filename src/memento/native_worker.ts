@@ -23,6 +23,9 @@ export default function worker(pi: any) {
       "Identity, schedule, model metadata and private lease tokens are supplied by the host.",
     parameters: Type.Object({ action: Type.Union(["pool","claim","submit","complete","status","release","renew"].map(value => Type.Literal(value))),
       command: Type.Any() }),
+    // Calls share the held-work state below, so sibling calls of one assistant message run
+    // one at a time (tool_call, execute and tool_result each) instead of interleaving.
+    executionMode: "sequential",
     async execute(_id: string, params: any, signal: AbortSignal) {
       const response = await fetch(url + "/work", { method: "POST", signal,
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(params) });
@@ -159,16 +162,23 @@ export default function worker(pi: any) {
         : event.input?.action === "complete" ? event.input.command?.id : undefined;
       const leased = failure?.[1] === "422" && validationCodes.has(failure[2]) ? claims.get(rejected) : undefined;
       if (!leased) return;
-      if (!await release(leased, ctx?.signal))
+      const confirmed = await release(leased, ctx?.signal);
+      const receipt = { rejected: leased.id, http_status: 422, code: failure?.[2], released: true,
+        next: "The adapter released this rejected job; do not release it. Claim other work." };
+      const result = () => ({ content: [{ type: "text", text: JSON.stringify({
+        current_work: current.map(item => ({ id: item.id, kind: item.kind })), receipt,
+        empty_kinds: [...emptyKinds], session_boundary: completed >= ROTATE_AFTER && !current.length }) }] });
+      // Another call released or completed it during the wait and already reported that; any
+      // work claimed since stays untouched.
+      if (!claims.has(leased.id)) return result();
+      if (!confirmed)
         return { content: [{ type: "text", text: text + "\nThe rejected job " + leased.id
           + " is still held: release it, or inspect its status if the outcome is uncertain." }] };
       released(leased.id);
-      last = { rejected: leased.id, http_status: 422, code: failure?.[2], released: true,
-        next: "The adapter released this rejected job; do not release it. Claim other work." };
+      last = receipt;
       emit({ type: "memento_worker_state", claimed: [], empty_kinds: [...emptyKinds], completed: null,
         released: leased.id, boundary: completed >= ROTATE_AFTER && !current.length, empty: false });
-      return { content: [{ type: "text", text: JSON.stringify({ current_work: [], receipt: last,
-        empty_kinds: [...emptyKinds], session_boundary: completed >= ROTATE_AFTER && !current.length }) }] };
+      return result();
     }
     const action = event.input.action;
     const completedId = value.completed || (action === "complete" && !event.isError ? event.input.command.id : null)

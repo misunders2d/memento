@@ -91,7 +91,7 @@ async function boot(script, { codes } = { codes: HOST_CODES }) {
     const messages = handlers.context({ messages: history }).messages;
     return { state: JSON.parse(messages[0].content[0].text), kept: messages.length - 1, text: JSON.stringify(messages) };
   };
-  return { call, context };
+  return { call, context, handlers, definition: () => definition };
 }
 const work = { work: [{ id: "job", owner: SECRET, kind: "consolidate", instruction: "fixed", schema: {},
   input: { candidates: [{ text: EVIDENCE }] } }], lease_seconds: 180, backlog: { claimable: { extract: 1, consolidate: 1 } } };
@@ -236,6 +236,37 @@ for (const name of ["aborted_release", "pre_aborted_release"]) {
   script.release = reply(200, { released: true });
   const manual = await adapter.call({ action: "release", command: { id: "job" } });
   out[name] = { rejected, after, manual, released: adapter.context() };
+}
+{
+  // Pi's parallel mode: a rejected submit and a model release of the same job in one message.
+  // The release's result lands while the adapter's own release is still waiting for the service.
+  const automatic = deferred();
+  let sent = 0;
+  const script = { claim: reply(200, work), submit: rejection,
+    release: (init) => ++sent === 1 ? reply(200, { released: true }) : automatic.answer(init) };
+  const adapter = await boot(script);
+  await adapter.call(claimInput());
+  const submit = { toolName: "memento_work", toolCallId: "parallel-submit", input: inputs.submit() };
+  const release = { toolName: "memento_work", toolCallId: "parallel-release", input: { action: "release", command: { id: "job" } } };
+  const start = records.length;
+  // Preflighted in source order, then executed concurrently.
+  const blocked = [adapter.handlers.tool_call(submit), adapter.handlers.tool_call(release)].map(result => !!result?.block);
+  const run = async (event) => {
+    try { return { content: (await adapter.definition().execute(event.toolCallId, event.input, undefined)).content, isError: false }; }
+    catch (error) { return { content: [{ type: "text", text: error.message }], isError: true }; }
+  };
+  const [rejected, released] = await Promise.all([run(submit), run(release)]);
+  const first = adapter.handlers.tool_result({ ...submit, ...rejected }, { signal: undefined });
+  await until(() => automatic.sent);
+  const second = await adapter.handlers.tool_result({ ...release, ...released }, { signal: undefined });
+  automatic.settle(reply(409, { detail: "Processing lease is not held" }));
+  const patch = await first;
+  out.parallel_release = { blocked, sent, text: (patch?.content ?? rejected.content).map(part => part.text).join("\n"),
+    release: second.content.map(part => part.text).join("\n"), events: records.slice(start), after: adapter.context() };
+}
+{
+  const adapter = await boot({});
+  out.definition = { executionMode: adapter.definition().executionMode };
 }
 process.stdout.write(JSON.stringify(out));
 '''
@@ -421,3 +452,25 @@ def test_pi_abort_ends_the_automatic_release_and_keeps_the_job_held(observed, na
     assert seen['manual']['posts'] == [RELEASE]
     assert [event['released'] for event in releases(seen['manual']['events'])] == ['job']
     assert seen['released']['state']['current'] == []
+
+
+def test_a_job_released_meanwhile_is_reported_released_not_still_held(observed):
+    seen = observed['parallel_release']
+    assert seen['blocked'] == [False, False] and seen['sent'] == 2
+    # The model's own release committed first and was reported once; nothing else claims a release.
+    assert [event for event in seen['events'] if 'released' in event] == [
+        dict(type='memento_worker_state', claimed=[], empty_kinds=[], completed=None, released='job',
+             boundary=False, empty=False)]
+    assert json.loads(seen['release'])['receipt'] == {'released': True}
+    # The rejected submit says the job is released, not still held.
+    assert 'still held' not in seen['text']
+    result = json.loads(seen['text'])
+    assert result['current_work'] == [] and result['session_boundary'] is False
+    assert result['receipt']['rejected'] == 'job' and result['receipt']['released'] is True
+    assert seen['after']['state']['current'] == []
+
+
+def test_work_tool_is_registered_for_sequential_execution(observed):
+    # Pi runs one assistant message's sibling calls of a sequential tool one after another
+    # (tool_call, execute, tool_result each), so they cannot interleave on the shared state.
+    assert observed['definition'] == {'executionMode': 'sequential'}
