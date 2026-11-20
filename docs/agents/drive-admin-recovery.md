@@ -1,0 +1,50 @@
+# Drive, owner administration and recovery
+
+Detail for [AGENTS.md](../../AGENTS.md). Caveman-compressed; every rule here is binding.
+
+## Drive, human administration and recovery
+
+Drive optional, integral when enabled: native image includes `memento-drive`, `memento-admin`, `memento-restore`; no Python service extra needed. Standalone owner commands need these native binaries + matching runtime libraries under `/usr/local`. Explicit Python comparison/development path still uses `--extra drive`. Human prerequisite: enable Google Drive API in dedicated project, create **Desktop app** OAuth client, explicitly consent to only `drive.file`. External consent screen: set publishing status **In production** (Testing refresh tokens expire after seven days). Do not use ambient Google credentials or broaden scopes. First-time operator setup creates dedicated app-accessible folder; normal reconnection verifies exact account, reuses that folder. Manually created folders not automatically app-accessible.
+
+**Installing agents:** native setup, `/health`, public website, Google branding are separate from Drive authorization. First run `drive-connect`: already-connected service or existing private bootstrap needs no new credential lookup. Only unavailable authorization needs provisioning, on **service host**, not browser laptop. Do not claim a requested Drive connection is ready until the helper reports verified activation. Reuse original Desktop client from human's authorized credential store before asking human for files or repeated Google Console setup; Infisical deployment may use `MEMENTO_GOOGLE_DESKTOP_CLIENT_JSON`. Infisical CLI missing -> install it, surface only necessary human login. Original account/folder: from existing binding metadata; ask only for missing metadata. Never invent a new client/folder, use ambient Google authentication, or print secret values. `/connect` gives same workflow to agents without this repository.
+
+**One-link connection:** keep original Desktop client, account, existing app-created folder. Human/operator provisions that binding once, with private original client JSON readable by service UID, running as that UID:
+```sh
+/usr/local/bin/memento-drive configure --client-json /private/original-desktop-client.json --account YOU@example.com --folder-id EXISTING_FOLDER_ID --data-dir /private/memento-data
+```
+Creates owner-private `DATA_DIR/drive-client.json`, not a Drive grant. Never create a replacement client or folder during recovery. Existing private connection + bootstrap bindings must agree. Service owner controls initial secret provisioning. Installing agent may use explicitly authorized credential-manager injection into existing owner provisioning helper, without exposing values or moving token files; otherwise pause for owner approval. Never read private credential files into the conversation, share the service UID, or elevate privileges.
+
+Normal connection: agent on user's browser device runs downloaded runner against private service:
+```sh
+python3 "$HOME/.local/share/memento/runner.py" drive-connect --url https://<machine>.<tailnet>.ts.net
+```
+Use actual private service URL. No `--url` -> runner uses selected `--config PATH` (default `runner.json`); `/connect` clients must reuse their harness-specific config path. Explicit URL also works before runner setup. Agent gives human printed official Google link; human opens it on that same device, picks intended account, approves `drive.file`. Stdlib runner handles Desktop client's loopback callback, relays one-time code over private HTTPS (HTTP only for loopback development). Not needed: SSH forwarding, user token-file transfer, chat switching, Web client, public callback.
+
+Service alone exchanges code, verifies exact account + owned/untrashed existing app-accessible folder, atomically saves mode-0600 `DATA_DIR/drive-oauth.json`, activates cold storage without restart. Success reported only after activation. Pending links expire after ten minutes, not replayable; denied consent, wrong accounts, broader grants, inaccessible folders never install connection or create folder. Definitive revoked/expired grant: service stays available for reconnection, `/health` reports `503 Drive reauthorization required`; malformed private config, wrong folder/account, unrelated startup failures not suppressed. Native agent admission unchanged.
+
+Already-connected service exits successfully, no new consent link. Ctrl-C on pending helper -> best-effort state-bound cancellation, so new attempt need not wait for expiry. Helper reports rejected, expired, pending/conflicting, unavailable authorization without echoing provider response bodies or credentials; cancellation never replaces original account/client/folder binding.
+
+Human explicitly requests fresh consent while already connected -> run same command with `--reconnect`. Working grant stays active until service verifies + installs replacement for exact original binding. Denial, expiry or failed verification never disconnects existing grant. Closing retired local HTTP client does not revoke old Google refresh token.
+
+Standalone operator `memento-drive connect` stays available for first-time folder creation and offline recovery. For recovery always provide `--folder-id EXISTING_FOLDER_ID` if the previous connection file was lost; conflicting explicit ID rejected before consent; reconnect keeps original client/account/folder. Without a previous connection or explicit folder ID it is first-time setup and creates a folder, so never omit the known ID during recovery.
+
+Drive connected: retained media and other payloads at least 10 MiB promptly eligible for verified remote storage, regardless of pinning or importance. Other unprotected artifacts stay eligible after 90 days (`MEMENTO_COLD_MAX_IMPORTANCE`, `MEMENTO_COLD_AFTER_DAYS`, `MEMENTO_COLD_MIN_BYTES`). Pending media work, active readers protect local bytes; upload failures retain them. Fetched cold copies: 1 GiB / one-hour cache, checked every minute (`MEMENTO_COLD_CACHE_BYTES`, `MEMENTO_COLD_CACHE_TTL_SECONDS`); in-use copies may temporarily exceed bound.
+
+No automatic database backup or remote forget journals. Request manual verified Drive backup via owner-only admin socket:
+```sh
+docker compose exec memory /usr/local/bin/memento-admin --data-dir /data backup
+```
+Run review `list|approve|reject` and `forget ID --why REASON` as service owner/root, never the agent; decisions require human terminal confirmation. Forget removes active memory, suppresses re-extraction, but keeps raw history/artifacts/backups; old backups can restore forgotten content. Also forgets other active memories whose entire current evidence lies in forgotten source messages (owner decision 2026-10-31); preview lists them as `dependents`.
+
+Duplicate-entity repair, same owner socket: read-only `inventory` reports suspected same-type clusters (case/whitespace spelling only; members may be distinct); `merge CLUSTER --why REASON [--into ID] [--exclude ID ...] [--include ID ...]` previews exact version/evidence/loop-bound plan (`--include` adds owner-chosen active same-type spelling variant; nothing grouped semantically), then applies existing reviewed merge per member after typed confirmation. Any change after preview refuses plan. Survivor gains new version carrying union of evidence + scopes; duplicate relations fold; candidates of pending reviews made stale by merge are requeued, not rejected. Agents never run these commands.
+
+Legacy replacement-ID revision chains recover via same owner socket: read-only `revisions` previews commit-proven chains, held-back protected chains (pinned, sensitive), untouched ambiguous ones (unproven/branching lineage, type or scope change, or relations a legacy correction/change left on older member); `recover-revisions --why REASON` applies token-fenced plan (member versions, relations, loop events, manual chronology) after typed confirmation. Protected chains need root in `--protected` and in confirmation text. Hops append same-ID versions with original evidence; `recovered_from` names original revision commit/actor/why/time; replacement IDs become merged aliases; raw history, earlier versions untouched. Export first; rollback = `memento-restore --archive` into empty directory. No HTTP/MCP route exists; agents never run it on a real database.
+
+After background compression, human/service owner can run `docker compose exec memory /usr/local/bin/memento-admin --data-dir /data compact` to reclaim free pages in existing database. Uses owner socket; no additional confirmation prompt, archive or Drive I/O. SQLite scratch private on persistent data volume; allow free space roughly twice database size. Service writer mutex stays held for VACUUM + its checkpoint: foreground operations may time out, native capture stays queued. Do not restart to clear the temporary wait. Ctrl+C disconnects the admin client without cancelling the server operation. Result reports before/after database + WAL bytes, free pages, checkpoint status; busy checkpoint returns incomplete/nonzero. Preserve logical history, vectors, FTS, implicit row identities, consolidation cursors. Qualify physical compaction on both supported host and image SQLite before changing this path.
+
+Recovery on separate host, as intended service owner, with human-provided private connection:
+```sh
+/usr/local/bin/memento-restore --connection /private/drive-oauth.json
+/usr/local/bin/memento-restore --connection /private/drive-oauth.json --backup-id ID --destination /private/empty-recovery
+```
+First lists verified backups; second restores database + available hot artifacts to an empty private directory. Incomplete snapshots are refused unless explicitly adding `--allow-incomplete`; inspect gap manifest. Keep original Desktop OAuth client securely off-box; after disk loss re-consent that same client to recover app-scoped access. Drive copies are plaintext; retained versions consume quota; local data/credential ownership must be restored before starting Compose.

@@ -1,0 +1,19 @@
+# Database export and host migration
+
+Detail for [AGENTS.md](../../AGENTS.md). Caveman-compressed; every rule here is binding.
+
+## Database export and host migration
+
+Owner-only `memento-admin --data-dir DIR export --output FILE` exports consistent database, its **existing Drive references, and only locally stored payloads without a verified remote copy** into one private plaintext archive. Never download or repack Drive-resident files for export. Inclusion follows `remote_id IS NULL` in snapshot, not hot/cold tier or cache presence; missing/corrupt required local bytes abort. Uses existing owner Unix socket + human terminal confirmation, never an HTTP/MCP export route. Output parent must be private; output `0600`, never overwritten. Use `/data/exports` or other persistent data-volume directory, not `/tmp` tmpfs. Copy out with `docker compose cp`, verify checksums, then remove only the verified in-volume copy.
+
+`memento export` and `memento restore` frontdoors delegate to these existing owner/export and restore engines; same ownership, confirmation and empty-destination requirements.
+
+`memento-restore --archive FILE --destination EMPTY` restores database without active Drive grant. Version-2 archives retain remote IDs + original non-secret account/folder/public-client binding; restore prints connection identity. Referenced Drive files readable after reconnecting that original binding. Included local-only payloads stay hot; referenced payloads become cold, not downloaded. Manifest checksums, exact local-only payload coverage, SQLite integrity and foreign keys validated in private staging before atomic publication; nonempty/live/symlink targets and unsafe members rejected. Existing host transfer/failure/backup records reset, not graph/raw/version/vector/audit history. Credentials, native configs and models excluded. Version-1 self-contained archives keep previous restore behavior: all payloads local/hot, old remote IDs cleared.
+
+Preserve restored owner-private `drive-binding.json`: records only expected account, folder and public client ID. Do not substitute another binding or infer the instance directory from an external credential-file path. Configure/one-link and startup use their existing explicit data directory; standalone `memento-drive connect` must receive `--data-dir RESTORED_DIR` for restored instance. Export must refuse remote references without original binding metadata; it must not recover them by downloading Drive files.
+
+Ctrl+C exits admin client but does not cancel its server export. Normal completion/failure cleans staging; service kill can leave `.memento-export-*` in output directory. Remove only the exact task-owned staging after its producer is stopped, never the live database or Drive objects.
+
+Fresh Compose recovery: **import before first startup**, as service UID, into `/data/instance` on empty data volume using `docker compose run --rm --no-deps --entrypoint /usr/local/bin/memento-restore -v /private/memento.tar:/import/memento.tar:ro memory --archive /import/memento.tar --destination /data/instance`. Archive must be privately readable by UID 10001. Then use persistent Compose override mounting `./data/instance:/data` before `up`; README has exact override. Do not restore over a started instance or atomically rename the mounted `/data` root.
+
+Migration = point-in-time move, not sync: before final export disable old host's Memento Serve route, stop its processor timer and wait for any running tick, close its native sessions to stop loopback uploads. Remote clients spool durably. Keep old service running for owner export, then stop it before enabling new instance/repointing clients; never accept writes on both. Retain client identities so queued captures upload to new host, configure one processor, separately reconnect optional Drive with original client/account/folder. Another-server deployment still requires explicit authorization.

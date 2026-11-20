@@ -1,0 +1,22 @@
+# Client and processing-host setup
+
+Detail for [AGENTS.md](../../AGENTS.md). Caveman-compressed; every rule here is binding.
+
+## Native capture and processing
+
+Ordinary agent connection: give agent private service's `/connect` URL; it downloads stdlib runner, exposes it as `memento`, runs `memento agent add HARNESS --url SERVICE_ORIGIN` with existing native login. Command reuses shipped installer: no new daemon, registry or per-message work. Human does not run commands or edit config files; mandatory native trust/permission prompts stay explicit approvals. Matching default config keeps role/identity; other harnesses use `${XDG_CONFIG_HOME:-$HOME/.config}/memento/HARNESS/runner.json`. Reuse `--config PATH` for existing custom location, including later commands, or pass `drive-connect --url URL` directly. Client setup needs no timezone or model API key.
+
+Commands below set up the **one designated processing host**, as ordinary host agent user, **not** service UID/root. First install/login to chosen native CLI normally; processing uses its own default model/login, never separate paid model API key. Download stdlib-only runner from trusted local service:
+```sh
+URL=http://127.0.0.1:8765
+install -d -m 0700 "$HOME/.local/share/memento"
+curl --fail "$URL/runner" -o "$HOME/.local/share/memento/runner.py"
+python3 "$HOME/.local/share/memento/runner.py" setup --agent pi --timezone Europe/Berlin --url "$URL"
+```
+Choose `--agent pi`, `omp`, `claude` or `codex`; server processing requires explicit IANA timezone (replace `Europe/Berlin`). Optional `--consolidation-start HH:MM --consolidation-end HH:MM` set that server's local-time consolidation window (start inclusive, end exclusive, may cross midnight; default 02:00–07:00); both flags go together; reinstall without them keeps stored window; clients take no schedule. Setup: prompt-free; installs selected native hooks/extensions + MCP definitions; writes private `${XDG_CONFIG_HOME:-$HOME/.config}/memento/runner.json` + sibling `bridge.py`. Server setup installs/activates `~/.config/systemd/user/memento-runner.{service,timer}`: boot +2 minutes, then every 15 minutes after completion. Unattended headless processing: human/operator must run `sudo loginctl enable-linger <agent-user>` so user manager + timer survive logout. Use one server processing config/timer; `memento agent add HARNESS` installs other harnesses without model discovery, generation or another processing timer. Reinstall preserves config's stable client identity. Optional `--config PATH` selects separate private config; use consistently below. `--no-activate` installs processor without starting user timer.
+
+`memento agent add HARNESS` never creates server processor or demotes existing server config; only reinstalls that harness's integration. Keep single server's `setup --agent HARNESS --timezone ZONE` flow. Failed native reinstall restores previous runner config instead of silently changing its service URL or mode.
+
+Restart native sessions after installation. **Codex needs human `/hooks` trust and MCP permissions; setup never grants them. Codex server processing stays fail-closed: tested 0.163.0 retains `functions.exec`/`wait` declarations and undeclared `apply_patch` routing, so read-only/approval policy is not tools-zero. Codex capture/import/recall/MCP client interfaces remain available after native consent; do not claim Codex extraction acceptance.** Choose Pi/OMP/Claude for single server processor; Pi verifies that only its Memento work adapter is active; OMP/Claude keep tool-free headless calls. Failed work stays pending.
+
+AGY server processing stays refused: synthetic qualification on CLI 1.4.5 / engine 1.3.5 executed native `manage_task` with `Action: list` despite custom agent with `excludeDefaultComponents: true` + empty component lists. Tools-zero isolation is unverified; qualification parser rejected the tool activity. Empty `tools` alone inherits defaults; `init.tools` advertises generic catalog, not proof of effective exclusion. Native headless calls also retain task/output transcripts as explicit-user history, with no verified per-run persistence opt-out. Do not delete native histories or import those processing sessions as human evidence. Native exclusion preserves post-invocation hooks; `MEMENTO_PROCESSING=1` suppresses Memento's own hooks, not arbitrary other hooks or native transcript storage. No AGY server processing adapter or automatic quota/outage fallback enabled.
