@@ -494,7 +494,12 @@ fn consolidation_view_labels_keep_source_identity_equality_across_the_packet() {
         let mut originals = std::collections::BTreeMap::new();
         for (shown, kept) in shown.iter().zip(&kept) {
             assert_eq!(shown["episode_id"], kept["episode_id"]);
-            let original = kept[key].as_str().unwrap();
+            // A native id names a record only within its source conversation.
+            let original = if key == "native_id" {
+                json!([kept["source"], kept["conversation_id"], kept[key]]).to_string()
+            } else {
+                kept[key].as_str().unwrap().to_owned()
+            };
             let label = shown[key].as_str().unwrap();
             assert!(
                 label
@@ -503,8 +508,11 @@ fn consolidation_view_labels_keep_source_identity_equality_across_the_packet() {
                 "{key} label {label}"
             );
             // Equal originals share one label and different originals never do.
-            assert_eq!(*labels.entry(original).or_insert(label), label);
-            assert_eq!(*originals.entry(label).or_insert(original), original);
+            assert_eq!(*labels.entry(original.clone()).or_insert(label), label);
+            assert_eq!(
+                *originals.entry(label).or_insert(original.clone()),
+                original
+            );
         }
         let expected = match key {
             // Conversations A and B.
@@ -518,9 +526,15 @@ fn consolidation_view_labels_keep_source_identity_equality_across_the_packet() {
         assert_eq!(shown[0][key], json!(format!("{prefix}1")));
     }
     // The policy explains the labels it now receives.
-    assert!(pipeline_schema::CONSOLIDATION_INSTRUCTION.contains(
-        "labels local to this input\n(conversation_id k1…, event_id e1…, native_id n1…)"
-    ));
+    let policy = pipeline_schema::CONSOLIDATION_INSTRUCTION
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        policy.contains(
+            "labels local to this input (conversation_id k1…, event_id e1…, native_id n1…)"
+        )
+    );
     // MCP read pages rebuild the same view from the stored context.
     let mut text = String::new();
     loop {
@@ -559,6 +573,76 @@ fn consolidation_view_labels_keep_source_identity_equality_across_the_packet() {
         .collect::<Vec<_>>();
     let result = f.complete(&work, json!({"actions":actions})).unwrap();
     assert_eq!(result["candidate_count"], 3);
+}
+
+#[test]
+fn consolidation_view_native_labels_never_join_two_conversations() {
+    // Some harnesses number native records per conversation (`step:3`), so equal native
+    // ids from another conversation or source are different records.
+    let item = |source: Option<&str>, conversation: &str, event: &str| {
+        let mut item = json!({"episode_id":event,"conversation_id":conversation,"event_id":event,"native_id":"step:3"});
+        if let Some(source) = source {
+            item["source"] = json!(source);
+        }
+        item
+    };
+    let (pi, claude) = (Some("native:host:pi"), Some("native:host:claude"));
+    let context = json!({
+        "candidates":[{"id":"c_1","evidence":[item(pi,"thread-a","message:a3")]}],
+        "existing_nodes":[{"id":"n_1","evidence":[item(pi,"thread-b","message:b3")]}],
+        "existing_relations":[],
+        "raw_windows":[
+            // The same native record as the candidate's evidence: another projection of it.
+            item(pi,"thread-a","output:a3:0"),
+            item(claude,"thread-a","message:c3"),
+            item(None,"thread-b","message:x3")
+        ],
+        // A loop event id is not a source event, even when the strings are equal.
+        "loop_snapshots":{"n_1":{"event_id":"message:a3","state":"open","pending_source_at":null,"manual_choice_at":null}}
+    });
+    let view = consolidation::Consolidator::model_input(&context);
+    let shown = source_references(&view);
+    let labels = |key: &str| {
+        shown
+            .iter()
+            .map(|item| item[key].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        labels("native_id"),
+        json!(["n1", "n2", "n1", "n3", "n4"])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+    // Conversation and event labels keep keying on the stored id alone.
+    assert_eq!(
+        labels("conversation_id"),
+        json!(["k1", "k2", "k1", "k1", "k2"])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+    assert_eq!(
+        labels("event_id"),
+        json!(["e1", "e2", "e3", "e4", "e5"])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+    assert_eq!(view["loop_snapshots"], context["loop_snapshots"]);
+    // The policy says where the labels appear and what equal labels mean.
+    let policy = pipeline_schema::CONSOLIDATION_INSTRUCTION
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(policy.contains(
+        "For this purpose evidence references and raw windows show their source event/conversation/native identities as \
+        labels local to this input (conversation_id k1…, event_id e1…, native_id n1…): equal conversation or event labels \
+        with the same source mean the same original conversation or event, and equal native labels mean the same native \
+        record of one source conversation."
+    ));
+    assert_eq!(view, consolidation::Consolidator::model_input(&context));
 }
 
 #[test]

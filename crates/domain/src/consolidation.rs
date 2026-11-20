@@ -174,27 +174,49 @@ impl Consolidator {
 }
 /// Packet-local labels for the source identities a plan never outputs and only compares:
 /// equal originals share one label, numbered by first appearance in packet order, so the
-/// same stored context always yields the same view (claim and every `read` page).
+/// same stored context always yields the same view (claim and every `read` page). A native
+/// id's original is its source, conversation and native id together.
 #[derive(Default)]
 struct SourceLabels {
     known: [std::collections::HashMap<String, String>; 3],
 }
 impl SourceLabels {
-    fn apply(&mut self, source: &mut Value) {
+    fn apply(&mut self, reference: &mut Value) {
+        // Some harnesses number native records per conversation (`step:3`, ordinals), so one
+        // native id can name records in different conversations. Read before relabelling.
+        let native = reference
+            .get("native_id")
+            .and_then(Value::as_str)
+            .map(|native| {
+                json!([
+                    reference.get("source"),
+                    reference.get("conversation_id"),
+                    native
+                ])
+                .to_string()
+            });
         for (known, (key, prefix)) in self.known.iter_mut().zip([
             ("conversation_id", 'k'),
             ("event_id", 'e'),
             ("native_id", 'n'),
         ]) {
-            let Some(original) = source.get(key).and_then(Value::as_str) else {
+            let original = if key == "native_id" {
+                native.clone()
+            } else {
+                reference
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
+            let Some(original) = original else {
                 continue;
             };
             let next = known.len() + 1;
             let label = known
-                .entry(original.to_owned())
+                .entry(original)
                 .or_insert_with(|| format!("{prefix}{next}"))
                 .clone();
-            source[key] = json!(label);
+            reference[key] = json!(label);
         }
     }
 }
