@@ -4,11 +4,14 @@ No model, native CLI or network: `fetch` is replaced, and the pi tool loop is mi
 tool_call -> execute -> tool_result (a blocked call skips the last two, a thrown error becomes
 an error result carrying the message)."""
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 
 import pytest
+
+from memento import runner
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / 'src' / 'memento' / 'native_worker.ts'
@@ -41,13 +44,18 @@ const worker = await load(process.argv[2]);
 const SECRET = "lease-capability", EVIDENCE = "synthetic evidence text";
 const records = [];
 console.error = (text) => { records.push(JSON.parse(text)); };
+// The host's validation codes, as worker.py passes them; a scenario may replace or drop them.
+const HOST_CODES = process.env.MEMENTO_WORKER_VALIDATION_CODES;
 const reply = (status, value) => ({ ok: status < 300, status,
   text: async () => typeof value === "string" ? value : JSON.stringify(value) });
 
-// One adapter instance against a scripted service: script[action] answers that action's request.
-async function boot(script) {
+// One adapter instance against a scripted service: script[action] answers that action's request
+// (a function receives the request's init). `codes` is the validation-code variable, absent when undefined.
+async function boot(script, { codes } = { codes: HOST_CODES }) {
   const handlers = {}, posts = [];
   let definition, calls = 0;
+  if (codes === undefined) delete process.env.MEMENTO_WORKER_VALIDATION_CODES;
+  else process.env.MEMENTO_WORKER_VALIDATION_CODES = codes;
   worker({ registerTool(value) { definition = value; }, on(name, handler) { handlers[name] = handler; },
     getActiveTools() { return ["memento_work"]; },
     getAllTools() { return [{ name: "memento_work", exposure: "direct", reachesTools: false }]; } });
@@ -57,7 +65,7 @@ async function boot(script) {
     const answer = script[body.action];
     if (answer === undefined) throw new Error("unscripted request " + body.action);
     if (answer === "network") throw new TypeError("fetch failed");
-    return answer;
+    return typeof answer === "function" ? answer(init) : answer;
   };
   await handlers.session_start();
   handlers.context({ messages: [] });  // the session's first model request: nothing to keep yet
@@ -122,11 +130,25 @@ for (const [name, answer] of Object.entries({ conflict: reply(409, { detail: "Pr
   const manual = await adapter.call({ action: "release", command: { id: "job" } });
   out["kept_" + name] = { failed, after, manual, released: adapter.context() };
 }
-{
-  // A 422 without a service detail is still a rejected submission of the held job.
-  const adapter = await boot({ claim: reply(200, work), submit: reply(422, "not json"), release: reply(200, { released: true }) });
+// A 422 that is not a model-output validation code (request shape, no detail), or a host that
+// supplied no usable codes: the job stays held and the model sees the error, as before.
+for (const [name, answer, codes] of [
+  ["without_detail", reply(422, "not json"), HOST_CODES],
+  ["invalid_command", reply(422, { detail: "Invalid processing command" }), HOST_CODES],
+  ["output_not_object", reply(422, { detail: "Model output and usage must be JSON objects" }), HOST_CODES],
+  ["invalid_fields", reply(422, { detail: "Invalid request fields" }), HOST_CODES],
+  ["codes_missing", rejection, undefined],
+  ["codes_empty", rejection, "[]"],
+  ["codes_malformed", rejection, "not json"],
+  ["codes_not_list", rejection, JSON.stringify({ consolidation_schema_invalid: true })],
+]) {
+  const script = { claim: reply(200, work), submit: answer, release: reply(200, { released: true }) };
+  const adapter = await boot(script, { codes });
   await adapter.call(claimInput());
-  out.rejected_without_detail = { rejected: await adapter.call(inputs.submit()), after: adapter.context() };
+  const failed = await adapter.call(inputs.submit());
+  const after = adapter.context();
+  const manual = await adapter.call({ action: "release", command: { id: "job" } });
+  out["held_" + name] = { failed, after, manual, released: adapter.context() };
 }
 {
   // Sixteen commits, then a rejection: the released job leaves nothing held, so the session boundary is due.
@@ -180,8 +202,10 @@ def node(tmp_path, source, target):
         pytest.skip('node cannot load the TypeScript adapter directly')
     (tmp_path / 'loader.mjs').write_text(LOADER)
     (tmp_path / 'run.mjs').write_text(source)
+    # The variable worker.py passes the adapter.
+    env = dict(os.environ, MEMENTO_WORKER_VALIDATION_CODES=json.dumps(sorted(runner.WORK_VALIDATION_CODES)))
     return subprocess.run(['node', str(tmp_path / 'run.mjs'), str(target)], capture_output=True, text=True,
-                          cwd=tmp_path, timeout=120)
+                          cwd=tmp_path, timeout=120, env=env)
 
 
 @pytest.fixture(scope='module')
@@ -242,14 +266,28 @@ def test_rejected_submission_is_released_by_the_adapter_without_a_model_turn(obs
     assert seen['reclaim']['posts'][0]['command']['exclude'] == ['job']
 
 
-def test_rejection_without_service_detail_and_at_the_session_boundary(observed):
-    plain = observed['rejected_without_detail']
-    assert [post['action'] for post in plain['rejected']['posts']] == ['submit', 'release']
-    assert plain['rejected']['events'] == [
-        dict(type='memento_worker_state', error=True, code='processing_request_failed', action='submit', http_status=422),
-        dict(type='memento_worker_state', claimed=[], empty_kinds=[], completed=None, released='job',
-             boundary=False, empty=False)]
-    assert plain['after']['state']['current'] == []
+@pytest.mark.parametrize('name,code', [
+    ('without_detail', 'processing_request_failed'), ('invalid_command', 'Invalid processing command'),
+    ('output_not_object', 'Model output and usage must be JSON objects'), ('invalid_fields', 'Invalid request fields'),
+    ('codes_missing', REJECTION), ('codes_empty', REJECTION), ('codes_malformed', REJECTION), ('codes_not_list', REJECTION)])
+def test_422_without_a_known_validation_code_keeps_the_job_held(observed, name, code):
+    seen = observed['held_' + name]
+    failed = seen['failed']
+    # No automatic release request: only the submit reached the service.
+    assert [post['action'] for post in failed['posts']] == ['submit']
+    assert failed['events'] == [dict(type='memento_worker_state', error=True, code=code, action='submit', http_status=422)]
+    # The model sees exactly the service error and no adapter rewrite, so it can correct its call.
+    assert failed['isError'] is True and failed['patched'] is False
+    assert failed['text'] == 'MEMENTO_HTTP_422: ' + code
+    assert seen['after']['state']['current'][0]['id'] == 'job' and seen['after']['kept'] == 3
+    # Still held: the model-driven release works exactly as before.
+    assert seen['manual']['posts'] == [RELEASE]
+    assert releases(seen['manual']['events']) == [dict(type='memento_worker_state', claimed=[], empty_kinds=[],
+                                                       completed=None, released='job', boundary=False, empty=False)]
+    assert seen['released']['state']['current'] == [] and seen['released']['kept'] == 0
+
+
+def test_rejection_at_the_session_boundary(observed):
     # Same boundary rule as a model-driven release: sixteen commits and nothing held.
     boundary = observed['rejected_at_boundary']['rejected']
     assert boundary['events'][1] == dict(type='memento_worker_state', claimed=[], empty_kinds=[], completed=None,

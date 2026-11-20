@@ -44,6 +44,13 @@ export default function worker(pi: any) {
   // Host-computed due kinds (window and pool) seed availability; later receipts update it.
   const dueKinds: string[] = JSON.parse(process.env.MEMENTO_WORKER_KINDS || '["extract","consolidate"]');
   const emptyKinds = new Set<string>(["extract", "consolidate"].filter(kind => !dueKinds.includes(kind)));
+  // The host's model-output validation codes: the 422s for which the service keeps
+  // rejection feedback for a later claim. Missing or malformed: never release automatically.
+  let validationCodes = new Set<string>();
+  try {
+    const codes = JSON.parse(process.env.MEMENTO_WORKER_VALIDATION_CODES || "[]");
+    if (Array.isArray(codes)) validationCodes = new Set(codes.filter((code: any) => typeof code === "string"));
+  } catch {}
   function claim(command: any) {
     if (current.length) throw new Error("Complete or release current work first");
     if (!Array.isArray(command.kinds) || command.kinds.length !== 1 || !["extract", "consolidate"].includes(command.kinds[0]))
@@ -147,11 +154,12 @@ export default function worker(pi: any) {
       emit({ type: "memento_worker_state", error: true, code: failure?.[2],
         action: ["pool","claim","submit","complete","status","release","renew"].includes(event.input?.action) ? event.input.action : "unknown",
         http_status: Number(failure?.[1] ?? text.match(/MEMENTO_HTTP_(\d{3})/)?.[1]) || undefined });
-      // The service rejected this held job's output. Give the job back here instead of
-      // spending a model call, with the whole packet re-sent, on the release.
+      // The service rejected this held job's output with a validation code. Give the job back
+      // here instead of spending a model call, with the whole packet re-sent, on the release.
+      // Any other 422 (request shape, no detail) leaves it held for the model to correct.
       const rejected = event.input?.action === "submit" ? event.input.command?.complete?.id
         : event.input?.action === "complete" ? event.input.command?.id : undefined;
-      const leased = failure?.[1] === "422" ? claims.get(rejected) : undefined;
+      const leased = failure?.[1] === "422" && validationCodes.has(failure[2]) ? claims.get(rejected) : undefined;
       if (!leased) return;
       if (!await release(leased, ctx?.signal))
         return { content: [{ type: "text", text: text + "\nThe rejected job " + leased.id

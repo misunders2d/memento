@@ -25,8 +25,8 @@ For each item, produce its COMPLETE exact-schema output. No invented quotes, ide
 Use work(action=submit,command={complete:{id,output},next:{kinds:[KIND],batch_size:N}})
 to commit and get fresh next work in one operation. Compare/resolve all same-batch identities before submitting.
 Do not reread completed evidence. Repair failed quotes/plans from current source or retain explicit uncertainty.
-The adapter itself releases a job whose submission the service rejects as invalid. A job is released only when the
-result says released; never call release for it then: continue with a fresh claim of unrelated work.
+The adapter itself releases a job whose submitted output the service rejects with a validation code. A job is
+released only when the result says released; never call release for it then: continue with a fresh claim of unrelated work.
 After any other rejected submission the job is still in current work: release it yourself and continue unrelated work.
 A fresh later claim supplies rejection feedback.
 Do not repeat an unchanged failed submission. For adapter argument errors, fix the stated cause using the current job id.
@@ -93,6 +93,10 @@ def tick(api, config, compaction=None, *, consolidate_now=False):
                            MEMENTO_WORKER_POOL=api.encode({key:value for key,value in pool.items() if key != 'policies'}).decode(),
                            MEMENTO_WORKER_KINDS=api.encode([kind for kind, due in (('extract', extraction_due),
                                                             ('consolidate', consolidation_due)) if due]).decode(),
+                           # Model-output validation codes the adapter may release automatically.
+                           # An older runner without them yields none: no automatic release.
+                           MEMENTO_WORKER_VALIDATION_CODES=api.encode(
+                               sorted(getattr(api, 'WORK_VALIDATION_CODES', ()))).decode(),
                            MEMENTO_WORKER_LOG=str(Path(directory) / 'mcp.log'))
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, cwd=directory, env=environment, start_new_session=True)

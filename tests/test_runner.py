@@ -427,6 +427,15 @@ def test_every_frozen_server_validation_code_is_a_safe_host_diagnostic():
     assert set(codes) - runner.WORK_REJECTION_CODES == set()
 
 
+def test_host_validation_codes_are_exactly_the_frozen_server_validation_codes():
+    # The Pi adapter releases a rejected job only for these; a request-shape or lease code must not be one.
+    codes = json.loads((Path(__file__).parents[1] / 'crates/domain/src/pipeline_assets/validation-codes.json').read_text())
+    assert runner.WORK_VALIDATION_CODES == set(codes)
+    assert runner.WORK_VALIDATION_CODES <= runner.WORK_REJECTION_CODES
+    assert not {'Invalid request fields', 'Invalid processing command',
+                'Model output and usage must be JSON objects'} & runner.WORK_VALIDATION_CODES
+
+
 @pytest.mark.parametrize('failure,status,body,diagnostic', [
     ('http', 422, runner.encode({'detail': 'consolidation_candidate_coverage_invalid', 'private': 'secret'}),
      {'http_status': 422, 'detail_code': 'consolidation_candidate_coverage_invalid'}),

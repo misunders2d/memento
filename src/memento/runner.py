@@ -46,8 +46,9 @@ RETRY_SECONDS = 15 * 60
 # may wait longer than the 15-second foreground allowance while staying well
 # inside the 180-second lease. Renewal, completion and release keep their bounds.
 CLAIM_SECONDS = 60
-# Exact server codes only; arbitrary HTTP detail is never a host-log diagnostic.
-WORK_REJECTION_CODES = frozenset({
+# The service's frozen model-output validation codes (pipeline_assets/validation-codes.json):
+# the rejections it keeps as previous_rejection feedback for the job's next claim.
+WORK_VALIDATION_CODES = frozenset({
     'consolidation_schema_invalid', 'consolidation_candidate_coverage_invalid',
     'consolidation_reference_not_supplied', 'consolidation_evidence_not_supplied',
     'consolidation_evidence_outside_context', 'consolidation_missing_candidate_source',
@@ -76,6 +77,9 @@ WORK_REJECTION_CODES = frozenset({
     'Invalid reviewed type definition', 'Merge requires distinct active entities of the same type',
     'Relations require active endpoints', 'Supersession requires an active node',
     'Change must follow the previous valid_from',
+})
+# Exact server codes only; arbitrary HTTP detail is never a host-log diagnostic.
+WORK_REJECTION_CODES = WORK_VALIDATION_CODES | frozenset({
     'Loop responsibility requires exact source evidence',
     'Loop responsibility requires eligible original evidence',
     'Loop responsibility requires an original target source',

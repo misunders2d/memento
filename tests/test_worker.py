@@ -1,6 +1,7 @@
 """Persistent launcher lifecycle tests; real native qualification is separate."""
 import json
 import os
+from pathlib import Path
 import sys
 import textwrap
 import time
@@ -207,7 +208,7 @@ def test_adapter_released_rejection_logs_the_failed_attempt_and_drops_the_lease(
 def test_system_prompt_no_longer_asks_the_model_to_release_rejected_jobs():
     text=' '.join(worker.SYSTEM.split())
     assert 'After a rejected submission, release that job' not in text
-    assert 'The adapter itself releases a job whose submission the service rejects as invalid.' in text
+    assert 'The adapter itself releases a job whose submitted output the service rejects with a validation code.' in text
     # Keyed on state, so a rejection the adapter did not release (conflict, unconfirmed release) is still given back.
     assert 'A job is released only when the result says released; never call release for it then' in text
     assert 'continue with a fresh claim of unrelated work.' in text
@@ -243,6 +244,29 @@ def test_reopened_kind_is_not_treated_as_exhausted_and_due_kinds_reach_adapter(n
     assert seen['kinds']==['extract']  # closed window: consolidation never seeded as available
     output=capsys.readouterr().out
     assert '"id":"late"' in output and '"completed_jobs":1' in output
+
+
+@pytest.mark.parametrize('older_runner',[False,True])
+def test_adapter_receives_exactly_the_validation_codes_it_may_release(native,monkeypatch,older_runner):
+    config,trace,calls=native
+    seen={}
+    original=worker.subprocess.Popen
+    def popen(argv,**kwargs):
+        env=kwargs.get('env') or {}
+        if 'MEMENTO_WORKER_KINDS' in env:seen['codes']=env.get('MEMENTO_WORKER_VALIDATION_CODES')
+        return original(argv,**kwargs)
+    monkeypatch.setattr(worker.subprocess,'Popen',popen)
+    if older_runner:
+        # A processor asset newer than its runner: no codes, so the adapter never releases by itself.
+        monkeypatch.delattr(runner,'WORK_VALIDATION_CODES')
+    assert worker.tick(runner,config,consolidate_now=True)==0
+    codes=json.loads(seen['codes'])
+    if older_runner:
+        assert codes==[]
+    else:
+        frozen=json.loads((Path(__file__).parents[1]/'crates/domain/src/pipeline_assets/validation-codes.json').read_text())
+        assert codes==sorted(frozen)
+        assert 'Invalid processing command' not in codes and 'Invalid request fields' not in codes
 
 
 def test_committed_submit_reconciled_by_failed_renewal_keeps_its_delayed_next_lease(native,monkeypatch,capsys):
