@@ -162,6 +162,49 @@ struct Prepared {
     continue_with: Vec<String>,
     resolutions: Map<String, Value>,
 }
+// Evidence the prepared context lets a plan cite: raw windows and existing-memory reference spans.
+struct Supplied<'a> {
+    windows: &'a Vec<Value>,
+    spans: HashMap<String, Vec<(usize, usize)>>,
+    traces: Vec<Value>,
+    ids: BTreeSet<String>,
+}
+impl Supplied<'_> {
+    fn authorized(&self, source: &Value, start: usize, end: usize) -> bool {
+        let Self { windows, spans, .. } = self;
+        let id = source["episode_id"].as_str().unwrap();
+        windows.iter().any(|window| {
+            window["episode_id"] == id
+                && window["start"].as_u64().unwrap() as usize <= start
+                && end <= window["end"].as_u64().unwrap() as usize
+        }) || spans.get(id).is_some_and(|spans| {
+            spans
+                .iter()
+                .any(|(left, right)| *left <= start && end <= *right)
+        })
+    }
+    // later_context spans are lifecycle evidence only, never premises of stored memory.
+    fn lifecycle_only(&self, source: &Value, start: usize, end: usize) -> bool {
+        let Self { windows, spans, .. } = self;
+        let id = source["episode_id"].as_str().unwrap();
+        let covers = |window: &Value| {
+            window["episode_id"] == id
+                && window["start"].as_u64().unwrap() as usize <= start
+                && end <= window["end"].as_u64().unwrap() as usize
+        };
+        windows
+            .iter()
+            .any(|window| window["later_context"] == true && covers(window))
+            && !windows
+                .iter()
+                .any(|window| window["later_context"] != true && covers(window))
+            && !spans.get(id).is_some_and(|spans| {
+                spans
+                    .iter()
+                    .any(|(left, right)| *left <= start && end <= *right)
+            })
+    }
+}
 fn validate(
     db: &Connection,
     dir: &std::path::Path,
@@ -177,27 +220,7 @@ fn validate(
     let windows = context["raw_windows"]
         .as_array()
         .ok_or(Error::Validation("Invalid prepared windows"))?;
-    let mut spans: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    let mut traces = windows.clone();
-    for item in nodes.values().chain(edges.values()) {
-        for reference in item["evidence"].as_array().unwrap() {
-            spans
-                .entry(get_str(reference, "episode_id")?.into())
-                .or_default()
-                .push((
-                    reference["start"].as_u64().unwrap() as usize,
-                    reference["end"].as_u64().unwrap() as usize,
-                ));
-            if reference["native_trace"].as_str().is_some() {
-                traces.push(reference.clone());
-            }
-        }
-    }
-    let mut supplied = windows
-        .iter()
-        .map(|window| window["episode_id"].as_str().unwrap().to_owned())
-        .collect::<BTreeSet<_>>();
-    supplied.extend(spans.keys().cloned());
+    let supplied = supplied_evidence(windows, &nodes, &edges)?;
     let mut actions = output["actions"].as_array().unwrap().clone();
     let mut repairs = output
         .get("repairs")
@@ -210,19 +233,10 @@ fn validate(
             cited.insert(get_str(source, "episode_id")?.to_owned());
         }
     }
-    if !cited.is_subset(&supplied) {
+    if !cited.is_subset(&supplied.ids) {
         return Err(reject("consolidation_evidence_not_supplied", vec![]));
     }
-    let mut episodes = Map::new();
-    for id in cited {
-        let mut episode = one(db, "SELECT * FROM episodes WHERE id=?", [&id])?
-            .ok_or(Error::Validation("extraction_source_missing"))?;
-        episode["text"] = json!(memento_core::raw::read_original(db, dir, &id)?.ok_or(
-            Error::Unavailable("Original raw source artifact is unavailable or corrupt")
-        )?);
-        episode["metadata"] = decode_json(get_str(&episode, "metadata")?)?;
-        episodes.insert(id, episode);
-    }
+    let episodes = cited_episodes(db, dir, cited)?;
     if actions.len() != selected.len()
         || actions
             .iter()
@@ -246,192 +260,8 @@ fn validate(
             }
         }
     }
-    let authorized = |source: &Value, start: usize, end: usize| {
-        let id = source["episode_id"].as_str().unwrap();
-        windows.iter().any(|window| {
-            window["episode_id"] == id
-                && window["start"].as_u64().unwrap() as usize <= start
-                && end <= window["end"].as_u64().unwrap() as usize
-        }) || spans.get(id).is_some_and(|spans| {
-            spans
-                .iter()
-                .any(|(left, right)| *left <= start && end <= *right)
-        })
-    };
-    // later_context spans are lifecycle evidence only, never premises of stored memory.
-    let lifecycle_only = |source: &Value, start: usize, end: usize| {
-        let id = source["episode_id"].as_str().unwrap();
-        let covers = |window: &Value| {
-            window["episode_id"] == id
-                && window["start"].as_u64().unwrap() as usize <= start
-                && end <= window["end"].as_u64().unwrap() as usize
-        };
-        windows
-            .iter()
-            .any(|window| window["later_context"] == true && covers(window))
-            && !windows
-                .iter()
-                .any(|window| window["later_context"] != true && covers(window))
-            && !spans.get(id).is_some_and(|spans| {
-                spans
-                    .iter()
-                    .any(|(left, right)| *left <= start && end <= *right)
-            })
-    };
     for action in &mut actions {
-        for key in ["target", "src", "dst"] {
-            if action[key].as_str().is_some_and(|id| !allowed.contains(id)) {
-                return Err(reject_item(
-                    "consolidation_reference_not_supplied",
-                    action,
-                    None,
-                ));
-            }
-        }
-        let closed = action
-            .get("closed_targets")
-            .map(strings)
-            .transpose()?
-            .unwrap_or_default();
-        if closed.iter().collect::<BTreeSet<_>>().len() != closed.len()
-            || closed
-                .iter()
-                .any(|id| context["loop_snapshots"].get(id).is_none())
-        {
-            return Err(reject_item(
-                "consolidation_loop_target_not_supplied",
-                action,
-                None,
-            ));
-        }
-        if !closed.is_empty() && action["open_loop"] == true {
-            return Err(reject_item(
-                "consolidation_loop_state_contradictory",
-                action,
-                None,
-            ));
-        }
-        action["closed_targets"] = json!(closed);
-        let candidate_id = get_str(action, "candidate_id")?.to_owned();
-        // A candidate's own real loop closes only through later chronology, never a decline.
-        let own = closed.contains(&candidate_id);
-        if own && action["open_loop"] == false {
-            return Err(reject_item(
-                "consolidation_loop_state_contradictory",
-                action,
-                None,
-            ));
-        }
-        let candidate = &selected[&candidate_id];
-        let original = candidate["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|reference| reference["episode_id"].as_str())
-            .collect::<BTreeSet<_>>();
-        let anchor = &context["_later_context"][&candidate_id];
-        let (mut premises, mut lifecycle) = (vec![], vec![]);
-        for source in action["evidence"].as_array().unwrap() {
-            let (start, end) = span(&episodes, source).map_err(|error| match error {
-                Error::Validation(code) => reject_item(code, action, Some(source)),
-                other => other.into(),
-            })?;
-            if !authorized(source, start, end) {
-                return Err(reject_item(
-                    "consolidation_evidence_outside_context",
-                    action,
-                    Some(source),
-                ));
-            }
-            let id = source["episode_id"].as_str().unwrap();
-            let episode = &episodes[id];
-            let later = !original.contains(id)
-                && anchor.is_object()
-                && episode["source"] == anchor["source"]
-                && episode["conversation_id"] == anchor["conversation_id"]
-                && matches!((episode["seq"].as_i64(), anchor["after_seq"].as_i64()), (Some(seq), Some(after)) if seq > after);
-            if own && later {
-                // Closing evidence for this candidate's own loop: kept out of its premises so
-                // a completion can never become (or freshen) the pending obligation's source.
-                lifecycle.push(source.clone());
-            } else if lifecycle_only(source, start, end) {
-                return Err(reject_item(
-                    "consolidation_evidence_outside_context",
-                    action,
-                    Some(source),
-                ));
-            } else {
-                premises.push(source.clone());
-            }
-        }
-        action["evidence"] = json!(premises);
-        action["_closure_evidence"] = json!(lifecycle);
-        if !matches!(action["operation"].as_str(), Some("reject" | "defer"))
-            || !action["closed_targets"].as_array().unwrap().is_empty()
-        {
-            if !action["evidence"].as_array().unwrap().iter().any(|source| {
-                source["episode_id"]
-                    .as_str()
-                    .is_some_and(|id| original.contains(id))
-            }) {
-                return Err(reject_item(
-                    "consolidation_missing_candidate_source",
-                    action,
-                    None,
-                ));
-            }
-        }
-        if !action["due"].is_null() {
-            // The date expression must be in an original premise quote and resolves
-            // against that source's time; later_context never dates a pending loop.
-            let cited = action["evidence"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|source| {
-                    original.contains(source["episode_id"].as_str().unwrap())
-                        && action["due"]["quote"].as_str().is_some_and(|expression| {
-                            source["quote"].as_str().unwrap().contains(expression)
-                        })
-                });
-            let resolved = match cited {
-                _ if action["open_loop"] != true => Err(loop_due::Invalid::Format),
-                None => Err(loop_due::Invalid::Quote),
-                Some(source) => loop_due::resolve(
-                    &action["due"],
-                    source["quote"].as_str().unwrap(),
-                    episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str(),
-                    context["timezone"].as_str(),
-                ),
-            };
-            let at = resolved.map_err(|invalid| {
-                let code = match invalid {
-                    loop_due::Invalid::Format => "consolidation_due_invalid",
-                    loop_due::Invalid::Quote => "consolidation_due_quote_invalid",
-                    loop_due::Invalid::BeforeSource => "consolidation_due_before_source",
-                };
-                reject_item(code, action, None)
-            })?;
-            action["_due_at"] = json!(at);
-        }
-        validate_behavior(action, candidate, &episodes, &traces).map_err(|error| match error {
-            Error::Validation(code) => reject_item(code, action, None),
-            other => other.into(),
-        })?;
-        for field in ["valid_from", "valid_to", "valid_at"] {
-            action[field] = json!(time(action[field].as_str())?);
-        }
-        if let (Some(left), Some(right)) =
-            (action["valid_from"].as_str(), action["valid_to"].as_str())
-        {
-            if parse_time(left)? >= parse_time(right)? {
-                return Err(reject_item(
-                    "consolidation_world_interval_invalid",
-                    action,
-                    None,
-                ));
-            }
-        }
+        validate_action(action, context, &selected, &allowed, &episodes, &supplied)?;
     }
     let continue_with = output
         .get("continue_with")
@@ -445,141 +275,437 @@ fn validate(
     }
     let mut repaired = BTreeSet::new();
     for repair in &mut repairs {
-        let target = get_str(repair, "target")?.to_owned();
-        let absorbed = repair
-            .get("absorbed")
-            .map(strings)
-            .transpose()?
-            .unwrap_or_default();
-        let mut affected = vec![target.clone()];
-        affected.extend(absorbed.clone());
-        if affected.iter().collect::<BTreeSet<_>>().len() != affected.len()
-            || affected
-                .iter()
-                .any(|id| repaired.contains(id) || !nodes.contains_key(id))
-        {
-            return Err(reject("consolidation_reference_not_supplied", vec![]));
-        }
-        repaired.extend(affected.clone());
-        if (repair["operation"] == "absorb") != !absorbed.is_empty() {
-            return Err(reject("consolidation_reference_not_supplied", vec![]));
-        }
-        if repair["operation"] == "link" {
-            let dst = repair["dst"]
-                .as_str()
-                .ok_or_else(|| reject("consolidation_relation_endpoints_required", vec![]))?;
-            if !nodes.contains_key(dst) {
-                return Err(reject("consolidation_reference_not_supplied", vec![]));
-            }
-            if !repair["relation"].as_str().is_some_and(valid_relation) {
-                return Err(reject("consolidation_relation_invalid", vec![]));
-            }
-            // The existing uniqueness bound is per repair target, not per
-            // referenced subject: several independent claims can name one entity.
-            if dst != target {
-                affected.push(dst.to_owned());
-            }
-            for endpoint in &affected {
-                if !visible_link_endpoint(db, endpoint)? {
-                    return Err(Error::Conflict(
-                        "Consolidation link endpoint changed; derive a fresh plan",
-                    )
-                    .into());
-                }
-                if node(db, endpoint)?["version"] != nodes[endpoint]["version"] {
-                    return Err(Error::Conflict(
-                        "Consolidation graph context changed; derive a fresh plan",
-                    )
-                    .into());
-                }
-            }
-        } else if !repair["dst"].is_null() || !repair["relation"].is_null() {
-            return Err(reject("consolidation_schema_invalid", vec![]));
-        }
-        repair["absorbed"] = json!(absorbed);
-        if repair["operation"] == "absorb" {
-            if let Some(code) = curation::absorb_check(db, &target, &absorbed)? {
-                return Err(reject_item(code, repair, None));
-            }
-        } else if repair["operation"] == "retire" {
-            if let Some(code) = retire_check(db, &target, &repair["evidence"])? {
-                return Err(reject_item(code, repair, None));
-            }
-        }
-        for source in repair["evidence"].as_array().unwrap() {
-            let (start, end) = span(&episodes, source)?;
-            if !authorized(source, start, end)
-                || (repair["operation"] != "close_loop" && lifecycle_only(source, start, end))
-            {
-                return Err(reject("consolidation_evidence_outside_context", vec![]));
-            }
-        }
-        if repair["operation"] != "close_loop" {
-            for target in &affected {
-                let mut grounded = false;
-                for source in repair["evidence"].as_array().unwrap() {
-                    let (start, end) = span(&episodes, source)?;
-                    if nodes[target]["evidence"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|reference| {
-                            reference["episode_id"] == source["episode_id"]
-                                && reference["start"].as_u64().unwrap() as usize <= start
-                                && end <= reference["end"].as_u64().unwrap() as usize
-                        })
-                    {
-                        grounded = true;
-                        break;
-                    }
-                }
-                if !grounded {
-                    return Err(reject("consolidation_missing_candidate_source", vec![]));
-                }
-            }
-        }
-        for field in ["valid_from", "valid_to", "valid_at"] {
-            repair[field] = json!(time(repair[field].as_str())?);
-        }
-        if repair["operation"] == "supersede" {
-            if repair["type"].as_str().is_none_or(str::is_empty)
-                || repair["text"].as_str().is_none_or(str::is_empty)
-                || repair["change_kind"].is_null()
-            {
-                return Err(reject("consolidation_supersede_invalid", vec![]));
-            }
-            if repair["change_kind"] == "change" && repair["valid_at"].is_null() {
-                return Err(reject("consolidation_change_time_required", vec![]));
-            }
-        } else if [
-            "type",
-            "text",
-            "scope",
-            "change_kind",
-            "valid_at",
-            "valid_from",
-            "valid_to",
-            "behavior",
-        ]
-        .iter()
-        .any(|field| !repair[*field].is_null())
-        {
-            return Err(reject("consolidation_schema_invalid", vec![]));
-        }
-        if repair["operation"] == "assign_loop" {
-            if !repair["responsibility"]
-                .as_str()
-                .is_some_and(loops::valid_responsibility)
-            {
-                return Err(reject("consolidation_schema_invalid", vec![]));
-            }
-        } else if !repair["responsibility"].is_null() {
-            return Err(reject("consolidation_schema_invalid", vec![]));
-        }
-        validate_behavior(repair, &nodes[&target], &episodes, &traces)?;
+        validate_repair(db, repair, &nodes, &mut repaired, &episodes, &supplied)?;
     }
-    // A correction or world change keeps the memory ID and its relations; it
-    // may retire only supplied, fenced relations incident to that memory.
+    validate_retired_relations(&mut actions, &mut repairs, &nodes, &edges)?;
+    Ok(Prepared {
+        selected,
+        nodes,
+        edges,
+        episodes,
+        actions,
+        repairs,
+        continue_with,
+        resolutions: context["resolved_candidates"].as_object().unwrap().clone(),
+    })
+}
+fn supplied_evidence<'a>(
+    windows: &'a Vec<Value>,
+    nodes: &Map<String, Value>,
+    edges: &Map<String, Value>,
+) -> Result<Supplied<'a>> {
+    let mut spans: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut traces = windows.clone();
+    for item in nodes.values().chain(edges.values()) {
+        for reference in item["evidence"].as_array().unwrap() {
+            spans
+                .entry(get_str(reference, "episode_id")?.into())
+                .or_default()
+                .push((
+                    reference["start"].as_u64().unwrap() as usize,
+                    reference["end"].as_u64().unwrap() as usize,
+                ));
+            if reference["native_trace"].as_str().is_some() {
+                traces.push(reference.clone());
+            }
+        }
+    }
+    let mut supplied = windows
+        .iter()
+        .map(|window| window["episode_id"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    supplied.extend(spans.keys().cloned());
+    Ok(Supplied {
+        windows,
+        spans,
+        traces,
+        ids: supplied,
+    })
+}
+// Reads every cited episode with its complete original text and decoded metadata.
+fn cited_episodes(
+    db: &Connection,
+    dir: &std::path::Path,
+    cited: BTreeSet<String>,
+) -> Result<Map<String, Value>> {
+    let mut episodes = Map::new();
+    for id in cited {
+        let mut episode = one(db, "SELECT * FROM episodes WHERE id=?", [&id])?
+            .ok_or(Error::Validation("extraction_source_missing"))?;
+        episode["text"] = json!(memento_core::raw::read_original(db, dir, &id)?.ok_or(
+            Error::Unavailable("Original raw source artifact is unavailable or corrupt")
+        )?);
+        episode["metadata"] = decode_json(get_str(&episode, "metadata")?)?;
+        episodes.insert(id, episode);
+    }
+    Ok(episodes)
+}
+fn validate_action(
+    action: &mut Value,
+    context: &Value,
+    selected: &Map<String, Value>,
+    allowed: &BTreeSet<String>,
+    episodes: &Map<String, Value>,
+    supplied: &Supplied,
+) -> WorkResult<()> {
+    let (candidate_id, own) = validate_action_targets(action, context, allowed)?;
+    let candidate = &selected[&candidate_id];
+    let original = candidate["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|reference| reference["episode_id"].as_str())
+        .collect::<BTreeSet<_>>();
+    let anchor = &context["_later_context"][&candidate_id];
+    split_action_evidence(action, episodes, supplied, &original, anchor, own)?;
+    if !matches!(action["operation"].as_str(), Some("reject" | "defer"))
+        || !action["closed_targets"].as_array().unwrap().is_empty()
+    {
+        if !action["evidence"].as_array().unwrap().iter().any(|source| {
+            source["episode_id"]
+                .as_str()
+                .is_some_and(|id| original.contains(id))
+        }) {
+            return Err(reject_item(
+                "consolidation_missing_candidate_source",
+                action,
+                None,
+            ));
+        }
+    }
+    resolve_action_due(action, context, episodes, &original)?;
+    validate_behavior(action, candidate, episodes, &supplied.traces).map_err(
+        |error| match error {
+            Error::Validation(code) => reject_item(code, action, None),
+            other => other.into(),
+        },
+    )?;
+    for field in ["valid_from", "valid_to", "valid_at"] {
+        action[field] = json!(time(action[field].as_str())?);
+    }
+    if let (Some(left), Some(right)) = (action["valid_from"].as_str(), action["valid_to"].as_str())
+    {
+        if parse_time(left)? >= parse_time(right)? {
+            return Err(reject_item(
+                "consolidation_world_interval_invalid",
+                action,
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+// Reference and closed-loop checks; returns the candidate ID and whether it closes its own loop.
+fn validate_action_targets(
+    action: &mut Value,
+    context: &Value,
+    allowed: &BTreeSet<String>,
+) -> WorkResult<(String, bool)> {
+    for key in ["target", "src", "dst"] {
+        if action[key].as_str().is_some_and(|id| !allowed.contains(id)) {
+            return Err(reject_item(
+                "consolidation_reference_not_supplied",
+                action,
+                None,
+            ));
+        }
+    }
+    let closed = action
+        .get("closed_targets")
+        .map(strings)
+        .transpose()?
+        .unwrap_or_default();
+    if closed.iter().collect::<BTreeSet<_>>().len() != closed.len()
+        || closed
+            .iter()
+            .any(|id| context["loop_snapshots"].get(id).is_none())
+    {
+        return Err(reject_item(
+            "consolidation_loop_target_not_supplied",
+            action,
+            None,
+        ));
+    }
+    if !closed.is_empty() && action["open_loop"] == true {
+        return Err(reject_item(
+            "consolidation_loop_state_contradictory",
+            action,
+            None,
+        ));
+    }
+    action["closed_targets"] = json!(closed);
+    let candidate_id = get_str(action, "candidate_id")?.to_owned();
+    // A candidate's own real loop closes only through later chronology, never a decline.
+    let own = closed.contains(&candidate_id);
+    if own && action["open_loop"] == false {
+        return Err(reject_item(
+            "consolidation_loop_state_contradictory",
+            action,
+            None,
+        ));
+    }
+    Ok((candidate_id, own))
+}
+// Splits cited evidence into stored premises and the candidate's own loop-closing evidence.
+fn split_action_evidence(
+    action: &mut Value,
+    episodes: &Map<String, Value>,
+    supplied: &Supplied,
+    original: &BTreeSet<&str>,
+    anchor: &Value,
+    own: bool,
+) -> WorkResult<()> {
+    let (mut premises, mut lifecycle) = (vec![], vec![]);
+    for source in action["evidence"].as_array().unwrap() {
+        let (start, end) = span(episodes, source).map_err(|error| match error {
+            Error::Validation(code) => reject_item(code, action, Some(source)),
+            other => other.into(),
+        })?;
+        if !supplied.authorized(source, start, end) {
+            return Err(reject_item(
+                "consolidation_evidence_outside_context",
+                action,
+                Some(source),
+            ));
+        }
+        let id = source["episode_id"].as_str().unwrap();
+        let episode = &episodes[id];
+        let later = !original.contains(id)
+            && anchor.is_object()
+            && episode["source"] == anchor["source"]
+            && episode["conversation_id"] == anchor["conversation_id"]
+            && matches!((episode["seq"].as_i64(), anchor["after_seq"].as_i64()), (Some(seq), Some(after)) if seq > after);
+        if own && later {
+            // Closing evidence for this candidate's own loop: kept out of its premises so
+            // a completion can never become (or freshen) the pending obligation's source.
+            lifecycle.push(source.clone());
+        } else if supplied.lifecycle_only(source, start, end) {
+            return Err(reject_item(
+                "consolidation_evidence_outside_context",
+                action,
+                Some(source),
+            ));
+        } else {
+            premises.push(source.clone());
+        }
+    }
+    action["evidence"] = json!(premises);
+    action["_closure_evidence"] = json!(lifecycle);
+    Ok(())
+}
+fn resolve_action_due(
+    action: &mut Value,
+    context: &Value,
+    episodes: &Map<String, Value>,
+    original: &BTreeSet<&str>,
+) -> WorkResult<()> {
+    if !action["due"].is_null() {
+        // The date expression must be in an original premise quote and resolves
+        // against that source's time; later_context never dates a pending loop.
+        let cited = action["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| {
+                original.contains(source["episode_id"].as_str().unwrap())
+                    && action["due"]["quote"].as_str().is_some_and(|expression| {
+                        source["quote"].as_str().unwrap().contains(expression)
+                    })
+            });
+        let resolved = match cited {
+            _ if action["open_loop"] != true => Err(loop_due::Invalid::Format),
+            None => Err(loop_due::Invalid::Quote),
+            Some(source) => loop_due::resolve(
+                &action["due"],
+                source["quote"].as_str().unwrap(),
+                episodes[source["episode_id"].as_str().unwrap()]["occurred_at"].as_str(),
+                context["timezone"].as_str(),
+            ),
+        };
+        let at = resolved.map_err(|invalid| {
+            let code = match invalid {
+                loop_due::Invalid::Format => "consolidation_due_invalid",
+                loop_due::Invalid::Quote => "consolidation_due_quote_invalid",
+                loop_due::Invalid::BeforeSource => "consolidation_due_before_source",
+            };
+            reject_item(code, action, None)
+        })?;
+        action["_due_at"] = json!(at);
+    }
+    Ok(())
+}
+fn validate_repair(
+    db: &Connection,
+    repair: &mut Value,
+    nodes: &Map<String, Value>,
+    repaired: &mut BTreeSet<String>,
+    episodes: &Map<String, Value>,
+    supplied: &Supplied,
+) -> WorkResult<()> {
+    let target = get_str(repair, "target")?.to_owned();
+    let absorbed = repair
+        .get("absorbed")
+        .map(strings)
+        .transpose()?
+        .unwrap_or_default();
+    let mut affected = vec![target.clone()];
+    affected.extend(absorbed.clone());
+    if affected.iter().collect::<BTreeSet<_>>().len() != affected.len()
+        || affected
+            .iter()
+            .any(|id| repaired.contains(id) || !nodes.contains_key(id))
+    {
+        return Err(reject("consolidation_reference_not_supplied", vec![]));
+    }
+    repaired.extend(affected.clone());
+    if (repair["operation"] == "absorb") != !absorbed.is_empty() {
+        return Err(reject("consolidation_reference_not_supplied", vec![]));
+    }
+    if repair["operation"] == "link" {
+        validate_repair_link(db, repair, nodes, &target, &mut affected)?;
+    } else if !repair["dst"].is_null() || !repair["relation"].is_null() {
+        return Err(reject("consolidation_schema_invalid", vec![]));
+    }
+    repair["absorbed"] = json!(absorbed);
+    if repair["operation"] == "absorb" {
+        if let Some(code) = curation::absorb_check(db, &target, &absorbed)? {
+            return Err(reject_item(code, repair, None));
+        }
+    } else if repair["operation"] == "retire" {
+        if let Some(code) = retire_check(db, &target, &repair["evidence"])? {
+            return Err(reject_item(code, repair, None));
+        }
+    }
+    validate_repair_evidence(repair, nodes, &affected, episodes, supplied)?;
+    for field in ["valid_from", "valid_to", "valid_at"] {
+        repair[field] = json!(time(repair[field].as_str())?);
+    }
+    if repair["operation"] == "supersede" {
+        if repair["type"].as_str().is_none_or(str::is_empty)
+            || repair["text"].as_str().is_none_or(str::is_empty)
+            || repair["change_kind"].is_null()
+        {
+            return Err(reject("consolidation_supersede_invalid", vec![]));
+        }
+        if repair["change_kind"] == "change" && repair["valid_at"].is_null() {
+            return Err(reject("consolidation_change_time_required", vec![]));
+        }
+    } else if [
+        "type",
+        "text",
+        "scope",
+        "change_kind",
+        "valid_at",
+        "valid_from",
+        "valid_to",
+        "behavior",
+    ]
+    .iter()
+    .any(|field| !repair[*field].is_null())
+    {
+        return Err(reject("consolidation_schema_invalid", vec![]));
+    }
+    if repair["operation"] == "assign_loop" {
+        if !repair["responsibility"]
+            .as_str()
+            .is_some_and(loops::valid_responsibility)
+        {
+            return Err(reject("consolidation_schema_invalid", vec![]));
+        }
+    } else if !repair["responsibility"].is_null() {
+        return Err(reject("consolidation_schema_invalid", vec![]));
+    }
+    validate_behavior(repair, &nodes[&target], episodes, &supplied.traces)?;
+    Ok(())
+}
+// Endpoint, relation and version checks of a link repair; adds its destination to `affected`.
+fn validate_repair_link(
+    db: &Connection,
+    repair: &Value,
+    nodes: &Map<String, Value>,
+    target: &str,
+    affected: &mut Vec<String>,
+) -> WorkResult<()> {
+    let dst = repair["dst"]
+        .as_str()
+        .ok_or_else(|| reject("consolidation_relation_endpoints_required", vec![]))?;
+    if !nodes.contains_key(dst) {
+        return Err(reject("consolidation_reference_not_supplied", vec![]));
+    }
+    if !repair["relation"].as_str().is_some_and(valid_relation) {
+        return Err(reject("consolidation_relation_invalid", vec![]));
+    }
+    // The existing uniqueness bound is per repair target, not per
+    // referenced subject: several independent claims can name one entity.
+    if dst != target {
+        affected.push(dst.to_owned());
+    }
+    for endpoint in affected.iter() {
+        if !visible_link_endpoint(db, endpoint)? {
+            return Err(Error::Conflict(
+                "Consolidation link endpoint changed; derive a fresh plan",
+            )
+            .into());
+        }
+        if node(db, endpoint)?["version"] != nodes[endpoint]["version"] {
+            return Err(Error::Conflict(
+                "Consolidation graph context changed; derive a fresh plan",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+// Repair evidence must lie inside supplied context and ground every affected memory.
+fn validate_repair_evidence(
+    repair: &Value,
+    nodes: &Map<String, Value>,
+    affected: &[String],
+    episodes: &Map<String, Value>,
+    supplied: &Supplied,
+) -> WorkResult<()> {
+    for source in repair["evidence"].as_array().unwrap() {
+        let (start, end) = span(episodes, source)?;
+        if !supplied.authorized(source, start, end)
+            || (repair["operation"] != "close_loop" && supplied.lifecycle_only(source, start, end))
+        {
+            return Err(reject("consolidation_evidence_outside_context", vec![]));
+        }
+    }
+    if repair["operation"] != "close_loop" {
+        for target in affected {
+            let mut grounded = false;
+            for source in repair["evidence"].as_array().unwrap() {
+                let (start, end) = span(episodes, source)?;
+                if nodes[target]["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reference| {
+                        reference["episode_id"] == source["episode_id"]
+                            && reference["start"].as_u64().unwrap() as usize <= start
+                            && end <= reference["end"].as_u64().unwrap() as usize
+                    })
+                {
+                    grounded = true;
+                    break;
+                }
+            }
+            if !grounded {
+                return Err(reject("consolidation_missing_candidate_source", vec![]));
+            }
+        }
+    }
+    Ok(())
+}
+// A correction or world change keeps the memory ID and its relations; it
+// may retire only supplied, fenced relations incident to that memory.
+fn validate_retired_relations(
+    actions: &mut [Value],
+    repairs: &mut [Value],
+    nodes: &Map<String, Value>,
+    edges: &Map<String, Value>,
+) -> WorkResult<()> {
     for item in actions.iter_mut().chain(repairs.iter_mut()) {
         let relations = item
             .get("retire_relations")
@@ -607,16 +733,7 @@ fn validate(
         }
         item["retire_relations"] = json!(relations);
     }
-    Ok(Prepared {
-        selected,
-        nodes,
-        edges,
-        episodes,
-        actions,
-        repairs,
-        continue_with,
-        resolutions: context["resolved_candidates"].as_object().unwrap().clone(),
-    })
+    Ok(())
 }
 fn validate_behavior(
     action: &Value,
