@@ -231,3 +231,437 @@ fn coverage_rejection_keeps_three_references_and_reaches_the_retry_claim() {
     f.complete(&retry, empty_windows(&ids)).unwrap();
     assert_eq!(f.stored::<i64>("SELECT count(*) FROM graph_commits"), 1);
 }
+
+const PI: &str = "native:host:pi";
+const MOVED: &str = "Orion expedition archives moved to the granite vault.";
+
+fn native(f: &Fixture, event: &str, conversation: &str, text: &str, native_id: &str) -> String {
+    f.capture(
+        event,
+        conversation,
+        text,
+        "user",
+        PI,
+        json!({"native_id":native_id,"extraction_mode":"message"}),
+        "2026-10-18T12:00:00Z",
+    )
+}
+/// Compacts and claims extraction only. A consolidation window twelve hours away keeps this
+/// claim from also queueing a batch, so candidates batch when the test asks.
+fn extraction(f: &Fixture, conversation: &str) -> Value {
+    use chrono::Timelike;
+    let hour = (chrono::Utc::now().hour() + 12) % 24;
+    let claimed = f.processing.claim(Claim {
+        agent: "fixture".into(),
+        timezone_name: "UTC".into(),
+        compaction: Some(Compaction {
+            source: PI.into(),
+            conversation_id: conversation.into(),
+        }),
+        exclude: vec![],
+        consolidate_now: false,
+        kinds: Some(vec!["extract".into()]),
+        consolidation_start: Some(format!("{hour:02}:00")),
+        consolidation_end: Some(format!("{hour:02}:01")),
+        continuous: false,
+        batch_size: 16,
+    });
+    claimed.unwrap()["work"][0].clone()
+}
+fn consolidation(f: &Fixture, size: usize) -> Value {
+    let command = json!({
+        "agent":"fixture",
+        "timezone":"UTC",
+        "kinds":["consolidate"],
+        "consolidate_now":true,
+        "continuous":true,
+        "batch_size":size
+    });
+    work_action(f, "claim", command).unwrap()["work"][0].clone()
+}
+/// The leased context stored for the one live consolidation lease.
+fn leased_context(f: &Fixture) -> Value {
+    serde_json::from_str(
+        &f.stored::<String>("SELECT context FROM jobs WHERE kind='consolidate' AND state='leased'"),
+    )
+    .unwrap()
+}
+/// Every supplied source reference in packet order: candidate, node and relation evidence, then raw windows.
+fn source_references(packet: &Value) -> Vec<&Value> {
+    let mut found = vec![];
+    for section in ["candidates", "existing_nodes", "existing_relations"] {
+        for item in packet[section].as_array().unwrap() {
+            found.extend(item["evidence"].as_array().unwrap());
+        }
+    }
+    found.extend(packet["raw_windows"].as_array().unwrap());
+    found
+}
+/// An existing claim -> subject relation from conversation A, then three candidates:
+/// two projections of one native record in conversation B and one more from A.
+fn mixed_packet(f: &Fixture) -> Value {
+    native(f, "message:a1", "conversation-a", CLAIM, "native-a1");
+    let work = extraction(f, "conversation-a");
+    let mut memory = draft(CLAIM, "knowledge", false);
+    memory["key"] = json!("claim");
+    let mut entity = draft(SUBJECT, "project", false);
+    entity["key"] = json!("subject");
+    let mut relation = draft(CLAIM, "knowledge", false);
+    relation["key"] = json!("subject-link");
+    relation["kind"] = json!("relation");
+    relation["type"] = json!("mentions");
+    relation["src_key"] = json!("claim");
+    relation["dst_key"] = json!("subject");
+    f.complete(
+        &work,
+        json!({"windows":[{"id":"w0","candidates":[memory,entity,relation]}]}),
+    )
+    .unwrap();
+    let work = consolidation(f, 16);
+    let candidates = work["input"]["candidates"].as_array().unwrap();
+    let claim = candidates.iter().find(|c| c["kind"] == "memory").unwrap();
+    let subject = candidates.iter().find(|c| c["kind"] == "entity").unwrap();
+    let relation = candidates.iter().find(|c| c["kind"] == "relation").unwrap();
+    let mut link = action(relation, "link");
+    link["type"] = Value::Null;
+    link["text"] = Value::Null;
+    link["scope"] = Value::Null;
+    link["src"] = claim["id"].clone();
+    link["dst"] = subject["id"].clone();
+    link["relation"] = json!("mentions");
+    f.complete(
+        &work,
+        json!({"actions":[link,action(claim,"remember"),action(subject,"remember")]}),
+    )
+    .unwrap();
+    native(f, "message:b1", "conversation-b", OTHER, "native-b1");
+    native(f, "output:b1:0", "conversation-b", MOVED, "native-b1");
+    let work = extraction(f, "conversation-b");
+    f.complete(
+        &work,
+        json!({
+            "windows": [
+                {"id":"w0","candidates":[draft(SUBJECT,"project",false)]},
+                {"id":"w1","candidates":[draft(MOVED,"knowledge",false)]}
+            ]
+        }),
+    )
+    .unwrap();
+    native(f, "message:a2", "conversation-a", OTHER, "native-a2");
+    let work = extraction(f, "conversation-a");
+    f.complete(
+        &work,
+        json!({"windows":[{"id":"w0","candidates":[draft(OTHER,"knowledge",false)]}]}),
+    )
+    .unwrap();
+    consolidation(f, 16)
+}
+
+#[test]
+fn consolidation_view_drops_bookkeeping_and_keeps_the_leased_context_whole() {
+    let f = Fixture::new();
+    let work = mixed_packet(&f);
+    let (view, leased) = (&work["input"], leased_context(&f));
+    assert_eq!(view["candidates"].as_array().unwrap().len(), 3);
+    assert!(!view["existing_nodes"].as_array().unwrap().is_empty());
+    assert!(!view["existing_relations"].as_array().unwrap().is_empty());
+    // The server-side context that every validator reads keeps every field.
+    assert_eq!(leased["loop_policy_version"], consolidation::VERSION);
+    for (section, fields) in [
+        ("candidates", &["run_id", "position", "decision_id"][..]),
+        (
+            "existing_nodes",
+            &["commit_id", "superseded_by", "state"][..],
+        ),
+        ("existing_relations", &["commit_id", "state"][..]),
+    ] {
+        let supplied = view[section].as_array().unwrap();
+        let stored = leased[section].as_array().unwrap();
+        assert_eq!(supplied.len(), stored.len());
+        for (shown, kept) in supplied.iter().zip(stored) {
+            for field in fields {
+                assert!(kept.get(*field).is_some(), "leased {section} lost {field}");
+                assert!(shown.get(*field).is_none(), "{section} still shows {field}");
+            }
+            if section != "candidates" {
+                assert_eq!(kept["state"], "active");
+            }
+            // Everything else is supplied unchanged.
+            for (key, value) in kept.as_object().unwrap() {
+                if !fields.contains(&key.as_str()) && key != "evidence" {
+                    assert_eq!(&shown[key], value, "{section}.{key}");
+                }
+            }
+            for (shown, kept) in shown["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(kept["evidence"].as_array().unwrap())
+            {
+                for (key, value) in kept.as_object().unwrap() {
+                    if !["conversation_id", "event_id", "native_id"].contains(&key.as_str()) {
+                        assert_eq!(&shown[key], value, "{section}.evidence.{key}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(view.get("loop_policy_version").is_none());
+    for key in [
+        "raw_windows",
+        "resolved_candidates",
+        "behavior_exposures",
+        "maintenance_ids",
+        "context_truncated",
+        "retirement_ready",
+        "timezone",
+    ] {
+        assert!(view.get(key).is_some(), "view lost {key}");
+    }
+    assert!(
+        view.as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with('_'))
+    );
+    // A snapshot carrying a date or choice is supplied whole; an all-null one says nothing.
+    let stored = leased["loop_snapshots"].as_object().unwrap();
+    assert!(!stored.is_empty());
+    for (id, snapshot) in stored {
+        if snapshot.as_object().unwrap().values().all(Value::is_null) {
+            assert!(view["loop_snapshots"].get(id).is_none());
+        } else {
+            assert_eq!(&view["loop_snapshots"][id], snapshot);
+        }
+    }
+}
+
+#[test]
+fn consolidation_view_labels_keep_source_identity_equality_across_the_packet() {
+    let f = Fixture::new();
+    let work = mixed_packet(&f);
+    let leased = leased_context(&f);
+    let (shown, kept) = (
+        source_references(&work["input"]),
+        source_references(&leased),
+    );
+    assert_eq!(shown.len(), kept.len());
+    for (key, prefix) in [
+        ("conversation_id", 'k'),
+        ("event_id", 'e'),
+        ("native_id", 'n'),
+    ] {
+        let mut labels = std::collections::BTreeMap::new();
+        let mut originals = std::collections::BTreeMap::new();
+        for (shown, kept) in shown.iter().zip(&kept) {
+            assert_eq!(shown["episode_id"], kept["episode_id"]);
+            let original = kept[key].as_str().unwrap();
+            let label = shown[key].as_str().unwrap();
+            assert!(
+                label
+                    .strip_prefix(prefix)
+                    .is_some_and(|number| number.parse::<usize>().is_ok()),
+                "{key} label {label}"
+            );
+            // Equal originals share one label and different originals never do.
+            assert_eq!(*labels.entry(original).or_insert(label), label);
+            assert_eq!(*originals.entry(label).or_insert(original), original);
+        }
+        let expected = match key {
+            // Conversations A and B.
+            "conversation_id" => 2,
+            // Four source episodes; b1's two projections share one native record.
+            "event_id" => 4,
+            _ => 3,
+        };
+        assert_eq!(labels.len(), expected, "{key}");
+        // Numbered by first appearance in packet order.
+        assert_eq!(shown[0][key], json!(format!("{prefix}1")));
+    }
+    // The policy explains the labels it now receives.
+    assert!(pipeline_schema::CONSOLIDATION_INSTRUCTION.contains(
+        "labels local to this input\n(conversation_id k1…, event_id e1…, native_id n1…)"
+    ));
+    // MCP read pages rebuild the same view from the stored context.
+    let mut text = String::new();
+    loop {
+        let page = work_action(
+            &f,
+            "read",
+            json!({"id":work["id"],"owner":work["owner"],"after":text.chars().count()}),
+        )
+        .unwrap();
+        text.push_str(page["text"].as_str().unwrap());
+        if page["next"].is_null() {
+            break;
+        }
+    }
+    let read: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(read["input"], work["input"]);
+    // A plan citing evidence by real episode_id and quote still validates and commits.
+    let candidates = work["input"]["candidates"].as_array().unwrap();
+    let subject = work["input"]["existing_nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["text"] == SUBJECT)
+        .unwrap();
+    let actions = candidates
+        .iter()
+        .map(|candidate| {
+            if candidate["kind"] == "entity" {
+                let mut duplicate = action(candidate, "duplicate");
+                duplicate["target"] = subject["id"].clone();
+                duplicate
+            } else {
+                action(candidate, "remember")
+            }
+        })
+        .collect::<Vec<_>>();
+    let result = f.complete(&work, json!({"actions":actions})).unwrap();
+    assert_eq!(result["candidate_count"], 3);
+}
+
+#[test]
+fn consolidation_view_keeps_anything_that_is_not_plain_bookkeeping() {
+    let reference = |conversation: Value, native: Value| json!({"episode_id":"e","quote":"q","conversation_id":conversation,"event_id":"message:x","native_id":native});
+    let context = json!({
+        "loop_policy_version":"consolidate-v0",
+        "candidates":[{"id":"c_1","run_id":"job/window","position":7,"decision_id":"d","evidence":[reference(json!("thread"),Value::Null)]}],
+        "existing_nodes":[
+            {"id":"n1","commit_id":"x","state":"active","superseded_by":null,"evidence":[reference(json!("thread"),json!("record"))]},
+            {"id":"n2","commit_id":"x","state":"refined","superseded_by":"n1","evidence":[]}
+        ],
+        "loop_snapshots":{
+            "c_1":{"event_id":null,"state":null,"pending_source_at":null,"manual_choice_at":null},
+            "n1":{"event_id":"loop-event","state":"open","pending_source_at":null,"manual_choice_at":null},
+            "n2":{"event_id":null,"state":null,"pending_source_at":"2026-10-18T12:00:00Z","manual_choice_at":null}
+        },
+        "_deferred":["c_2"]
+    });
+    let view = consolidation::Consolidator::model_input(&context);
+    assert_eq!(
+        view,
+        json!({
+            "candidates":[{"id":"c_1","evidence":[{"episode_id":"e","quote":"q","conversation_id":"k1","event_id":"e1","native_id":null,"local_time":null}]}],
+            "existing_nodes":[
+                {"id":"n1","evidence":[{"episode_id":"e","quote":"q","conversation_id":"k1","event_id":"e1","native_id":"n1"}]},
+                // Never produced by preparation; shown if it ever is.
+                {"id":"n2","state":"refined","superseded_by":"n1","evidence":[]}
+            ],
+            // A loop event id is a different identity from a source event and stays as stored.
+            "loop_snapshots":{
+                "n1":context["loop_snapshots"]["n1"],
+                "n2":context["loop_snapshots"]["n2"]
+            }
+        })
+    );
+    // The same stored context always yields the same view.
+    assert_eq!(view, consolidation::Consolidator::model_input(&context));
+}
+
+/// A 16-candidate update batch against 48 existing assertions with uuid-sized source
+/// identities and ~900-character messages, the shape a production packet has.
+fn update_packet(f: &Fixture) -> Value {
+    let (c, v) = (b"bdfgklmnprstvz", b"aeiou");
+    let names = (0..48)
+        .map(|i| {
+            format!(
+                "{}{}{}{}lor",
+                (c[i % 14] as char).to_ascii_uppercase(),
+                v[i / 14 % 5] as char,
+                c[(i * 5 + 3) % 14] as char,
+                v[i % 5] as char
+            )
+        })
+        .collect::<Vec<_>>();
+    let extract = |facts: &[String]| {
+        let conversation = util::id();
+        for (index, fact) in facts.iter().enumerate() {
+            let filler =
+                format!("Routine scheduling note {index} about unrelated logistics and travel. ")
+                    .repeat(6);
+            native(
+                f,
+                &format!("message:{}", util::id()),
+                &conversation,
+                &format!("{filler}{fact} {filler}"),
+                &util::id(),
+            );
+        }
+        let work = extraction(f, &conversation);
+        let windows = work["input"]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|window| {
+                let text = window["text"].as_str().unwrap();
+                let fact = facts
+                    .iter()
+                    .find(|fact| text.contains(fact.as_str()))
+                    .unwrap();
+                json!({"id":window["id"],"candidates":[draft(fact,"knowledge",false)]})
+            })
+            .collect::<Vec<_>>();
+        f.complete(&work, json!({"windows":windows})).unwrap();
+    };
+    // Three projects per guild, so each update candidate discovers three distinct targets.
+    let guilds = [
+        "amber", "birch", "cedar", "delta", "ember", "flint", "grove", "heron", "iris", "jade",
+        "kelp", "larch", "maple", "nori", "opal", "pine",
+    ];
+    let fact = |index: usize, month: &str| {
+        format!(
+            "Project {} of the {} guild ships in {month}.",
+            names[index],
+            guilds[index % 16]
+        )
+    };
+    for chunk in (0..48).collect::<Vec<_>>().chunks(12) {
+        let facts = chunk
+            .iter()
+            .map(|index| fact(*index, "March"))
+            .collect::<Vec<_>>();
+        extract(&facts);
+    }
+    let work = consolidation(f, 64);
+    let candidates = work["input"]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 48);
+    let actions = candidates
+        .iter()
+        .map(|candidate| action(candidate, "remember"))
+        .collect::<Vec<_>>();
+    f.complete(&work, json!({"actions":actions})).unwrap();
+    let facts = (0..16)
+        .map(|index| fact(index, "April"))
+        .collect::<Vec<_>>();
+    extract(&facts);
+    consolidation(f, 16)
+}
+
+#[test]
+fn consolidation_view_is_smaller_than_the_leased_context_it_is_built_from() {
+    let f = Fixture::new();
+    let work = update_packet(&f);
+    let leased = leased_context(&f);
+    assert_eq!(work["input"]["candidates"].as_array().unwrap().len(), 16);
+    assert_eq!(
+        work["input"]["existing_nodes"].as_array().unwrap().len(),
+        48
+    );
+    let public = Value::Object(
+        leased
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| !key.starts_with('_'))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let bytes = |value: &Value| serde_json::to_vec(value).unwrap().len();
+    let (view, full) = (bytes(&work["input"]), bytes(&public));
+    eprintln!(
+        "PACKET consolidation candidates=16 existing_nodes=48 view_bytes={view} leased_public_bytes={full}"
+    );
+    assert!(view * 100 < full * 90, "view {view} of {full} bytes");
+}

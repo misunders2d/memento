@@ -80,30 +80,83 @@ impl Consolidator {
             )
         })
     }
+    /// The model's view of a leased context. Validation always reads the stored context,
+    /// never this view, so the view omits storage bookkeeping the policy never names and
+    /// shows source identities as packet-local equality labels. Nothing the model must echo
+    /// (candidate, node, edge and episode ids, quotes, offsets) is changed.
     pub fn model_input(context: &Value) -> Value {
         let mut view = Value::Object(
             context
                 .as_object()
                 .into_iter()
                 .flatten()
-                .filter(|(key, _)| !key.starts_with('_'))
+                .filter(|(key, _)| !key.starts_with('_') && *key != "loop_policy_version")
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         );
         // local_time (with weekday) resolves an explicit relative due date only.
         let zone = context["timezone"].as_str();
-        if let Some(candidates) = view.get_mut("candidates").and_then(Value::as_array_mut) {
-            for candidate in candidates {
-                if let Some(evidence) = candidate.get_mut("evidence").and_then(Value::as_array_mut)
+        let mut labels = SourceLabels::default();
+        for (section, bookkeeping) in [
+            ("candidates", &["run_id", "position", "decision_id"][..]),
+            ("existing_nodes", &["commit_id"][..]),
+            ("existing_relations", &["commit_id"][..]),
+        ] {
+            for item in view
+                .get_mut(section)
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                let Some(fields) = item.as_object_mut() else {
+                    continue;
+                };
+                for key in bookkeeping {
+                    fields.remove(*key);
+                }
+                if section != "candidates" {
+                    // Supplied nodes and relations are always the active current version.
+                    if fields.get("state").is_some_and(|state| state == "active") {
+                        fields.remove("state");
+                    }
+                    if fields.get("superseded_by").is_some_and(Value::is_null) {
+                        fields.remove("superseded_by");
+                    }
+                }
+                for reference in fields
+                    .get_mut("evidence")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
                 {
-                    for reference in evidence {
+                    if section == "candidates" {
                         reference["local_time"] = json!(crate::loop_due::local_time(
                             reference["occurred_at"].as_str(),
                             zone
                         ));
                     }
+                    labels.apply(reference);
                 }
             }
+        }
+        for window in view
+            .get_mut("raw_windows")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            labels.apply(window);
+        }
+        // A snapshot with no marker, date or choice says nothing.
+        if let Some(snapshots) = view
+            .get_mut("loop_snapshots")
+            .and_then(Value::as_object_mut)
+        {
+            snapshots.retain(|_, snapshot| {
+                snapshot
+                    .as_object()
+                    .is_none_or(|fields| fields.values().any(|value| !value.is_null()))
+            });
         }
         view
     }
@@ -117,6 +170,32 @@ impl Consolidator {
         usage: Option<&Value>,
     ) -> WorkResult<Value> {
         apply::apply(self, job, context, output, agent, model, usage)
+    }
+}
+/// Packet-local labels for the source identities a plan never outputs and only compares:
+/// equal originals share one label, numbered by first appearance in packet order, so the
+/// same stored context always yields the same view (claim and every `read` page).
+#[derive(Default)]
+struct SourceLabels {
+    known: [std::collections::HashMap<String, String>; 3],
+}
+impl SourceLabels {
+    fn apply(&mut self, source: &mut Value) {
+        for (known, (key, prefix)) in self.known.iter_mut().zip([
+            ("conversation_id", 'k'),
+            ("event_id", 'e'),
+            ("native_id", 'n'),
+        ]) {
+            let Some(original) = source.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            let next = known.len() + 1;
+            let label = known
+                .entry(original.to_owned())
+                .or_insert_with(|| format!("{prefix}{next}"))
+                .clone();
+            source[key] = json!(label);
+        }
     }
 }
 pub fn pending_in(
