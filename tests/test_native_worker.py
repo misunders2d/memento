@@ -70,7 +70,7 @@ async function boot(script, { codes } = { codes: HOST_CODES }) {
   await handlers.session_start();
   handlers.context({ messages: [] });  // the session's first model request: nothing to keep yet
   const from = () => records.length;
-  const call = async (input) => {
+  const call = async (input, ctx = { signal: undefined }) => {
     const event = { toolName: "memento_work", toolCallId: "call-" + ++calls, input };
     const start = from(), sent = posts.length;
     const blocked = handlers.tool_call(event);
@@ -79,7 +79,7 @@ async function boot(script, { codes } = { codes: HOST_CODES }) {
     let content, isError = false;
     try { content = (await definition.execute(event.toolCallId, event.input, undefined)).content; }
     catch (error) { content = [{ type: "text", text: error.message }]; isError = true; }
-    const patch = await handlers.tool_result({ ...event, content, isError }, { signal: undefined });
+    const patch = await handlers.tool_result({ ...event, content, isError }, ctx);
     return { blocked: false, patched: !!patch, isError: patch?.isError ?? isError,
       text: (patch?.content ?? content).map(part => part.text).join("\n"),
       events: records.slice(start), posts: posts.slice(sent).map(post => post.body),
@@ -188,6 +188,54 @@ for (const [name, answer] of Object.entries({ unconfirmed: reply(200, { released
   script.release = reply(200, { released: true });
   const manual = await adapter.call({ action: "release", command: { id: "job" } });
   out["unreleased_" + name] = { rejected, after, manual, released: adapter.context() };
+}
+// A release reply that waits until `settle` is called; an abort of its request rejects it as fetch would.
+const realSetTimeout = globalThis.setTimeout;
+const pause = () => new Promise(resolve => realSetTimeout(resolve, 1));
+async function until(ready) {
+  for (let index = 0; !ready(); index++) { if (index > 2000) throw new Error("request never sent"); await pause(); }
+}
+function deferred() {
+  const state = { sent: false, settle: undefined };
+  state.answer = (init) => new Promise((resolve, reject) => {
+    state.sent = true;
+    state.settle = resolve;
+    init.signal?.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")));
+  });
+  return state;
+}
+{
+  // The service commits the automatic release only after more than fifteen seconds. A fake clock
+  // fires every long timer while the request is in flight: no adapter timer may give up on it.
+  const timers = [];
+  globalThis.setTimeout = (callback, ms, ...rest) => ms >= 1000 ? (timers.push(callback), 0)
+    : realSetTimeout(callback, ms, ...rest);
+  try {
+    const release = deferred();
+    const adapter = await boot({ claim: reply(200, work), submit: rejection, release: release.answer });
+    await adapter.call(claimInput());
+    const pending = adapter.call(inputs.submit());
+    await until(() => release.sent);
+    for (const callback of timers.splice(0)) callback();
+    await pause();
+    release.settle(reply(200, { released: true }));
+    out.slow_release = { rejected: await pending, after: adapter.context() };
+  } finally { globalThis.setTimeout = realSetTimeout; }
+}
+// Pi's abort signal still ends the automatic release, in flight or already aborted: the job stays held.
+for (const name of ["aborted_release", "pre_aborted_release"]) {
+  const controller = new AbortController(), release = deferred();
+  const script = { claim: reply(200, work), submit: rejection, release: release.answer };
+  const adapter = await boot(script);
+  await adapter.call(claimInput());
+  if (name === "pre_aborted_release") controller.abort();
+  const pending = adapter.call(inputs.submit(), { signal: controller.signal });
+  if (name === "aborted_release") { await until(() => release.sent); controller.abort(); }
+  const rejected = await pending;
+  const after = adapter.context();
+  script.release = reply(200, { released: true });
+  const manual = await adapter.call({ action: "release", command: { id: "job" } });
+  out[name] = { rejected, after, manual, released: adapter.context() };
 }
 process.stdout.write(JSON.stringify(out));
 '''
@@ -342,5 +390,34 @@ def test_unconfirmed_automatic_release_keeps_the_lease_held_and_says_so(observed
     assert seen['after']['state']['current'][0]['id'] == 'job' and seen['after']['kept'] == 3
     # The model can still release it, and only the service's confirmation marks it released.
     assert not seen['manual']['blocked'] and seen['manual']['posts'] == [RELEASE]
+    assert [event['released'] for event in releases(seen['manual']['events'])] == ['job']
+    assert seen['released']['state']['current'] == []
+
+
+def test_a_slow_automatic_release_is_not_given_up_by_an_adapter_timer(observed):
+    rejected = observed['slow_release']['rejected']
+    assert [post['action'] for post in rejected['posts']] == ['submit', 'release']
+    assert rejected['posts'][1] == RELEASE
+    # The service's late released:true is what the adapter reports, as for a prompt reply.
+    assert rejected['events'] == [
+        dict(type='memento_worker_state', error=True, code=REJECTION, action='submit', http_status=422),
+        dict(type='memento_worker_state', claimed=[], empty_kinds=[], completed=None, released='job',
+             boundary=False, empty=False)]
+    result = json.loads(rejected['text'])
+    assert result['current_work'] == [] and result['receipt']['released'] is True
+    assert 'still held' not in rejected['text']
+    assert observed['slow_release']['after']['state']['current'] == []
+
+
+@pytest.mark.parametrize('name,sent', [('aborted_release', True), ('pre_aborted_release', False)])
+def test_pi_abort_ends_the_automatic_release_and_keeps_the_job_held(observed, name, sent):
+    seen = observed[name]
+    rejected = seen['rejected']
+    assert [post['action'] for post in rejected['posts']] == (['submit', 'release'] if sent else ['submit'])
+    assert rejected['events'] == [dict(type='memento_worker_state', error=True, code=REJECTION,
+                                       action='submit', http_status=422)]
+    assert rejected['isError'] is True and 'still held' in rejected['text']
+    assert seen['after']['state']['current'][0]['id'] == 'job' and seen['after']['kept'] == 3
+    assert seen['manual']['posts'] == [RELEASE]
     assert [event['released'] for event in releases(seen['manual']['events'])] == ['job']
     assert seen['released']['state']['current'] == []

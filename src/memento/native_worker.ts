@@ -129,18 +129,16 @@ export default function worker(pi: any) {
     cooling.set(id, Date.now() + 900000); resetContext = true;
   }
   // The release request the model otherwise sends through the tool; true only on service confirmation.
+  // Like that request it has no timer of its own: only Pi's abort signal ends the wait, never
+  // an adapter timeout that a slow but committed release would contradict.
   async function release(leased: any, signal?: AbortSignal) {
-    const abort = new AbortController(), stop = () => abort.abort();
-    const timer = setTimeout(stop, 15000);
     try {
       if (signal?.aborted) return false;
-      signal?.addEventListener("abort", stop, { once: true });
-      const response = await fetch(url + "/work", { method: "POST", signal: abort.signal,
+      const response = await fetch(url + "/work", { method: "POST", signal,
         headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "release",
           command: { id: leased.id, owner: leased.owner, error: "service_rejected" } }) });
       return response.ok && JSON.parse(await response.text()).released === true;
     } catch { return false; }
-    finally { clearTimeout(timer); signal?.removeEventListener("abort", stop); }
   }
   pi.on("tool_result", async (event: any, ctx: any) => {
     if (event.toolName !== TOOL) return;
