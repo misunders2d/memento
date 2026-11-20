@@ -840,6 +840,7 @@ pub(super) fn prepare(
     }
     Ok(context)
 }
+type TargetQueues = Vec<(String, Vec<String>)>;
 fn prepare_cached(
     db: &Connection,
     dir: &Path,
@@ -875,6 +876,130 @@ fn prepare_cached(
     {
         builder.add_node(&target)?;
     }
+    let (mut candidates, resolutions) = load_candidates(db, &mut builder, &ids)?;
+    for target in &maintenance {
+        let n = curation::canonical(db, target)?;
+        if n["state"] == "active" {
+            builder.add_node(get_str(&n, "id")?)?;
+        }
+    }
+    builder.continuity()?;
+    builder.retirement()?;
+    crate::work_timing::lap("prepare_load", &mut lap);
+    let mut sub = std::time::Instant::now();
+    let Discovered {
+        identities,
+        relevant,
+        mut optional,
+    } = candidate_targets(db, discovery, discovery_cache, &candidates, &mut sub)?;
+    let (mentioned, subjects) =
+        maintenance_subjects(db, &builder, discovery_cache, &maintenance, &reviewed)?;
+    crate::work_timing::lap("targets_maintenance", &mut sub);
+    let comparison = comparison_queues(
+        db,
+        discovery_cache,
+        &candidates,
+        &identities,
+        &relevant,
+        &mut optional,
+    )?;
+    crate::work_timing::lap("targets_neighbors", &mut sub);
+    builder.allocate(&comparison, Some(2))?;
+    crate::work_timing::lap("targets_allocate", &mut sub);
+    builder.continuity()?;
+    crate::work_timing::lap("targets_continuity", &mut sub);
+    crate::work_timing::lap("prepare_discover_targets", &mut lap);
+    builder.retirement()?;
+    builder.allocate(&comparison, Some(6))?;
+    // After reserved comparison slots, at most LESSON_SUBJECTS per lesson.
+    builder.allocate(&mentioned, None)?;
+    builder.allocate(&subjects, None)?;
+    let exposures = exposures(&mut builder, &candidates)?;
+    builder.allocate(&optional, None)?;
+    builder.continuity()?;
+    builder.retirement()?;
+    crate::work_timing::lap("prepare_allocate", &mut lap);
+    // Bounded continuation: in cursor-free admission, a candidate whose top exact,
+    // lexical or semantic target did not fit the ceiling stays pending for a later batch
+    // instead of being decided without them. At least one candidate always proceeds.
+    let mut deferred = vec![];
+    if job.payload["night"].is_null() {
+        let uncovered = uncovered_candidates(db, &builder, &relevant, &candidates)?;
+        if uncovered.len() < candidates.len() {
+            candidates.retain(|candidate| !uncovered.contains(candidate["id"].as_str().unwrap()));
+            optional.retain(|(id, _)| !uncovered.contains(id));
+            deferred = uncovered.into_iter().collect();
+        } else if job.payload["_priority"].is_null()
+            && candidates
+                .iter()
+                .any(|candidate| candidate["kind"] != "relation")
+        {
+            // None fits beside its targets: reprepare the first half of the non-relation
+            // candidates plus relations whose batch endpoints stay; the rest stays pending.
+            // A lone kept candidate's top targets are seeded first in the in-memory clone.
+            // Each level keeps fewer non-relation candidates or seeds once, so this terminates.
+            let batch = uncovered; // here: every candidate in this context
+            let (narrowed, kept) = narrowed_job(job, &candidates, &relevant, &batch)?;
+            let mut context =
+                prepare_cached(db, dir, &narrowed, discovery, configured, discovery_cache)?;
+            let rest = batch.into_iter().filter(|id| !kept.contains(id));
+            context["_deferred"] = json!(unique(
+                strings(&context["_deferred"])?.into_iter().chain(rest)
+            ));
+            return Ok(context);
+        }
+    }
+    annotate_supplied(&mut builder, &mut candidates, &identities, &mentioned);
+    crate::work_timing::lap("prepare_defer", &mut lap);
+    let snapshots = relations_and_snapshots(db, &mut builder, &candidates)?;
+    crate::work_timing::lap("prepare_relations_loops", &mut lap);
+    builder.technical_context(&candidates)?;
+    crate::work_timing::lap("prepare_technical", &mut lap);
+    let later = builder.later_context(&candidates)?;
+    crate::work_timing::lap("prepare_later", &mut lap);
+    let unchecked = unchecked_targets(&builder, &subjects, &optional, &reviewed)?;
+    let windows = sorted_windows(builder.windows);
+    let mut maintenance_ids = vec![];
+    for target in maintenance {
+        let n = curation::canonical(db, &target)?;
+        let id = get_str(&n, "id")?.to_owned();
+        if builder.nodes.contains_key(&id) && !maintenance_ids.contains(&id) {
+            maintenance_ids.push(id);
+        }
+    }
+    let pending = !unchecked.is_empty()
+        || !builder.continuity["pending"].as_array().unwrap().is_empty()
+        || discovery.map_or(configured, |value| value["pending"] == true);
+    let ready = builder.retirement["ready"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "loop_policy_version":VERSION,
+        "candidates":candidates,
+        "existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),
+        "existing_relations":builder.edges.into_values().collect::<Vec<_>>(),
+        "raw_windows":windows,
+        "resolved_candidates":resolutions,
+        "loop_snapshots":snapshots,
+        "behavior_exposures":exposures,
+        "maintenance_ids":maintenance_ids,
+        "context_truncated":pending,
+        "retirement_ready":ready,
+        "_unchecked":unchecked,
+        "_deferred":deferred,
+        "_continuity":builder.continuity,
+        "_retirement":builder.retirement,
+        "_later_context":later
+    }))
+}
+fn load_candidates(
+    db: &Connection,
+    builder: &mut Builder<'_>,
+    ids: &[String],
+) -> Result<(Vec<Value>, Map<String, Value>)> {
     let mut candidates = rows(
         db,
         &format!(
@@ -912,20 +1037,25 @@ fn prepare_cached(
             }
         }
     }
-    for target in &maintenance {
-        let n = curation::canonical(db, target)?;
-        if n["state"] == "active" {
-            builder.add_node(get_str(&n, "id")?)?;
-        }
-    }
-    builder.continuity()?;
-    builder.retirement()?;
-    crate::work_timing::lap("prepare_load", &mut lap);
+    Ok((candidates, resolutions))
+}
+// Discovery queues per candidate, in candidate order.
+struct Discovered {
+    identities: Vec<(String, Vec<String>, Vec<String>)>,
+    relevant: TargetQueues,
+    optional: TargetQueues,
+}
+fn candidate_targets(
+    db: &Connection,
+    discovery: Option<&Value>,
+    discovery_cache: &mut DiscoveryCache,
+    candidates: &[Value],
+    sub: &mut std::time::Instant,
+) -> Result<Discovered> {
     let mut identities: Vec<(String, Vec<String>, Vec<String>)> = vec![];
     let mut relevant: Vec<(String, Vec<String>)> = vec![];
     let mut optional: Vec<(String, Vec<String>)> = vec![];
-    let mut sub = std::time::Instant::now();
-    for candidate in &candidates {
+    for candidate in candidates {
         let id = get_str(candidate, "id")?;
         let mut queue = vec![];
         let vector = db
@@ -946,7 +1076,7 @@ fn prepare_cached(
                         .as_ref()
                         .is_some_and(|vector| hint["vector"] == memento_core::raw::sha256(vector))
             });
-        crate::work_timing::lap("targets_hint", &mut sub);
+        crate::work_timing::lap("targets_hint", sub);
         if candidate["kind"] != "relation" {
             let exact = exact_ids(
                 db,
@@ -954,7 +1084,7 @@ fn prepare_cached(
                 get_str(candidate, "type")?,
                 get_str(candidate, "text")?,
             )?;
-            crate::work_timing::lap("targets_exact", &mut sub);
+            crate::work_timing::lap("targets_exact", sub);
             let lex = lexical(
                 db,
                 discovery_cache,
@@ -965,7 +1095,7 @@ fn prepare_cached(
                 &[],
                 false,
             )?;
-            crate::work_timing::lap("targets_lexical", &mut sub);
+            crate::work_timing::lap("targets_lexical", sub);
             let heads = lexical(
                 db,
                 discovery_cache,
@@ -976,7 +1106,7 @@ fn prepare_cached(
                 &[],
                 true,
             )?;
-            crate::work_timing::lap("targets_heads", &mut sub);
+            crate::work_timing::lap("targets_heads", sub);
             let semantic = hinted(db, hint, "typed")?;
             relevant.push((
                 id.into(),
@@ -1007,7 +1137,7 @@ fn prepare_cached(
             identities.push((id.into(), exact, similar));
         }
         queue.extend(hinted(db, hint, "broad")?);
-        crate::work_timing::lap("targets_hinted", &mut sub);
+        crate::work_timing::lap("targets_hinted", sub);
         let words = excerpt(get_str(candidate, "text")?, 512);
         queue.extend(cached(
             discovery_cache,
@@ -1020,13 +1150,26 @@ fn prepare_cached(
             },
         )?);
         optional.push((id.into(), unique(queue)));
-        crate::work_timing::lap("targets_keywords", &mut sub);
+        crate::work_timing::lap("targets_keywords", sub);
     }
+    Ok(Discovered {
+        identities,
+        relevant,
+        optional,
+    })
+}
+fn maintenance_subjects(
+    db: &Connection,
+    builder: &Builder<'_>,
+    discovery_cache: &mut DiscoveryCache,
+    maintenance: &[String],
+    reviewed: &[String],
+) -> Result<(TargetQueues, TargetQueues)> {
     // Only existing lessons (maintenance targets) get named entities: a new lesson cannot
     // link in its own plan, so supplying them for candidates would only spend the ceiling.
     let mut mentioned: Vec<(String, Vec<String>)> = vec![];
     let mut subjects = vec![];
-    for target in &maintenance {
+    for target in maintenance {
         let n = curation::canonical(db, target)?;
         let id = get_str(&n, "id")?;
         if !builder.nodes.contains_key(id) {
@@ -1046,7 +1189,7 @@ fn prepare_cached(
             get_str(&n, "type")?,
             2,
             96,
-            &reviewed,
+            reviewed,
             false,
         )?);
         // An experience target's named entities; listing them as subjects too keeps an
@@ -1068,12 +1211,21 @@ fn prepare_cached(
                 .collect(),
         ));
     }
-    crate::work_timing::lap("targets_maintenance", &mut sub);
+    Ok((mentioned, subjects))
+}
+fn comparison_queues(
+    db: &Connection,
+    discovery_cache: &mut DiscoveryCache,
+    candidates: &[Value],
+    identities: &[(String, Vec<String>, Vec<String>)],
+    relevant: &[(String, Vec<String>)],
+    optional: &mut [(String, Vec<String>)],
+) -> Result<TargetQueues> {
     // Per subject: required top exact/lexical/semantic targets of every member candidate,
     // then the rest. Reserved comparison slots reach the tops before weak first-word
     // matches, so a candidate is not deferred only because head hints filled them.
     let mut subjects_queue: Vec<(String, Vec<String>, Vec<String>)> = vec![];
-    for (key, exact, similar) in &identities {
+    for (key, exact, similar) in identities {
         let tops = relevant
             .iter()
             .find(|(id, _)| id == key)
@@ -1109,104 +1261,86 @@ fn prepare_cached(
         .into_iter()
         .map(|(subject, tops, rest)| (subject, unique(tops.into_iter().chain(rest))))
         .collect();
-    crate::work_timing::lap("targets_neighbors", &mut sub);
-    builder.allocate(&comparison, Some(2))?;
-    crate::work_timing::lap("targets_allocate", &mut sub);
-    builder.continuity()?;
-    crate::work_timing::lap("targets_continuity", &mut sub);
-    crate::work_timing::lap("prepare_discover_targets", &mut lap);
-    builder.retirement()?;
-    builder.allocate(&comparison, Some(6))?;
-    // After reserved comparison slots, at most LESSON_SUBJECTS per lesson.
-    builder.allocate(&mentioned, None)?;
-    builder.allocate(&subjects, None)?;
-    let exposures = exposures(&mut builder, &candidates)?;
-    builder.allocate(&optional, None)?;
-    builder.continuity()?;
-    builder.retirement()?;
-    crate::work_timing::lap("prepare_allocate", &mut lap);
-    // Bounded continuation: in cursor-free admission, a candidate whose top exact,
-    // lexical or semantic target did not fit the ceiling stays pending for a later batch
-    // instead of being decided without them. At least one candidate always proceeds.
-    let mut deferred = vec![];
-    if job.payload["night"].is_null() {
-        let mut uncovered = BTreeSet::new();
-        for (id, targets) in &relevant {
-            for target in targets {
-                if !builder.nodes.contains_key(target)
-                    && one(db, &format!("SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT \
-                        max(x.version) FROM node_versions x WHERE x.id=n.id) AND {VISIBLE}"), [target])?.is_some()
-                {
-                    uncovered.insert(id.clone());
-                }
-            }
-        }
-        // A relation waits with a deferred endpoint candidate instead of a dependency defer.
-        for candidate in &candidates {
-            if ["src", "dst"].iter().any(|key| {
-                candidate[*key]
-                    .as_str()
-                    .is_some_and(|id| uncovered.contains(id))
-            }) {
-                uncovered.insert(get_str(candidate, "id")?.to_owned());
-            }
-        }
-        if uncovered.len() < candidates.len() {
-            candidates.retain(|candidate| !uncovered.contains(candidate["id"].as_str().unwrap()));
-            optional.retain(|(id, _)| !uncovered.contains(id));
-            deferred = uncovered.into_iter().collect();
-        } else if job.payload["_priority"].is_null()
-            && candidates
-                .iter()
-                .any(|candidate| candidate["kind"] != "relation")
-        {
-            // None fits beside its targets: reprepare the first half of the non-relation
-            // candidates plus relations whose batch endpoints stay; the rest stays pending.
-            // A lone kept candidate's top targets are seeded first in the in-memory clone.
-            // Each level keeps fewer non-relation candidates or seeds once, so this terminates.
-            let batch = uncovered; // here: every candidate in this context
-            let entities = candidates
-                .iter()
-                .filter(|candidate| candidate["kind"] != "relation")
-                .collect::<Vec<_>>();
-            let entities = &entities[..(entities.len() / 2).max(1)];
-            let mut kept = entities
-                .iter()
-                .map(|candidate| get_str(candidate, "id").map(str::to_owned))
-                .collect::<Result<BTreeSet<_>>>()?;
-            for candidate in candidates
-                .iter()
-                .filter(|candidate| candidate["kind"] == "relation")
+    Ok(comparison)
+}
+// Candidates whose top target is active and visible but did not fit the ceiling.
+fn uncovered_candidates(
+    db: &Connection,
+    builder: &Builder<'_>,
+    relevant: &[(String, Vec<String>)],
+    candidates: &[Value],
+) -> Result<BTreeSet<String>> {
+    let mut uncovered = BTreeSet::new();
+    for (id, targets) in relevant {
+        for target in targets {
+            if !builder.nodes.contains_key(target)
+                && one(db, &format!("SELECT 1 FROM node_versions n WHERE n.id=? AND n.state='active' AND n.version=(SELECT \
+                    max(x.version) FROM node_versions x WHERE x.id=n.id) AND {VISIBLE}"), [target])?.is_some()
             {
-                if ["src", "dst"].iter().all(|key| {
-                    candidate[*key]
-                        .as_str()
-                        .is_none_or(|id| !batch.contains(id) || kept.contains(id))
-                }) {
-                    kept.insert(get_str(candidate, "id")?.to_owned());
-                }
+                uncovered.insert(id.clone());
             }
-            let mut narrowed = job.clone();
-            narrowed.payload["candidate_ids"] = json!(kept);
-            if let [only] = entities {
-                narrowed.payload["_priority"] = json!(
-                    relevant
-                        .iter()
-                        .find(|(id, _)| only["id"] == *id)
-                        .map(|(_, targets)| targets.clone())
-                        .unwrap_or_default()
-                );
-            }
-            let mut context =
-                prepare_cached(db, dir, &narrowed, discovery, configured, discovery_cache)?;
-            let rest = batch.into_iter().filter(|id| !kept.contains(id));
-            context["_deferred"] = json!(unique(
-                strings(&context["_deferred"])?.into_iter().chain(rest)
-            ));
-            return Ok(context);
         }
     }
-    for candidate in &mut candidates {
+    // A relation waits with a deferred endpoint candidate instead of a dependency defer.
+    for candidate in candidates {
+        if ["src", "dst"].iter().any(|key| {
+            candidate[*key]
+                .as_str()
+                .is_some_and(|id| uncovered.contains(id))
+        }) {
+            uncovered.insert(get_str(candidate, "id")?.to_owned());
+        }
+    }
+    Ok(uncovered)
+}
+// The narrowed in-memory job clone and the candidate ids it keeps.
+fn narrowed_job(
+    job: &Job,
+    candidates: &[Value],
+    relevant: &[(String, Vec<String>)],
+    batch: &BTreeSet<String>,
+) -> Result<(Job, BTreeSet<String>)> {
+    let entities = candidates
+        .iter()
+        .filter(|candidate| candidate["kind"] != "relation")
+        .collect::<Vec<_>>();
+    let entities = &entities[..(entities.len() / 2).max(1)];
+    let mut kept = entities
+        .iter()
+        .map(|candidate| get_str(candidate, "id").map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()?;
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate["kind"] == "relation")
+    {
+        if ["src", "dst"].iter().all(|key| {
+            candidate[*key]
+                .as_str()
+                .is_none_or(|id| !batch.contains(id) || kept.contains(id))
+        }) {
+            kept.insert(get_str(candidate, "id")?.to_owned());
+        }
+    }
+    let mut narrowed = job.clone();
+    narrowed.payload["candidate_ids"] = json!(kept);
+    if let [only] = entities {
+        narrowed.payload["_priority"] = json!(
+            relevant
+                .iter()
+                .find(|(id, _)| only["id"] == *id)
+                .map(|(_, targets)| targets.clone())
+                .unwrap_or_default()
+        );
+    }
+    Ok((narrowed, kept))
+}
+fn annotate_supplied(
+    builder: &mut Builder<'_>,
+    candidates: &mut [Value],
+    identities: &[(String, Vec<String>, Vec<String>)],
+    mentioned: &[(String, Vec<String>)],
+) {
+    for candidate in candidates {
         if let Some((_, exact, similar)) =
             identities.iter().find(|(id, _, _)| candidate["id"] == *id)
         {
@@ -1217,7 +1351,7 @@ fn prepare_cached(
             });
         }
     }
-    for (lesson, named) in &mentioned {
+    for (lesson, named) in mentioned {
         let supplied = named
             .iter()
             .filter(|id| builder.nodes.contains_key(*id))
@@ -1230,7 +1364,12 @@ fn prepare_cached(
             n["named_entities"] = json!(supplied);
         }
     }
-    crate::work_timing::lap("prepare_defer", &mut lap);
+}
+fn relations_and_snapshots(
+    db: &Connection,
+    builder: &mut Builder<'_>,
+    candidates: &[Value],
+) -> Result<Map<String, Value>> {
     let node_ids = builder.nodes.keys().cloned().collect::<Vec<_>>();
     if !node_ids.is_empty() {
         for mut edge in rows(
@@ -1258,13 +1397,16 @@ fn prepare_cached(
             loops::snapshot(db, id, item["version"].as_i64().unwrap_or(1))?,
         );
     }
-    crate::work_timing::lap("prepare_relations_loops", &mut lap);
-    builder.technical_context(&candidates)?;
-    crate::work_timing::lap("prepare_technical", &mut lap);
-    let later = builder.later_context(&candidates)?;
-    crate::work_timing::lap("prepare_later", &mut lap);
+    Ok(snapshots)
+}
+fn unchecked_targets(
+    builder: &Builder<'_>,
+    subjects: &[(String, Vec<String>)],
+    optional: &[(String, Vec<String>)],
+    reviewed: &[String],
+) -> Result<Map<String, Value>> {
     let mut unchecked: Map<String, Value> = Map::new();
-    for (key, queue) in &subjects {
+    for (key, queue) in subjects {
         let missing = queue
             .iter()
             .filter(|target| !builder.nodes.contains_key(*target) && !reviewed.contains(target))
@@ -1274,7 +1416,7 @@ fn prepare_cached(
             unchecked.insert(key.clone(), json!(missing));
         }
     }
-    for (_, queue) in &optional {
+    for (_, queue) in optional {
         let missing = queue
             .iter()
             .filter(|target| !builder.nodes.contains_key(*target) && !reviewed.contains(target))
@@ -1295,9 +1437,11 @@ fn prepare_cached(
             }
         }
     }
+    Ok(unchecked)
+}
+fn sorted_windows(windows: Vec<(WindowKey, Value)>) -> Vec<Value> {
     let mut windows = coalesce_windows(
-        builder
-            .windows
+        windows
             .into_iter()
             .map(|(_, value)| value)
             .collect::<Vec<_>>(),
@@ -1308,41 +1452,7 @@ fn prepare_cached(
             window["start"].as_i64().unwrap_or(0),
         )
     });
-    let mut maintenance_ids = vec![];
-    for target in maintenance {
-        let n = curation::canonical(db, &target)?;
-        let id = get_str(&n, "id")?.to_owned();
-        if builder.nodes.contains_key(&id) && !maintenance_ids.contains(&id) {
-            maintenance_ids.push(id);
-        }
-    }
-    let pending = !unchecked.is_empty()
-        || !builder.continuity["pending"].as_array().unwrap().is_empty()
-        || discovery.map_or(configured, |value| value["pending"] == true);
-    let ready = builder.retirement["ready"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    Ok(json!({
-        "loop_policy_version":VERSION,
-        "candidates":candidates,
-        "existing_nodes":builder.nodes.into_values().collect::<Vec<_>>(),
-        "existing_relations":builder.edges.into_values().collect::<Vec<_>>(),
-        "raw_windows":windows,
-        "resolved_candidates":resolutions,
-        "loop_snapshots":snapshots,
-        "behavior_exposures":exposures,
-        "maintenance_ids":maintenance_ids,
-        "context_truncated":pending,
-        "retirement_ready":ready,
-        "_unchecked":unchecked,
-        "_deferred":deferred,
-        "_continuity":builder.continuity,
-        "_retirement":builder.retirement,
-        "_later_context":later
-    }))
+    windows
 }
 
 /// Exact union of overlapping source spans with identical provenance/authority.
