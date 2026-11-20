@@ -928,506 +928,663 @@ pub(super) fn apply(
         .graph
         .store
         .command(&ctx, &request, |tx, commit| {
-            job.check_in(tx.sql())?;
-            check_continuity(tx.sql(), context_value)?;
-            for repair in &prepared.repairs {
-                if repair["operation"] == "retire" {
-                    check_retirement(tx.sql(), context_value, get_str(repair, "target")?)?;
-                }
-                if repair["operation"] == "link" {
-                    for key in ["target", "dst"] {
-                        if !visible_link_endpoint(tx.sql(), get_str(repair, key)?)? {
-                            return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan"));
-                        }
-                    }
-                }
-            }
-            if !ineligible(tx.sql(), &ids)?.is_empty() {
-                return Err(Error::Conflict("Consolidation eligibility changed; derive a fresh plan"));
-            }
-            for (target, frozen) in &prepared.nodes {
-                if node(tx.sql(), target)?["version"] != frozen["version"] {
-                    return Err(Error::Conflict("Consolidation graph context changed; derive a fresh plan"));
-                }
-            }
-            for (target, frozen) in &prepared.edges {
-                if one(tx.sql(), "SELECT version FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1", [target])?
-                    .is_none_or(|current| current["version"] != frozen["version"])
-                {
-                    return Err(Error::Conflict("Consolidation relation context changed; derive a fresh plan"));
-                }
-            }
-            let loop_snapshots = context_value["loop_snapshots"].as_object().unwrap();
-            let frozen_version = |target: &str| {
-                prepared
-                    .nodes
-                    .get(target)
-                    .or_else(|| prepared.edges.get(target))
-                    .and_then(|value| value["version"].as_i64())
-                    .unwrap_or(1)
-            };
-            if !prepared.repairs.is_empty()
-                || prepared
-                    .actions
-                    .iter()
-                    .any(|action| !action["closed_targets"].as_array().unwrap().is_empty())
-            {
-                for (target, frozen) in loop_snapshots {
-                    if loops::snapshot(tx.sql(), target, frozen_version(target))? != *frozen {
-                        return Err(Error::Conflict("Consolidation loop state changed; derive a fresh plan"));
-                    }
-                }
-            }
-            let mut closures = vec![];
-            let mut closure_sources: HashMap<(String, String), Vec<Option<String>>> =
-                HashMap::new();
-            for action in &prepared.actions {
-                let candidate_id = get_str(action, "candidate_id")?;
-                let original = prepared.selected[candidate_id]["evidence"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|reference| reference["episode_id"].as_str().unwrap())
-                    .collect::<BTreeSet<_>>();
-                let dated = |items: &Value, originals: bool| {
-                    items
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter(|source| {
-                            !originals || original.contains(source["episode_id"].as_str().unwrap())
-                        })
-                        .map(|source| {
-                            prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"]
-                                .as_str()
-                                .map(str::to_owned)
-                        })
-                        .collect::<Vec<_>>()
-                };
-                for target in action["closed_targets"].as_array().unwrap() {
-                    let target = target.as_str().unwrap();
-                    // Its own loop closes only on later lifecycle evidence; other targets on its original sources.
-                    let sources = if target == candidate_id {
-                        dated(&action["_closure_evidence"], false)
-                    } else {
-                        dated(&action["evidence"], true)
-                    };
-                    let (at, status) = loops::closure_time(&loop_snapshots[target], &sources)?;
-                    closures.push(json!({
-                        "candidate_id":candidate_id,
-                        "target":target,
-                        "source_occurred_at":at,
-                        "status":status
-                    }));
-                    closure_sources.insert((candidate_id.into(), target.into()), sources);
-                }
-            }
-            let mut results = Map::new();
-            let mut loop_responsibilities = Map::new();
-            let mut destinations: Map<String, Value> = Map::new();
-            let mut resolutions = prepared.resolutions.clone();
-            let mut lessons = vec![];
-            let mut actions = prepared.actions.clone();
-            actions.sort_by_key(|action| {
-                (
-                    action["operation"] == "link",
-                    !matches!(
-                        action["operation"].as_str(),
-                        Some("remember" | "reject" | "defer")
-                    ),
-                )
-            });
-            for action in &actions {
-                let candidate_id = get_str(action, "candidate_id")?;
-                let candidate = &prepared.selected[candidate_id];
-                if one(tx.sql(), &format!("SELECT 1 FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"), [candidate_id])?.is_none() {
-                    continue;
-                }
-                let decision = one(tx.sql(), "SELECT id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1", [candidate_id])?;
-                if decision
-                    .map(|decision| decision["id"].clone())
-                    .unwrap_or(Value::Null)
-                    != candidate["decision_id"]
-                {
-                    return Err(Error::Conflict("Candidate decision changed while consolidation was running"));
-                }
-                let (mut result, state) = apply_action(
-                    tx,
-                    commit,
-                    action,
-                    candidate,
-                    &resolutions,
-                    &prepared.nodes,
-                    &destinations,
-                )?;
-                let target = result["superseded_by"]
-                    .as_str()
-                    .or_else(|| result["merged_into"].as_str())
-                    .or_else(|| result["id"].as_str())
-                    .map(str::to_owned);
-                if state == "promote" {
-                    if let Some(target) = &target {
-                        let marker = loops::current(tx.sql(), candidate_id)?;
-                        let fresh = loops::current(tx.sql(), target)?.is_none();
-                        if !(action["open_loop"] == false
-                            && loops::decline_extracted(tx, commit, candidate_id)?)
-                        {
-                            loops::transfer(tx, commit, candidate_id, target)?;
-                        }
-                        importance::transfer_usage(tx, candidate_id, target)?;
-                        loops::mark(
-                            tx,
-                            commit,
-                            target,
-                            action["open_loop"].as_bool(),
-                            Some(candidate_id),
-                            marker.as_ref(),
-                            None,
-                        )?;
-                        // This plan's explicit due date, else the candidate's own one for a reaffirmed existing loop.
-                        let due = action["_due_at"].as_str().or_else(|| {
-                            marker
-                                .as_ref()
-                                .filter(|marker| {
-                                    !fresh
-                                        && action["open_loop"] == true
-                                        && marker["state"] == "open"
-                                })
-                                .and_then(|marker| marker["due_at"].as_str())
-                        });
-                        if let Some(due) = due {
-                            let sources = candidate["evidence"]
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .map(|source| source["occurred_at"].as_str().map(str::to_owned))
-                                .collect::<Vec<_>>();
-                            loops::automatic_due(
-                                tx,
-                                commit,
-                                target,
-                                frozen_version(target.as_str()),
-                                due,
-                                &sources,
-                                fresh,
-                                Some(candidate_id),
-                            )?;
-                        }
-                    }
-                } else if state == "review" {
-                    loops::mark(
-                        tx,
-                        commit,
-                        candidate_id,
-                        action["open_loop"].as_bool(),
-                        None,
-                        None,
-                        action["_due_at"].as_str(),
-                    )?;
-                    if let Some(due) = action["_due_at"].as_str() {
-                        loops::automatic_due(tx, commit, candidate_id, 1, due, &[], true, None)?;
-                    }
-                }
-                let role_target = if state == "promote" {
-                    target.as_deref()
-                } else if state == "review" {
-                    Some(candidate_id)
-                } else {
-                    None
-                };
-                if let (Some(role_target), Some(value)) =
-                    (role_target, action["responsibility"].as_str())
-                {
-                    if loops::current(tx.sql(), role_target)?.is_some() {
-                        let role = loops::assign_automatic(
-                            tx,
-                            commit,
-                            role_target,
-                            value,
-                            &action["evidence"],
-                        )?;
-                        if let Some(map) = role["loop_responsibilities"].as_object() {
-                            loop_responsibilities.extend(map.clone());
-                        }
-                    }
-                }
-                tx.sql().execute(
-                    "INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",
-                    params![
-                        id(),
-                        candidate_id,
-                        commit,
-                        state,
-                        target,
-                        if state == "defer" {
-                            Some(timestamp() + 3600.0)
-                        } else {
-                            None
-                        }
-                    ],
-                )?;
-                if ["promote", "reject"].contains(&state) {
-                    tx.sql().execute("UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE \
-                        kind='candidate' AND target=?)", [candidate_id])?;
-                }
-                tx.touch_target(candidate_id)?;
-                if state == "promote" {
-                    if let Some(target) = &target {
-                        resolutions.insert(candidate_id.into(), json!(target));
-                        if action["operation"] == "supersede" {
-                            if let Some(previous) = action["target"].as_str() {
-                                let previous = resolutions
-                                    .get(previous)
-                                    .and_then(Value::as_str)
-                                    .unwrap_or(previous);
-                                if previous != target {
-                                    destinations.insert(previous.into(), json!(target));
-                                }
-                            }
-                        }
-                    }
-                }
-                if state == "promote"
-                    && matches!(action["operation"].as_str(), Some("remember" | "supersede"))
-                    && action["type"] == "experience"
-                    && action["behavior"].is_object()
-                {
-                    if let Some(target) = &target {
-                        lessons.push((target.clone(), action.clone()));
-                    }
-                }
-                result["decision"] = json!(state);
-                results.insert(candidate_id.into(), result);
-            }
-            let mut repair_results = Map::new();
-            for repair in &prepared.repairs {
-                let original = get_str(repair, "target")?;
-                let target = follow_refinements(tx.sql(), original, &destinations)?;
-                let evidence = &repair["evidence"];
-                let result = match get_str(repair, "operation")? {
-                    "link" => {
-                        let dst =
-                            follow_refinements(tx.sql(), get_str(repair, "dst")?, &destinations)?;
-                        if !visible_link_endpoint(tx.sql(), &target)?
-                            || !visible_link_endpoint(tx.sql(), &dst)?
-                        {
-                            return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan"));
-                        }
-                        link(
-                            tx,
-                            commit,
-                            &target,
-                            get_str(repair, "relation")?,
-                            &dst,
-                            evidence,
-                        )?
-                    }
-                    "absorb" => {
-                        let mut absorbed = vec![];
-                        for source in strings(&repair["absorbed"])? {
-                            absorbed.push(follow_refinements(tx.sql(), &source, &destinations)?);
-                        }
-                        let result = curation::absorb(
-                            tx,
-                            commit,
-                            &target,
-                            &absorbed,
-                            Some(evidence),
-                            false,
-                            None,
-                        )?;
-                        if result["status"] == "absorbed" {
-                            for source in absorbed {
-                                if node(tx.sql(), &source)?["state"] == "merged" {
-                                    destinations.insert(source, json!(target));
-                                }
-                            }
-                        }
-                        result
-                    }
-                    "supersede" => TxGraph::supersede(tx, commit, &json!({
-                        "op":"supersede",
-                        "old":target,
-                        "new": {
-                            "type":repair["type"],
-                            "text":repair["text"],
-                            "scope":repair.get("scope").filter(|scope|!scope.is_null()).unwrap_or(&prepared.nodes[original]["scope"])
-                        },
-                        "kind":repair["change_kind"],
-                        "valid_at":repair["valid_at"],
-                        "evidence":evidence,
-                        "retire_relations":repair["retire_relations"]
-                    }), false)?,
-                    "decline_loop" => loops::decline_automatic(
-                        tx,
-                        commit,
-                        &target,
-                        frozen_version(original),
-                        &loop_snapshots[original],
-                    )?,
-                    "assign_loop" => {
-                        let result = loops::assign_automatic(
-                            tx,
-                            commit,
-                            &target,
-                            get_str(repair, "responsibility")?,
-                            evidence,
-                        )?;
-                        if let Some(map) = result["loop_responsibilities"].as_object() {
-                            loop_responsibilities.extend(map.clone());
-                        }
-                        result
-                    }
-                    "retire" => curation::retire(tx, commit, &target, evidence)?,
-                    "close_loop" => {
-                        let sources = evidence
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|source| {
-                            prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"]
-                                .as_str()
-                                .map(str::to_owned)
-                        })
-                        .collect::<Vec<_>>();
-                        let (at, mut status) =
-                            loops::closure_time(&loop_snapshots[original], &sources)?;
-                        if prepared.nodes[original]["pinned"].as_i64().unwrap_or(0) != 0 {
-                            status = Some("protected_loop_choice");
-                        }
-                        if status.is_none() {
-                            let previous = loops::current(tx.sql(), &target)?
-                                .ok_or(Error::Conflict("Consolidation loop state changed; derive a fresh plan"))?;
-                            loops::append(
-                                tx,
-                                commit,
-                                &target,
-                                "closed",
-                                previous["due_at"].as_str(),
-                                None,
-                            )?;
-                            status = Some("closed");
-                        }
-                        closures.push(json!({"target":target,"status":status,"source_occurred_at":at}));
-                        json!({"id":target,"status":status,"source_occurred_at":at})
-                    }
-                    _ => return Err(Error::Validation("consolidation_schema_invalid")),
-                };
-                repair_results.insert(original.into(), result);
-            }
-            closures.sort_by(|a, b| {
-                b["source_occurred_at"]
-                    .as_str()
-                    .unwrap_or("")
-                    .cmp(a["source_occurred_at"].as_str().unwrap_or(""))
-            });
-            for closure in &mut closures {
-                let original = get_str(closure, "target")?.to_owned();
-                let mut target = resolutions
-                    .get(&original)
-                    .and_then(Value::as_str)
-                    .unwrap_or(&original)
-                    .to_owned();
-                let mut seen = BTreeSet::new();
-                while let Some(next) = destinations.get(&target).and_then(Value::as_str) {
-                    if !seen.insert(target.clone()) {
-                        return Err(Error::Conflict("Consolidation identity cycle"));
-                    }
-                    target = next.into();
-                }
-                closure["target"] = json!(target);
-                if !closure["status"].is_null() {
-                    continue;
-                }
-                let candidate_id = get_str(closure, "candidate_id")?.to_owned();
-                if target != original && loop_snapshots.contains_key(&target) {
-                    let (at, status) = loops::closure_time(
-                        &loop_snapshots[&target],
-                        &closure_sources[&(candidate_id.clone(), original.clone())],
-                    )?;
-                    closure["source_occurred_at"] = json!(at);
-                    closure["status"] = json!(status);
-                    if status.is_some() {
-                        continue;
-                    }
-                }
-                if !matches!(
-                    results
-                        .get(&candidate_id)
-                        .and_then(|result| result["decision"].as_str()),
-                    Some("promote" | "reject")
-                ) {
-                    closure["status"] = json!("decision_pending");
-                    continue;
-                }
-                let marker = loops::current(tx.sql(), &target)?;
-                if marker
-                    .as_ref()
-                    .is_none_or(|marker| marker["state"] != "open")
-                {
-                    closure["status"] = json!("not_open");
-                    continue;
-                }
-                loops::append(
-                    tx,
-                    commit,
-                    &target,
-                    "closed",
-                    marker.as_ref().unwrap()["due_at"].as_str(),
-                    None,
-                )?;
-                closure["status"] = json!("closed");
-            }
-            if !job.payload["night"].is_null() {
-                tx.sql().execute(
-                    "UPDATE consolidation_nights SET cursor=max(cursor,?) WHERE id=?",
-                    params![
-                        job.payload["next_cursor"].as_i64(),
-                        job.payload["night"].as_str()
-                    ],
-                )?;
-            }
-            let mut context = context_value.clone();
-            let redirected = apply_continuity(tx, commit, &mut context)?;
-            let mut progressed = !redirected.is_empty();
-            for (target, n) in &prepared.nodes {
-                progressed |= node(tx.sql(), target)?["version"] != n["version"];
-            }
-            if !progressed {
-                for (target, frozen) in loop_snapshots {
-                    let current = one(tx.sql(), "SELECT id FROM loop_events WHERE target=? ORDER BY rowid DESC LIMIT 1", [target])?
-                        .map(|row| row["id"].clone())
-                        .unwrap_or(Value::Null);
-                    if current != frozen["event_id"] {
-                        progressed = true;
-                        break;
-                    }
-                }
-            }
-            continue_work(
+            commit_plan(
                 tx,
                 commit,
                 job,
-                &context,
-                &prepared.continue_with,
-                &prepared.nodes,
-                &destinations,
-                progressed,
-            )?;
-            seed_lesson_links(tx, &lessons)?;
-            Ok(json!({
-                "candidate_count":results.len(),
-                "results":results,
-                "reported_model":model,
-                "usage":usage,
-                "loop_closures":closures,
-                "repair_results":repair_results,
-                "redirected_relations":redirected,
-                "loop_responsibilities":loop_responsibilities
-            }))
+                context_value,
+                &prepared,
+                &ids,
+                model,
+                usage,
+            )
         });
     crate::work_timing::lap("apply_commit", &mut lap);
     Ok(committed?)
+}
+// What one committed plan accumulates across its candidate actions and repairs.
+struct Applied {
+    closures: Vec<Value>,
+    results: Map<String, Value>,
+    loop_responsibilities: Map<String, Value>,
+    destinations: Map<String, Value>,
+    resolutions: Map<String, Value>,
+    lessons: Vec<(String, Value)>,
+}
+type ClosureSources = HashMap<(String, String), Vec<Option<String>>>;
+fn frozen_version(prepared: &Prepared, target: &str) -> i64 {
+    prepared
+        .nodes
+        .get(target)
+        .or_else(|| prepared.edges.get(target))
+        .and_then(|value| value["version"].as_i64())
+        .unwrap_or(1)
+}
+// The whole consolidation commit: runs inside one `store.command` transaction.
+#[allow(clippy::too_many_arguments)]
+fn commit_plan(
+    tx: &WriteTxn,
+    commit: &str,
+    job: &Job,
+    context_value: &Value,
+    prepared: &Prepared,
+    ids: &[String],
+    model: Option<&str>,
+    usage: Option<&Value>,
+) -> Result<Value> {
+    job.check_in(tx.sql())?;
+    check_continuity(tx.sql(), context_value)?;
+    check_plan_fences(tx, context_value, prepared, ids)?;
+    let loop_snapshots = context_value["loop_snapshots"].as_object().unwrap();
+    if !prepared.repairs.is_empty()
+        || prepared
+            .actions
+            .iter()
+            .any(|action| !action["closed_targets"].as_array().unwrap().is_empty())
+    {
+        for (target, frozen) in loop_snapshots {
+            if loops::snapshot(tx.sql(), target, frozen_version(prepared, target))? != *frozen {
+                return Err(Error::Conflict(
+                    "Consolidation loop state changed; derive a fresh plan",
+                ));
+            }
+        }
+    }
+    let (closures, closure_sources) = plan_loop_closures(prepared, loop_snapshots)?;
+    let mut applied = Applied {
+        closures,
+        results: Map::new(),
+        loop_responsibilities: Map::new(),
+        destinations: Map::new(),
+        resolutions: prepared.resolutions.clone(),
+        lessons: vec![],
+    };
+    let mut actions = prepared.actions.clone();
+    actions.sort_by_key(|action| {
+        (
+            action["operation"] == "link",
+            !matches!(
+                action["operation"].as_str(),
+                Some("remember" | "reject" | "defer")
+            ),
+        )
+    });
+    for action in &actions {
+        apply_candidate(tx, commit, action, prepared, &mut applied)?;
+    }
+    let repair_results = apply_repairs(tx, commit, prepared, loop_snapshots, &mut applied)?;
+    settle_loop_closures(tx, commit, &mut applied, &closure_sources, loop_snapshots)?;
+    let Applied {
+        closures,
+        results,
+        loop_responsibilities,
+        destinations,
+        lessons,
+        ..
+    } = applied;
+    if !job.payload["night"].is_null() {
+        tx.sql().execute(
+            "UPDATE consolidation_nights SET cursor=max(cursor,?) WHERE id=?",
+            params![
+                job.payload["next_cursor"].as_i64(),
+                job.payload["night"].as_str()
+            ],
+        )?;
+    }
+    let mut context = context_value.clone();
+    let redirected = apply_continuity(tx, commit, &mut context)?;
+    let mut progressed = !redirected.is_empty();
+    for (target, n) in &prepared.nodes {
+        progressed |= node(tx.sql(), target)?["version"] != n["version"];
+    }
+    if !progressed {
+        for (target, frozen) in loop_snapshots {
+            let current = one(
+                tx.sql(),
+                "SELECT id FROM loop_events WHERE target=? ORDER BY rowid DESC LIMIT 1",
+                [target],
+            )?
+            .map(|row| row["id"].clone())
+            .unwrap_or(Value::Null);
+            if current != frozen["event_id"] {
+                progressed = true;
+                break;
+            }
+        }
+    }
+    continue_work(
+        tx,
+        commit,
+        job,
+        &context,
+        &prepared.continue_with,
+        &prepared.nodes,
+        &destinations,
+        progressed,
+    )?;
+    seed_lesson_links(tx, &lessons)?;
+    Ok(json!({
+        "candidate_count":results.len(),
+        "results":results,
+        "reported_model":model,
+        "usage":usage,
+        "loop_closures":closures,
+        "repair_results":repair_results,
+        "redirected_relations":redirected,
+        "loop_responsibilities":loop_responsibilities
+    }))
+}
+// Refuses the plan when repair targets, eligibility or supplied graph versions changed.
+fn check_plan_fences(
+    tx: &WriteTxn,
+    context_value: &Value,
+    prepared: &Prepared,
+    ids: &[String],
+) -> Result<()> {
+    for repair in &prepared.repairs {
+        if repair["operation"] == "retire" {
+            check_retirement(tx.sql(), context_value, get_str(repair, "target")?)?;
+        }
+        if repair["operation"] == "link" {
+            for key in ["target", "dst"] {
+                if !visible_link_endpoint(tx.sql(), get_str(repair, key)?)? {
+                    return Err(Error::Conflict(
+                        "Consolidation link endpoint changed; derive a fresh plan",
+                    ));
+                }
+            }
+        }
+    }
+    if !ineligible(tx.sql(), ids)?.is_empty() {
+        return Err(Error::Conflict(
+            "Consolidation eligibility changed; derive a fresh plan",
+        ));
+    }
+    for (target, frozen) in &prepared.nodes {
+        if node(tx.sql(), target)?["version"] != frozen["version"] {
+            return Err(Error::Conflict(
+                "Consolidation graph context changed; derive a fresh plan",
+            ));
+        }
+    }
+    for (target, frozen) in &prepared.edges {
+        if one(
+            tx.sql(),
+            "SELECT version FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1",
+            [target],
+        )?
+        .is_none_or(|current| current["version"] != frozen["version"])
+        {
+            return Err(Error::Conflict(
+                "Consolidation relation context changed; derive a fresh plan",
+            ));
+        }
+    }
+    Ok(())
+}
+// Chronology verdict for every loop a candidate action closes, with the source times it used.
+fn plan_loop_closures(
+    prepared: &Prepared,
+    loop_snapshots: &Map<String, Value>,
+) -> Result<(Vec<Value>, ClosureSources)> {
+    let mut closures = vec![];
+    let mut closure_sources: HashMap<(String, String), Vec<Option<String>>> = HashMap::new();
+    for action in &prepared.actions {
+        let candidate_id = get_str(action, "candidate_id")?;
+        let original = prepared.selected[candidate_id]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|reference| reference["episode_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        let dated = |items: &Value, originals: bool| {
+            items
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|source| {
+                    !originals || original.contains(source["episode_id"].as_str().unwrap())
+                })
+                .map(|source| {
+                    prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        };
+        for target in action["closed_targets"].as_array().unwrap() {
+            let target = target.as_str().unwrap();
+            // Its own loop closes only on later lifecycle evidence; other targets on its original sources.
+            let sources = if target == candidate_id {
+                dated(&action["_closure_evidence"], false)
+            } else {
+                dated(&action["evidence"], true)
+            };
+            let (at, status) = loops::closure_time(&loop_snapshots[target], &sources)?;
+            closures.push(json!({
+                "candidate_id":candidate_id,
+                "target":target,
+                "source_occurred_at":at,
+                "status":status
+            }));
+            closure_sources.insert((candidate_id.into(), target.into()), sources);
+        }
+    }
+    Ok((closures, closure_sources))
+}
+fn apply_candidate(
+    tx: &WriteTxn,
+    commit: &str,
+    action: &Value,
+    prepared: &Prepared,
+    applied: &mut Applied,
+) -> Result<()> {
+    let candidate_id = get_str(action, "candidate_id")?;
+    let candidate = &prepared.selected[candidate_id];
+    if one(
+        tx.sql(),
+        &format!("SELECT 1 FROM candidates c WHERE c.id=? AND {ACTIVE_CANDIDATE}"),
+        [candidate_id],
+    )?
+    .is_none()
+    {
+        return Ok(());
+    }
+    let decision = one(
+        tx.sql(),
+        "SELECT id FROM candidate_decisions WHERE candidate_id=? ORDER BY rowid DESC LIMIT 1",
+        [candidate_id],
+    )?;
+    if decision
+        .map(|decision| decision["id"].clone())
+        .unwrap_or(Value::Null)
+        != candidate["decision_id"]
+    {
+        return Err(Error::Conflict(
+            "Candidate decision changed while consolidation was running",
+        ));
+    }
+    let (mut result, state) = apply_action(
+        tx,
+        commit,
+        action,
+        candidate,
+        &applied.resolutions,
+        &prepared.nodes,
+        &applied.destinations,
+    )?;
+    let target = result["superseded_by"]
+        .as_str()
+        .or_else(|| result["merged_into"].as_str())
+        .or_else(|| result["id"].as_str())
+        .map(str::to_owned);
+    if state == "promote" {
+        if let Some(target) = &target {
+            transfer_promoted_loop(
+                tx,
+                commit,
+                action,
+                candidate_id,
+                candidate,
+                target,
+                prepared,
+            )?;
+        }
+    } else if state == "review" {
+        loops::mark(
+            tx,
+            commit,
+            candidate_id,
+            action["open_loop"].as_bool(),
+            None,
+            None,
+            action["_due_at"].as_str(),
+        )?;
+        if let Some(due) = action["_due_at"].as_str() {
+            loops::automatic_due(tx, commit, candidate_id, 1, due, &[], true, None)?;
+        }
+    }
+    let role_target = if state == "promote" {
+        target.as_deref()
+    } else if state == "review" {
+        Some(candidate_id)
+    } else {
+        None
+    };
+    if let (Some(role_target), Some(value)) = (role_target, action["responsibility"].as_str()) {
+        if loops::current(tx.sql(), role_target)?.is_some() {
+            let role =
+                loops::assign_automatic(tx, commit, role_target, value, &action["evidence"])?;
+            if let Some(map) = role["loop_responsibilities"].as_object() {
+                applied.loop_responsibilities.extend(map.clone());
+            }
+        }
+    }
+    record_decision(tx, commit, action, candidate_id, state, &target, applied)?;
+    result["decision"] = json!(state);
+    applied.results.insert(candidate_id.into(), result);
+    Ok(())
+}
+// Moves the candidate's loop marker, usage and due date onto the memory it was promoted into.
+fn transfer_promoted_loop(
+    tx: &WriteTxn,
+    commit: &str,
+    action: &Value,
+    candidate_id: &str,
+    candidate: &Value,
+    target: &str,
+    prepared: &Prepared,
+) -> Result<()> {
+    let marker = loops::current(tx.sql(), candidate_id)?;
+    let fresh = loops::current(tx.sql(), target)?.is_none();
+    if !(action["open_loop"] == false && loops::decline_extracted(tx, commit, candidate_id)?) {
+        loops::transfer(tx, commit, candidate_id, target)?;
+    }
+    importance::transfer_usage(tx, candidate_id, target)?;
+    loops::mark(
+        tx,
+        commit,
+        target,
+        action["open_loop"].as_bool(),
+        Some(candidate_id),
+        marker.as_ref(),
+        None,
+    )?;
+    // This plan's explicit due date, else the candidate's own one for a reaffirmed existing loop.
+    let due = action["_due_at"].as_str().or_else(|| {
+        marker
+            .as_ref()
+            .filter(|marker| !fresh && action["open_loop"] == true && marker["state"] == "open")
+            .and_then(|marker| marker["due_at"].as_str())
+    });
+    if let Some(due) = due {
+        let sources = candidate["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["occurred_at"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        loops::automatic_due(
+            tx,
+            commit,
+            target,
+            frozen_version(prepared, target),
+            due,
+            &sources,
+            fresh,
+            Some(candidate_id),
+        )?;
+    }
+    Ok(())
+}
+// Stores the candidate decision and tracks promoted identities and behavior-bearing lessons.
+fn record_decision(
+    tx: &WriteTxn,
+    commit: &str,
+    action: &Value,
+    candidate_id: &str,
+    state: &str,
+    target: &Option<String>,
+    applied: &mut Applied,
+) -> Result<()> {
+    tx.sql().execute(
+        "INSERT INTO candidate_decisions VALUES (?,?,?,?,?,?)",
+        params![
+            id(),
+            candidate_id,
+            commit,
+            state,
+            target,
+            if state == "defer" {
+                Some(timestamp() + 3600.0)
+            } else {
+                None
+            }
+        ],
+    )?;
+    if ["promote", "reject"].contains(&state) {
+        tx.sql().execute(
+            "UPDATE vector_blobs SET current=0 WHERE seq IN (SELECT seq FROM vector_items WHERE \
+            kind='candidate' AND target=?)",
+            [candidate_id],
+        )?;
+    }
+    tx.touch_target(candidate_id)?;
+    if state == "promote" {
+        if let Some(target) = target {
+            applied
+                .resolutions
+                .insert(candidate_id.into(), json!(target));
+            if action["operation"] == "supersede" {
+                if let Some(previous) = action["target"].as_str() {
+                    let previous = applied
+                        .resolutions
+                        .get(previous)
+                        .and_then(Value::as_str)
+                        .unwrap_or(previous);
+                    if previous != target {
+                        applied.destinations.insert(previous.into(), json!(target));
+                    }
+                }
+            }
+        }
+    }
+    if state == "promote"
+        && matches!(action["operation"].as_str(), Some("remember" | "supersede"))
+        && action["type"] == "experience"
+        && action["behavior"].is_object()
+    {
+        if let Some(target) = target {
+            applied.lessons.push((target.clone(), action.clone()));
+        }
+    }
+    Ok(())
+}
+fn apply_repairs(
+    tx: &WriteTxn,
+    commit: &str,
+    prepared: &Prepared,
+    loop_snapshots: &Map<String, Value>,
+    applied: &mut Applied,
+) -> Result<Map<String, Value>> {
+    let mut repair_results = Map::new();
+    for repair in &prepared.repairs {
+        let original = get_str(repair, "target")?;
+        let target = follow_refinements(tx.sql(), original, &applied.destinations)?;
+        let evidence = &repair["evidence"];
+        let result = match get_str(repair, "operation")? {
+            "link" => {
+                let dst =
+                    follow_refinements(tx.sql(), get_str(repair, "dst")?, &applied.destinations)?;
+                if !visible_link_endpoint(tx.sql(), &target)?
+                    || !visible_link_endpoint(tx.sql(), &dst)?
+                {
+                    return Err(Error::Conflict(
+                        "Consolidation link endpoint changed; derive a fresh plan",
+                    ));
+                }
+                link(
+                    tx,
+                    commit,
+                    &target,
+                    get_str(repair, "relation")?,
+                    &dst,
+                    evidence,
+                )?
+            }
+            "absorb" => {
+                let mut absorbed = vec![];
+                for source in strings(&repair["absorbed"])? {
+                    absorbed.push(follow_refinements(
+                        tx.sql(),
+                        &source,
+                        &applied.destinations,
+                    )?);
+                }
+                let result =
+                    curation::absorb(tx, commit, &target, &absorbed, Some(evidence), false, None)?;
+                if result["status"] == "absorbed" {
+                    for source in absorbed {
+                        if node(tx.sql(), &source)?["state"] == "merged" {
+                            applied.destinations.insert(source, json!(target));
+                        }
+                    }
+                }
+                result
+            }
+            "supersede" => TxGraph::supersede(
+                tx,
+                commit,
+                &json!({
+                    "op":"supersede",
+                    "old":target,
+                    "new": {
+                        "type":repair["type"],
+                        "text":repair["text"],
+                        "scope":repair.get("scope").filter(|scope|!scope.is_null()).unwrap_or(&prepared.nodes[original]["scope"])
+                    },
+                    "kind":repair["change_kind"],
+                    "valid_at":repair["valid_at"],
+                    "evidence":evidence,
+                    "retire_relations":repair["retire_relations"]
+                }),
+                false,
+            )?,
+            "decline_loop" => loops::decline_automatic(
+                tx,
+                commit,
+                &target,
+                frozen_version(prepared, original),
+                &loop_snapshots[original],
+            )?,
+            "assign_loop" => {
+                let result = loops::assign_automatic(
+                    tx,
+                    commit,
+                    &target,
+                    get_str(repair, "responsibility")?,
+                    evidence,
+                )?;
+                if let Some(map) = result["loop_responsibilities"].as_object() {
+                    applied.loop_responsibilities.extend(map.clone());
+                }
+                result
+            }
+            "retire" => curation::retire(tx, commit, &target, evidence)?,
+            "close_loop" => {
+                let sources = evidence
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|source| {
+                        prepared.episodes[source["episode_id"].as_str().unwrap()]["occurred_at"]
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>();
+                let (at, mut status) = loops::closure_time(&loop_snapshots[original], &sources)?;
+                if prepared.nodes[original]["pinned"].as_i64().unwrap_or(0) != 0 {
+                    status = Some("protected_loop_choice");
+                }
+                if status.is_none() {
+                    let previous = loops::current(tx.sql(), &target)?.ok_or(Error::Conflict(
+                        "Consolidation loop state changed; derive a fresh plan",
+                    ))?;
+                    loops::append(
+                        tx,
+                        commit,
+                        &target,
+                        "closed",
+                        previous["due_at"].as_str(),
+                        None,
+                    )?;
+                    status = Some("closed");
+                }
+                applied
+                    .closures
+                    .push(json!({"target":target,"status":status,"source_occurred_at":at}));
+                json!({"id":target,"status":status,"source_occurred_at":at})
+            }
+            _ => return Err(Error::Validation("consolidation_schema_invalid")),
+        };
+        repair_results.insert(original.into(), result);
+    }
+    Ok(repair_results)
+}
+// Closes the planned loops, newest source first, against the identities this commit produced.
+fn settle_loop_closures(
+    tx: &WriteTxn,
+    commit: &str,
+    applied: &mut Applied,
+    closure_sources: &ClosureSources,
+    loop_snapshots: &Map<String, Value>,
+) -> Result<()> {
+    applied.closures.sort_by(|a, b| {
+        b["source_occurred_at"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(a["source_occurred_at"].as_str().unwrap_or(""))
+    });
+    for closure in &mut applied.closures {
+        let original = get_str(closure, "target")?.to_owned();
+        let mut target = applied
+            .resolutions
+            .get(&original)
+            .and_then(Value::as_str)
+            .unwrap_or(&original)
+            .to_owned();
+        let mut seen = BTreeSet::new();
+        while let Some(next) = applied.destinations.get(&target).and_then(Value::as_str) {
+            if !seen.insert(target.clone()) {
+                return Err(Error::Conflict("Consolidation identity cycle"));
+            }
+            target = next.into();
+        }
+        closure["target"] = json!(target);
+        if !closure["status"].is_null() {
+            continue;
+        }
+        let candidate_id = get_str(closure, "candidate_id")?.to_owned();
+        if target != original && loop_snapshots.contains_key(&target) {
+            let (at, status) = loops::closure_time(
+                &loop_snapshots[&target],
+                &closure_sources[&(candidate_id.clone(), original.clone())],
+            )?;
+            closure["source_occurred_at"] = json!(at);
+            closure["status"] = json!(status);
+            if status.is_some() {
+                continue;
+            }
+        }
+        if !matches!(
+            applied
+                .results
+                .get(&candidate_id)
+                .and_then(|result| result["decision"].as_str()),
+            Some("promote" | "reject")
+        ) {
+            closure["status"] = json!("decision_pending");
+            continue;
+        }
+        let marker = loops::current(tx.sql(), &target)?;
+        if marker
+            .as_ref()
+            .is_none_or(|marker| marker["state"] != "open")
+        {
+            closure["status"] = json!("not_open");
+            continue;
+        }
+        loops::append(
+            tx,
+            commit,
+            &target,
+            "closed",
+            marker.as_ref().unwrap()["due_at"].as_str(),
+            None,
+        )?;
+        closure["status"] = json!("closed");
+    }
+    Ok(())
 }
 
 fn resolve(
