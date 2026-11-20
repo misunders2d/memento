@@ -61,7 +61,10 @@ impl ColdStore for Directory {
         _checkpoint: &Value,
         save: &mut dyn FnMut(Value) -> Result<()>,
     ) -> Result<ColdObject> {
-        assert!(!self.panic.load(Ordering::Acquire), "synthetic cold upload panic");
+        assert!(
+            !self.panic.load(Ordering::Acquire),
+            "synthetic cold upload panic"
+        );
         let (sha, md5, size) = drive::hashes(path)?;
         let target = self.root.join(&sha);
         if !target.exists() {

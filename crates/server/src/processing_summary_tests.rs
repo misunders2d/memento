@@ -3,17 +3,32 @@ use memento_core::Store;
 use memento_domain::{Graph, processing::Processing};
 use std::{fs, os::unix::fs::PermissionsExt};
 
-fn capture(store: &Store, conversation: &str, event: &str, kind: &str, metadata: Value) -> (String, i64) {
+fn capture(
+    store: &Store,
+    conversation: &str,
+    event: &str,
+    kind: &str,
+    metadata: Value,
+) -> (String, i64) {
     let id = store
         .capture(serde_json::from_value(json!({"source":"native:fixture:pi","event_id":event,"conversation_id":conversation,"kind":kind,"text":format!("Synthetic {event} text"),"metadata":metadata})).unwrap())
         .unwrap()
         .id;
     let seq = store
-        .read(|tx| Ok(tx.sql().query_row("SELECT seq FROM episodes WHERE id=?", [&id], |r| r.get(0))?))
+        .read(|tx| {
+            Ok(tx
+                .sql()
+                .query_row("SELECT seq FROM episodes WHERE id=?", [&id], |r| r.get(0))?)
+        })
         .unwrap();
     (id, seq)
 }
-fn summary(store: &Store, instant: chrono::DateTime<chrono::Utc>, conversations: usize, records: i64) -> Value {
+fn summary(
+    store: &Store,
+    instant: chrono::DateTime<chrono::Utc>,
+    conversations: usize,
+    records: i64,
+) -> Value {
     let indexing = json!({"available":false});
     store
         .read(|tx| bounded_summary(tx.sql(), &indexing, 0., instant, conversations, records))
@@ -30,7 +45,13 @@ fn counts_extraction_input_messages_by_admission_jobs_and_parking() {
     let (user, _) = capture(&store, "thread", "user", "user", json!({}));
     let (_, assistant) = capture(&store, "thread", "assistant", "assistant", json!({}));
     capture(&store, "thread", "tool", "tool", json!({}));
-    capture(&store, "thread", "raw", "native_record", json!({"extraction_mode":"skip"}));
+    capture(
+        &store,
+        "thread",
+        "raw",
+        "native_record",
+        json!({"extraction_mode":"skip"}),
+    );
     capture(&store, "thread", "forgotten", "user", json!({}));
     store
         .write(|tx| {
@@ -63,7 +84,10 @@ fn counts_extraction_input_messages_by_admission_jobs_and_parking() {
     // A compaction marker admits only through its sequence.
     store
         .write(|tx| {
-            tx.sql().execute("UPDATE processing_progress SET compact_through=?", [assistant])?;
+            tx.sql().execute(
+                "UPDATE processing_progress SET compact_through=?",
+                [assistant],
+            )?;
             Ok(())
         })
         .unwrap();
@@ -88,8 +112,14 @@ fn counts_extraction_input_messages_by_admission_jobs_and_parking() {
         })
         .unwrap();
     let value = summary(&store, now, 64, 1000);
-    assert_eq!(value["extraction"]["batched"]["leased_live"], json!({"jobs":1,"messages":1,"other":0}));
-    assert_eq!(value["extraction"]["batched"]["pending_live"], json!({"jobs":0,"messages":0,"other":0}));
+    assert_eq!(
+        value["extraction"]["batched"]["leased_live"],
+        json!({"jobs":1,"messages":1,"other":0})
+    );
+    assert_eq!(
+        value["extraction"]["batched"]["pending_live"],
+        json!({"jobs":0,"messages":0,"other":0})
+    );
     assert_eq!(value["extraction"]["conversations"]["in_live_job"], 1);
     assert_eq!(value["extraction"]["leased_jobs"], 1);
 
@@ -100,11 +130,16 @@ fn counts_extraction_input_messages_by_admission_jobs_and_parking() {
             Ok(())
         })
         .unwrap();
-    Processing::new(Graph::new(store.clone())).park_history().unwrap();
+    Processing::new(Graph::new(store.clone()))
+        .park_history()
+        .unwrap();
     let value = summary(&store, idle, 64, 1000);
     assert_eq!(value["extraction"]["pending_conversations"], 0);
     assert_eq!(value["extraction"]["parked_conversations"], 1);
-    assert_eq!(value["extraction"]["conversations"]["parked_live_up_to_date"], 1);
+    assert_eq!(
+        value["extraction"]["conversations"]["parked_live_up_to_date"],
+        1
+    );
     assert_eq!(value["extraction"]["remaining"]["admissible_messages"], 0);
     assert_eq!(value["historical"]["parked_conversations"], 1);
     assert_eq!(value["historical"]["active"], true);

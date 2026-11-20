@@ -62,7 +62,7 @@ impl F {
         self.graph.link(parse(json!({"command_id":"link","actor":"synthetic","why":"Related","a":self.a,"b":self.b,"rel":"related_to","evidence":[{"episode_id":self.episode,"quote":"Atlas launch"}]}))).unwrap()["id"].as_str().unwrap().into()
     }
     fn candidate(&self, id: &str, episode: &str) {
-        self.candidate_scope(id,episode,"personal");
+        self.candidate_scope(id, episode, "personal");
     }
     fn candidate_scope(&self, id: &str, episode: &str, scope: &str) {
         self.store.command(&CommandContext{command_id:format!("candidate-{id}"),actor:"fixture".into(),why:"Synthetic extraction".into()},&json!({"fixture":id}),|tx,commit|{let run=format!("run-{id}");tx.sql().execute("INSERT INTO extraction_runs VALUES(?,?,?,'extract-v2','fixture','[]','{}',?)",params![run,commit,episode,NOW])?;tx.sql().execute("INSERT INTO candidates VALUES(?,?,'memory','knowledge','Renew Zephyr passport','Synthetic exact source',NULL,NULL,0.9,NULL,NULL,?)",params![id,run,json!([scope]).to_string()])?;tx.sql().execute("INSERT INTO graph_evidence VALUES(?,1,?,0,5,'Exact')",params![id,episode])?;Ok(json!({"id":id}))}).unwrap();
@@ -87,9 +87,22 @@ fn graph_scope_views_loop_counts_xss_and_forgotten_boundaries() {
             assert_eq!(all["total_nodes"], 3);
             assert_eq!(all["total_edges"], 1);
             // Unassigned loops are unresolved: counted apart, not as open obligations.
-            assert_eq!((all["loops"]["open"].clone(), all["loops"]["deferred"].clone(), all["loops"]["unresolved"].clone()), (json!(0), json!(0), json!(2)));
+            assert_eq!(
+                (
+                    all["loops"]["open"].clone(),
+                    all["loops"]["deferred"].clone(),
+                    all["loops"]["unresolved"].clone()
+                ),
+                (json!(0), json!(0), json!(2))
+            );
             let unresolved = graph(tx.sql(), &parse(json!({"responsibility":"unknown"})), NOW)?;
-            assert_eq!((unresolved["loops"]["open"].clone(), unresolved["loops"]["deferred"].clone()), (json!(1), json!(1)));
+            assert_eq!(
+                (
+                    unresolved["loops"]["open"].clone(),
+                    unresolved["loops"]["deferred"].clone()
+                ),
+                (json!(1), json!(1))
+            );
             assert!(
                 all["nodes"]
                     .as_array()
@@ -131,13 +144,30 @@ fn complete_loop_view_includes_candidates_beyond_default_cap_with_scope_and_forg
     let f = F::new();
     for index in 0..103 {
         let id = format!("loop-candidate-{index}");
-        f.candidate_scope(&id, &f.episode, if index==101 {"professional"} else {"personal"});
-        f.graph.loop_command(parse(json!({"action":"open","id":id,"command_id":format!("open-{index}")}))).unwrap();
+        f.candidate_scope(
+            &id,
+            &f.episode,
+            if index == 101 {
+                "professional"
+            } else {
+                "personal"
+            },
+        );
+        f.graph
+            .loop_command(parse(
+                json!({"action":"open","id":id,"command_id":format!("open-{index}")}),
+            ))
+            .unwrap();
     }
-    f.store.write(|tx| {
-        tx.sql().execute("INSERT INTO forgotten_targets VALUES('loop-candidate-102','fixture','candidate')", [])?;
-        Ok(())
-    }).unwrap();
+    f.store
+        .write(|tx| {
+            tx.sql().execute(
+                "INSERT INTO forgotten_targets VALUES('loop-candidate-102','fixture','candidate')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     f.store.read(|tx| {
         assert_eq!(graph(tx.sql(), &parse(json!({"view":"loops"})), NOW)?["loops"]["candidates"]["total"], 0);
         let bounded = graph(tx.sql(), &parse(json!({"view":"loops","responsibility":"unknown"})), NOW)?;
@@ -365,7 +395,10 @@ fn behavior_commit_mapping_preserves_full_record_and_focus() {
 /// Verbatim pre-change `graph()` (whole-graph materialization), kept as the selection oracle.
 fn legacy_graph(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Result<Value> {
     scope(q.scope.as_deref())?;
-    if q.responsibility.as_deref().is_some_and(|value|!loops::valid_responsibility(value)) {
+    if q.responsibility
+        .as_deref()
+        .is_some_and(|value| !loops::valid_responsibility(value))
+    {
         return Err(Error::Validation("Invalid loop responsibility"));
     }
     if !["memories", "behaviors", "loops", "around"].contains(&q.view.as_str()) {
@@ -410,22 +443,46 @@ fn legacy_graph(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Resul
     for edge in &mut edges {
         edge["loop"] = Value::Null;
     }
-    let every = rows(db, "SELECT DISTINCT id FROM node_versions", [])?.into_iter().map(|r| r["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    let every = rows(db, "SELECT DISTINCT id FROM node_versions", [])?
+        .into_iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
     for (id, behavior) in behavior_map(db, &every)? {
         if let Some(node) = nodes.get_mut(&id) {
             node["behavior"] = behavior["authority"].clone();
         }
     }
-    let markers = rows(db,&format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),[])?;
-    let roles = loops::responsibilities(db,&markers.iter().map(|row|row["target"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?;
-    let keep = |role: &str| q.responsibility.as_deref().map_or(role != "unknown", |wanted| wanted == role);
+    let markers = rows(
+        db,
+        &format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),
+        [],
+    )?;
+    let roles = loops::responsibilities(
+        db,
+        &markers
+            .iter()
+            .map(|row| row["target"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    let keep = |role: &str| {
+        q.responsibility
+            .as_deref()
+            .map_or(role != "unknown", |wanted| wanted == role)
+    };
     let mut unknown = HashSet::new();
     for mut row in markers {
         let target = row["target"].as_str().unwrap().to_owned();
-        let role=roles.get(&target).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown");
-        if role == "unknown" { unknown.insert(target.clone()); }
-        if !keep(role) { continue; }
-        row["responsibility"]=json!(role);
+        let role = roles
+            .get(&target)
+            .and_then(|value| value["responsibility"].as_str())
+            .unwrap_or("unknown");
+        if role == "unknown" {
+            unknown.insert(target.clone());
+        }
+        if !keep(role) {
+            continue;
+        }
+        row["responsibility"] = json!(role);
         if let Some(node) = nodes.get_mut(&target) {
             node["loop"] = loop_value(&row, now);
         } else if let Some(edge) = edges.iter_mut().find(|e| e["id"] == target) {
@@ -433,14 +490,28 @@ fn legacy_graph(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Resul
         }
     }
     let candidates=loops::visible_loop_targets(db,rows(db,&format!("SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?)?.into_iter().map(|mut row|{row["responsibility"]=json!(roles.get(row["id"].as_str().unwrap()).and_then(|value|value["responsibility"].as_str()).unwrap_or("unknown"));Ok(json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"loop":loop_value(&row,now)}))}).collect::<Result<Vec<_>>>()?.into_iter().filter(|r|within(r,q.scope.as_deref())).collect::<Vec<_>>();
-    let unresolved = nodes.iter().filter(|(id, n)| unknown.contains(*id) && within(n, q.scope.as_deref())).count()
-        + edges.iter().filter(|e| {
-            let id = e["id"].as_str().unwrap();
-            unknown.contains(id) && !nodes.contains_key(id)
-                && (within(&nodes[e["src"].as_str().unwrap()], q.scope.as_deref()) || within(&nodes[e["dst"].as_str().unwrap()], q.scope.as_deref()))
-        }).count()
-        + candidates.iter().filter(|c| c["loop"]["responsibility"] == "unknown").count();
-    let candidates = candidates.into_iter().filter(|c| keep(c["loop"]["responsibility"].as_str().unwrap())).collect::<Vec<_>>();
+    let unresolved = nodes
+        .iter()
+        .filter(|(id, n)| unknown.contains(*id) && within(n, q.scope.as_deref()))
+        .count()
+        + edges
+            .iter()
+            .filter(|e| {
+                let id = e["id"].as_str().unwrap();
+                unknown.contains(id)
+                    && !nodes.contains_key(id)
+                    && (within(&nodes[e["src"].as_str().unwrap()], q.scope.as_deref())
+                        || within(&nodes[e["dst"].as_str().unwrap()], q.scope.as_deref()))
+            })
+            .count()
+        + candidates
+            .iter()
+            .filter(|c| c["loop"]["responsibility"] == "unknown")
+            .count();
+    let candidates = candidates
+        .into_iter()
+        .filter(|c| keep(c["loop"]["responsibility"].as_str().unwrap()))
+        .collect::<Vec<_>>();
     let mut looped = nodes
         .values()
         .filter(|n| within(n, q.scope.as_deref()) && !n["loop"].is_null())
@@ -564,9 +635,17 @@ fn legacy_graph(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Resul
 /// A deterministic graph with LIMIT-sized ties, pins, revisions, forgetting,
 /// scopes, node/edge/candidate loops with roles, and consolidated behaviors.
 fn synthetic(f: &F, n: usize) -> Vec<String> {
-    let ctx = |id: String| CommandContext{command_id:id,actor:"fixture".into(),why:"Synthetic graph".into()};
+    let ctx = |id: String| CommandContext {
+        command_id: id,
+        actor: "fixture".into(),
+        why: "Synthetic graph".into(),
+    };
     let types = ["knowledge", "person", "concept", "experience", "decision"];
-    let scopes = [json!(["personal"]), json!(["professional"]), json!(["personal","professional"])];
+    let scopes = [
+        json!(["personal"]),
+        json!(["professional"]),
+        json!(["personal", "professional"]),
+    ];
     let id = |i: usize| format!("n{i:06}");
     for chunk in 0..n.div_ceil(23) {
         let range = chunk * 23..n.min((chunk + 1) * 23);
@@ -577,7 +656,10 @@ fn synthetic(f: &F, n: usize) -> Vec<String> {
             if types[i % 5] == "experience" && i % 3 != 2 {
                 action["behavior"] = json!({"authority":if i % 2 == 0 {"inferred"} else {"explicit_user"},"applicability":"Synthetic trigger","conduct":"Synthetic conduct","rationale":"Synthetic rationale","exceptions":[]});
                 if i % 7 == 0 {
-                    action["behavior"].as_object_mut().unwrap().remove("authority");
+                    action["behavior"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("authority");
                 }
             }
             actions.push(action);
@@ -596,29 +678,75 @@ fn synthetic(f: &F, n: usize) -> Vec<String> {
     let edges = (n / 9).max(150);
     let step = (n / 150).clamp(7, 211);
     let edge = |k: usize| format!("e{k:06}");
-    f.store.command(&ctx("revise".into()), &json!({"fixture":"revise"}), |tx, commit| {
-        for i in 0..n {
-            if i % 11 == 0 || i % 13 == 0 {
-                tx.sql().execute("INSERT INTO node_versions VALUES(?,2,?,?,?,?,NULL,NULL,NULL,0,?)", params![id(i), commit, types[i % 5], format!("Revised memory {i}"), if i % 13 == 0 {"deleted"} else {"active"}, scopes[(i + 1) % 3].to_string()])?;
-            }
-            if i % 31 == 0 {
-                tx.sql().execute("INSERT INTO forgotten_targets VALUES(?,?,'node')", params![id(i), commit])?;
-            }
-        }
-        for k in 0..edges {
-            tx.sql().execute("INSERT INTO edge_versions VALUES(?,1,?,?,'related_to',?,'active')", params![edge(k), commit, id((k * 7919 + 13) % n), id((k * 104_729 + 7) % n)])?;
-            if k % 17 == 0 {
-                tx.sql().execute("INSERT INTO edge_versions VALUES(?,2,?,?,'related_to',?,'deleted')", params![edge(k), commit, id((k * 7919 + 13) % n), id((k * 104_729 + 7) % n)])?;
-            }
-            if k % 19 == 0 {
-                tx.sql().execute("INSERT INTO forgotten_targets VALUES(?,?,'edge')", params![edge(k), commit])?;
-            }
-        }
-        Ok(json!({}))
-    }).unwrap();
+    f.store
+        .command(
+            &ctx("revise".into()),
+            &json!({"fixture":"revise"}),
+            |tx, commit| {
+                for i in 0..n {
+                    if i % 11 == 0 || i % 13 == 0 {
+                        tx.sql().execute(
+                            "INSERT INTO node_versions VALUES(?,2,?,?,?,?,NULL,NULL,NULL,0,?)",
+                            params![
+                                id(i),
+                                commit,
+                                types[i % 5],
+                                format!("Revised memory {i}"),
+                                if i % 13 == 0 { "deleted" } else { "active" },
+                                scopes[(i + 1) % 3].to_string()
+                            ],
+                        )?;
+                    }
+                    if i % 31 == 0 {
+                        tx.sql().execute(
+                            "INSERT INTO forgotten_targets VALUES(?,?,'node')",
+                            params![id(i), commit],
+                        )?;
+                    }
+                }
+                for k in 0..edges {
+                    tx.sql().execute(
+                        "INSERT INTO edge_versions VALUES(?,1,?,?,'related_to',?,'active')",
+                        params![
+                            edge(k),
+                            commit,
+                            id((k * 7919 + 13) % n),
+                            id((k * 104_729 + 7) % n)
+                        ],
+                    )?;
+                    if k % 17 == 0 {
+                        tx.sql().execute(
+                            "INSERT INTO edge_versions VALUES(?,2,?,?,'related_to',?,'deleted')",
+                            params![
+                                edge(k),
+                                commit,
+                                id((k * 7919 + 13) % n),
+                                id((k * 104_729 + 7) % n)
+                            ],
+                        )?;
+                    }
+                    if k % 19 == 0 {
+                        tx.sql().execute(
+                            "INSERT INTO forgotten_targets VALUES(?,?,'edge')",
+                            params![edge(k), commit],
+                        )?;
+                    }
+                }
+                Ok(json!({}))
+            },
+        )
+        .unwrap();
     let candidates = (n / 130).clamp(5, 250);
     for c in 0..candidates {
-        f.candidate_scope(&format!("loop-cand-{c}"), &f.episode, if c % 4 == 3 {"professional"} else {"personal"});
+        f.candidate_scope(
+            &format!("loop-cand-{c}"),
+            &f.episode,
+            if c % 4 == 3 {
+                "professional"
+            } else {
+                "personal"
+            },
+        );
     }
     let mut targets = (0..n).filter(|i| i % step == 5).map(id).collect::<Vec<_>>();
     targets.extend((0..edges).filter(|k| k % step == 3).map(edge));
@@ -629,19 +757,42 @@ fn synthetic(f: &F, n: usize) -> Vec<String> {
             roles.insert(target.clone(), json!({"responsibility":if index % 3 == 0 {"owner"} else {"other"},"manual":true,"evidence":[]}));
         }
     }
-    f.store.command(&ctx("loops".into()), &json!({"fixture":"loops"}), |tx, commit| {
-        for (index, target) in targets.iter().enumerate() {
-            let (due, deferred) = match index % 4 { 0 => (Some("2000-01-01T00:00:00Z"), None), 1 => (None, Some("2999-01-01T00:00:00Z")), 2 => (Some("2999-02-01T00:00:00Z"), None), _ => (None, None) };
-            tx.sql().execute("INSERT INTO loop_events VALUES(?,?,?,'open',?,?)", params![format!("open-{target}"), target, commit, due, deferred])?;
-        }
-        Ok(json!({"loop_responsibilities":roles}))
-    }).unwrap();
-    f.store.command(&ctx("close".into()), &json!({"fixture":"close"}), |tx, commit| {
-        for target in targets.iter().step_by(5) {
-            tx.sql().execute("INSERT INTO loop_events VALUES(?,?,?,'closed',NULL,NULL)", params![format!("close-{target}"), target, commit])?;
-        }
-        Ok(json!({}))
-    }).unwrap();
+    f.store
+        .command(
+            &ctx("loops".into()),
+            &json!({"fixture":"loops"}),
+            |tx, commit| {
+                for (index, target) in targets.iter().enumerate() {
+                    let (due, deferred) = match index % 4 {
+                        0 => (Some("2000-01-01T00:00:00Z"), None),
+                        1 => (None, Some("2999-01-01T00:00:00Z")),
+                        2 => (Some("2999-02-01T00:00:00Z"), None),
+                        _ => (None, None),
+                    };
+                    tx.sql().execute(
+                        "INSERT INTO loop_events VALUES(?,?,?,'open',?,?)",
+                        params![format!("open-{target}"), target, commit, due, deferred],
+                    )?;
+                }
+                Ok(json!({"loop_responsibilities":roles}))
+            },
+        )
+        .unwrap();
+    f.store
+        .command(
+            &ctx("close".into()),
+            &json!({"fixture":"close"}),
+            |tx, commit| {
+                for target in targets.iter().step_by(5) {
+                    tx.sql().execute(
+                        "INSERT INTO loop_events VALUES(?,?,?,'closed',NULL,NULL)",
+                        params![format!("close-{target}"), target, commit],
+                    )?;
+                }
+                Ok(json!({}))
+            },
+        )
+        .unwrap();
     // Around anchors: a behavior experience, a loop node, a forgotten and an inactive node.
     vec![id(3), id(5 + step), id(31), id(13), f.a.clone()]
 }
@@ -649,51 +800,105 @@ fn synthetic(f: &F, n: usize) -> Vec<String> {
 fn every_view_selects_exactly_what_whole_graph_materialization_selected() {
     let f = F::new();
     let anchors = synthetic(&f, 600);
-    f.store.read(|tx| {
-        let db = tx.sql();
-        let mut views = ["memories", "behaviors", "loops"].map(|view| json!({"view":view})).to_vec();
-        views.extend(anchors.iter().map(|id| json!({"view":"around","id":id})));
-        let mut compared = 0;
-        for cap in [MAX_NODES, 120, 3] {
-            for view in &views {
-                for scope in [None, Some("personal"), Some("professional")] {
-                    for responsibility in [None, Some("owner"), Some("unknown")] {
-                        for all in [false, true] {
-                            let mut query = view.clone();
-                            query["all"] = json!(all);
-                            if let Some(scope) = scope { query["scope"] = json!(scope); }
-                            if let Some(role) = responsibility { query["responsibility"] = json!(role); }
-                            let q: GraphQuery = parse(query.clone());
-                            match (legacy_graph(db, &q, NOW, cap), graph_capped(db, &q, NOW, cap)) {
-                                (Ok(old), Ok(new)) => {
-                                    assert_eq!(new, old, "{query} cap={cap}");
-                                    compared += 1;
+    f.store
+        .read(|tx| {
+            let db = tx.sql();
+            let mut views = ["memories", "behaviors", "loops"]
+                .map(|view| json!({"view":view}))
+                .to_vec();
+            views.extend(anchors.iter().map(|id| json!({"view":"around","id":id})));
+            let mut compared = 0;
+            for cap in [MAX_NODES, 120, 3] {
+                for view in &views {
+                    for scope in [None, Some("personal"), Some("professional")] {
+                        for responsibility in [None, Some("owner"), Some("unknown")] {
+                            for all in [false, true] {
+                                let mut query = view.clone();
+                                query["all"] = json!(all);
+                                if let Some(scope) = scope {
+                                    query["scope"] = json!(scope);
                                 }
-                                (Err(old), Err(new)) => assert_eq!(new.to_string(), old.to_string(), "{query}"),
-                                (old, new) => panic!("{query} cap={cap}: legacy {:?} new {:?}", old.map(|_| ()), new.map(|_| ())),
+                                if let Some(role) = responsibility {
+                                    query["responsibility"] = json!(role);
+                                }
+                                let q: GraphQuery = parse(query.clone());
+                                match (
+                                    legacy_graph(db, &q, NOW, cap),
+                                    graph_capped(db, &q, NOW, cap),
+                                ) {
+                                    (Ok(old), Ok(new)) => {
+                                        assert_eq!(new, old, "{query} cap={cap}");
+                                        compared += 1;
+                                    }
+                                    (Err(old), Err(new)) => {
+                                        assert_eq!(new.to_string(), old.to_string(), "{query}")
+                                    }
+                                    (old, new) => panic!(
+                                        "{query} cap={cap}: legacy {:?} new {:?}",
+                                        old.map(|_| ()),
+                                        new.map(|_| ())
+                                    ),
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        // The fixture really exercises every limit and every focus kind.
-        let memories = graph(db, &GraphQuery::default(), NOW)?;
-        let shown = memories["nodes"].as_array().unwrap().len();
-        assert!(memories["total_nodes"].as_u64().unwrap() > 500 && shown > 200 && shown <= 300, "{shown}");
-        assert!(memories["nodes"].as_array().unwrap().iter().any(|n| n["weight"] == 1.0));
-        assert!(memories["edges"].as_array().unwrap().len() > 5);
-        let behaviors = graph(db, &parse(json!({"view":"behaviors"})), NOW)?;
-        assert!(behaviors["nodes"].as_array().unwrap().iter().any(|n| n["focus"] == true && n["behavior"] == "inferred"));
-        assert!(behaviors["nodes"].as_array().unwrap().iter().any(|n| n["focus"] == false));
-        let loops = graph(db, &parse(json!({"view":"loops","responsibility":"owner"})), NOW)?;
-        assert!(loops["nodes"].as_array().unwrap().iter().any(|n| n["loop"]["responsibility"] == "owner"));
-        assert!(loops["edges"].as_array().unwrap().iter().any(|e| e["loop"]["responsibility"] == "owner"));
-        assert!(loops["loops"]["deferred"].as_u64().unwrap() > 0);
-        assert!(loops["loops"]["candidates"]["total"].as_u64().unwrap() > 0);
-        assert!(compared > 200);
-        Ok(())
-    }).unwrap();
+            // The fixture really exercises every limit and every focus kind.
+            let memories = graph(db, &GraphQuery::default(), NOW)?;
+            let shown = memories["nodes"].as_array().unwrap().len();
+            assert!(
+                memories["total_nodes"].as_u64().unwrap() > 500 && shown > 200 && shown <= 300,
+                "{shown}"
+            );
+            assert!(
+                memories["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n["weight"] == 1.0)
+            );
+            assert!(memories["edges"].as_array().unwrap().len() > 5);
+            let behaviors = graph(db, &parse(json!({"view":"behaviors"})), NOW)?;
+            assert!(
+                behaviors["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n["focus"] == true && n["behavior"] == "inferred")
+            );
+            assert!(
+                behaviors["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n["focus"] == false)
+            );
+            let loops = graph(
+                db,
+                &parse(json!({"view":"loops","responsibility":"owner"})),
+                NOW,
+            )?;
+            assert!(
+                loops["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n["loop"]["responsibility"] == "owner")
+            );
+            assert!(
+                loops["edges"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["loop"]["responsibility"] == "owner")
+            );
+            assert!(loops["loops"]["deferred"].as_u64().unwrap() > 0);
+            assert!(loops["loops"]["candidates"]["total"].as_u64().unwrap() > 0);
+            assert!(compared > 200);
+            Ok(())
+        })
+        .unwrap();
 }
 #[test]
 fn show_all_above_the_cap_is_refused_from_the_count_without_reading_nodes() {
@@ -701,45 +906,92 @@ fn show_all_above_the_cap_is_refused_from_the_count_without_reading_nodes() {
     f.link();
     // Any attempt to read this current node's fields fails.
     f.store.command(&CommandContext{command_id:"unreadable".into(),actor:"fixture".into(),why:"Unreadable scope".into()},&json!({"fixture":"unreadable"}),|tx,commit|{tx.sql().execute("INSERT INTO node_versions VALUES('unreadable',1,?,'knowledge','Unreadable scope','active',NULL,NULL,NULL,0,'not json')",[commit])?;Ok(json!({}))}).unwrap();
-    f.store.read(|tx| {
-        let all: GraphQuery = parse(json!({"all":true}));
-        assert!(graph(tx.sql(), &all, NOW).is_err());
-        let refused = graph_capped(tx.sql(), &all, NOW, 3)?;
-        assert_eq!(refused["too_large"], true);
-        assert_eq!(refused["total_nodes"], 4);
-        assert_eq!(refused["total_edges"], 1);
-        assert_eq!(refused["nodes"], json!([]));
-        assert_eq!(refused["edges"], json!([]));
-        assert_eq!(graph_capped(tx.sql(), &parse(json!({"all":true,"view":"behaviors"})), NOW, 3)?["too_large"], true);
-        Ok(())
-    }).unwrap();
+    f.store
+        .read(|tx| {
+            let all: GraphQuery = parse(json!({"all":true}));
+            assert!(graph(tx.sql(), &all, NOW).is_err());
+            let refused = graph_capped(tx.sql(), &all, NOW, 3)?;
+            assert_eq!(refused["too_large"], true);
+            assert_eq!(refused["total_nodes"], 4);
+            assert_eq!(refused["total_edges"], 1);
+            assert_eq!(refused["nodes"], json!([]));
+            assert_eq!(refused["edges"], json!([]));
+            assert_eq!(
+                graph_capped(
+                    tx.sql(),
+                    &parse(json!({"all":true,"view":"behaviors"})),
+                    NOW,
+                    3
+                )?["too_large"],
+                true
+            );
+            Ok(())
+        })
+        .unwrap();
 }
 /// Synthetic scale timings; run with MEMENTO_VIEWER_BENCH_NODES and `--ignored --nocapture`.
 #[test]
 #[ignore]
 fn viewer_scale_timings() {
-    let n = std::env::var("MEMENTO_VIEWER_BENCH_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(32_000);
+    let n = std::env::var("MEMENTO_VIEWER_BENCH_NODES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32_000);
     let f = F::new();
     let started = std::time::Instant::now();
     let anchors = synthetic(&f, n);
     println!("fixture {n} nodes built in {:?}", started.elapsed());
-    f.store.read(|tx| {
-        let db = tx.sql();
-        let time = |label: &str, run: &dyn Fn() -> Result<Value>| -> Result<()> {
-            let started = std::time::Instant::now();
-            let value = run()?;
-            println!("{label}: {:?} ({} bytes)", started.elapsed(), value.to_string().len());
+    f.store
+        .read(|tx| {
+            let db = tx.sql();
+            let time = |label: &str, run: &dyn Fn() -> Result<Value>| -> Result<()> {
+                let started = std::time::Instant::now();
+                let value = run()?;
+                println!(
+                    "{label}: {:?} ({} bytes)",
+                    started.elapsed(),
+                    value.to_string().len()
+                );
+                Ok(())
+            };
+            let every = rows(db, "SELECT DISTINCT id FROM node_versions", [])?
+                .into_iter()
+                .map(|r| r["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            time("behavior_map(all experiences)", &|| {
+                Ok(json!(behavior_map(db, &every)?.len()))
+            })?;
+            let targets = rows(
+                db,
+                &format!("SELECT l.target FROM loop_events l WHERE {OPEN_LOOP}"),
+                [],
+            )?
+            .into_iter()
+            .map(|r| r["target"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+            time(
+                &format!("responsibilities({} open loops)", targets.len()),
+                &|| {
+                    Ok(json!(
+                        memento_domain::loops::responsibilities(db, &targets)?.len()
+                    ))
+                },
+            )?;
+            for query in [
+                json!({}),
+                json!({"view":"behaviors"}),
+                json!({"view":"loops"}),
+                json!({"view":"loops","responsibility":"owner"}),
+                json!({"view":"around","id":anchors[1]}),
+                json!({"all":true}),
+            ] {
+                let q: GraphQuery = parse(query.clone());
+                time(&format!("legacy {query}"), &|| {
+                    legacy_graph(db, &q, NOW, MAX_NODES)
+                })?;
+                time(&format!("new    {query}"), &|| graph(db, &q, NOW))?;
+            }
             Ok(())
-        };
-        let every = rows(db, "SELECT DISTINCT id FROM node_versions", [])?.into_iter().map(|r| r["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
-        time("behavior_map(all experiences)", &|| Ok(json!(behavior_map(db, &every)?.len())))?;
-        let targets = rows(db, &format!("SELECT l.target FROM loop_events l WHERE {OPEN_LOOP}"), [])?.into_iter().map(|r| r["target"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
-        time(&format!("responsibilities({} open loops)", targets.len()), &|| Ok(json!(memento_domain::loops::responsibilities(db, &targets)?.len())))?;
-        for query in [json!({}), json!({"view":"behaviors"}), json!({"view":"loops"}), json!({"view":"loops","responsibility":"owner"}), json!({"view":"around","id":anchors[1]}), json!({"all":true})] {
-            let q: GraphQuery = parse(query.clone());
-            time(&format!("legacy {query}"), &|| legacy_graph(db, &q, NOW, MAX_NODES))?;
-            time(&format!("new    {query}"), &|| graph(db, &q, NOW))?;
-        }
-        Ok(())
-    }).unwrap();
+        })
+        .unwrap();
 }

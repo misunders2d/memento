@@ -248,7 +248,11 @@ fn select_ids<P: rusqlite::Params>(db: &Connection, sql: &str, params: P) -> Res
         .collect())
 }
 /// Current viewer nodes among `targets`, each mapped to whether it is inside the scope.
-fn current(db: &Connection, scope: Option<&str>, targets: &[String]) -> Result<HashMap<String, bool>> {
+fn current(
+    db: &Connection,
+    scope: Option<&str>,
+    targets: &[String],
+) -> Result<HashMap<String, bool>> {
     Ok(rows(
         db,
         &format!("SELECT n.id,{IN_SCOPE} AS inside FROM {NODES} WHERE {IN_IDS} AND {CURRENT_NODE}"),
@@ -269,9 +273,17 @@ pub fn graph(db: &Connection, q: &GraphQuery, now: &str) -> Result<Value> {
 }
 /// Each view selects its nodes in SQL; labels, behaviors and loop roles are
 /// resolved only for what is returned. Header counts stay whole-graph.
-pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usize) -> Result<Value> {
+pub(crate) fn graph_capped(
+    db: &Connection,
+    q: &GraphQuery,
+    now: &str,
+    cap: usize,
+) -> Result<Value> {
     scope(q.scope.as_deref())?;
-    if q.responsibility.as_deref().is_some_and(|value|!loops::valid_responsibility(value)) {
+    if q.responsibility
+        .as_deref()
+        .is_some_and(|value| !loops::valid_responsibility(value))
+    {
         return Err(Error::Validation("Invalid loop responsibility"));
     }
     if !["memories", "behaviors", "loops", "around"].contains(&q.view.as_str()) {
@@ -294,10 +306,14 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
         [inside],
         |r| r.get(0),
     )?;
-    let markers = rows(db,&format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),[])?
-        .into_iter()
-        .map(|row| (row["target"].as_str().unwrap().to_owned(), row))
-        .collect::<HashMap<_, _>>();
+    let markers = rows(
+        db,
+        &format!("SELECT l.target,l.due_at,l.deferred_until FROM loop_events l WHERE {OPEN_LOOP}"),
+        [],
+    )?
+    .into_iter()
+    .map(|row| (row["target"].as_str().unwrap().to_owned(), row))
+    .collect::<HashMap<_, _>>();
     let targets = markers.keys().cloned().collect::<Vec<_>>();
     let roles = loops::responsibilities(db, &targets)?;
     let loop_nodes = current(db, inside, &targets)?;
@@ -305,18 +321,42 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
         .into_iter()
         .filter(|e| !loop_nodes.contains_key(e["id"].as_str().unwrap()))
         .collect::<Vec<_>>();
-    let ends = current(db, inside, &loop_edges.iter().flat_map(|e| [e["src"].as_str().unwrap().to_owned(), e["dst"].as_str().unwrap().to_owned()]).collect::<Vec<_>>())?;
+    let ends = current(
+        db,
+        inside,
+        &loop_edges
+            .iter()
+            .flat_map(|e| {
+                [
+                    e["src"].as_str().unwrap().to_owned(),
+                    e["dst"].as_str().unwrap().to_owned(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    )?;
     let loop_edges = loop_edges
         .into_iter()
-        .filter(|e| ends.contains_key(e["src"].as_str().unwrap()) && ends.contains_key(e["dst"].as_str().unwrap()))
+        .filter(|e| {
+            ends.contains_key(e["src"].as_str().unwrap())
+                && ends.contains_key(e["dst"].as_str().unwrap())
+        })
         .collect::<Vec<_>>();
     let unknown = |id: &str| role(&roles, id) == "unknown";
-    let mut unresolved = loop_nodes.iter().filter(|(id, scoped)| **scoped && unknown(id)).count()
+    let mut unresolved = loop_nodes
+        .iter()
+        .filter(|(id, scoped)| **scoped && unknown(id))
+        .count()
         + loop_edges
             .iter()
-            .filter(|e| (ends[e["src"].as_str().unwrap()] || ends[e["dst"].as_str().unwrap()]) && unknown(e["id"].as_str().unwrap()))
+            .filter(|e| {
+                (ends[e["src"].as_str().unwrap()] || ends[e["dst"].as_str().unwrap()])
+                    && unknown(e["id"].as_str().unwrap())
+            })
             .count();
-    let loop_edges = loop_edges.into_iter().filter(|e| keep(&roles, e["id"].as_str().unwrap())).collect::<Vec<_>>();
+    let loop_edges = loop_edges
+        .into_iter()
+        .filter(|e| keep(&roles, e["id"].as_str().unwrap()))
+        .collect::<Vec<_>>();
     let deferred = |target: &str| loop_value(&markers[target], now)["deferred"] == true;
     let mut looped = loop_nodes
         .iter()
@@ -330,7 +370,16 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
             .map(|e| deferred(e["id"].as_str().unwrap())),
     );
     let mut candidates = Vec::new();
-    for row in loops::visible_loop_targets(db,rows(db,&format!("SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"),[])?)? {
+    for row in loops::visible_loop_targets(
+        db,
+        rows(
+            db,
+            &format!(
+                "SELECT c.id,c.kind AS candidate_kind,c.src AS loop_src,c.dst AS loop_dst,substr(c.text,1,240) AS text,c.scope,l.due_at,l.deferred_until FROM loop_events l JOIN candidates c ON c.id=l.target WHERE {OPEN_LOOP} AND {ACTIVE_CANDIDATE} ORDER BY l.due_at IS NULL,l.due_at,c.rowid DESC"
+            ),
+            [],
+        )?,
+    )? {
         let item = json!({"id":row["id"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"])?,"loop":null});
         if within(&item, inside) && unknown(row["id"].as_str().unwrap()) {
             unresolved += 1;
@@ -378,13 +427,28 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
     let mut behaviors = None;
     match q.view.as_str() {
         "behaviors" => {
-            let experiences = select_ids(db, &format!("SELECT n.id FROM {NODES} WHERE n.type='experience' AND {CURRENT_NODE} AND {IN_SCOPE}"), [inside])?;
+            let experiences = select_ids(
+                db,
+                &format!(
+                    "SELECT n.id FROM {NODES} WHERE n.type='experience' AND {CURRENT_NODE} AND {IN_SCOPE}"
+                ),
+                [inside],
+            )?;
             let map = behavior_map(db, &experiences)?;
-            focus.extend(map.iter().filter(|(_, b)| !b["authority"].is_null()).map(|(id, _)| id.clone()));
+            focus.extend(
+                map.iter()
+                    .filter(|(_, b)| !b["authority"].is_null())
+                    .map(|(id, _)| id.clone()),
+            );
             behaviors = Some(map);
         }
         "loops" => {
-            focus.extend(loop_nodes.iter().filter(|(id, scoped)| **scoped && keep(&roles, id)).map(|(id, _)| id.clone()));
+            focus.extend(
+                loop_nodes
+                    .iter()
+                    .filter(|(id, scoped)| **scoped && keep(&roles, id))
+                    .map(|(id, _)| id.clone()),
+            );
             for edge in &loop_edges {
                 for endpoint in ["src", "dst"] {
                     let id = edge[endpoint].as_str().unwrap();
@@ -399,35 +463,69 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
     let chosen = if all {
         None
     } else if q.view == "memories" {
-        db.create_scalar_function("viewer_weight", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-            weight(ctx.get(0)?, ctx.get(1)?).map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))
-        })?;
-        Some(select_ids(db, &format!("SELECT id FROM (SELECT n.id FROM {NODES} LEFT JOIN node_stats s ON s.node_id=n.id WHERE {CURRENT_NODE} AND {IN_SCOPE} ORDER BY viewer_weight(n.pinned,coalesce(s.importance,0.5)*coalesce(s.decay,1)) DESC,n.id LIMIT 200) UNION SELECT id FROM (SELECT n.id FROM {NODES} WHERE {CURRENT_NODE} AND {IN_SCOPE} ORDER BY c.recorded_at DESC,n.rowid LIMIT 100)"), [inside])?)
+        db.create_scalar_function(
+            "viewer_weight",
+            2,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                weight(ctx.get(0)?, ctx.get(1)?)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))
+            },
+        )?;
+        Some(select_ids(
+            db,
+            &format!(
+                "SELECT id FROM (SELECT n.id FROM {NODES} LEFT JOIN node_stats s ON s.node_id=n.id WHERE {CURRENT_NODE} AND {IN_SCOPE} ORDER BY viewer_weight(n.pinned,coalesce(s.importance,0.5)*coalesce(s.decay,1)) DESC,n.id LIMIT 200) UNION SELECT id FROM (SELECT n.id FROM {NODES} WHERE {CURRENT_NODE} AND {IN_SCOPE} ORDER BY c.recorded_at DESC,n.rowid LIMIT 100)"
+            ),
+            [inside],
+        )?)
     } else {
-        let others = select_ids(db, &format!("SELECT e.dst AS id FROM edge_versions e WHERE e.src IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE} UNION SELECT e.src FROM edge_versions e WHERE e.dst IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE}"), [serde_json::to_string(&focus)?])?;
+        let others = select_ids(
+            db,
+            &format!(
+                "SELECT e.dst AS id FROM edge_versions e WHERE e.src IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE} UNION SELECT e.src FROM edge_versions e WHERE e.dst IN (SELECT value FROM json_each(?1)) AND {CURRENT_EDGE}"
+            ),
+            [serde_json::to_string(&focus)?],
+        )?;
         let mut chosen = focus.iter().cloned().collect::<Vec<_>>();
-        chosen.extend(current(db, inside, &others)?.into_iter().filter(|(id, scoped)| *scoped && !focus.contains(id)).map(|(id, _)| id));
+        chosen.extend(
+            current(db, inside, &others)?
+                .into_iter()
+                .filter(|(id, scoped)| *scoped && !focus.contains(id))
+                .map(|(id, _)| id),
+        );
         Some(chosen)
     };
     if chosen.as_ref().is_some_and(|c| c.len() > cap) {
         result["too_large"] = json!(true);
         return Ok(result);
     }
-    let select = format!("SELECT n.id,n.type,substr(n.text,1,240) AS text,n.scope,n.pinned,c.recorded_at,coalesce(s.importance,0.5)*coalesce(s.decay,1) AS weight FROM {NODES} LEFT JOIN node_stats s ON s.node_id=n.id WHERE {CURRENT_NODE} AND {IN_SCOPE}");
+    let select = format!(
+        "SELECT n.id,n.type,substr(n.text,1,240) AS text,n.scope,n.pinned,c.recorded_at,coalesce(s.importance,0.5)*coalesce(s.decay,1) AS weight FROM {NODES} LEFT JOIN node_stats s ON s.node_id=n.id WHERE {CURRENT_NODE} AND {IN_SCOPE}"
+    );
     let found = match &chosen {
         None => rows(db, &select, [inside])?,
-        Some(chosen) => rows(db, &format!("{select} AND {IN_IDS}"), params![inside, serde_json::to_string(chosen)?])?,
+        Some(chosen) => rows(
+            db,
+            &format!("{select} AND {IN_IDS}"),
+            params![inside, serde_json::to_string(chosen)?],
+        )?,
     };
     let mut nodes = Vec::new();
     for row in found {
         let weight = weight(
             row["pinned"].as_i64().unwrap_or(0),
-            row["weight"].as_f64().ok_or(Error::Unavailable("Invalid viewer weight"))?,
+            row["weight"]
+                .as_f64()
+                .ok_or(Error::Unavailable("Invalid viewer weight"))?,
         )?;
         nodes.push(json!({"id":row["id"],"type":row["type"],"label":label(row["text"].as_str().unwrap()),"scope":query_rows::array(&row["scope"] )?,"weight":weight,"at":row["recorded_at"],"behavior":null,"loop":null}));
     }
     nodes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    let returned = nodes.iter().map(|n| n["id"].as_str().unwrap().to_owned()).collect::<HashSet<_>>();
+    let returned = nodes
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_owned())
+        .collect::<HashSet<_>>();
     let mut edges = match chosen {
         None => rows(db, &format!("SELECT e.id,e.src,e.rel,e.dst FROM edge_versions e WHERE {CURRENT_EDGE} ORDER BY e.rowid"), [])?
             .into_iter()
@@ -437,7 +535,14 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
     };
     let behaviors = match behaviors {
         Some(map) => map,
-        None => behavior_map(db, &nodes.iter().filter(|n| n["type"] == "experience").map(|n| n["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>())?,
+        None => behavior_map(
+            db,
+            &nodes
+                .iter()
+                .filter(|n| n["type"] == "experience")
+                .map(|n| n["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+        )?,
     };
     let loop_of = |id: &str| {
         markers.get(id).filter(|_| keep(&roles, id)).map(|row| {
@@ -459,7 +564,9 @@ pub(crate) fn graph_capped(db: &Connection, q: &GraphQuery, now: &str, cap: usiz
     for edge in &mut edges {
         let id = edge["id"].as_str().unwrap().to_owned();
         // A loop on an ID that is also a current node belongs to the node.
-        edge["loop"] = loop_of(&id).filter(|_| !loop_nodes.contains_key(&id)).unwrap_or(Value::Null);
+        edge["loop"] = loop_of(&id)
+            .filter(|_| !loop_nodes.contains_key(&id))
+            .unwrap_or(Value::Null);
     }
     result["nodes"] = json!(nodes);
     result["edges"] = json!(edges);
@@ -481,7 +588,9 @@ pub fn node(db: &Connection, id: &str, now: &str) -> Result<Value> {
         ),
         [id],
     )?;
-    if let Some(event)=event.as_mut(){event["responsibility"]=json!(loops::responsibility(db,id)?);}
+    if let Some(event) = event.as_mut() {
+        event["responsibility"] = json!(loops::responsibility(db, id)?);
+    }
     let links = rows(
         db,
         &format!(

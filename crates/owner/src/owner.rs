@@ -521,8 +521,15 @@ pub fn request(data: &Path, value: &Value) -> Result<Value> {
         ));
     }
     stream.write_all(&bytes)?;
-    if ["backup", "export", "compact", "history_park", "history_release-candidates", "recover_revisions"]
-        .contains(&value["operation"].as_str().unwrap_or(""))
+    if [
+        "backup",
+        "export",
+        "compact",
+        "history_park",
+        "history_release-candidates",
+        "recover_revisions",
+    ]
+    .contains(&value["operation"].as_str().unwrap_or(""))
     {
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;

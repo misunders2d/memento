@@ -285,7 +285,9 @@ pub(crate) fn snapshot(data: &Path, target: &Path) -> Result<i64> {
         // restarts from page 0 whenever another connection writes between steps, so
         // a busy live database never finishes. In WAL mode the read blocks no writer.
         if Backup::new(&source, &mut copy)?.step(-1)? != StepResult::Done {
-            return Err(Error::Unavailable("Database snapshot could not read the live database"));
+            return Err(Error::Unavailable(
+                "Database snapshot could not read the live database",
+            ));
         }
     }
     let db = Connection::open(target)?;

@@ -81,7 +81,12 @@ impl Extractor {
                     continue;
                 }
                 let resolved = if draft["open_loop"] == true {
-                    loop_due::resolve(&draft["due"], draft["quote"].as_str().unwrap(), windows[handle]["occurred_at"].as_str(), leased["timezone"].as_str())
+                    loop_due::resolve(
+                        &draft["due"],
+                        draft["quote"].as_str().unwrap(),
+                        windows[handle]["occurred_at"].as_str(),
+                        leased["timezone"].as_str(),
+                    )
                 } else {
                     Err(loop_due::Invalid::Format)
                 };
@@ -93,7 +98,10 @@ impl Extractor {
                     };
                     reject(code, vec![json!({"window_id":handle,"key":draft["key"],"quote":draft["due"]["quote"]})])
                 })?;
-                dues.insert((handle.to_owned(), draft["key"].as_str().unwrap().to_owned()), at);
+                dues.insert(
+                    (handle.to_owned(), draft["key"].as_str().unwrap().to_owned()),
+                    at,
+                );
             }
         }
         let prepared=self.graph.store.read(|tx|{let mut prepared=Vec::new();for batch in batches{let handle=get_str(batch,"id")?;let window=&windows[handle];let episode_id=get_str(window,"episode_id")?;let episode=one(tx.sql(),"SELECT * FROM episodes WHERE id=?",[episode_id])?.ok_or(Error::Validation("extraction_source_missing"))?;let text=tx.original_text(episode_id)?.ok_or(Error::Validation("extraction_source_missing"))?;let metadata=decode_json(get_str(&episode,"metadata")?)?;

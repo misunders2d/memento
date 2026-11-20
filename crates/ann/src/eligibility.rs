@@ -13,7 +13,9 @@ macro_rules! raw_fallback {
     };
 }
 pub const RAW_FALLBACK: &str = raw_fallback!("");
-pub const HISTORICAL: &str = raw_fallback!("EXISTS (SELECT 1 FROM historical_parking h WHERE h.source=e.source AND h.conversation_id=e.conversation_id AND e.seq<=h.parked_through) AND ");
+pub const HISTORICAL: &str = raw_fallback!(
+    "EXISTS (SELECT 1 FROM historical_parking h WHERE h.source=e.source AND h.conversation_id=e.conversation_id AND e.seq<=h.parked_through) AND "
+);
 pub fn visible_sql(node: &str) -> String {
     format!(
         "(NOT EXISTS (SELECT 1 FROM captured_media cm WHERE cm.node_id={node}) OR EXISTS (SELECT 1 FROM captured_media cm JOIN captured_media_refs r ON r.sha256=cm.sha256 JOIN episodes e ON e.id=r.episode_id WHERE cm.node_id={node} AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND NOT EXISTS (SELECT 1 FROM media_files m JOIN forgotten_targets f ON f.target=m.node_id WHERE m.sha256=cm.sha256)))"

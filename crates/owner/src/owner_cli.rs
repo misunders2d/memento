@@ -175,9 +175,12 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
         return Err(usage("--output is required"));
     }
     if parsed.operation == "history"
-        && !["park", "status", "release-candidates"].contains(&parsed.positional.as_deref().unwrap_or(""))
+        && !["park", "status", "release-candidates"]
+            .contains(&parsed.positional.as_deref().unwrap_or(""))
     {
-        return Err(usage("History action must be park, status or release-candidates"));
+        return Err(usage(
+            "History action must be park, status or release-candidates",
+        ));
     }
     if ["approve", "reject", "merge", "forget", "recover-revisions"]
         .contains(&parsed.operation.as_str())

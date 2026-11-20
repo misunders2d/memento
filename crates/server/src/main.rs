@@ -142,7 +142,9 @@ fn run() -> Result<()> {
                 s.parse::<usize>()
                     .ok()
                     .filter(|n| (1..=8).contains(n))
-                    .ok_or(Error::Validation("MEMENTO_TEXT_SCORER_THREADS must be 1..8"))
+                    .ok_or(Error::Validation(
+                        "MEMENTO_TEXT_SCORER_THREADS must be 1..8",
+                    ))
             })
             .transpose()?
             .unwrap_or(1),

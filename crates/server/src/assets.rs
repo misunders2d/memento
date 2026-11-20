@@ -55,8 +55,12 @@ impl ClientAssets {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let processing = ["worker.py","native_worker.ts"].into_iter().map(|name|(name,records.remove(name).unwrap())).collect::<BTreeMap<_,_>>();
-        let release = json!({"format":1,"revision":revision,"files":records,"processing_files":processing});
+        let processing = ["worker.py", "native_worker.ts"]
+            .into_iter()
+            .map(|name| (name, records.remove(name).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let release =
+            json!({"format":1,"revision":revision,"files":records,"processing_files":processing});
         Ok(Self {
             revision,
             bridge,

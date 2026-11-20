@@ -16,7 +16,9 @@ macro_rules! keys {
 }
 // Stages accumulate over both passes. `scorer` and `scorer_lock_wait` are also
 // inside `validation` and `fallback`; pass walls contain their index/search stages.
-keys!(Stage, STAGES,
+keys!(
+    Stage,
+    STAGES,
     Queue = "queue",
     Embedding = "embedding",
     FirstPass = "first_pass",
@@ -44,7 +46,9 @@ keys!(Stage, STAGES,
     Scorer = "scorer",
     ScorerLockWait = "scorer_lock_wait",
 );
-keys!(Count, COUNTS,
+keys!(
+    Count,
+    COUNTS,
     Passes = "passes",
     AnnHits = "ann_hits",
     LexicalHits = "lexical_hits",

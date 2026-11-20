@@ -1,7 +1,9 @@
 use super::{ELIGIBLE, UNPARKED, VERSION, continuation, native_trace, strings, unique, word_terms};
 use crate::util::*;
 use crate::{
-    behavior, behavior_ground_truth, curation, exact_identities, jobs::Job, loops, recall_keywords,
+    behavior, behavior_ground_truth, curation, exact_identities,
+    jobs::Job,
+    loops, recall_keywords,
     unicode::{name_contained, name_tokens},
 };
 use memento_core::{Error, Result};
@@ -490,7 +492,12 @@ impl<'a> Builder<'a> {
             for row in rows(
                 self.db,
                 LATER_MESSAGES,
-                params![anchor["source"].as_str(), anchor["conversation_id"].as_str(), anchor["seq"].as_i64(), LATER_MESSAGES_PER_CANDIDATE],
+                params![
+                    anchor["source"].as_str(),
+                    anchor["conversation_id"].as_str(),
+                    anchor["seq"].as_i64(),
+                    LATER_MESSAGES_PER_CANDIDATE
+                ],
             )? {
                 let episode = self.episode(get_str(&row, "id")?)?;
                 let id = get_str(&episode, "id")?;
@@ -509,7 +516,9 @@ impl<'a> Builder<'a> {
                 }) {
                     continue;
                 }
-                if chars + end - start > LATER_CANDIDATE_CHARS || added + end - start > LATER_BATCH_CHARS {
+                if chars + end - start > LATER_CANDIDATE_CHARS
+                    || added + end - start > LATER_BATCH_CHARS
+                {
                     break;
                 }
                 chars += end - start;
@@ -535,7 +544,11 @@ const LEXICAL: &str = "SELECT n.id FROM node_fts CROSS JOIN node_fts_documents d
 /// Discovery lookups for one claim, including its narrowed re-preparations, share one
 /// read snapshot; each distinct lookup is answered once.
 type DiscoveryCache = HashMap<String, Vec<String>>;
-fn cached(cache: &mut DiscoveryCache, key: String, lookup: impl FnOnce() -> Result<Vec<String>>) -> Result<Vec<String>> {
+fn cached(
+    cache: &mut DiscoveryCache,
+    key: String,
+    lookup: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<Vec<String>> {
     if let Some(found) = cache.get(&key) {
         return Ok(found.clone());
     }
@@ -543,13 +556,28 @@ fn cached(cache: &mut DiscoveryCache, key: String, lookup: impl FnOnce() -> Resu
     cache.insert(key, found.clone());
     Ok(found)
 }
-fn exact_ids(db: &Connection, cache: &mut DiscoveryCache, kind: &str, text: &str) -> Result<Vec<String>> {
+fn exact_ids(
+    db: &Connection,
+    cache: &mut DiscoveryCache,
+    kind: &str,
+    text: &str,
+) -> Result<Vec<String>> {
     cached(cache, format!("exact\0{kind}\0{text}"), || {
-        Ok(exact_identities(db, kind, text)?.into_iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect())
+        Ok(exact_identities(db, kind, text)?
+            .into_iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect())
     })
 }
-fn neighbor_ids(db: &Connection, cache: &mut DiscoveryCache, target: &str, limit: usize) -> Result<Vec<String>> {
-    cached(cache, format!("neighbors\0{target}\0{limit}"), || neighbors(db, target, limit))
+fn neighbor_ids(
+    db: &Connection,
+    cache: &mut DiscoveryCache,
+    target: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    cached(cache, format!("neighbors\0{target}\0{limit}"), || {
+        neighbors(db, target, limit)
+    })
 }
 #[allow(clippy::too_many_arguments)]
 fn lexical(
@@ -576,13 +604,26 @@ fn lexical(
             .join(" OR ")
     };
     let reviewed = encode_json(&json!(reviewed))?;
-    cached(cache, format!("lexical\0{query}\0{kind}\0{limit}\0{reviewed}"), || {
-        crate::work_timing::count(if head { "lexical_head_queries" } else { "lexical_queries" }, 1);
-        Ok(rows(db, LEXICAL, params![query, kind, reviewed, limit as i64])?
-            .into_iter()
-            .map(|row| row["id"].as_str().unwrap().into())
-            .collect())
-    })
+    cached(
+        cache,
+        format!("lexical\0{query}\0{kind}\0{limit}\0{reviewed}"),
+        || {
+            crate::work_timing::count(
+                if head {
+                    "lexical_head_queries"
+                } else {
+                    "lexical_queries"
+                },
+                1,
+            );
+            Ok(
+                rows(db, LEXICAL, params![query, kind, reviewed, limit as i64])?
+                    .into_iter()
+                    .map(|row| row["id"].as_str().unwrap().into())
+                    .collect(),
+            )
+        },
+    )
 }
 /// Named entities supplied per experience lesson (candidate or maintenance target).
 pub(super) const LESSON_SUBJECTS: usize = 3;
@@ -598,7 +639,10 @@ pub(super) fn lesson_texts<'v>(text: &'v Value, behavior: &'v Value) -> Vec<&'v 
 /// field, exactly as entity anchors match a request. FTS (rarest terms first) is discovery
 /// only; same-spelled entities stay separate identities and nothing is inferred from names.
 pub(super) fn named_entities(db: &Connection, texts: &[&str], limit: usize) -> Result<Vec<String>> {
-    let fields = texts.iter().map(|text| name_tokens(text)).collect::<Vec<_>>();
+    let fields = texts
+        .iter()
+        .map(|text| name_tokens(text))
+        .collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
     let terms = fields
         .iter()
@@ -611,7 +655,13 @@ pub(super) fn named_entities(db: &Connection, texts: &[&str], limit: usize) -> R
     if terms.is_empty() || limit == 0 {
         return Ok(result);
     }
-    for row in rows(db,&format!("SELECT n.id,n.text FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND {ENTITY} AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS (SELECT 1 FROM entity_merges m WHERE m.source=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {VISIBLE} ORDER BY bm25(node_fts),n.id LIMIT 128"),[terms.join(" OR ")])? {
+    for row in rows(
+        db,
+        &format!(
+            "SELECT n.id,n.text FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND {ENTITY} AND n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND NOT EXISTS (SELECT 1 FROM entity_merges m WHERE m.source=n.id) AND NOT EXISTS (SELECT 1 FROM forgotten_targets f WHERE f.target=n.id) AND {VISIBLE} ORDER BY bm25(node_fts),n.id LIMIT 128"
+        ),
+        [terms.join(" OR ")],
+    )? {
         let text = get_str(&row, "text")?;
         if fields.iter().any(|tokens| name_contained(text, tokens)) {
             result.push(get_str(&row, "id")?.to_owned());
@@ -641,8 +691,19 @@ pub(super) fn prepare(
     discovery: Option<&Value>,
     configured: bool,
 ) -> Result<Value> {
-    let context = prepare_cached(db, dir, job, discovery, configured, &mut DiscoveryCache::new())?;
-    for (name, list) in [("prepare_admitted", &job.payload["candidate_ids"]), ("prepare_kept", &context["candidates"]), ("prepare_deferred", &context["_deferred"])] {
+    let context = prepare_cached(
+        db,
+        dir,
+        job,
+        discovery,
+        configured,
+        &mut DiscoveryCache::new(),
+    )?;
+    for (name, list) in [
+        ("prepare_admitted", &job.payload["candidate_ids"]),
+        ("prepare_kept", &context["candidates"]),
+        ("prepare_deferred", &context["_deferred"]),
+    ] {
         crate::work_timing::count(name, list.as_array().map_or(0, Vec::len) as u64);
     }
     Ok(context)
@@ -673,7 +734,13 @@ fn prepare_cached(
     let mut builder = Builder::new(db, dir);
     // Narrowing's terminal singleton (in-memory clone only): its at most three validated top
     // targets precede promoted endpoints and continuity inside the same ceiling.
-    for target in job.payload.get("_priority").map(strings).transpose()?.unwrap_or_default() {
+    for target in job
+        .payload
+        .get("_priority")
+        .map(strings)
+        .transpose()?
+        .unwrap_or_default()
+    {
         builder.add_node(&target)?;
     }
     let mut candidates = rows(
@@ -742,7 +809,12 @@ fn prepare_cached(
             });
         crate::work_timing::lap("targets_hint", &mut sub);
         if candidate["kind"] != "relation" {
-            let exact = exact_ids(db, discovery_cache, get_str(candidate, "type")?, get_str(candidate, "text")?)?;
+            let exact = exact_ids(
+                db,
+                discovery_cache,
+                get_str(candidate, "type")?,
+                get_str(candidate, "text")?,
+            )?;
             crate::work_timing::lap("targets_exact", &mut sub);
             let lex = lexical(
                 db,
@@ -770,7 +842,14 @@ fn prepare_cached(
             relevant.push((
                 id.into(),
                 // Top target per channel; longer exact lists keep their existing review gate.
-                unique(exact.first().into_iter().chain(lex.first()).chain(semantic.first()).cloned()),
+                unique(
+                    exact
+                        .first()
+                        .into_iter()
+                        .chain(lex.first())
+                        .chain(semantic.first())
+                        .cloned(),
+                ),
             ));
             let mut similar = heads;
             for index in 0..lex.len().max(semantic.len()) {
@@ -791,9 +870,16 @@ fn prepare_cached(
         queue.extend(hinted(db, hint, "broad")?);
         crate::work_timing::lap("targets_hinted", &mut sub);
         let words = excerpt(get_str(candidate, "text")?, 512);
-        queue.extend(cached(discovery_cache, format!("keywords\0{words}"), || {
-            Ok(recall_keywords(db, &words, 8, None)?.into_iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect())
-        })?);
+        queue.extend(cached(
+            discovery_cache,
+            format!("keywords\0{words}"),
+            || {
+                Ok(recall_keywords(db, &words, 8, None)?
+                    .into_iter()
+                    .map(|row| row["id"].as_str().unwrap().to_owned())
+                    .collect())
+            },
+        )?);
         optional.push((id.into(), unique(queue)));
         crate::work_timing::lap("targets_keywords", &mut sub);
     }
@@ -807,7 +893,12 @@ fn prepare_cached(
         if !builder.nodes.contains_key(id) {
             continue;
         }
-        let mut queue = exact_ids(db, discovery_cache, get_str(&n, "type")?, get_str(&n, "text")?)?;
+        let mut queue = exact_ids(
+            db,
+            discovery_cache,
+            get_str(&n, "type")?,
+            get_str(&n, "text")?,
+        )?;
         queue.extend(neighbor_ids(db, discovery_cache, id, 96)?);
         queue.extend(lexical(
             db,
@@ -822,7 +913,11 @@ fn prepare_cached(
         // An experience target's named entities; listing them as subjects too keeps an
         // unfitted one in the existing unchecked/continue_with bookkeeping.
         if n["type"] == "experience" {
-            let named = named_entities(db, &lesson_texts(&n["text"], &builder.nodes[id]["behavior"]), LESSON_SUBJECTS)?;
+            let named = named_entities(
+                db,
+                &lesson_texts(&n["text"], &builder.nodes[id]["behavior"]),
+                LESSON_SUBJECTS,
+            )?;
             queue.extend(named.iter().cloned());
             mentioned.push((id.into(), named));
         }
@@ -861,7 +956,10 @@ fn prepare_cached(
             .next()
             .unwrap_or_else(|| candidate["text"].as_str().unwrap().into());
         let subject = format!("{}\0{head}", get_str(candidate, "type")?);
-        if let Some((_, prior_tops, prior)) = subjects_queue.iter_mut().find(|(key, _, _)| key == &subject) {
+        if let Some((_, prior_tops, prior)) = subjects_queue
+            .iter_mut()
+            .find(|(key, _, _)| key == &subject)
+        {
             prior_tops.extend(tops);
             prior.extend(queue);
         } else {
@@ -903,7 +1001,11 @@ fn prepare_cached(
         }
         // A relation waits with a deferred endpoint candidate instead of a dependency defer.
         for candidate in &candidates {
-            if ["src", "dst"].iter().any(|key| candidate[*key].as_str().is_some_and(|id| uncovered.contains(id))) {
+            if ["src", "dst"].iter().any(|key| {
+                candidate[*key]
+                    .as_str()
+                    .is_some_and(|id| uncovered.contains(id))
+            }) {
                 uncovered.insert(get_str(candidate, "id")?.to_owned());
             }
         }
@@ -911,28 +1013,54 @@ fn prepare_cached(
             candidates.retain(|candidate| !uncovered.contains(candidate["id"].as_str().unwrap()));
             optional.retain(|(id, _)| !uncovered.contains(id));
             deferred = uncovered.into_iter().collect();
-        } else if job.payload["_priority"].is_null() && candidates.iter().any(|candidate| candidate["kind"] != "relation") {
+        } else if job.payload["_priority"].is_null()
+            && candidates
+                .iter()
+                .any(|candidate| candidate["kind"] != "relation")
+        {
             // None fits beside its targets: reprepare the first half of the non-relation
             // candidates plus relations whose batch endpoints stay; the rest stays pending.
             // A lone kept candidate's top targets are seeded first in the in-memory clone.
             // Each level keeps fewer non-relation candidates or seeds once, so this terminates.
             let batch = uncovered; // here: every candidate in this context
-            let entities = candidates.iter().filter(|candidate| candidate["kind"] != "relation").collect::<Vec<_>>();
+            let entities = candidates
+                .iter()
+                .filter(|candidate| candidate["kind"] != "relation")
+                .collect::<Vec<_>>();
             let entities = &entities[..(entities.len() / 2).max(1)];
-            let mut kept = entities.iter().map(|candidate| get_str(candidate, "id").map(str::to_owned)).collect::<Result<BTreeSet<_>>>()?;
-            for candidate in candidates.iter().filter(|candidate| candidate["kind"] == "relation") {
-                if ["src", "dst"].iter().all(|key| candidate[*key].as_str().is_none_or(|id| !batch.contains(id) || kept.contains(id))) {
+            let mut kept = entities
+                .iter()
+                .map(|candidate| get_str(candidate, "id").map(str::to_owned))
+                .collect::<Result<BTreeSet<_>>>()?;
+            for candidate in candidates
+                .iter()
+                .filter(|candidate| candidate["kind"] == "relation")
+            {
+                if ["src", "dst"].iter().all(|key| {
+                    candidate[*key]
+                        .as_str()
+                        .is_none_or(|id| !batch.contains(id) || kept.contains(id))
+                }) {
                     kept.insert(get_str(candidate, "id")?.to_owned());
                 }
             }
             let mut narrowed = job.clone();
             narrowed.payload["candidate_ids"] = json!(kept);
             if let [only] = entities {
-                narrowed.payload["_priority"] = json!(relevant.iter().find(|(id, _)| only["id"] == *id).map(|(_, targets)| targets.clone()).unwrap_or_default());
+                narrowed.payload["_priority"] = json!(
+                    relevant
+                        .iter()
+                        .find(|(id, _)| only["id"] == *id)
+                        .map(|(_, targets)| targets.clone())
+                        .unwrap_or_default()
+                );
             }
-            let mut context = prepare_cached(db, dir, &narrowed, discovery, configured, discovery_cache)?;
+            let mut context =
+                prepare_cached(db, dir, &narrowed, discovery, configured, discovery_cache)?;
             let rest = batch.into_iter().filter(|id| !kept.contains(id));
-            context["_deferred"] = json!(unique(strings(&context["_deferred"])?.into_iter().chain(rest)));
+            context["_deferred"] = json!(unique(
+                strings(&context["_deferred"])?.into_iter().chain(rest)
+            ));
             return Ok(context);
         }
     }
@@ -944,7 +1072,11 @@ fn prepare_cached(
         }
     }
     for (lesson, named) in &mentioned {
-        let supplied = named.iter().filter(|id| builder.nodes.contains_key(*id)).cloned().collect::<Vec<_>>();
+        let supplied = named
+            .iter()
+            .filter(|id| builder.nodes.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
         if supplied.is_empty() {
             continue;
         }
@@ -1015,11 +1147,13 @@ fn prepare_cached(
             }
         }
     }
-    let mut windows = coalesce_windows(builder
-        .windows
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect::<Vec<_>>());
+    let mut windows = coalesce_windows(
+        builder
+            .windows
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>(),
+    );
     windows.sort_by_key(|window| {
         (
             window["sequence"].as_i64().unwrap_or(0),
@@ -1051,8 +1185,19 @@ fn prepare_cached(
 /// Exact union of overlapping source spans with identical provenance/authority.
 /// This removes repeated context, never adds a gap or combines native trace kinds.
 fn coalesce_windows(mut windows: Vec<Value>) -> Vec<Value> {
-    windows.sort_by_key(|w| (w["episode_id"].as_str().unwrap_or("").to_owned(), w["start"].as_u64().unwrap_or(0)));
-    let metadata = |w: &Value| { let mut fields = w.as_object().unwrap().clone(); for key in ["start","end","text"] { fields.remove(key); } fields };
+    windows.sort_by_key(|w| {
+        (
+            w["episode_id"].as_str().unwrap_or("").to_owned(),
+            w["start"].as_u64().unwrap_or(0),
+        )
+    });
+    let metadata = |w: &Value| {
+        let mut fields = w.as_object().unwrap().clone();
+        for key in ["start", "end", "text"] {
+            fields.remove(key);
+        }
+        fields
+    };
     let mut merged: Vec<Value> = vec![];
     for window in windows {
         if let Some(previous) = merged.last_mut() {
@@ -1062,7 +1207,11 @@ fn coalesce_windows(mut windows: Vec<Value>) -> Vec<Value> {
                 let next_end = window["end"].as_u64().unwrap();
                 if next_end > end {
                     let mut text = previous["text"].as_str().unwrap().to_owned();
-                    text.push_str(&substring(window["text"].as_str().unwrap(), (end-start) as usize, (next_end-start) as usize));
+                    text.push_str(&substring(
+                        window["text"].as_str().unwrap(),
+                        (end - start) as usize,
+                        (next_end - start) as usize,
+                    ));
                     previous["text"] = json!(text);
                     previous["end"] = json!(next_end);
                 }
@@ -1079,21 +1228,43 @@ mod overlap_tests {
     use super::*;
     #[test]
     fn exact_unicode_union_preserves_gaps_and_authority() {
-        let w = |start,end,text,authority| json!({"episode_id":"e","start":start,"end":end,"text":text,"behavior_ground_truth":authority});
-        let result = coalesce_windows(vec![w(0,3,"a🧠б",true),w(2,5,"бcd",true),w(6,7,"x",true),w(1,2,"🧠",false)]);
-        assert_eq!(result.len(),4); // Different authority interrupts merging; never broaden it.
-        let result = coalesce_windows(vec![w(0,3,"a🧠б",true),w(2,5,"бcd",true),w(6,7,"x",true)]);
-        assert_eq!(result,vec![w(0,5,"a🧠бcd",true),w(6,7,"x",true)]);
+        let w = |start, end, text, authority| json!({"episode_id":"e","start":start,"end":end,"text":text,"behavior_ground_truth":authority});
+        let result = coalesce_windows(vec![
+            w(0, 3, "a🧠б", true),
+            w(2, 5, "бcd", true),
+            w(6, 7, "x", true),
+            w(1, 2, "🧠", false),
+        ]);
+        assert_eq!(result.len(), 4); // Different authority interrupts merging; never broaden it.
+        let result = coalesce_windows(vec![
+            w(0, 3, "a🧠б", true),
+            w(2, 5, "бcd", true),
+            w(6, 7, "x", true),
+        ]);
+        assert_eq!(result, vec![w(0, 5, "a🧠бcd", true), w(6, 7, "x", true)]);
     }
 
     #[test]
     fn existing_evidence_keeps_founding_and_latest_original_sources() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let store = memento_core::Store::open(dir.path()).unwrap();
         // Nine supports: the decisive correction is the ninth by id (dropped by the old
         // id-order LIMIT 8) and the founding source has a middle id.
-        let days = ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05", "2026-01-06", "2026-01-01", "2026-01-07", "2026-01-08", "2026-01-09"];
+        let days = [
+            "2026-01-02",
+            "2026-01-03",
+            "2026-01-04",
+            "2026-01-05",
+            "2026-01-06",
+            "2026-01-01",
+            "2026-01-07",
+            "2026-01-08",
+            "2026-01-09",
+        ];
         store.write(|tx| {
             for (index, day) in days.iter().enumerate() {
                 let text = if index == 8 { "Correction: the launch moved to Friday." } else { "The launch is on Monday." };
@@ -1104,17 +1275,31 @@ mod overlap_tests {
             }
             Ok(())
         }).unwrap();
-        let ids = store.read(|tx| Builder::new(tx.sql(), dir.path()).evidence("n1", 1, false)).unwrap()
-            .iter().map(|reference| reference["episode_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let ids = store
+            .read(|tx| Builder::new(tx.sql(), dir.path()).evidence("n1", 1, false))
+            .unwrap()
+            .iter()
+            .map(|reference| reference["episode_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
         assert_eq!(ids, ["e5", "e0", "e1", "e2", "e4", "e6", "e7", "e8"]);
     }
 
     #[test]
     fn lexical_matches_the_stored_column_join() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let store = memento_core::Store::open(dir.path()).unwrap();
-        let texts = ["Launch plan for Memento", "Memento launch moved", "Plan the garden", "Launch launch launch", "Old memento plan", "Memento"];
+        let texts = [
+            "Launch plan for Memento",
+            "Memento launch moved",
+            "Plan the garden",
+            "Launch launch launch",
+            "Old memento plan",
+            "Memento",
+        ];
         store.write(|tx| {
             for (index, text) in texts.iter().enumerate() {
                 let (kind, state) = if index == 2 { ("person", "active") } else if index == 4 { ("fact", "merged") } else { ("fact", "active") };
@@ -1127,20 +1312,61 @@ mod overlap_tests {
             Ok(())
         }).unwrap();
         let old = "SELECT n.id FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ? AND n.type=? AND n.state='active' AND n.id NOT IN (SELECT value FROM json_each(?)) AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY bm25(node_fts),n.id LIMIT ?";
-        store.read(|tx| {
-            let mut cache = DiscoveryCache::new();
-            for (text, kind, reviewed, head) in [("launch plan memento", "fact", vec![], false), ("memento", "fact", vec!["n1".to_owned()], false), ("garden plan", "person", vec![], false), ("garden plan", "fact", vec![], true), ("launch", "fact", vec![], true)] {
-                let terms = word_terms(text, 3, 32);
-                let query = if head { format!("\"{}\"", terms[0]) } else { terms.iter().map(|term| format!("\"{term}\"")).collect::<Vec<_>>().join(" OR ") };
-                let expected = rows(tx.sql(), old, params![query, kind, encode_json(&json!(reviewed))?, 8])?.into_iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
-                assert_eq!(lexical(tx.sql(), &mut cache, text, kind, 3, 8, &reviewed, head)?, expected);
-                // A repeated lookup is answered from the batch cache with the same result.
-                assert_eq!(lexical(tx.sql(), &mut cache, text, kind, 3, 8, &reviewed, head)?, expected);
-            }
-            // Superseded text is not indexed; the only "garden" match is the person.
-            assert!(lexical(tx.sql(), &mut cache, "stale garden", "fact", 3, 8, &[], false)?.is_empty());
-            Ok(())
-        }).unwrap();
+        store
+            .read(|tx| {
+                let mut cache = DiscoveryCache::new();
+                for (text, kind, reviewed, head) in [
+                    ("launch plan memento", "fact", vec![], false),
+                    ("memento", "fact", vec!["n1".to_owned()], false),
+                    ("garden plan", "person", vec![], false),
+                    ("garden plan", "fact", vec![], true),
+                    ("launch", "fact", vec![], true),
+                ] {
+                    let terms = word_terms(text, 3, 32);
+                    let query = if head {
+                        format!("\"{}\"", terms[0])
+                    } else {
+                        terms
+                            .iter()
+                            .map(|term| format!("\"{term}\""))
+                            .collect::<Vec<_>>()
+                            .join(" OR ")
+                    };
+                    let expected = rows(
+                        tx.sql(),
+                        old,
+                        params![query, kind, encode_json(&json!(reviewed))?, 8],
+                    )?
+                    .into_iter()
+                    .map(|row| row["id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                    assert_eq!(
+                        lexical(tx.sql(), &mut cache, text, kind, 3, 8, &reviewed, head)?,
+                        expected
+                    );
+                    // A repeated lookup is answered from the batch cache with the same result.
+                    assert_eq!(
+                        lexical(tx.sql(), &mut cache, text, kind, 3, 8, &reviewed, head)?,
+                        expected
+                    );
+                }
+                // Superseded text is not indexed; the only "garden" match is the person.
+                assert!(
+                    lexical(
+                        tx.sql(),
+                        &mut cache,
+                        "stale garden",
+                        "fact",
+                        3,
+                        8,
+                        &[],
+                        false
+                    )?
+                    .is_empty()
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 }
 

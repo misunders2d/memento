@@ -206,7 +206,11 @@ pub fn clear_done_contexts(store: &memento_core::Store, from: i64) -> Result<(i6
             Ok(())
         })?;
     }
-    let next = if scanned < BATCH { None } else { last.checked_add(1) };
+    let next = if scanned < BATCH {
+        None
+    } else {
+        last.checked_add(1)
+    };
     Ok((scanned, next))
 }
 pub fn active_captured_source(db: &Connection, sha: &str) -> Result<bool> {
@@ -316,7 +320,8 @@ impl Worker {
     }
     /// The dispatch thread ended without close(): a panic escaped a callback outside job containment.
     pub fn stopped(&self) -> bool {
-        !self.stop.load(Ordering::Acquire) && self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+        !self.stop.load(Ordering::Acquire)
+            && self.thread.as_ref().is_some_and(JoinHandle::is_finished)
     }
     pub fn close(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -426,14 +431,25 @@ mod context_tests {
             Ok(())
         }).unwrap();
         assert_eq!(clear_done_contexts(&store, i64::MIN).unwrap(), (4, None));
-        store.read(|tx| {
-            let mut query = tx.sql().prepare("SELECT id FROM jobs WHERE context IS NOT NULL ORDER BY id")?;
-            let kept = query.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
-            // Retries still need their previous rejection; live leases their packet.
-            assert_eq!(kept, ["failed", "leased", "pending"]);
-            assert_eq!(tx.sql().query_row("SELECT result FROM jobs WHERE id='done'", [], |r| r.get::<_, String>(0))?, "{\"kept\":true}");
-            Ok(())
-        }).unwrap();
+        store
+            .read(|tx| {
+                let mut query = tx
+                    .sql()
+                    .prepare("SELECT id FROM jobs WHERE context IS NOT NULL ORDER BY id")?;
+                let kept = query
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                // Retries still need their previous rejection; live leases their packet.
+                assert_eq!(kept, ["failed", "leased", "pending"]);
+                assert_eq!(
+                    tx.sql()
+                        .query_row("SELECT result FROM jobs WHERE id='done'", [], |r| r
+                            .get::<_, String>(0))?,
+                    "{\"kept\":true}"
+                );
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(clear_done_contexts(&store, i64::MAX).unwrap(), (0, None));
     }
 }

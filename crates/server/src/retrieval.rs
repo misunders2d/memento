@@ -146,7 +146,10 @@ fn validate_text_passages(
     for (id, row) in found.iter() {
         check(deadline)?;
         if text_passage(db, row, or_only.contains(id))? {
-            if row["text"].as_str().is_none_or(|text| text.trim().is_empty()) {
+            if row["text"]
+                .as_str()
+                .is_none_or(|text| text.trim().is_empty())
+            {
                 rejected.push(id.clone());
             } else {
                 passages.push((id.clone(), row));
@@ -252,7 +255,9 @@ impl Retrieval {
         let query = effective_query(request);
         let score = |documents: &[&str], until: Instant| {
             let mut waited = Duration::ZERO;
-            let logits = self.text_reranker.score(&query, documents, until, &mut waited);
+            let logits = self
+                .text_reranker
+                .score(&query, documents, until, &mut waited);
             timings.add(Stage::ScorerLockWait, waited);
             logits
         };
@@ -282,17 +287,30 @@ impl Retrieval {
             && Period::of(request)?.is_none();
         let cut = |archive: bool| {
             let (at, mut wait) = (Instant::now(), SnapshotTiming::default());
-            let value = projection
-                .snapshot_hot_timed(archive, deadline, &mut wait,
-                    |tx, view| {
-                        let at = Instant::now();
-                        let period = Self::period(tx, request);
-                        timings.lap(Stage::Period, at);
-                        Self::hot_preview(view, request, vector, archive, period?, timings)
-                    },
-                    |tx, hot, cold| Self::current_owned_scored(tx, hot,
+            let value = projection.snapshot_hot_timed(
+                archive,
+                deadline,
+                &mut wait,
+                |tx, view| {
+                    let at = Instant::now();
+                    let period = Self::period(tx, request);
+                    timings.lap(Stage::Period, at);
+                    Self::hot_preview(view, request, vector, archive, period?, timings)
+                },
+                |tx, hot, cold| {
+                    Self::current_owned_scored(
+                        tx,
+                        hot,
                         |n, pool| cold.search(vector, n, "episode", pool, None, None),
-                        request, vector, archive, deadline, Some(&score), timings));
+                        request,
+                        vector,
+                        archive,
+                        deadline,
+                        Some(&score),
+                        timings,
+                    )
+                },
+            );
             timings.index(&wait);
             timings.count(Count::Passes, 1);
             (value, at)
@@ -327,32 +345,88 @@ impl Retrieval {
             .map(|p| Ok((p, period::eligible(tx, &p, request.scope.as_deref())?)))
             .transpose()
     }
-    fn hot_preview(view: &SearchView<'_>, request: &RecallRequest, vector: &[f32; 768], archive: bool, period: Option<(Period, Eligible)>, timings: &RecallTimings) -> Result<HotPreview> {
+    fn hot_preview(
+        view: &SearchView<'_>,
+        request: &RecallRequest,
+        vector: &[f32; 768],
+        archive: bool,
+        period: Option<(Period, Eligible)>,
+        timings: &RecallTimings,
+    ) -> Result<HotPreview> {
         let at = Utc::now();
-        let limit = if request.automatic { request.limit.min(6) } else { request.limit };
-        let n = if request.automatic { (limit * 20).clamp(24, 120) } else { (limit * 20).min(1000) };
-        let pool = if request.automatic { Pool::Automatic } else { Pool::Ordinary };
+        let limit = if request.automatic {
+            request.limit.min(6)
+        } else {
+            request.limit
+        };
+        let n = if request.automatic {
+            (limit * 20).clamp(24, 120)
+        } else {
+            (limit * 20).min(1000)
+        };
+        let pool = if request.automatic {
+            Pool::Automatic
+        } else {
+            Pool::Ordinary
+        };
         // Eligibility precedes the top-n cut: out-of-period neighbours never take slots.
-        let points = period.as_ref().map(|(_, eligible)| eligible.points.as_slice());
+        let points = period
+            .as_ref()
+            .map(|(_, eligible)| eligible.points.as_slice());
         let mut curated = Vec::new();
-        for (kind, stage) in [("node", Stage::SearchNode), ("candidate", Stage::SearchCandidate), ("segment", Stage::SearchSegment)] {
+        for (kind, stage) in [
+            ("node", Stage::SearchNode),
+            ("candidate", Stage::SearchCandidate),
+            ("segment", Stage::SearchSegment),
+        ] {
             let started = Instant::now();
-            curated.extend(view.search_within(Tier::Hot, vector, n, kind, pool, request.scope.as_deref(), None, points)?);
+            curated.extend(view.search_within(
+                Tier::Hot,
+                vector,
+                n,
+                kind,
+                pool,
+                request.scope.as_deref(),
+                None,
+                points,
+            )?);
             timings.lap(stage, started);
         }
         timings.count(Count::AnnHits, curated.len());
         let started = Instant::now();
-        let deep_raw = if request.effort == "deep" && !request.automatic && request.scope.is_none() && period.is_none() {
+        let deep_raw = if request.effort == "deep"
+            && !request.automatic
+            && request.scope.is_none()
+            && period.is_none()
+        {
             view.search(Tier::Hot, vector, n, "episode", Pool::Ordinary, None, None)?
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         let started = timings.lap(Stage::SearchDeepRaw, started);
         // A bounded preview may be unused if the archive cut has enough curated
         // results. Preserve its error until this optional pool is actually used.
         let parked = if archive && request.automatic && request.scope.is_none() && limit > 0 {
-            Some(view.search(Tier::Hot, vector, 4, "candidate", Pool::ParkedCandidate, None, None))
-        } else { None };
+            Some(view.search(
+                Tier::Hot,
+                vector,
+                4,
+                "candidate",
+                Pool::ParkedCandidate,
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
         timings.lap(Stage::SearchParked, started);
-        Ok(HotPreview { at, curated, deep_raw, parked, period })
+        Ok(HotPreview {
+            at,
+            curated,
+            deep_raw,
+            parked,
+            period,
+        })
     }
     #[cfg(test)]
     fn current_scored(
@@ -365,10 +439,25 @@ impl Retrieval {
         score: Option<&TextScore<'_>>,
     ) -> Result<(Vec<Value>, bool)> {
         let timings = RecallTimings::default();
-        let hot = Self::hot_preview(view, request, vector, archive, Self::period(tx, request)?, &timings)?;
-        Self::current_owned_scored(tx, hot,
+        let hot = Self::hot_preview(
+            view,
+            request,
+            vector,
+            archive,
+            Self::period(tx, request)?,
+            &timings,
+        )?;
+        Self::current_owned_scored(
+            tx,
+            hot,
             |n, pool| view.search(Tier::Cold, vector, n, "episode", pool, None, None),
-            request, vector, archive, deadline, score, &timings)
+            request,
+            vector,
+            archive,
+            deadline,
+            score,
+            &timings,
+        )
     }
     fn current_owned_scored(
         tx: &ReadTxn<'_>,
@@ -383,8 +472,16 @@ impl Retrieval {
     ) -> Result<(Vec<Value>, bool)> {
         let db = tx.sql();
         let scope = request.scope.as_deref();
-        let HotPreview { at, curated, deep_raw, parked: parked_preview, period } = hot;
-        let allowed = period.as_ref().map(|(_, eligible)| eligible.ids_json.as_str());
+        let HotPreview {
+            at,
+            curated,
+            deep_raw,
+            parked: parked_preview,
+            period,
+        } = hot;
+        let allowed = period
+            .as_ref()
+            .map(|(_, eligible)| eligible.ids_json.as_str());
         let limit = if request.automatic {
             request.limit.min(6)
         } else {
@@ -504,7 +601,15 @@ impl Retrieval {
         }
         timings.count(Count::Admitted, matches.len());
         clock = timings.lap(Stage::Hydration, clock);
-        validate_text_passages(db, &mut matches, limit, deadline, score, &or_only, request.explain)?;
+        validate_text_passages(
+            db,
+            &mut matches,
+            limit,
+            deadline,
+            score,
+            &or_only,
+            request.explain,
+        )?;
         timings.count(Count::Validated, matches.len());
         let meaningful = matches.values().try_fold(false, |yes, v| {
             Ok::<_, Error>(yes || records::meaningful(db, v)?)
@@ -525,7 +630,10 @@ impl Retrieval {
             for hit in raw_hits {
                 if hit.cosine as f64 >= TEXT_FLOOR {
                     if let Some(mut row) = hydrate(tx, &hit, false)? {
-                        records::merge(&mut row, json!({"cosine":hit.cosine,"score":hit.cosine,"match":"semantic"}));
+                        records::merge(
+                            &mut row,
+                            json!({"cosine":hit.cosine,"score":hit.cosine,"match":"semantic"}),
+                        );
                         raw_matches.entry(key(&row).to_owned()).or_insert(row);
                     }
                 }
@@ -563,12 +671,21 @@ impl Retrieval {
             timings.count(Count::ColdHits, fallback_hits.len());
             clock = timings.lap(Stage::SearchCold, clock);
             let mut fallback = Self::raw_fallback_scored(
-                tx, fallback_hits, &request.query, fallback_limit,
-                !request.automatic, at, deadline, score, request.explain,
+                tx,
+                fallback_hits,
+                &request.query,
+                fallback_limit,
+                !request.automatic,
+                at,
+                deadline,
+                score,
+                request.explain,
             )?;
             if request.automatic {
                 let mut parked = Vec::new();
-                for hit in parked_preview.ok_or(Error::Unavailable("Parked candidate preview is unavailable"))?? {
+                for hit in parked_preview.ok_or(Error::Unavailable(
+                    "Parked candidate preview is unavailable",
+                ))?? {
                     if (hit.cosine as f64) < AUTO_FLOOR {
                         continue;
                     }
@@ -598,7 +715,15 @@ impl Retrieval {
                     .into_iter()
                     .map(|row| (key(&row).to_owned(), row))
                     .collect();
-                validate_text_passages(db, &mut eligible, limit, deadline, score, &HashSet::new(), request.explain)?;
+                validate_text_passages(
+                    db,
+                    &mut eligible,
+                    limit,
+                    deadline,
+                    score,
+                    &HashSet::new(),
+                    request.explain,
+                )?;
                 let mut parked: Vec<Value> = eligible.into_values().collect();
                 parked.sort_by(order);
                 if let Some(row) = parked.into_iter().next() {
@@ -844,7 +969,10 @@ impl Retrieval {
             if request.explain {
                 // Facts the pipeline already computed for this returned row; no extra search or clock.
                 let raw = row["tier"] == "raw" || row["type"] == "raw_episode";
-                let deep = request.effort == "deep" && !request.automatic && scope.is_none() && period.is_none();
+                let deep = request.effort == "deep"
+                    && !request.automatic
+                    && scope.is_none()
+                    && period.is_none();
                 let (route, gate) = if raw {
                     (if deep { "deep_raw" } else { "raw_fallback" }, TEXT_FLOOR)
                 } else if row["tier"] == "candidate" && row["historical"] == true {
@@ -1044,7 +1172,15 @@ impl Retrieval {
     ) -> Result<Vec<Value>> {
         Self::raw_fallback_scored(
             tx,
-            view.search(Tier::Cold, vector, (limit * 4).max(8), "episode", Pool::RawFallback, None, None)?,
+            view.search(
+                Tier::Cold,
+                vector,
+                (limit * 4).max(8),
+                "episode",
+                Pool::RawFallback,
+                None,
+                None,
+            )?,
             query,
             limit,
             keywords,
@@ -1254,7 +1390,9 @@ pub(crate) fn finish(db: &rusqlite::Connection, row: &mut Value, at: DateTime<Ut
         .map(Value::String)
         .unwrap_or(Value::Null);
         // `text` is the stored assertion's 240-character summary (SQLite substr counts characters).
-        let truncated = row["_full_text"].as_str().map(|full| full.chars().count() > 240);
+        let truncated = row["_full_text"]
+            .as_str()
+            .map(|full| full.chars().count() > 240);
         if let Some(truncated) = truncated {
             row["text_truncated"] = json!(truncated);
         }
@@ -2360,50 +2498,150 @@ mod tests {
     }
     struct RepairFixtureRecall(Vec<Value>);
     impl crate::Recall for RepairFixtureRecall {
-        fn recall(&self, _: &crate::RecallRequest, _: Instant) -> Result<Vec<Value>> { Ok(self.0.clone()) }
-        fn ready(&self) -> bool { true }
+        fn recall(&self, _: &crate::RecallRequest, _: Instant) -> Result<Vec<Value>> {
+            Ok(self.0.clone())
+        }
+        fn ready(&self) -> bool {
+            true
+        }
     }
     #[test]
     fn recall_duplicate_repair_seeds_only_durable_nodes_once() {
         let mut f = Fixture::new();
-        let one = f.add("Alex North", "person", "2020-01-01T00:00:00Z", 0.5, 0.82, "personal");
-        let two = f.add("Alex North", "person", "2020-01-01T00:00:00Z", 0.5, 0.81, "personal");
+        let one = f.add(
+            "Alex North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.82,
+            "personal",
+        );
+        let two = f.add(
+            "Alex North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.81,
+            "personal",
+        );
         let rows = f.recall("Alex North", 6, true, Some("personal"));
         let before = rows.clone();
         let mut state = crate::AppState::new(f.store.clone()).unwrap();
         state.recall = Some(Arc::new(RepairFixtureRecall(rows.clone())));
-        let request = RecallRequest { query: "Alex North".into(), scope: Some("personal".into()), automatic: true, ..Default::default() };
-        assert_eq!(state.recall_memories(&request, Instant::now() + std::time::Duration::from_secs(5)).unwrap(), before);
+        let request = RecallRequest {
+            query: "Alex North".into(),
+            scope: Some("personal".into()),
+            automatic: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            state
+                .recall_memories(&request, Instant::now() + std::time::Duration::from_secs(5))
+                .unwrap(),
+            before
+        );
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        while f.store.read(|tx| Ok(tx.sql().query_row("SELECT count(*) FROM repair_groups", [], |r| r.get::<_, i64>(0))?)).unwrap() == 0 {
+        while f
+            .store
+            .read(|tx| {
+                Ok(tx
+                    .sql()
+                    .query_row("SELECT count(*) FROM repair_groups", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?)
+            })
+            .unwrap()
+            == 0
+        {
             assert!(Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let counts = || f.store.read(|tx| {
-            let groups: i64 = tx.sql().query_row("SELECT count(*) FROM repair_groups WHERE state='pending'", [], |r| r.get(0))?;
-            let commits: i64 = tx.sql().query_row("SELECT count(*) FROM graph_commits WHERE actor='memento-recall'", [], |r| r.get(0))?;
-            let seeds: String = tx.sql().query_row("SELECT seed_ids FROM repair_groups WHERE state='pending'", [], |r| r.get(0))?;
-            Ok((groups, commits, seeds))
-        }).unwrap();
+        let counts = || {
+            f.store
+                .read(|tx| {
+                    let groups: i64 = tx.sql().query_row(
+                        "SELECT count(*) FROM repair_groups WHERE state='pending'",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    let commits: i64 = tx.sql().query_row(
+                        "SELECT count(*) FROM graph_commits WHERE actor='memento-recall'",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    let seeds: String = tx.sql().query_row(
+                        "SELECT seed_ids FROM repair_groups WHERE state='pending'",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    Ok((groups, commits, seeds))
+                })
+                .unwrap()
+        };
         let first = counts();
-        let mut expected = vec![one, two]; expected.sort();
+        let mut expected = vec![one, two];
+        expected.sort();
         assert_eq!((first.0, first.1), (1, 1));
-        assert_eq!(serde_json::from_str::<Vec<String>>(&first.2).unwrap(), expected);
-        assert_eq!(state.recall_memories(&request, Instant::now() + std::time::Duration::from_secs(5)).unwrap(), before);
-        state.seed_recall_repairs(&rows, Some("personal".into())).unwrap().join().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&first.2).unwrap(),
+            expected
+        );
+        assert_eq!(
+            state
+                .recall_memories(&request, Instant::now() + std::time::Duration::from_secs(5))
+                .unwrap(),
+            before
+        );
+        state
+            .seed_recall_repairs(&rows, Some("personal".into()))
+            .unwrap()
+            .join()
+            .unwrap();
         assert_eq!(counts(), first);
         assert_eq!(rows, before);
     }
     #[test]
     fn recall_duplicate_repair_seeds_identical_text_memories() {
         let mut f = Fixture::new();
-        let one = f.add("Orion launches on Friday.", "knowledge", "2020-01-01T00:00:00Z", 0.5, 0.9, "personal");
-        let two = f.add("orion launches on friday", "knowledge", "2020-01-01T00:00:00Z", 0.5, 0.89, "personal");
+        let one = f.add(
+            "Orion launches on Friday.",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.9,
+            "personal",
+        );
+        let two = f.add(
+            "orion launches on friday",
+            "knowledge",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.89,
+            "personal",
+        );
         let rows = f.recall("When does Orion launch?", 6, true, Some("personal"));
-        assert!(rows.iter().any(|row| row["duplicate_ids"].as_array().is_some_and(|ids| !ids.is_empty())));
+        assert!(rows.iter().any(|row| {
+            row["duplicate_ids"]
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty())
+        }));
         let state = crate::AppState::new(f.store.clone()).unwrap();
-        state.seed_recall_repairs(&rows, Some("personal".into())).unwrap().join().unwrap();
-        let seeds: Vec<String> = f.store.read(|tx| Ok(tx.sql().query_row("SELECT seed_ids FROM repair_groups WHERE state='pending'", [], |r| r.get::<_, String>(0))?)).map(|s| serde_json::from_str(&s).unwrap()).unwrap();
+        state
+            .seed_recall_repairs(&rows, Some("personal".into()))
+            .unwrap()
+            .join()
+            .unwrap();
+        let seeds: Vec<String> = f
+            .store
+            .read(|tx| {
+                Ok(tx.sql().query_row(
+                    "SELECT seed_ids FROM repair_groups WHERE state='pending'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .unwrap();
         let mut expected = vec![one, two];
         expected.sort();
         assert_eq!(seeds, expected);
@@ -2411,7 +2649,14 @@ mod tests {
     #[test]
     fn recall_duplicate_repair_excludes_pending_candidate() {
         let mut f = Fixture::new();
-        let seed = f.add("Alex North", "person", "2020-01-01T00:00:00Z", 0.5, 0.8, "personal");
+        let seed = f.add(
+            "Alex North",
+            "person",
+            "2020-01-01T00:00:00Z",
+            0.5,
+            0.8,
+            "personal",
+        );
         let episode=f.store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"pending-alex","conversation_id":"pending-alex","kind":"user","text":"Alex North","metadata":{}})).unwrap()).unwrap();
         f.store.write(|tx| {
             tx.sql().execute("INSERT INTO extraction_runs SELECT 'pending-run',commit_id,?2,'test','test','[]','{}','2026-10-25' FROM node_versions WHERE id=?1 AND version=1",params![seed,episode.id])?;
@@ -2422,8 +2667,19 @@ mod tests {
         let rows = f.recall("Alex North", 6, true, Some("personal"));
         assert!(rows.iter().any(|row| row["same_name_count"] == 2));
         let state = crate::AppState::new(f.store.clone()).unwrap();
-        state.seed_recall_repairs(&rows, Some("personal".into())).unwrap().join().unwrap();
-        let count: i64 = f.store.read(|tx| Ok(tx.sql().query_row("SELECT count(*) FROM repair_groups", [], |r| r.get(0))?)).unwrap();
+        state
+            .seed_recall_repairs(&rows, Some("personal".into()))
+            .unwrap()
+            .join()
+            .unwrap();
+        let count: i64 = f
+            .store
+            .read(|tx| {
+                Ok(tx
+                    .sql()
+                    .query_row("SELECT count(*) FROM repair_groups", [], |r| r.get(0))?)
+            })
+            .unwrap();
         assert_eq!(count, 0);
     }
     #[test]

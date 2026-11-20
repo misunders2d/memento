@@ -161,7 +161,11 @@ fn exact(
     )? {
         let id = row["id"].as_str().unwrap();
         if contained(row["text"].as_str().unwrap_or(""), request) && !found.contains_key(id) {
-            let full = one(db, &node, params![id, row["version"].as_i64(), None::<&str>])?;
+            let full = one(
+                db,
+                &node,
+                params![id, row["version"].as_i64(), None::<&str>],
+            )?;
             found.insert(id.to_owned(), full.ok_or_else(missing)?);
         }
     }
@@ -756,7 +760,11 @@ mod lesson_slot_tests {
             Ok(())
         }).unwrap();
         // Behavior comes only from the consolidation commit that produced the version.
-        let context = CommandContext { command_id: "lesson".into(), actor: "fixture".into(), why: "Synthetic behavior provenance".into() };
+        let context = CommandContext {
+            command_id: "lesson".into(),
+            actor: "fixture".into(),
+            why: "Synthetic behavior provenance".into(),
+        };
         let request = json!({"op":"consolidate","output":{"actions":[{"candidate_id":"lesson","operation":"remember","type":"experience","behavior":{"authority":"explicit_user","applicability":"Hubtool deploys","conduct":text,"exceptions":[],"rationale":"Exact fixture user instruction"}}]}});
         store.command(&context, &request, |tx, commit| {
             tx.touch_target("lesson-node")?;
@@ -765,25 +773,32 @@ mod lesson_slot_tests {
             tx.sql().execute("INSERT INTO edge_versions VALUES('z-lesson',1,?,'lesson-node','mentions','hub','active')", [commit])?;
             Ok(json!({"results":{"lesson":{"id":"lesson-node"}}}))
         }).unwrap();
-        store.read(|tx| {
-            let db = tx.sql();
-            assert!(memento_domain::behavior(db, "lesson-node")?.is_some());
-            // related() keeps its arbitrary first-eight-edges semantics for other callers.
-            let related = records::related(db, "hub", 1, None)?;
-            assert_eq!(related.len(), 8);
-            assert!(!related.iter().any(|row| row["id"] == "lesson-node"));
-            let found = anchors(db, "How do Hubtool deploys work?", 2, None)?;
-            let anchor = found.iter().find(|anchor| anchor["id"] == "hub").unwrap();
-            let connections = anchor["connections"].as_array().unwrap();
-            assert_eq!(connections.len(), 5);
-            assert_eq!(connections[0]["id"], "lesson-node");
-            assert_eq!(connections[0]["relation"], "mentions");
-            assert_eq!(connections[0]["direction"], "in");
-            assert_eq!(connections[0]["relation_id"], "z-lesson");
-            assert!(connections[1..].iter().all(|row| row["type"] == "person"));
-            assert!(anchor["text"].as_str().unwrap().contains("[experience; edge z-lesson] mentions this"));
-            Ok(())
-        }).unwrap();
+        store
+            .read(|tx| {
+                let db = tx.sql();
+                assert!(memento_domain::behavior(db, "lesson-node")?.is_some());
+                // related() keeps its arbitrary first-eight-edges semantics for other callers.
+                let related = records::related(db, "hub", 1, None)?;
+                assert_eq!(related.len(), 8);
+                assert!(!related.iter().any(|row| row["id"] == "lesson-node"));
+                let found = anchors(db, "How do Hubtool deploys work?", 2, None)?;
+                let anchor = found.iter().find(|anchor| anchor["id"] == "hub").unwrap();
+                let connections = anchor["connections"].as_array().unwrap();
+                assert_eq!(connections.len(), 5);
+                assert_eq!(connections[0]["id"], "lesson-node");
+                assert_eq!(connections[0]["relation"], "mentions");
+                assert_eq!(connections[0]["direction"], "in");
+                assert_eq!(connections[0]["relation_id"], "z-lesson");
+                assert!(connections[1..].iter().all(|row| row["type"] == "person"));
+                assert!(
+                    anchor["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("[experience; edge z-lesson] mentions this")
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 }
 
@@ -932,7 +947,11 @@ mod exact_name_equivalence_tests {
     }
 
     // The same pre-change discovery, stopped before rendering.
-    fn found_before(db: &Connection, query: &str, scope: Option<&str>) -> Result<BTreeMap<String, Value>> {
+    fn found_before(
+        db: &Connection,
+        query: &str,
+        scope: Option<&str>,
+    ) -> Result<BTreeMap<String, Value>> {
         let request = tokens(query);
         let mut seen = HashSet::new();
         let terms = request
@@ -999,14 +1018,32 @@ mod exact_name_equivalence_tests {
     struct Rng(u64);
     impl Rng {
         fn next(&mut self, n: usize) -> usize {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as usize % n
         }
     }
     // Limit groups use names absent from the random vocabulary.
-    const NAMES: [&str; 9] = ["Nova", "Kim", "Lee", "Park", "Delta", "Echo", "River", "Stone", "Mila"];
-    const TYPES: [&str; 8] = ["person", "organization", "project", "tool", "concept", "custom_ent", "custom_mem", "fact"];
-    const SCOPES: [&str; 3] = ["[\"personal\"]", "[\"professional\"]", "[\"personal\",\"professional\"]"];
+    const NAMES: [&str; 9] = [
+        "Nova", "Kim", "Lee", "Park", "Delta", "Echo", "River", "Stone", "Mila",
+    ];
+    const TYPES: [&str; 8] = [
+        "person",
+        "organization",
+        "project",
+        "tool",
+        "concept",
+        "custom_ent",
+        "custom_mem",
+        "fact",
+    ];
+    const SCOPES: [&str; 3] = [
+        "[\"personal\"]",
+        "[\"professional\"]",
+        "[\"personal\",\"professional\"]",
+    ];
 
     /// Random entities plus three groups over the 64-row limit of each index:
     /// 90 same-spelled "Acme" nodes, 80 merged sources aliased "Orion", 80 "Zeta" candidates.
@@ -1138,9 +1175,21 @@ mod exact_name_equivalence_tests {
     }
     fn queries() -> Vec<String> {
         let mut result = [
-            "Acme", "tell me about ACME", "Orion", "Orion Belt and Orion", "Zeta", "zeta acme orion",
-            "Lee Park", "lee park and Lee Park", "Mila Stone Mila", "Echo Stone Mila", "What did Lee Park and Kim say about Nova River?",
-            "", "the", "\"Acme\" OR Zeta", "deploy tool for recall memory work",
+            "Acme",
+            "tell me about ACME",
+            "Orion",
+            "Orion Belt and Orion",
+            "Zeta",
+            "zeta acme orion",
+            "Lee Park",
+            "lee park and Lee Park",
+            "Mila Stone Mila",
+            "Echo Stone Mila",
+            "What did Lee Park and Kim say about Nova River?",
+            "",
+            "the",
+            "\"Acme\" OR Zeta",
+            "deploy tool for recall memory work",
         ]
         .map(String::from)
         .to_vec();
@@ -1148,7 +1197,13 @@ mod exact_name_equivalence_tests {
         let filler = ["about", "the", "and", "what", "Acme", "Orion", "Zeta"];
         for _ in 0..40 {
             let words = (0..2 + rng.next(7))
-                .map(|_| if rng.next(3) == 0 { filler[rng.next(filler.len())] } else { NAMES[rng.next(NAMES.len())] })
+                .map(|_| {
+                    if rng.next(3) == 0 {
+                        filler[rng.next(filler.len())]
+                    } else {
+                        NAMES[rng.next(NAMES.len())]
+                    }
+                })
                 .collect::<Vec<_>>();
             result.push(words.join(" "));
         }
@@ -1168,20 +1223,33 @@ mod exact_name_equivalence_tests {
                     for scope in [None, Some("personal"), Some("professional"), Some("absent")] {
                         let before = found_before(db, &query, scope)?;
                         let after = exact(db, &tokens(&query), scope)?;
-                        assert_eq!(serde_json::to_string(&before)?, serde_json::to_string(&after)?, "{query:?} {scope:?}");
+                        assert_eq!(
+                            serde_json::to_string(&before)?,
+                            serde_json::to_string(&after)?,
+                            "{query:?} {scope:?}"
+                        );
                         for limit in [0, 1, 2, 6] {
                             let before = anchors_before(db, &query, limit, scope)?;
                             let after = anchors(db, &query, limit, scope)?;
-                            assert_eq!(serde_json::to_string(&before)?, serde_json::to_string(&after)?, "{query:?} {scope:?} {limit}");
+                            assert_eq!(
+                                serde_json::to_string(&before)?,
+                                serde_json::to_string(&after)?,
+                                "{query:?} {scope:?} {limit}"
+                            );
                             compared += usize::from(!after.is_empty());
                         }
                     }
                 }
                 assert!(compared > 20, "{compared}");
                 // Each index really hits its 64-row limit with more passing rows beyond it.
-                let tier = |found: &BTreeMap<String, Value>, f: &dyn Fn(&Value) -> bool| found.values().filter(|r| f(r)).count();
+                let tier = |found: &BTreeMap<String, Value>, f: &dyn Fn(&Value) -> bool| {
+                    found.values().filter(|r| f(r)).count()
+                };
                 let acme = exact(db, &tokens("Acme"), None)?;
-                assert_eq!(tier(&acme, &|r| r["id"].as_str().unwrap().starts_with("acme")), 64);
+                assert_eq!(
+                    tier(&acme, &|r| r["id"].as_str().unwrap().starts_with("acme")),
+                    64
+                );
                 let orion = exact(db, &tokens("Orion"), None)?;
                 assert_eq!(tier(&orion, &|r| r["alias"] == "Orion"), 64);
                 let zeta = exact(db, &tokens("Zeta"), None)?;

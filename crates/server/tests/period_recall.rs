@@ -398,11 +398,17 @@ async fn explicit_recall_marks_a_cut_summary_and_never_returns_the_tail() {
     );
     let (status, episode) = request(&state, "POST", "/episodes", Some(json!({"source":"native:synthetic:pi","event_id":"long","conversation_id":"period","kind":"user","text":text,"occurred_at":"2026-10-20T12:00:00Z","metadata":{}}))).await;
     assert!(status.is_success(), "{status} {episode}");
-    let (status, node) = request(&state, "POST", "/remember", Some(json!({
-        "command_id":"period-long","actor":"fixture","why":"Exact synthetic period source",
-        "type":"knowledge","text":text,"scope":["personal"],
-        "evidence":[{"episode_id":episode["id"],"quote":text}]
-    }))).await;
+    let (status, node) = request(
+        &state,
+        "POST",
+        "/remember",
+        Some(json!({
+            "command_id":"period-long","actor":"fixture","why":"Exact synthetic period source",
+            "type":"knowledge","text":text,"scope":["personal"],
+            "evidence":[{"episode_id":episode["id"],"quote":text}]
+        })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{node}");
     let (status, body) = request(&state, "GET", &format!("/recall?{WINDOW}"), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -423,14 +429,32 @@ async fn http_explain_labels_period_rows_without_changing_them() {
     let f = fixture().await;
     // Each request reads its own clock, so `decay` legitimately differs between calls.
     let rows = |body: &Value| -> Vec<Value> {
-        body["memories"].as_array().unwrap().iter().cloned().map(|mut r| {
-            r.as_object_mut().unwrap().remove("decay");
-            r
-        }).collect()
+        body["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.as_object_mut().unwrap().remove("decay");
+                r
+            })
+            .collect()
     };
     let (_, plain) = request(&f.state, "GET", &format!("/recall?{WINDOW}"), None).await;
-    let (_, off) = request(&f.state, "GET", &format!("/recall?{WINDOW}&explain=false"), None).await;
-    let (status, on) = request(&f.state, "GET", &format!("/recall?{WINDOW}&explain=true"), None).await;
+    let (_, off) = request(
+        &f.state,
+        "GET",
+        &format!("/recall?{WINDOW}&explain=false"),
+        None,
+    )
+    .await;
+    let (status, on) = request(
+        &f.state,
+        "GET",
+        &format!("/recall?{WINDOW}&explain=true"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{on}");
     assert_eq!(rows(&plain), rows(&off));
     assert!(rows(&off).iter().all(|r| r.get("explain").is_none()));

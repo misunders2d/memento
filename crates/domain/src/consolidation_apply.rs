@@ -256,10 +256,16 @@ fn validate(
                 && window["start"].as_u64().unwrap() as usize <= start
                 && end <= window["end"].as_u64().unwrap() as usize
         };
-        windows.iter().any(|window| window["later_context"] == true && covers(window))
-            && !windows.iter().any(|window| window["later_context"] != true && covers(window))
+        windows
+            .iter()
+            .any(|window| window["later_context"] == true && covers(window))
+            && !windows
+                .iter()
+                .any(|window| window["later_context"] != true && covers(window))
             && !spans.get(id).is_some_and(|spans| {
-                spans.iter().any(|(left, right)| *left <= start && end <= *right)
+                spans
+                    .iter()
+                    .any(|(left, right)| *left <= start && end <= *right)
             })
     };
     for action in &mut actions {
@@ -368,12 +374,16 @@ fn validate(
         if !action["due"].is_null() {
             // The date expression must be in an original premise quote and resolves
             // against that source's time; later_context never dates a pending loop.
-            let cited = action["evidence"].as_array().unwrap().iter().find(|source| {
-                original.contains(source["episode_id"].as_str().unwrap())
-                    && action["due"]["quote"]
-                        .as_str()
-                        .is_some_and(|expression| source["quote"].as_str().unwrap().contains(expression))
-            });
+            let cited = action["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|source| {
+                    original.contains(source["episode_id"].as_str().unwrap())
+                        && action["due"]["quote"].as_str().is_some_and(|expression| {
+                            source["quote"].as_str().unwrap().contains(expression)
+                        })
+                });
             let resolved = match cited {
                 _ if action["open_loop"] != true => Err(loop_due::Invalid::Format),
                 None => Err(loop_due::Invalid::Quote),
@@ -445,7 +455,9 @@ fn validate(
             return Err(reject("consolidation_reference_not_supplied", vec![]));
         }
         if repair["operation"] == "link" {
-            let dst = repair["dst"].as_str().ok_or_else(|| reject("consolidation_relation_endpoints_required", vec![]))?;
+            let dst = repair["dst"]
+                .as_str()
+                .ok_or_else(|| reject("consolidation_relation_endpoints_required", vec![]))?;
             if !nodes.contains_key(dst) {
                 return Err(reject("consolidation_reference_not_supplied", vec![]));
             }
@@ -459,10 +471,16 @@ fn validate(
             }
             for endpoint in &affected {
                 if !visible_link_endpoint(db, endpoint)? {
-                    return Err(Error::Conflict("Consolidation link endpoint changed; derive a fresh plan").into());
+                    return Err(Error::Conflict(
+                        "Consolidation link endpoint changed; derive a fresh plan",
+                    )
+                    .into());
                 }
                 if node(db, endpoint)?["version"] != nodes[endpoint]["version"] {
-                    return Err(Error::Conflict("Consolidation graph context changed; derive a fresh plan").into());
+                    return Err(Error::Conflict(
+                        "Consolidation graph context changed; derive a fresh plan",
+                    )
+                    .into());
                 }
             }
         } else if !repair["dst"].is_null() || !repair["relation"].is_null() {
@@ -538,8 +556,11 @@ fn validate(
         {
             return Err(reject("consolidation_schema_invalid", vec![]));
         }
-        if repair["operation"]=="assign_loop" {
-            if !repair["responsibility"].as_str().is_some_and(loops::valid_responsibility) {
+        if repair["operation"] == "assign_loop" {
+            if !repair["responsibility"]
+                .as_str()
+                .is_some_and(loops::valid_responsibility)
+            {
                 return Err(reject("consolidation_schema_invalid", vec![]));
             }
         } else if !repair["responsibility"].is_null() {
@@ -550,15 +571,24 @@ fn validate(
     // A correction or world change keeps the memory ID and its relations; it
     // may retire only supplied, fenced relations incident to that memory.
     for item in actions.iter_mut().chain(repairs.iter_mut()) {
-        let relations = item.get("retire_relations").filter(|value| !value.is_null()).map(strings).transpose()?.unwrap_or_default();
+        let relations = item
+            .get("retire_relations")
+            .filter(|value| !value.is_null())
+            .map(strings)
+            .transpose()?
+            .unwrap_or_default();
         if !relations.is_empty() {
-            let target = item["target"].as_str().filter(|target| nodes.contains_key(*target));
+            let target = item["target"]
+                .as_str()
+                .filter(|target| nodes.contains_key(*target));
             if item["operation"] != "supersede"
                 || !matches!(item["change_kind"].as_str(), Some("correction" | "change"))
                 || relations.iter().collect::<BTreeSet<_>>().len() != relations.len()
                 || target.is_none_or(|target| {
                     relations.iter().any(|id| {
-                        edges.get(id).is_none_or(|edge| edge["src"] != target && edge["dst"] != target)
+                        edges
+                            .get(id)
+                            .is_none_or(|edge| edge["src"] != target && edge["dst"] != target)
                     })
                 })
             {
@@ -855,15 +885,31 @@ fn follow_refinements(
     }
     Ok(target)
 }
-fn link(tx: &WriteTxn, commit: &str, a: &str, rel: &str, b: &str, evidence: &Value) -> Result<Value> {
+fn link(
+    tx: &WriteTxn,
+    commit: &str,
+    a: &str,
+    rel: &str,
+    b: &str,
+    evidence: &Value,
+) -> Result<Value> {
     if !valid_relation(rel) {
         return Err(Error::Validation("consolidation_relation_invalid"));
     }
-    let existing = one(tx.sql(), "SELECT e.id FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1", params![a, rel, b])?;
+    let existing = one(
+        tx.sql(),
+        "SELECT e.id FROM edge_versions e WHERE e.src=? AND e.rel=? AND e.dst=? AND e.state='active' AND e.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) LIMIT 1",
+        params![a, rel, b],
+    )?;
     if let Some(existing) = existing {
         curation::attach(tx, commit, get_str(&existing, "id")?, evidence, false, None)
     } else {
-        TxGraph::link(tx, commit, &json!({"op":"link","a":a,"rel":rel,"b":b,"evidence":evidence}), false)
+        TxGraph::link(
+            tx,
+            commit,
+            &json!({"op":"link","a":a,"rel":rel,"b":b,"evidence":evidence}),
+            false,
+        )
     }
 }
 fn apply_action(
@@ -1022,7 +1068,16 @@ fn apply_action(
                     &json!({"op":"merge","a":a,"b":b,"evidence":evidence}),
                 )?
             } else {
-                link(tx, commit, &a, action["relation"].as_str().ok_or(Error::Validation("consolidation_relation_invalid"))?, &b, evidence)?
+                link(
+                    tx,
+                    commit,
+                    &a,
+                    action["relation"]
+                        .as_str()
+                        .ok_or(Error::Validation("consolidation_relation_invalid"))?,
+                    &b,
+                    evidence,
+                )?
             }
         }
         "register_type" => {
@@ -1196,7 +1251,13 @@ fn seed_lesson_links(tx: &WriteTxn, lessons: &[(String, Value)]) -> Result<()> {
     let seeds = seeds.into_iter().collect::<Vec<_>>();
     for group in seeds.chunks(8) {
         let serialized = encode_json(&json!(group))?;
-        if one(tx.sql(), "SELECT 1 FROM repair_groups WHERE seed_ids=? AND state='pending' LIMIT 1", [&serialized])?.is_some() {
+        if one(
+            tx.sql(),
+            "SELECT 1 FROM repair_groups WHERE seed_ids=? AND state='pending' LIMIT 1",
+            [&serialized],
+        )?
+        .is_some()
+        {
             continue;
         }
         let stamp = now();

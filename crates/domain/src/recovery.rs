@@ -51,7 +51,11 @@ fn walk(
         // A replacement is proven only when the same commit created it and its
         // still-active supersedes edge.
         let commit = get_str(link, "commit_id")?;
-        let edge = one(db, "SELECT e.id,e.src,e.dst,l.version,l.state FROM edge_versions e JOIN edge_versions l ON l.id=e.id AND l.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) WHERE e.src=? AND e.rel='supersedes' AND e.dst=? AND e.version=1 AND e.commit_id=?", params![to, current, commit])?;
+        let edge = one(
+            db,
+            "SELECT e.id,e.src,e.dst,l.version,l.state FROM edge_versions e JOIN edge_versions l ON l.id=e.id AND l.version=(SELECT max(x.version) FROM edge_versions x WHERE x.id=e.id) WHERE e.src=? AND e.rel='supersedes' AND e.dst=? AND e.version=1 AND e.commit_id=?",
+            params![to, current, commit],
+        )?;
         let created = one(
             db,
             "SELECT 1 FROM node_versions WHERE id=? AND version=1 AND commit_id=?",
@@ -70,9 +74,13 @@ fn walk(
                     members.push(to);
                     return Ok((members, hops, Some("end_not_active")));
                 }
-                one(db, "SELECT min(version) AS version FROM node_revisions WHERE id=?", [&to])?
-                    .and_then(|row| row["version"].as_i64())
-                    .map_or(get_i64(&end, "version")?, |first| first - 1)
+                one(
+                    db,
+                    "SELECT min(version) AS version FROM node_revisions WHERE id=?",
+                    [&to],
+                )?
+                .and_then(|row| row["version"].as_i64())
+                .map_or(get_i64(&end, "version")?, |first| first - 1)
             }
         };
         let Some(row) = content(db, &to, version)? else {
@@ -110,17 +118,18 @@ fn walk(
         "SELECT 1 FROM forgotten_targets WHERE target IN (SELECT value FROM json_each(?)) LIMIT 1",
         [encode_json(&json!(members))?],
     )?;
-    Ok((
-        members,
-        hops,
-        forgotten.is_some().then_some("forgotten"),
-    ))
+    Ok((members, hops, forgotten.is_some().then_some("forgotten")))
 }
 
 /// The fenced chain, or why it must stay untouched for a distinct review.
 type Blocked = Option<(&'static str, Vec<String>)>;
 
-fn fence(db: &Connection, root: &str, members: &[String], hops: Vec<Value>) -> Result<(Value, Blocked)> {
+fn fence(
+    db: &Connection,
+    root: &str,
+    members: &[String],
+    hops: Vec<Value>,
+) -> Result<(Value, Blocked)> {
     let ids = encode_json(&json!(members))?;
     let end = members.last().unwrap();
     let mut summaries = vec![];
@@ -146,7 +155,10 @@ fn fence(db: &Connection, root: &str, members: &[String], hops: Vec<Value>) -> R
         rows_seen.extend(content(db, source, get_i64(&hop["source"], "version")?)?);
     }
     let mut reasons = vec![];
-    if rows_seen.iter().any(|n| n["pinned"].as_i64().unwrap_or(0) != 0) {
+    if rows_seen
+        .iter()
+        .any(|n| n["pinned"].as_i64().unwrap_or(0) != 0)
+    {
         reasons.push("pinned");
     }
     let mut sensitive_type = false;
@@ -169,7 +181,9 @@ fn fence(db: &Connection, root: &str, members: &[String], hops: Vec<Value>) -> R
     let left = hops
         .iter()
         .rposition(|hop| hop["kind"] != "refinement")
-        .map_or(&members[..0], |last| &members[..(last + 1).min(members.len() - 1)]);
+        .map_or(&members[..0], |last| {
+            &members[..(last + 1).min(members.len() - 1)]
+        });
     let mut obsolete = vec![];
     let mut relations = json!({});
     let mut reattached = vec![];
@@ -187,10 +201,10 @@ fn fence(db: &Connection, root: &str, members: &[String], hops: Vec<Value>) -> R
             obsolete.push(edge_id.to_owned());
         }
         // Relations left on a retired member become current again on the root.
-        if [&edge["src"], &edge["dst"]]
-            .iter()
-            .any(|side| side.as_str().is_some_and(|id| id != end && members.iter().any(|m| m == id)))
-        {
+        if [&edge["src"], &edge["dst"]].iter().any(|side| {
+            side.as_str()
+                .is_some_and(|id| id != end && members.iter().any(|m| m == id))
+        }) {
             reattached.push(edge_id.to_owned());
         }
     }
@@ -201,22 +215,36 @@ fn fence(db: &Connection, root: &str, members: &[String], hops: Vec<Value>) -> R
     if blocked.is_none() && !obsolete.is_empty() {
         blocked = Some(("relations_need_review", obsolete));
     }
-    Ok((json!({"root":root,"members":summaries,"hops":hops,"relations":relations,
-        "reattached_relations":reattached,"loops":marks,"pending_reviews":reviews,"protected_reasons":reasons}), blocked))
+    Ok((
+        json!({"root":root,"members":summaries,"hops":hops,"relations":relations,
+        "reattached_relations":reattached,"loops":marks,"pending_reviews":reviews,"protected_reasons":reasons}),
+        blocked,
+    ))
 }
 
 /// Read-only dry run: the next `limit` recoverable chains plus every ambiguous
 /// one. Protected chains are only reported unless the owner names each root.
-pub fn plan(db: &Connection, limit: usize, exclude: &[String], protected: &[String]) -> Result<Value> {
+pub fn plan(
+    db: &Connection,
+    limit: usize,
+    exclude: &[String],
+    protected: &[String],
+) -> Result<Value> {
     if !(1..=256).contains(&limit) {
-        return Err(Error::Validation("Recovery limit must be between 1 and 256"));
+        return Err(Error::Validation(
+            "Recovery limit must be between 1 and 256",
+        ));
     }
     if protected.iter().any(|id| exclude.contains(id)) {
         return Err(Error::Validation(
             "A chain cannot be both excluded and selected as protected",
         ));
     }
-    let links = rows(db, "SELECT n.id,n.version,n.state,n.superseded_by,n.commit_id FROM node_versions n WHERE n.state IN ('refined','corrected','superseded') AND n.superseded_by IS NOT NULL AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY n.id", [])?;
+    let links = rows(
+        db,
+        "SELECT n.id,n.version,n.state,n.superseded_by,n.commit_id FROM node_versions n WHERE n.state IN ('refined','corrected','superseded') AND n.superseded_by IS NOT NULL AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) ORDER BY n.id",
+        [],
+    )?;
     let mut next = HashMap::new();
     let mut incoming = HashMap::<String, usize>::new();
     for link in &links {
@@ -264,7 +292,9 @@ pub fn plan(db: &Connection, limit: usize, exclude: &[String], protected: &[Stri
             if guarded && protected.iter().any(|id| id == root) {
                 selected += 1;
             } else if guarded {
-                held.push(json!({"root":root,"members":members,"reasons":chain["protected_reasons"]}));
+                held.push(
+                    json!({"root":root,"members":members,"reasons":chain["protected_reasons"]}),
+                );
                 continue;
             }
             if chains.len() < limit {

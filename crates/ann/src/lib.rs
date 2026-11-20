@@ -5,10 +5,11 @@ use memento_core::{Error, EventFence, F32Blob, ModelSignature, ReadTxn, Result, 
 use qdrant_edge::{
     BoolIndexParams, CreateIndex, DEFAULT_VECTOR_NAME, Distance, EdgeConfig, EdgeConfigBuilder,
     EdgeOptimizersConfig, EdgeShard, EdgeVectorParamsBuilder, FieldIndexOperations, Filter,
-    HnswIndexConfig, KeywordIndexParams, Memory, NamedQuery, Payload, PayloadFieldSchema, PayloadSchemaParams, PayloadSchemaType, PointId,
-    PointInsertOperations, PointOperations, PointStructPersisted, QueryEnum, QueryRequestBuilder,
-    ResourceBudget, ScoringQuery, SearchParams, UpdateOperation, VectorInternal,
-    VectorStorageDatatype, VectorStructPersisted, WalOptions,
+    HnswIndexConfig, KeywordIndexParams, Memory, NamedQuery, Payload, PayloadFieldSchema,
+    PayloadSchemaParams, PayloadSchemaType, PointId, PointInsertOperations, PointOperations,
+    PointStructPersisted, QueryEnum, QueryRequestBuilder, ResourceBudget, ScoringQuery,
+    SearchParams, UpdateOperation, VectorInternal, VectorStorageDatatype, VectorStructPersisted,
+    WalOptions,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -216,7 +217,9 @@ fn lock_ready_until(shard: &Shard, deadline: Instant) -> Result<MutexGuard<'_, S
             Err(_) => {
                 // Rebuild owns State while publishing no usable Cold view. Do
                 // not wait its entire build/request deadline before reporting it.
-                if !shard.ready.load(Ordering::Acquire) { return Err(unavailable()); }
+                if !shard.ready.load(Ordering::Acquire) {
+                    return Err(unavailable());
+                }
                 check(Some(deadline))?;
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -373,12 +376,14 @@ fn indices(shard: &EdgeShard) -> Result<()> {
     ] {
         let schema = match kind {
             PayloadSchemaType::Keyword => PayloadSchemaParams::Keyword(KeywordIndexParams {
-                memory: Some(Memory::Cold), ..Default::default()
+                memory: Some(Memory::Cold),
+                ..Default::default()
             }),
             // The pinned vendor accepts Cold but implements Bool as heap/Pinned
             // RoaringFlags<MmapFile>. The lifecycle test retains this limitation.
             PayloadSchemaType::Bool => PayloadSchemaParams::Bool(BoolIndexParams {
-                memory: Some(Memory::Cold), ..Default::default()
+                memory: Some(Memory::Cold),
+                ..Default::default()
             }),
             _ => unreachable!(),
         };
@@ -526,12 +531,7 @@ impl Projection {
         let mut query=tx.sql().prepare("SELECT id,nonce,generation,vector_seq FROM projection_events WHERE tier=? AND id>? AND id<=? ORDER BY id LIMIT ?")?;
         let events = query
             .query_map(
-                params![
-                    tier.as_str(),
-                    checkpoint.cursor.id,
-                    cut.id,
-                    limit + 1
-                ],
+                params![tier.as_str(), checkpoint.cursor.id, cut.id, limit + 1],
                 |r| {
                     Ok((
                         EventFence {
@@ -595,9 +595,9 @@ impl Projection {
         let _maintenance = shard.maintenance.lock().map_err(|_| unavailable())?;
         let (result, native) = {
             let mut state = shard.state.lock().map_err(|_| unavailable())?;
-            let result = self.store.read(|tx| {
-                self.sync(tx, tier, &mut state, &shard.path, None, false, true)
-            });
+            let result = self
+                .store
+                .read(|tx| self.sync(tx, tier, &mut state, &shard.path, None, false, true));
             (result, state.shard.clone())
         };
         // Same-tier foreground reads/updates may use the native Arc during vendor
@@ -655,7 +655,9 @@ impl Projection {
                     None => break,
                     Some(seq) => {
                         after = Some(seq);
-                        if stop.load(Ordering::Acquire) { return Err(unavailable()); }
+                        if stop.load(Ordering::Acquire) {
+                            return Err(unavailable());
+                        }
                         optimize(&shard)?;
                     }
                 }
@@ -675,7 +677,9 @@ impl Projection {
                 let synced = self.store.read(|tx| {
                     self.sync(tx, tier, &mut staging_state, &staging, None, false, false)
                 })?;
-                if stop.load(Ordering::Acquire) { return Err(unavailable()); }
+                if stop.load(Ordering::Acquire) {
+                    return Err(unavailable());
+                }
                 optimize(staging_state.shard.as_deref().ok_or_else(unavailable)?)?;
                 if synced {
                     break;
@@ -712,11 +716,21 @@ impl Projection {
         }
         result
     }
-    fn sync_snapshot(&self, tx: &ReadTxn<'_>, tier: Tier, state: &mut State, deadline: Instant) -> Result<()> {
+    fn sync_snapshot(
+        &self,
+        tx: &ReadTxn<'_>,
+        tier: Tier,
+        state: &mut State,
+        deadline: Instant,
+    ) -> Result<()> {
         let shard = self.tier(tier);
         let synced = self.sync(tx, tier, state, &shard.path, Some(deadline), true, true);
-        shard.ready.store(matches!(synced, Ok(true)), Ordering::Release);
-        if !synced? { return Err(unavailable()); }
+        shard
+            .ready
+            .store(matches!(synced, Ok(true)), Ordering::Release);
+        if !synced? {
+            return Err(unavailable());
+        }
         Ok(())
     }
     /// Own every required Hot hit before releasing Hot. The same SQLite read
@@ -728,7 +742,13 @@ impl Projection {
         collect_hot: impl FnOnce(&ReadTxn<'_>, &SearchView<'_>) -> Result<H>,
         finish: impl FnOnce(&ReadTxn<'_>, H, ColdQuery<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.snapshot_hot_timed(cold, deadline, &mut SnapshotTiming::default(), collect_hot, finish)
+        self.snapshot_hot_timed(
+            cold,
+            deadline,
+            &mut SnapshotTiming::default(),
+            collect_hot,
+            finish,
+        )
     }
     /// `snapshot_hot_until` that also records lock, open and sync wall time, even on error.
     pub fn snapshot_hot_timed<H, T>(
@@ -742,7 +762,9 @@ impl Projection {
         check(Some(deadline))?;
         // Preserve cold->hot order; waiting for a Cold build never holds Hot.
         let at = Instant::now();
-        let cold_guard = cold.then(|| lock_ready_until(&self.cold, deadline)).transpose();
+        let cold_guard = cold
+            .then(|| lock_ready_until(&self.cold, deadline))
+            .transpose();
         timing.cold_lock = at.elapsed();
         let mut cold_guard = cold_guard?;
         let at = Instant::now();
@@ -769,13 +791,22 @@ impl Projection {
             synced?;
             let owned_hot = {
                 let hot_view = SearchView {
-                    hot: hot_guard.shard.as_deref(), cold: None, deadline,
+                    hot: hot_guard.shard.as_deref(),
+                    cold: None,
+                    deadline,
                 };
                 collect_hot(tx, &hot_view)?
             };
             // The borrowed view is gone; no Hot handle escapes in the owned hits.
             drop(hot_guard);
-            let value = finish(tx, owned_hot, ColdQuery { guard: cold_guard, deadline })?;
+            let value = finish(
+                tx,
+                owned_hot,
+                ColdQuery {
+                    guard: cold_guard,
+                    deadline,
+                },
+            )?;
             check(Some(deadline))?;
             Ok(value)
         })
@@ -1060,10 +1091,24 @@ mod recovery_tests {
         let (_dir, store, index) = fixture();
         add(&store, "old", 1, 0.7);
         index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
-        let before = store.read(|tx| Ok((tx.source_cut().clone(), tx.sql().query_row(
-            "SELECT embedding,current,generation FROM vector_blobs WHERE seq=1", [],
-            |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)),
-        )?))).unwrap();
+        let before = store
+            .read(|tx| {
+                Ok((
+                    tx.source_cut().clone(),
+                    tx.sql().query_row(
+                        "SELECT embedding,current,generation FROM vector_blobs WHERE seq=1",
+                        [],
+                        |r| {
+                            Ok((
+                                r.get::<_, Vec<u8>>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )?,
+                ))
+            })
+            .unwrap();
         let mut legacy = load_checkpoint(&index.hot.path).unwrap().unwrap();
         legacy.format = 2;
         persist(&index.hot.path, &legacy).unwrap();
@@ -1075,10 +1120,24 @@ mod recovery_tests {
         index.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
         assert_eq!(top(&index).unwrap(), "old");
         assert_eq!(load_checkpoint(&index.hot.path).unwrap().unwrap().format, 3);
-        let after = store.read(|tx| Ok((tx.source_cut().clone(), tx.sql().query_row(
-            "SELECT embedding,current,generation FROM vector_blobs WHERE seq=1", [],
-            |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)),
-        )?))).unwrap();
+        let after = store
+            .read(|tx| {
+                Ok((
+                    tx.source_cut().clone(),
+                    tx.sql().query_row(
+                        "SELECT embedding,current,generation FROM vector_blobs WHERE seq=1",
+                        [],
+                        |r| {
+                            Ok((
+                                r.get::<_, Vec<u8>>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )?,
+                ))
+            })
+            .unwrap();
         assert_eq!(after, before, "derived profile upgrade changed authority");
     }
     #[test]
@@ -1092,16 +1151,24 @@ mod recovery_tests {
         let (release_tx, release_rx) = mpsc::channel();
         let background = {
             let index = index.clone();
-            std::thread::spawn(move || index.synchronize_with(Tier::Hot, |shard| {
-                entered_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                optimize(shard)
-            }))
+            std::thread::spawn(move || {
+                index.synchronize_with(Tier::Hot, |shard| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    optimize(shard)
+                })
+            })
         };
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(index.hot.maintenance.try_lock().is_err());
-        assert!(index.hot.state.try_lock().is_ok(), "State held during native maintenance");
-        assert!(index.cold.maintenance.try_lock().is_ok(), "maintenance crossed tiers");
+        assert!(
+            index.hot.state.try_lock().is_ok(),
+            "State held during native maintenance"
+        );
+        assert!(
+            index.cold.maintenance.try_lock().is_ok(),
+            "maintenance crossed tiers"
+        );
         // A fresh authoritative mutation and foreground fence/query must proceed
         // while maintenance is paused; no SQL read transaction/State guard remains.
         add(&store, "new", 2, 0.9);
@@ -1118,104 +1185,189 @@ mod recovery_tests {
             })
         };
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(matches!(finished_rx.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)), "rebuild reused path during old-Arc maintenance");
-        assert!(Arc::ptr_eq(index.hot.state.lock().unwrap().shard.as_ref().unwrap(), &native));
+        assert!(
+            matches!(
+                finished_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "rebuild reused path during old-Arc maintenance"
+        );
+        assert!(Arc::ptr_eq(
+            index.hot.state.lock().unwrap().shard.as_ref().unwrap(),
+            &native
+        ));
         release_tx.send(()).unwrap();
         assert!(background.join().unwrap().unwrap());
         rebuilding.join().unwrap().unwrap();
-        assert!(!Arc::ptr_eq(index.hot.state.lock().unwrap().shard.as_ref().unwrap(), &native));
+        assert!(!Arc::ptr_eq(
+            index.hot.state.lock().unwrap().shard.as_ref().unwrap(),
+            &native
+        ));
         assert_eq!(top(&index).unwrap(), "new");
     }
     #[test]
     fn below_threshold_bulk_build_flushes_before_ready_checkpoint_without_wal_replay() {
         fn disk_version(path: &Path) -> u64 {
-            let versions:Vec<_> = std::fs::read_dir(path.join("edge/segments")).unwrap()
-                .map(|entry|entry.unwrap().path())
-                .filter(|path|path.join("version.info").is_file())
-                .map(|path|serde_json::from_slice::<qdrant_edge::SegmentState>(
-                    &std::fs::read(path.join("segment.json")).unwrap()).unwrap().version.unwrap())
+            let versions: Vec<_> = std::fs::read_dir(path.join("edge/segments"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.join("version.info").is_file())
+                .map(|path| {
+                    serde_json::from_slice::<qdrant_edge::SegmentState>(
+                        &std::fs::read(path.join("segment.json")).unwrap(),
+                    )
+                    .unwrap()
+                    .version
+                    .unwrap()
+                })
                 .collect();
-            assert_eq!(versions.len(),1,"tiny fixture must remain appendable");
+            assert_eq!(versions.len(), 1, "tiny fixture must remain appendable");
             versions[0]
         }
         let (_dir, store, index) = fixture();
-        add(&store,"durable",1,0.7);
-        let path=index.hot.path.with_file_name("unpublished-flush-proof");
+        add(&store, "durable", 1, 0.7);
+        let path = index.hot.path.with_file_name("unpublished-flush-proof");
         std::fs::create_dir(&path).unwrap();
-        let native=EdgeShard::new(&path.join("edge"),config()).unwrap();
+        let native = EdgeShard::new(&path.join("edge"), config()).unwrap();
         indices(&native).unwrap();
         native.flush().unwrap();
-        let before=disk_version(&path);
-        let mut checkpoint=store.read(|tx| {
-            let checkpoint=Checkpoint {format:PROJECTION_FORMAT,db_uuid:tx.source_cut().db_uuid.clone(),
-                signature:ModelSignature::pinned(),tier:Tier::Hot,cursor:tx.fence(Tier::Hot)?,
-                pending:None,building:true};
-            persist(&path,&checkpoint)?;
-            upsert(&native,tx,&rows(tx,Tier::Hot,None,None)?)?;
-            Ok(checkpoint)
-        }).unwrap();
+        let before = disk_version(&path);
+        let mut checkpoint = store
+            .read(|tx| {
+                let checkpoint = Checkpoint {
+                    format: PROJECTION_FORMAT,
+                    db_uuid: tx.source_cut().db_uuid.clone(),
+                    signature: ModelSignature::pinned(),
+                    tier: Tier::Hot,
+                    cursor: tx.fence(Tier::Hot)?,
+                    pending: None,
+                    building: true,
+                };
+                persist(&path, &checkpoint)?;
+                upsert(&native, tx, &rows(tx, Tier::Hot, None, None)?)?;
+                Ok(checkpoint)
+            })
+            .unwrap();
         optimize(&native).unwrap();
-        assert_eq!(disk_version(&path),before,"unchanged optimizer unexpectedly force-flushed");
+        assert_eq!(
+            disk_version(&path),
+            before,
+            "unchanged optimizer unexpectedly force-flushed"
+        );
         assert!(load_checkpoint(&path).unwrap().unwrap().building);
-        finish_build(&native,&path,&mut checkpoint).unwrap();
+        finish_build(&native, &path, &mut checkpoint).unwrap();
         // Check actual persisted segment state BEFORE load can replay/flush WAL.
-        assert!(disk_version(&path)>before,"ready checkpoint preceded bulk data flush");
+        assert!(
+            disk_version(&path) > before,
+            "ready checkpoint preceded bulk data flush"
+        );
         assert!(!load_checkpoint(&path).unwrap().unwrap().building);
         drop(native);
-        let native=EdgeShard::load(&path.join("edge"),None).unwrap();
-        let mut query=[0.;768];query[0]=1.;
-        let view=SearchView {hot:Some(&native),cold:None,deadline:Instant::now()+Duration::from_secs(2)};
-        let hits=view.search(Tier::Hot,&query,1,"node",Pool::Ordinary,Some("personal"),None).unwrap();
-        assert_eq!(hits[0].target,"durable");
-        assert!((hits[0].cosine-0.7).abs()<1e-6);
+        let native = EdgeShard::load(&path.join("edge"), None).unwrap();
+        let mut query = [0.; 768];
+        query[0] = 1.;
+        let view = SearchView {
+            hot: Some(&native),
+            cold: None,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        let hits = view
+            .search(
+                Tier::Hot,
+                &query,
+                1,
+                "node",
+                Pool::Ordinary,
+                Some("personal"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(hits[0].target, "durable");
+        assert!((hits[0].cosine - 0.7).abs() < 1e-6);
     }
     #[test]
     fn cold_rebuild_unavailable_returns_without_waiting_or_blocking_hot() {
         use std::sync::mpsc;
         let (_dir, store, index) = fixture();
-        add(&store,"curated",1,0.9);
-        for tier in [Tier::Hot,Tier::Cold] {
-            index.rebuild(tier,&AtomicBool::new(false)).unwrap();
+        add(&store, "curated", 1, 0.9);
+        for tier in [Tier::Hot, Tier::Cold] {
+            index.rebuild(tier, &AtomicBool::new(false)).unwrap();
         }
         // Pause the exact Cold rebuild ownership boundary; no Hot lock is held.
-        let maintenance=index.cold.maintenance.lock().unwrap();
-        let cold=index.cold.state.lock().unwrap();
-        let (started_tx,started_rx)=mpsc::channel();
-        let (result_tx,result_rx)=mpsc::channel();
-        let callbacks=Arc::new(AtomicBool::new(false));
-        let workers:Vec<_>=[false,true].into_iter().map(|owned| {
-            let index=index.clone();let started=started_tx.clone();
-            let result=result_tx.clone();let callbacks=callbacks.clone();
-            std::thread::spawn(move || {
-                started.send(()).unwrap();
-                let deadline=Instant::now()+Duration::from_secs(10);
-                let value=if owned {
-                    index.snapshot_hot_until(true,deadline,|_,_| {
-                        callbacks.store(true,Ordering::Release);Ok(())
-                    },|_,(),_|Ok(()))
-                } else {
-                    index.snapshot_until(true,true,deadline,|_,_| {
-                        callbacks.store(true,Ordering::Release);Ok(())
-                    })
-                };
-                result.send(matches!(value,Err(Error::Unavailable("Semantic search is not ready")))).unwrap();
+        let maintenance = index.cold.maintenance.lock().unwrap();
+        let cold = index.cold.state.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let callbacks = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = [false, true]
+            .into_iter()
+            .map(|owned| {
+                let index = index.clone();
+                let started = started_tx.clone();
+                let result = result_tx.clone();
+                let callbacks = callbacks.clone();
+                std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let value = if owned {
+                        index.snapshot_hot_until(
+                            true,
+                            deadline,
+                            |_, _| {
+                                callbacks.store(true, Ordering::Release);
+                                Ok(())
+                            },
+                            |_, (), _| Ok(()),
+                        )
+                    } else {
+                        index.snapshot_until(true, true, deadline, |_, _| {
+                            callbacks.store(true, Ordering::Release);
+                            Ok(())
+                        })
+                    };
+                    result
+                        .send(matches!(
+                            value,
+                            Err(Error::Unavailable("Semantic search is not ready"))
+                        ))
+                        .unwrap();
+                })
             })
-        }).collect();
-        for _ in 0..2 {started_rx.recv_timeout(Duration::from_secs(5)).unwrap();}
+            .collect();
+        for _ in 0..2 {
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
         // Covers readiness becoming false while the lock is contended, as well
         // as a request arriving after rebuild has already announced unavailability.
-        index.cold.ready.store(false,Ordering::Release);
-        let first=result_rx.recv_timeout(Duration::from_secs(1));
-        let second=result_rx.recv_timeout(Duration::from_secs(1));
-        let hot=top(&index);
-        drop(cold);drop(maintenance);
-        index.cold.ready.store(true,Ordering::Release);
-        for worker in workers {worker.join().unwrap();}
-        assert_eq!(first.unwrap(),true,"Cold request waited for rebuild State");
-        assert_eq!(second.unwrap(),true,"Cold request waited for rebuild State");
-        assert!(!callbacks.load(Ordering::Acquire),"unavailable Cold invoked snapshot callbacks");
-        assert_eq!(hot.unwrap(),"curated","Cold rebuild blocked available Hot results");
+        index.cold.ready.store(false, Ordering::Release);
+        let first = result_rx.recv_timeout(Duration::from_secs(1));
+        let second = result_rx.recv_timeout(Duration::from_secs(1));
+        let hot = top(&index);
+        drop(cold);
+        drop(maintenance);
+        index.cold.ready.store(true, Ordering::Release);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            first.unwrap(),
+            true,
+            "Cold request waited for rebuild State"
+        );
+        assert_eq!(
+            second.unwrap(),
+            true,
+            "Cold request waited for rebuild State"
+        );
+        assert!(
+            !callbacks.load(Ordering::Acquire),
+            "unavailable Cold invoked snapshot callbacks"
+        );
+        assert_eq!(
+            hot.unwrap(),
+            "curated",
+            "Cold rebuild blocked available Hot results"
+        );
     }
 }
 

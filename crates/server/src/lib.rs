@@ -3,8 +3,8 @@ mod anchors;
 pub mod assets;
 pub mod bootstrap;
 mod connect_guide;
-mod index_counts;
 mod drive_api;
+mod index_counts;
 pub mod indexing;
 mod legacy_text;
 pub mod mcp;
@@ -35,11 +35,11 @@ use axum::{
 };
 use futures_util::StreamExt;
 use memento_core::{Error, Result, Store, capture::EpisodeInput};
-use recall_timings::RecallTimings;
 use memento_domain::{
     Graph, dto,
     processing::{self, Processing},
 };
+use recall_timings::RecallTimings;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
@@ -252,18 +252,35 @@ impl AppState {
         }
         self.processing.queue.submit_media(&command)
     }
-    fn seed_recall_repairs(&self, rows: &[Value], scope: Option<String>) -> Option<std::thread::JoinHandle<()>> {
-        let clusters: Vec<Vec<String>> = rows.iter().filter_map(|row| {
-            // Same-spelled anchors and identical-text rows collapsed by automatic recall.
-            let others = row["same_name_ids"].as_array().into_iter().flatten();
-            let copies = (row["type"] != "media").then(|| row["duplicate_ids"].as_array()).flatten().into_iter().flatten();
-            let mut ids: Vec<String> = others.chain(copies).filter_map(Value::as_str).map(str::to_owned).collect();
-            ids.push(row["id"].as_str()?.to_owned());
-            ids.sort();
-            ids.dedup();
-            (ids.len() >= 2).then_some(ids)
-        }).collect();
-        if clusters.is_empty() { return None; }
+    fn seed_recall_repairs(
+        &self,
+        rows: &[Value],
+        scope: Option<String>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let clusters: Vec<Vec<String>> = rows
+            .iter()
+            .filter_map(|row| {
+                // Same-spelled anchors and identical-text rows collapsed by automatic recall.
+                let others = row["same_name_ids"].as_array().into_iter().flatten();
+                let copies = (row["type"] != "media")
+                    .then(|| row["duplicate_ids"].as_array())
+                    .flatten()
+                    .into_iter()
+                    .flatten();
+                let mut ids: Vec<String> = others
+                    .chain(copies)
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                ids.push(row["id"].as_str()?.to_owned());
+                ids.sort();
+                ids.dedup();
+                (ids.len() >= 2).then_some(ids)
+            })
+            .collect();
+        if clusters.is_empty() {
+            return None;
+        }
         let state = self.clone();
         std::thread::Builder::new().name("recall-repair".into()).spawn(move || {
             use sha2::{Digest, Sha256};
@@ -496,7 +513,10 @@ async fn admission(State(state): State<AppState>, request: Request, next: Next) 
         !origin
             .to_str()
             .ok()
-            .and_then(|o| o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")))
+            .and_then(|o| {
+                o.strip_prefix("https://")
+                    .or_else(|| o.strip_prefix("http://"))
+            })
             .is_some_and(|host| trusted_host(&state.allowed_hosts, host))
     });
     if untrusted {
@@ -745,8 +765,7 @@ async fn recall(
     let Query(query) = query.map_err(|_| ApiError(Error::Validation("Invalid recall query")))?;
     let revision = state.assets.revision.clone();
     let started = Instant::now();
-    let deadline =
-        started + std::time::Duration::from_secs(if query.automatic { 15 } else { 30 });
+    let deadline = started + std::time::Duration::from_secs(if query.automatic { 15 } else { 30 });
     let (memories, timings) = blocking(move || {
         let timings = RecallTimings::default();
         timings.lap(recall_timings::Stage::Queue, started);

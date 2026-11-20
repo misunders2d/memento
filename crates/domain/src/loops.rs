@@ -508,7 +508,9 @@ pub fn mark(
         if parse_time(get_str(&row, "occurred_at")?)? > boundary {
             let incoming = evidence_loop.and_then(|value| value["due_at"].as_str());
             // A manual reminder survives reopening by automatically dated evidence.
-            let due = if manual_due(tx.sql(), target)? && !manual_due(tx.sql(), evidence_target.unwrap())? {
+            let due = if manual_due(tx.sql(), target)?
+                && !manual_due(tx.sql(), evidence_target.unwrap())?
+            {
                 previous["due_at"].as_str().or(incoming)
             } else {
                 incoming.or_else(|| previous["due_at"].as_str())
@@ -568,8 +570,13 @@ pub fn automatic_due(
         return Ok("unchanged");
     }
     if manual_due(tx.sql(), target)?
-        || origin.map(|origin| manual_due(tx.sql(), origin)).transpose()? == Some(true)
-        || marker["deferred_until"].as_str().is_some_and(|until| until > now().as_str())
+        || origin
+            .map(|origin| manual_due(tx.sql(), origin))
+            .transpose()?
+            == Some(true)
+        || marker["deferred_until"]
+            .as_str()
+            .is_some_and(|until| until > now().as_str())
     {
         return Ok("protected_loop_choice");
     }
@@ -578,7 +585,14 @@ pub fn automatic_due(
             return Ok(status);
         }
     }
-    append(tx, commit, target, "open", Some(due), marker["deferred_until"].as_str())?;
+    append(
+        tx,
+        commit,
+        target,
+        "open",
+        Some(due),
+        marker["deferred_until"].as_str(),
+    )?;
     Ok("updated")
 }
 pub fn decline_extracted(tx: &WriteTxn, commit: &str, target: &str) -> Result<bool> {
@@ -623,9 +637,11 @@ pub fn decline_automatic(
     // A version appended by this transaction has no graph_commits row yet; its
     // guard fields need no committed-history summary. Any other version still
     // resolves through the committed viewer target.
-    let pending = one(tx.sql(),
+    let pending = one(
+        tx.sql(),
         "SELECT n.* FROM node_versions n WHERE n.id=? AND n.commit_id=? AND n.state='active' AND n.version=(SELECT max(v.version) FROM node_versions v WHERE v.id=n.id)",
-        params![target, commit])?;
+        params![target, commit],
+    )?;
     let n = match pending {
         Some(node) => Some(node),
         None => self::target(tx.sql(), target)?,
@@ -644,9 +660,9 @@ pub fn decline_automatic(
     if (n["state"] != "active" && n["tier"] != "candidate")
         || protected(tx.sql(), &n)?
         || !live["manual_choice_at"].is_null()
-        || marker.as_ref().is_none_or(|value| {
-            value["state"] != "open" || !value["deferred_until"].is_null()
-        })
+        || marker
+            .as_ref()
+            .is_none_or(|value| value["state"] != "open" || !value["deferred_until"].is_null())
     {
         return Ok(json!({"id":target,"status":"protected_loop_choice"}));
     }

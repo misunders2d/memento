@@ -34,8 +34,7 @@ fn protect(mut response: Response, cache: &'static str) -> Response {
     response
 }
 fn host(state: &AppState, headers: &HeaderMap) -> Result<()> {
-    if !crate::single_host(headers).is_some_and(|h| viewer::host_allowed(h, &state.allowed_hosts))
-    {
+    if !crate::single_host(headers).is_some_and(|h| viewer::host_allowed(h, &state.allowed_hosts)) {
         return Err(Error::Validation("Viewer host is not allowed"));
     }
     Ok(())
@@ -292,12 +291,7 @@ pub async fn processing(State(state): State<AppState>, headers: HeaderMap) -> Re
                 RuntimeStatus::disabled().indexing
             };
             state.store.read(|tx| {
-                operational_status::processing_summary(
-                    tx.sql(),
-                    &indexing,
-                    now,
-                    chrono::Utc::now(),
-                )
+                operational_status::processing_summary(tx.sql(), &indexing, now, chrono::Utc::now())
             })
         })
         .await,

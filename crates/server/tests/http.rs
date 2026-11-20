@@ -295,7 +295,16 @@ async fn actual_mcp_lists_shared_tools_normalizes_only_optional_empties_and_wrap
         .collect::<Vec<_>>();
     assert_eq!(
         names,
-        ["recall", "remember", "link", "supersede", "reconcile", "history", "loop", "work"]
+        [
+            "recall",
+            "remember",
+            "link",
+            "supersede",
+            "reconcile",
+            "history",
+            "loop",
+            "work"
+        ]
     );
     let command = json!({"command_id":"tool-save","actor":"synthetic","why":"Grounded fixture","type":"knowledge","text":"Remembered source","scope":["personal"],"valid_from":"","source":"","conversation_id":"","evidence":[{"episode_id":created["id"],"quote":"Exact quoted source"}]});
     let saved = rpc(
@@ -334,48 +343,78 @@ async fn actual_mcp_lists_shared_tools_normalizes_only_optional_empties_and_wrap
 
 #[tokio::test]
 async fn shared_processing_tool_uses_checked_api_and_one_evidence_envelope() {
-    let (_dir,state)=fixture();
-    request(&state,"POST","/episodes",Some(capture("🧠 The synthetic laboratory uses a copper spectrometer."))).await;
+    let (_dir, state) = fixture();
+    request(
+        &state,
+        "POST",
+        "/episodes",
+        Some(capture(
+            "🧠 The synthetic laboratory uses a copper spectrometer.",
+        )),
+    )
+    .await;
     let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"pool","command":{"kind":"extract","policies":true}}})).await;
-    assert_eq!(response["result"]["isError"],false);
+    assert_eq!(response["result"]["isError"], false);
     assert!(response["result"].get("structuredContent").is_none());
-    let page:Value=serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(page["worker_protocol"],1);
-    assert_eq!(page["items"].as_array().unwrap().len(),1);
+    let page: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(page["worker_protocol"], 1);
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
     assert!(page["items"][0].get("text").is_none());
-    assert_eq!(page["policy_pages"]["consolidate"]["policy"],"consolidate");
-    let mut after=0;
-    let mut policy=String::new();
+    assert_eq!(page["policy_pages"]["consolidate"]["policy"], "consolidate");
+    let mut after = 0;
+    let mut policy = String::new();
     loop {
         let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"read","command":{"policy":"consolidate","after":after}}})).await;
-        let text=response["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.len()<16_000);
-        let part:Value=serde_json::from_str(text).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() < 16_000);
+        let part: Value = serde_json::from_str(text).unwrap();
         policy.push_str(part["text"].as_str().unwrap());
-        if part["next"].is_null(){break;}
-        after=part["next"].as_u64().unwrap();
+        if part["next"].is_null() {
+            break;
+        }
+        after = part["next"].as_u64().unwrap();
     }
-    let policy:Value=serde_json::from_str(&policy).unwrap();
-    assert_eq!(policy["schema"]["properties"]["actions"]["maxItems"],128);
+    let policy: Value = serde_json::from_str(&policy).unwrap();
+    assert_eq!(policy["schema"]["properties"]["actions"]["maxItems"], 128);
     let (_,bad)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"pool","command":{"kind":"extract","path":"/private"}}})).await;
-    assert_eq!(bad["result"]["isError"],true);
-    let (status,_)=request(&state,"POST","/work",Some(json!({"action":"pool","command":{"kind":"extract"}}))).await;
-    assert_eq!(status,StatusCode::OK);
+    assert_eq!(bad["result"]["isError"], true);
+    let (status, _) = request(
+        &state,
+        "POST",
+        "/work",
+        Some(json!({"action":"pool","command":{"kind":"extract"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"claim","command":{"agent":"fixture","timezone":"UTC","kinds":["extract"],"compaction":{"source":"native:synthetic:pi","conversation_id":"thread"}}}})).await;
-    let claim:Value=serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    let mut read=claim["work"][0]["read"].clone();
+    let claim: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let mut read = claim["work"][0]["read"].clone();
     assert!(claim["work"][0].get("input").is_none());
-    read["limit"]=json!(61);
-    let mut payload=String::new();
+    read["limit"] = json!(61);
+    let mut payload = String::new();
     loop {
-        let (_,response)=rpc(&state,"tools/call",json!({"name":"work","arguments":{"action":"read","command":read}})).await;
-        let part:Value=serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let (_, response) = rpc(
+            &state,
+            "tools/call",
+            json!({"name":"work","arguments":{"action":"read","command":read}}),
+        )
+        .await;
+        let part: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
         payload.push_str(part["text"].as_str().unwrap());
-        if part["next"].is_null(){break;}
-        read["after"]=part["next"].clone();
+        if part["next"].is_null() {
+            break;
+        }
+        read["after"] = part["next"].clone();
     }
-    let restored:Value=serde_json::from_str(&payload).unwrap();
-    assert_eq!(restored["input"]["windows"][0]["text"],"🧠 The synthetic laboratory uses a copper spectrometer.");
+    let restored: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        restored["input"]["windows"][0]["text"],
+        "🧠 The synthetic laboratory uses a copper spectrometer."
+    );
 }
 #[tokio::test]
 async fn actual_mcp_scoped_recall_validates_since_before_dispatch() {
@@ -425,7 +464,10 @@ async fn send(
     kind: Option<&str>,
     body: &str,
 ) -> axum::response::Response {
-    let mut builder = Request::builder().method(method).uri(path).header("host", host);
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", host);
     if let Some(origin) = origin {
         builder = builder.header("origin", origin);
     }
@@ -442,8 +484,19 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
     let (_dir, mut state) = fixture();
     // A tailnet-only allowlist must keep loopback trusted: the container health check uses it.
     state.allowed_hosts = std::sync::Arc::new(vec!["zen.example.ts.net".into()]);
-    for host in ["127.0.0.1:8765", "localhost:8765", "[::1]:8765", "zen.example.ts.net"] {
-        assert_eq!(send(&state, "GET", "/health", host, None, None, "").await.status(), StatusCode::OK, "{host}");
+    for host in [
+        "127.0.0.1:8765",
+        "localhost:8765",
+        "[::1]:8765",
+        "zen.example.ts.net",
+    ] {
+        assert_eq!(
+            send(&state, "GET", "/health", host, None, None, "")
+                .await
+                .status(),
+            StatusCode::OK,
+            "{host}"
+        );
     }
     let routes: [(&str, &str, Option<&str>, &str); 14] = [
         ("GET", "/health", None, ""),
@@ -459,36 +512,132 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
         ("POST", "/work", Some("application/json"), "{}"),
         ("POST", "/blobs", Some("application/pdf"), "bytes"),
         ("POST", "/mcp/", Some("application/json"), "{}"),
-        ("POST", "/drive/connect/begin", Some("application/json"), "{}"),
+        (
+            "POST",
+            "/drive/connect/begin",
+            Some("application/json"),
+            "{}",
+        ),
     ];
     for (method, path, kind, body) in routes {
-        for host in ["evil.example", "zen.example.ts.net.evil.example", "evil.example@127.0.0.1"] {
+        for host in [
+            "evil.example",
+            "zen.example.ts.net.evil.example",
+            "evil.example@127.0.0.1",
+        ] {
             let response = send(&state, method, path, host, None, kind, body).await;
-            assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST, "{method} {path} {host}");
+            assert_eq!(
+                response.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "{method} {path} {host}"
+            );
             assert_eq!(response.headers()["cache-control"], "no-store");
         }
-        for origin in ["https://evil.example", "null", "file://", "https://zen.example.ts.net.evil.example"] {
-            let response = send(&state, method, path, "127.0.0.1:8765", Some(origin), kind, body).await;
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path} {origin}");
+        for origin in [
+            "https://evil.example",
+            "null",
+            "file://",
+            "https://zen.example.ts.net.evil.example",
+        ] {
+            let response = send(
+                &state,
+                method,
+                path,
+                "127.0.0.1:8765",
+                Some(origin),
+                kind,
+                body,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} {origin}"
+            );
         }
     }
-    for path in ["/episodes", "/remember", "/work", "/work/claim", "/usage", "/drive/connect/begin"] {
-        for kind in [None, Some("text/plain"), Some("application/x-www-form-urlencoded")] {
+    for path in [
+        "/episodes",
+        "/remember",
+        "/work",
+        "/work/claim",
+        "/usage",
+        "/drive/connect/begin",
+    ] {
+        for kind in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+        ] {
             let response = send(&state, "POST", path, "127.0.0.1:8765", None, kind, "{}").await;
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path} {kind:?}");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path} {kind:?}"
+            );
         }
     }
     let typeless = serde_json::to_string(&capture("Typeless capture is refused")).unwrap();
-    assert_eq!(send(&state, "POST", "/episodes", "127.0.0.1:8765", None, None, &typeless).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(request(&state, "GET", "/status", None).await.1["captured"]["episodes"], 0);
+    assert_eq!(
+        send(
+            &state,
+            "POST",
+            "/episodes",
+            "127.0.0.1:8765",
+            None,
+            None,
+            &typeless
+        )
+        .await
+        .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        request(&state, "GET", "/status", None).await.1["captured"]["episodes"],
+        0
+    );
     for (host, origin, kind) in [
-        ("zen.example.ts.net", Some("https://zen.example.ts.net"), "application/json"),
-        ("127.0.0.1:8765", Some("http://127.0.0.1:8765"), "application/vnd.memento+json; charset=utf-8"),
+        (
+            "zen.example.ts.net",
+            Some("https://zen.example.ts.net"),
+            "application/json",
+        ),
+        (
+            "127.0.0.1:8765",
+            Some("http://127.0.0.1:8765"),
+            "application/vnd.memento+json; charset=utf-8",
+        ),
     ] {
-        assert!(send(&state, "POST", "/episodes", host, origin, Some(kind), &typeless).await.status().is_success(), "{host}");
+        assert!(
+            send(
+                &state,
+                "POST",
+                "/episodes",
+                host,
+                origin,
+                Some(kind),
+                &typeless
+            )
+            .await
+            .status()
+            .is_success(),
+            "{host}"
+        );
     }
-    assert_eq!(request(&state, "GET", "/status", None).await.1["captured"]["episodes"], 1);
-    let blob = send(&state, "POST", "/blobs", "zen.example.ts.net", None, Some("application/pdf"), "synthetic bytes").await;
+    assert_eq!(
+        request(&state, "GET", "/status", None).await.1["captured"]["episodes"],
+        1
+    );
+    let blob = send(
+        &state,
+        "POST",
+        "/blobs",
+        "zen.example.ts.net",
+        None,
+        Some("application/pdf"),
+        "synthetic bytes",
+    )
+    .await;
     assert_eq!(blob.status(), StatusCode::CREATED);
     // A duplicated Origin header cannot hide a foreign value behind a trusted first one.
     let response = router(state.clone())
@@ -508,7 +657,11 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
     for (host, origin, expected) in [
         ("zen.example.ts.net", None, StatusCode::OK),
         ("127.0.0.1:8765", None, StatusCode::MISDIRECTED_REQUEST),
-        ("zen.example.ts.net", Some("http://127.0.0.1:8765"), StatusCode::FORBIDDEN),
+        (
+            "zen.example.ts.net",
+            Some("http://127.0.0.1:8765"),
+            StatusCode::FORBIDDEN,
+        ),
     ] {
         let mut builder = Request::post("/mcp/")
             .header("host", host)
@@ -517,24 +670,51 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
         if let Some(origin) = origin {
             builder = builder.header("origin", origin);
         }
-        let response = router(state.clone()).oneshot(builder.body(Body::from(initialize)).unwrap()).await.unwrap();
+        let response = router(state.clone())
+            .oneshot(builder.body(Body::from(initialize)).unwrap())
+            .await
+            .unwrap();
         assert_eq!(response.status(), expected, "{host} {origin:?}");
         if expected != StatusCode::OK {
-            assert_eq!(response.headers()["cache-control"], "no-store", "{host} {origin:?}");
+            assert_eq!(
+                response.headers()["cache-control"],
+                "no-store",
+                "{host} {origin:?}"
+            );
         }
     }
     // MCP refuses the loopback Host before judging the body: typeless loopback POST is 421, not 400.
-    let response = send(&state, "POST", "/mcp/", "127.0.0.1:8765", None, None, initialize).await;
+    let response = send(
+        &state,
+        "POST",
+        "/mcp/",
+        "127.0.0.1:8765",
+        None,
+        None,
+        initialize,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
     assert_eq!(response.headers()["cache-control"], "no-store");
     // A repeated Host header is never trusted, even when every value is trusted.
-    for (path, extra) in [("/health", "evil.example"), ("/mcp/", "evil.example"), ("/health", "127.0.0.1:8765")] {
+    for (path, extra) in [
+        ("/health", "evil.example"),
+        ("/mcp/", "evil.example"),
+        ("/health", "127.0.0.1:8765"),
+    ] {
         let response = router(state.clone())
             .oneshot(
                 Request::builder()
                     .method(if path == "/mcp/" { "POST" } else { "GET" })
                     .uri(path)
-                    .header("host", if path == "/mcp/" { "zen.example.ts.net" } else { "127.0.0.1:8765" })
+                    .header(
+                        "host",
+                        if path == "/mcp/" {
+                            "zen.example.ts.net"
+                        } else {
+                            "127.0.0.1:8765"
+                        },
+                    )
                     .header("host", extra)
                     .header("content-type", "application/json")
                     .header("accept", "application/json, text/event-stream")
@@ -543,7 +723,11 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST, "{path} {extra}");
+        assert_eq!(
+            response.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "{path} {extra}"
+        );
     }
     // A trusted first Origin cannot carry a loopback Origin past MCP's stricter rule.
     let response = router(state.clone())
@@ -561,7 +745,16 @@ async fn router_wide_admission_denies_untrusted_host_origin_and_typeless_json() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     // Drive's runner-only route still refuses even a trusted browser Origin.
-    let response = send(&state, "POST", "/drive/connect/begin", "127.0.0.1:8765", Some("http://127.0.0.1:8765"), Some("application/json"), r#"{"callback_port":12345}"#).await;
+    let response = send(
+        &state,
+        "POST",
+        "/drive/connect/begin",
+        "127.0.0.1:8765",
+        Some("http://127.0.0.1:8765"),
+        Some("application/json"),
+        r#"{"callback_port":12345}"#,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(response.headers()["cache-control"], "no-store");
 }
@@ -877,7 +1070,12 @@ async fn configured_bare_mcp_hosts_accept_valid_ports_and_reject_host_origin_con
         );
     }
     let response = router(state)
-        .oneshot(Request::get("/client-release").header("host", "127.0.0.1:8765").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/client-release")
+                .header("host", "127.0.0.1:8765")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.headers()["cache-control"], "no-store");
@@ -936,14 +1134,26 @@ async fn strict_json_media_and_drive_validation_fail_before_authority_or_provide
 async fn explicit_reconcile_http_and_mcp_preserve_the_private_review_boundary() {
     for transport in ["http", "mcp"] {
         let (_dir, state) = fixture();
-        let (_, episode) = request(&state, "POST", "/episodes", Some(capture("Vega Incorporated is Vega."))).await;
+        let (_, episode) = request(
+            &state,
+            "POST",
+            "/episodes",
+            Some(capture("Vega Incorporated is Vega.")),
+        )
+        .await;
         let mut ids = Vec::new();
         for name in ["Vega", "Vega Incorporated"] {
-            let (status, node) = request(&state, "POST", "/remember", Some(json!({
-                "command_id":name,"actor":"fixture","why":"Original identity evidence",
-                "type":"organization","text":name,"scope":["professional"],
-                "evidence":[{"episode_id":episode["id"],"quote":"Vega Incorporated is Vega."}]
-            }))).await;
+            let (status, node) = request(
+                &state,
+                "POST",
+                "/remember",
+                Some(json!({
+                    "command_id":name,"actor":"fixture","why":"Original identity evidence",
+                    "type":"organization","text":name,"scope":["professional"],
+                    "evidence":[{"episode_id":episode["id"],"quote":"Vega Incorporated is Vega."}]
+                })),
+            )
+            .await;
             assert_eq!(status, StatusCode::OK);
             ids.push(node["id"].as_str().unwrap().to_owned());
         }
@@ -953,22 +1163,40 @@ async fn explicit_reconcile_http_and_mcp_preserve_the_private_review_boundary() 
             "evidence":[{"quote":"Vega Incorporated is Vega."}]});
         let mut bypass = command.clone();
         bypass["approved"] = json!(true);
-        assert_eq!(request(&state, "POST", "/reconcile", Some(bypass)).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            request(&state, "POST", "/reconcile", Some(bypass)).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
         let mut stale = command.clone();
         stale["expected_versions"][&ids[0]] = json!(2);
-        assert_eq!(request(&state, "POST", "/reconcile", Some(stale)).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            request(&state, "POST", "/reconcile", Some(stale)).await.0,
+            StatusCode::CONFLICT
+        );
         let result = if transport == "http" {
             let response = request(&state, "POST", "/reconcile", Some(command.clone())).await;
             assert_eq!(response.0, StatusCode::OK);
-            assert_eq!(request(&state, "POST", "/reconcile", Some(command)).await.1, response.1);
+            assert_eq!(
+                request(&state, "POST", "/reconcile", Some(command)).await.1,
+                response.1
+            );
             response.1
         } else {
-            let response = rpc(&state, "tools/call", json!({"name":"reconcile","arguments":{"command":command}})).await.1;
+            let response = rpc(
+                &state,
+                "tools/call",
+                json!({"name":"reconcile","arguments":{"command":command}}),
+            )
+            .await
+            .1;
             assert_eq!(response["result"]["isError"], false, "{response}");
             response["result"]["structuredContent"].clone()
         };
         assert_eq!(result["status"], "absorbed", "{result}");
         let (_, history) = request(&state, "GET", &format!("/history/{}", ids[1]), None).await;
-        assert_eq!(history["versions"].as_array().unwrap().last().unwrap()["state"], "merged");
+        assert_eq!(
+            history["versions"].as_array().unwrap().last().unwrap()["state"],
+            "merged"
+        );
     }
 }

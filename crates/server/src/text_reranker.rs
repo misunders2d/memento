@@ -117,7 +117,9 @@ impl TextReranker {
     /// Load only pinned local FP32 assets. Performs no network/authority access.
     pub fn load(root: &Path, runtime_library: &Path, threads: usize) -> Result<Self> {
         if !(1..=8).contains(&threads) {
-            return Err(Error::Validation("MEMENTO_TEXT_SCORER_THREADS must be 1..8"));
+            return Err(Error::Validation(
+                "MEMENTO_TEXT_SCORER_THREADS must be 1..8",
+            ));
         }
         for asset in ASSETS {
             if !bootstrap::verify(&root.join(asset.path), asset)? {
@@ -302,7 +304,12 @@ mod tests {
             "New York City is famous for the Metropolitan Museum of Art.",
         ];
         let before = scorer
-            .score(query, &documents, Instant::now() + Duration::from_secs(30), &mut Duration::default())
+            .score(
+                query,
+                &documents,
+                Instant::now() + Duration::from_secs(30),
+                &mut Duration::default(),
+            )
             .unwrap();
         assert_eq!(before.len(), 2);
         assert!(before[0] > before[1]);
@@ -334,9 +341,18 @@ mod tests {
                     .is_err()
             );
         }
-        assert!(scorer.score(query, &documents, Instant::now(), &mut Duration::default()).is_err());
+        assert!(
+            scorer
+                .score(query, &documents, Instant::now(), &mut Duration::default())
+                .is_err()
+        );
         let after = scorer
-            .score(query, &documents, Instant::now() + Duration::from_secs(30), &mut Duration::default())
+            .score(
+                query,
+                &documents,
+                Instant::now() + Duration::from_secs(30),
+                &mut Duration::default(),
+            )
             .unwrap();
         assert_eq!(before, after);
     }
@@ -346,10 +362,20 @@ mod tests {
         let root =
             std::env::var_os("MEMENTO_TEXT_RERANKER_TEST_ASSETS").expect("explicit test assets");
         let runtime = std::env::var_os("MEMENTO_ORT_LIBRARY").expect("explicit pinned runtime");
-        let long = "Memento keeps raw history and consolidates durable facts overnight. ".repeat(60);
-        let queries = ["How many people live in Berlin?", "which loops does the owner still need to close", long.as_str()];
+        let long =
+            "Memento keeps raw history and consolidates durable facts overnight. ".repeat(60);
+        let queries = [
+            "How many people live in Berlin?",
+            "which loops does the owner still need to close",
+            long.as_str(),
+        ];
         let documents: Vec<String> = (0..10)
-            .map(|i| format!("Passage {i}: {}", "Berlin population registry and open loop evidence notes. ".repeat(1 + i * 4)))
+            .map(|i| {
+                format!(
+                    "Passage {i}: {}",
+                    "Berlin population registry and open loop evidence notes. ".repeat(1 + i * 4)
+                )
+            })
             .collect();
         let documents: Vec<&str> = documents.iter().map(String::as_str).collect();
         let deadline = || Instant::now() + Duration::from_secs(120);
@@ -358,18 +384,29 @@ mod tests {
             let many = TextReranker::load(Path::new(&root), Path::new(&runtime), threads).unwrap();
             for query in queries {
                 let started = Instant::now();
-                let a = one.score(query, &documents, deadline(), &mut Duration::default()).unwrap();
+                let a = one
+                    .score(query, &documents, deadline(), &mut Duration::default())
+                    .unwrap();
                 let single = started.elapsed();
                 let started = Instant::now();
-                let b = many.score(query, &documents, deadline(), &mut Duration::default()).unwrap();
+                let b = many
+                    .score(query, &documents, deadline(), &mut Duration::default())
+                    .unwrap();
                 let parallel = started.elapsed();
-                let diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                let diff = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max);
                 let order = |v: &[f32]| {
                     let mut i: Vec<usize> = (0..v.len()).collect();
                     i.sort_by(|x, y| v[*y].total_cmp(&v[*x]));
                     i
                 };
-                eprintln!("threads={threads} query_chars={} max_diff={diff:e} one={single:?} many={parallel:?}", query.len());
+                eprintln!(
+                    "threads={threads} query_chars={} max_diff={diff:e} one={single:?} many={parallel:?}",
+                    query.len()
+                );
                 assert!(diff < 1e-4);
                 assert_eq!(order(&a), order(&b));
             }

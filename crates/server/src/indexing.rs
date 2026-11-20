@@ -24,20 +24,43 @@ fn candidate_source() -> String {
 /// history. Text matches `episodes_status_indexable_v2`, so checks stay index-only.
 macro_rules! message {
     ($alias:literal) => {
-        concat!($alias,".kind IN ('user','assistant') AND CAST(coalesce(json_extract(",$alias,".metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip' AND coalesce(json_extract(",$alias,".metadata,'$.evidence_eligible'),1)<>0")
+        concat!(
+            $alias,
+            ".kind IN ('user','assistant') AND CAST(coalesce(json_extract(",
+            $alias,
+            ".metadata,'$.extraction_mode'),'message') AS TEXT)<>'skip' AND coalesce(json_extract(",
+            $alias,
+            ".metadata,'$.evidence_eligible'),1)<>0"
+        )
     };
 }
 /// Newest message episode in `(?1, ?2]` that still needs chunks or a vector. Episodes
 /// are scanned by seq; membership uses the message index, so no body is read.
-const WALK: &str = concat!("SELECT e.id,e.seq,EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) AS chunked FROM episodes e WHERE e.seq>?1 AND e.seq<=?2 AND EXISTS(SELECT 1 FROM episodes m INDEXED BY episodes_status_indexable_v2 WHERE m.id=e.id AND ",message!("m"),") AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND (NOT EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) OR EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=x.id AND i.kind='episode' AND i.version=1) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=x.id AND f.version=1 AND f.resolved=0))) ORDER BY e.seq DESC LIMIT 1");
-const EPISODE: &str = concat!("SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,x.episode_id,x.start,x.end,x.rowid AS position FROM episode_chunks x JOIN episodes e INDEXED BY episodes_status_indexable_v2 ON e.id=x.episode_id WHERE ",message!("e")," AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)");
+const WALK: &str = concat!(
+    "SELECT e.id,e.seq,EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) AS chunked FROM episodes e WHERE e.seq>?1 AND e.seq<=?2 AND EXISTS(SELECT 1 FROM episodes m INDEXED BY episodes_status_indexable_v2 WHERE m.id=e.id AND ",
+    message!("m"),
+    ") AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id) AND (NOT EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id) OR EXISTS(SELECT 1 FROM episode_chunks x WHERE x.episode_id=e.id AND NOT EXISTS(SELECT 1 FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target=x.id AND i.kind='episode' AND i.version=1) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.target=x.id AND f.version=1 AND f.resolved=0))) ORDER BY e.seq DESC LIMIT 1"
+);
+const EPISODE: &str = concat!(
+    "SELECT x.id,'episode' AS kind,1 AS version,NULL AS text,NULL AS type,x.episode_id,x.start,x.end,x.rowid AS position FROM episode_chunks x JOIN episodes e INDEXED BY episodes_status_indexable_v2 ON e.id=x.episode_id WHERE ",
+    message!("e"),
+    " AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)"
+);
 /// Excluded raw chunks whose vectors predate the message-only rule. Only embeddings
 /// are removed here; `UNUSED` then removes the vectorless chunk rows.
-const RETIRED: &str = concat!("SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target WHERE i.kind='episode' AND i.seq BETWEEN ?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM episodes e INDEXED BY episodes_status_indexable_v2 WHERE e.id=x.episode_id AND ",message!("e"),")");
+const RETIRED: &str = concat!(
+    "SELECT i.seq FROM vector_items i JOIN episode_chunks x ON x.id=i.target WHERE i.kind='episode' AND i.seq BETWEEN ?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM episodes e INDEXED BY episodes_status_indexable_v2 WHERE e.id=x.episode_id AND ",
+    message!("e"),
+    ")"
+);
 /// Chunk rows of excluded episodes once vectorless: bookkeeping no reader reaches.
 /// Literal hits fall back to an episode span; cited or shown chunks stay references.
 /// Mirrors the `episode_chunks_no_DELETE_v2` trigger, which refuses every other delete.
-const UNUSED: &str = concat!("SELECT x.id FROM episode_chunks x WHERE x.rowid BETWEEN ?1 AND ?2 AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=x.episode_id) AND NOT EXISTS(SELECT 1 FROM episodes m INDEXED BY episodes_status_indexable_v2 WHERE m.id=x.episode_id AND ",message!("m"),") AND NOT EXISTS(SELECT 1 FROM vector_items i WHERE i.target=x.id) AND NOT EXISTS(SELECT 1 FROM node_stats s WHERE s.node_id=x.id) AND x.id NOT IN (SELECT q.target FROM query_feedback q WHERE q.target IS NOT NULL)");
+const UNUSED: &str = concat!(
+    "SELECT x.id FROM episode_chunks x WHERE x.rowid BETWEEN ?1 AND ?2 AND EXISTS(SELECT 1 FROM episodes e WHERE e.id=x.episode_id) AND NOT EXISTS(SELECT 1 FROM episodes m INDEXED BY episodes_status_indexable_v2 WHERE m.id=x.episode_id AND ",
+    message!("m"),
+    ") AND NOT EXISTS(SELECT 1 FROM vector_items i WHERE i.target=x.id) AND NOT EXISTS(SELECT 1 FROM node_stats s WHERE s.node_id=x.id) AND x.id NOT IN (SELECT q.target FROM query_feedback q WHERE q.target IS NOT NULL)"
+);
 const RETIRE_BATCH: i64 = 512;
 pub(crate) fn sources() -> [(String, &'static str); 3] {
     [
@@ -114,8 +137,9 @@ impl Indexer {
             .lock()
             .map_err(|_| Error::Unavailable("Index cursor is unavailable"))?;
         loop {
-            let Some((id, seq, chunked)) =
-                self.store.read(|tx| next_episode(tx.sql(), &mut frontier))?
+            let Some((id, seq, chunked)) = self
+                .store
+                .read(|tx| next_episode(tx.sql(), &mut frontier))?
             else {
                 return Ok(None);
             };
@@ -266,7 +290,9 @@ struct Frontier {
     ranges: Vec<(i64, i64)>,
 }
 fn next_episode(db: &Connection, frontier: &mut Frontier) -> Result<Option<(String, i64, bool)>> {
-    let high: i64 = db.query_row("SELECT coalesce(max(seq),0) FROM episodes", [], |r| r.get(0))?;
+    let high: i64 = db.query_row("SELECT coalesce(max(seq),0) FROM episodes", [], |r| {
+        r.get(0)
+    })?;
     let low = frontier.top.unwrap_or(i64::MIN);
     if high > low {
         frontier.ranges.push((low, high));
@@ -275,7 +301,11 @@ fn next_episode(db: &Connection, frontier: &mut Frontier) -> Result<Option<(Stri
     while let Some(&(low, cursor)) = frontier.ranges.last() {
         let found = db
             .query_row(WALK, params![low, cursor], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
             })
             .optional()?;
         match found {
@@ -318,13 +348,19 @@ fn retire_batch(store: &Store, from: i64) -> Result<(i64, Option<i64>)> {
                 for tier in [Tier::Hot, Tier::Cold] {
                     tx.touch_vector(*seq, tier)?;
                 }
-                tx.sql().execute("DELETE FROM vector_blobs WHERE seq=?", [seq])?;
-                tx.sql().execute("DELETE FROM vector_items WHERE seq=?", [seq])?;
+                tx.sql()
+                    .execute("DELETE FROM vector_blobs WHERE seq=?", [seq])?;
+                tx.sql()
+                    .execute("DELETE FROM vector_items WHERE seq=?", [seq])?;
             }
             Ok(())
         })?;
     }
-    let next = if scanned < RETIRE_BATCH { None } else { last.checked_add(1) };
+    let next = if scanned < RETIRE_BATCH {
+        None
+    } else {
+        last.checked_add(1)
+    };
     Ok((scanned, next))
 }
 /// One bounded batch from chunk rowid `from`: delete excluded episodes' chunk rows the
@@ -358,7 +394,11 @@ fn retire_chunks(store: &Store, from: i64) -> Result<(i64, Option<i64>)> {
             Ok(())
         })?;
     }
-    let next = if scanned < RETIRE_BATCH { None } else { last.checked_add(1) };
+    let next = if scanned < RETIRE_BATCH {
+        None
+    } else {
+        last.checked_add(1)
+    };
     Ok((scanned, next))
 }
 fn commit_index(store: &Store, row: &Value, vector: &[f32; 768], hints: &[Value]) -> Result<()> {
@@ -396,10 +436,25 @@ mod tests {
     }
     #[test]
     fn raw_pool_new_unparked_index_unit_is_cold_without_reembedding_or_parking() {
-        let (_dir,store,_graph,episode)=fixture();
-        store.write(|tx|{tx.sql().execute("INSERT INTO episode_chunks VALUES('fresh-chunk',?,0,8)",[&episode])?;Ok(())}).unwrap();
-        let mut vector=[0.;768];vector[0]=1.;
-        commit_index(&store,&json!({"id":"fresh-chunk","kind":"episode","version":1,"text":"Original"}),&vector,&[]).unwrap();
+        let (_dir, store, _graph, episode) = fixture();
+        store
+            .write(|tx| {
+                tx.sql().execute(
+                    "INSERT INTO episode_chunks VALUES('fresh-chunk',?,0,8)",
+                    [&episode],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut vector = [0.; 768];
+        vector[0] = 1.;
+        commit_index(
+            &store,
+            &json!({"id":"fresh-chunk","kind":"episode","version":1,"text":"Original"}),
+            &vector,
+            &[],
+        )
+        .unwrap();
         store.read(|tx|{
             let (tier,bytes):(String,Vec<u8>)=tx.sql().query_row("SELECT b.tier,b.embedding FROM vector_items i JOIN vector_blobs b ON b.seq=i.seq WHERE i.target='fresh-chunk'",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
             assert_eq!(tier,"cold");assert_eq!(bytes,F32Blob::from_values(&vector)?.as_bytes());
@@ -501,12 +556,20 @@ pub fn status(
     let (episode_index, episode_filter) = if source.is_some() {
         (
             "episodes_status_cover_v1",
-            concat!("e.source=?1 AND ",message!("e")," AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)"),
+            concat!(
+                "e.source=?1 AND ",
+                message!("e"),
+                " AND NOT EXISTS(SELECT 1 FROM forgotten_sources f WHERE f.source=e.source AND f.event_id=e.event_id)"
+            ),
         )
     } else {
         (
             "episodes_status_indexable_v2",
-            concat!("?1 IS NULL AND ",message!("e")," AND NOT EXISTS(SELECT 1 FROM forgotten_episode_ids f WHERE f.id=e.id)"),
+            concat!(
+                "?1 IS NULL AND ",
+                message!("e"),
+                " AND NOT EXISTS(SELECT 1 FROM forgotten_episode_ids f WHERE f.id=e.id)"
+            ),
         )
     };
     // All three joined keys are unique. A no-chunk episode contributes only to
@@ -573,22 +636,46 @@ mod status_tests {
         capture("tool", "tool", json!({"extraction_mode":"tool_output"}));
         let new = capture("new", "user", json!({}));
         let chunk = |episode: &str| {
-            store.write(|tx| {
-                tx.sql().execute("INSERT INTO episode_chunks VALUES(?,?,0,4)", params![format!("chunk-{episode}"), episode])?;
-                Ok(())
-            }).unwrap()
+            store
+                .write(|tx| {
+                    tx.sql().execute(
+                        "INSERT INTO episode_chunks VALUES(?,?,0,4)",
+                        params![format!("chunk-{episode}"), episode],
+                    )?;
+                    Ok(())
+                })
+                .unwrap()
         };
         let embed = |episode: &str| {
             let mut vector = [0f32; 768];
             vector[0] = 1.;
-            store.write(|tx| {
-                let seq: i64 = tx.sql().query_row("SELECT coalesce(max(seq),0)+1 FROM vector_items", [], |r| r.get(0))?;
-                tx.put_vector(&VectorWrite{seq,target:format!("chunk-{episode}"),kind:VectorKind::Episode,version:1,current:true,tier:Tier::Cold,embedding:F32Blob::from_values(&vector)?})?;
-                Ok(())
-            }).unwrap()
+            store
+                .write(|tx| {
+                    let seq: i64 = tx.sql().query_row(
+                        "SELECT coalesce(max(seq),0)+1 FROM vector_items",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    tx.put_vector(&VectorWrite {
+                        seq,
+                        target: format!("chunk-{episode}"),
+                        kind: VectorKind::Episode,
+                        version: 1,
+                        current: true,
+                        tier: Tier::Cold,
+                        embedding: F32Blob::from_values(&vector)?,
+                    })?;
+                    Ok(())
+                })
+                .unwrap()
         };
         let mut frontier = Frontier::default();
-        let mut next = || store.read(|tx| next_episode(tx.sql(), &mut frontier)).unwrap().map(|(id, _, chunked)| (id, chunked));
+        let mut next = || {
+            store
+                .read(|tx| next_episode(tx.sql(), &mut frontier))
+                .unwrap()
+                .map(|(id, _, chunked)| (id, chunked))
+        };
         chunk(&old);
         chunk(&mid);
         // The newest message episode comes first, even before it has chunks.
@@ -604,21 +691,37 @@ mod status_tests {
         embed(&arrival);
         assert_eq!(next(), Some((mid.clone(), true)));
         // A chunk awaiting its failure retry does not hold the walk.
-        store.write(|tx| {
-            tx.sql().execute("INSERT INTO index_failures VALUES(?,1,1,'Fixture',0,0)", [format!("chunk-{mid}")])?;
-            Ok(())
-        }).unwrap();
+        store
+            .write(|tx| {
+                tx.sql().execute(
+                    "INSERT INTO index_failures VALUES(?,1,1,'Fixture',0,0)",
+                    [format!("chunk-{mid}")],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(next(), Some((old.clone(), true)));
         embed(&old);
         assert_eq!(next(), None);
         // Episodes are walked by seq with index-only membership, never a full sort.
-        store.read(|tx| {
-            let mut query = tx.sql().prepare(&format!("EXPLAIN QUERY PLAN {WALK}"))?;
-            let plan = query.query_map(params![0, 100], |r| r.get::<_, String>(3))?.collect::<std::result::Result<Vec<_>, _>>()?;
-            assert!(plan.iter().any(|step| step.starts_with("SEARCH e USING INTEGER PRIMARY KEY")), "{plan:?}");
-            assert!(plan.iter().all(|step| !step.contains("TEMP B-TREE")), "{plan:?}");
-            Ok(())
-        }).unwrap();
+        store
+            .read(|tx| {
+                let mut query = tx.sql().prepare(&format!("EXPLAIN QUERY PLAN {WALK}"))?;
+                let plan = query
+                    .query_map(params![0, 100], |r| r.get::<_, String>(3))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert!(
+                    plan.iter()
+                        .any(|step| step.starts_with("SEARCH e USING INTEGER PRIMARY KEY")),
+                    "{plan:?}"
+                );
+                assert!(
+                    plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                    "{plan:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
     #[test]
     fn only_messages_are_raw_index_units_and_older_excluded_vectors_retire() {
@@ -629,39 +732,96 @@ mod status_tests {
         };
         let episodes = [
             capture("user", "user", "Human message", json!({})),
-            capture("reply", "assistant", "Assistant reply", json!({"extraction_mode":"message"})),
-            capture("tool", "tool", "Tool output", json!({"extraction_mode":"tool_output"})),
-            capture("call", "assistant", "[{\"type\":\"toolCall\"}]", json!({"extraction_mode":"message","evidence_eligible":false})),
-            capture("hook", "user", "Hook context", json!({"extraction_mode":"skip"})),
+            capture(
+                "reply",
+                "assistant",
+                "Assistant reply",
+                json!({"extraction_mode":"message"}),
+            ),
+            capture(
+                "tool",
+                "tool",
+                "Tool output",
+                json!({"extraction_mode":"tool_output"}),
+            ),
+            capture(
+                "call",
+                "assistant",
+                "[{\"type\":\"toolCall\"}]",
+                json!({"extraction_mode":"message","evidence_eligible":false}),
+            ),
+            capture(
+                "hook",
+                "user",
+                "Hook context",
+                json!({"extraction_mode":"skip"}),
+            ),
         ];
         capture("unchunked", "user", "Waiting message", json!({}));
-        capture("unchunked-tool", "tool", "Waiting output", json!({"extraction_mode":"tool_output"}));
+        capture(
+            "unchunked-tool",
+            "tool",
+            "Waiting output",
+            json!({"extraction_mode":"tool_output"}),
+        );
         let mut vector = [0f32; 768];
         vector[0] = 1.;
         // Chunks and vectors written before the message-only rule.
-        store.write(|tx| {
-            for (seq, episode) in episodes.iter().enumerate() {
-                tx.sql().execute("INSERT INTO episode_chunks VALUES(?,?,0,4)", params![format!("chunk-{seq}"), episode])?;
-                tx.put_vector(&VectorWrite{seq:seq as i64,target:format!("chunk-{seq}"),kind:VectorKind::Episode,version:1,current:true,tier:Tier::Cold,embedding:F32Blob::from_values(&vector)?})?;
-            }
-            Ok(())
-        }).unwrap();
+        store
+            .write(|tx| {
+                for (seq, episode) in episodes.iter().enumerate() {
+                    tx.sql().execute(
+                        "INSERT INTO episode_chunks VALUES(?,?,0,4)",
+                        params![format!("chunk-{seq}"), episode],
+                    )?;
+                    tx.put_vector(&VectorWrite {
+                        seq: seq as i64,
+                        target: format!("chunk-{seq}"),
+                        kind: VectorKind::Episode,
+                        version: 1,
+                        current: true,
+                        tier: Tier::Cold,
+                        embedding: F32Blob::from_values(&vector)?,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
         let counts = |store: &Store| {
-            store.read(|tx| {
-                let global = status(tx.sql(), None, false, true, false)?;
-                let source = status(tx.sql(), Some("synthetic"), false, true, false)?;
-                assert_eq!(global["total"], source["total"]);
-                assert_eq!(global["unprepared_episodes"], 1);
-                assert_eq!(source["unprepared_episodes"], 1);
-                let units = sources()[2].0.clone();
-                let mut query = tx.sql().prepare(&format!("SELECT id FROM ({units}) ORDER BY id"))?;
-                let ids = query.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
-                assert_eq!(ids, ["chunk-0", "chunk-1"]);
-                Ok((global["total"].as_i64().unwrap(), global["indexed"].as_i64().unwrap()))
-            }).unwrap()
+            store
+                .read(|tx| {
+                    let global = status(tx.sql(), None, false, true, false)?;
+                    let source = status(tx.sql(), Some("synthetic"), false, true, false)?;
+                    assert_eq!(global["total"], source["total"]);
+                    assert_eq!(global["unprepared_episodes"], 1);
+                    assert_eq!(source["unprepared_episodes"], 1);
+                    let units = sources()[2].0.clone();
+                    let mut query = tx
+                        .sql()
+                        .prepare(&format!("SELECT id FROM ({units}) ORDER BY id"))?;
+                    let ids = query
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    assert_eq!(ids, ["chunk-0", "chunk-1"]);
+                    Ok((
+                        global["total"].as_i64().unwrap(),
+                        global["indexed"].as_i64().unwrap(),
+                    ))
+                })
+                .unwrap()
         };
         assert_eq!(counts(&store), (2, 2));
-        let events = |store: &Store| store.read(|tx| Ok(tx.sql().query_row("SELECT count(*) FROM projection_events",[],|r|r.get::<_,i64>(0))?)).unwrap();
+        let events = |store: &Store| {
+            store
+                .read(|tx| {
+                    Ok(tx
+                        .sql()
+                        .query_row("SELECT count(*) FROM projection_events", [], |r| {
+                            r.get::<_, i64>(0)
+                        })?)
+                })
+                .unwrap()
+        };
         let before = events(&store);
         assert_eq!(retire_batch(&store, i64::MIN).unwrap(), (5, None));
         store.read(|tx| {
@@ -686,11 +846,35 @@ mod status_tests {
             store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":event,"conversation_id":"thread","kind":kind,"text":text,"metadata":metadata})).unwrap()).unwrap().id
         };
         let user = capture("user", "user", "Human message", json!({}));
-        let tool = capture("tool", "tool", "Tool output listing", json!({"extraction_mode":"tool_output"}));
-        let call = capture("call", "assistant", "[{\"type\":\"toolCall\"}]", json!({"extraction_mode":"message","evidence_eligible":false}));
-        let hook = capture("hook", "user", "Hook context", json!({"extraction_mode":"skip"}));
+        let tool = capture(
+            "tool",
+            "tool",
+            "Tool output listing",
+            json!({"extraction_mode":"tool_output"}),
+        );
+        let call = capture(
+            "call",
+            "assistant",
+            "[{\"type\":\"toolCall\"}]",
+            json!({"extraction_mode":"message","evidence_eligible":false}),
+        );
+        let hook = capture(
+            "hook",
+            "user",
+            "Hook context",
+            json!({"extraction_mode":"skip"}),
+        );
         let (user, tool, call, hook) = (user.as_str(), tool.as_str(), call.as_str(), hook.as_str());
-        let chunks: [(&str, &str, i64); 8] = [("message", user, 0), ("tool", tool, 0), ("vector", tool, 4), ("cited", tool, 8), ("shown", tool, 12), ("call", call, 0), ("hook", hook, 0), ("orphan", "missing", 0)];
+        let chunks: [(&str, &str, i64); 8] = [
+            ("message", user, 0),
+            ("tool", tool, 0),
+            ("vector", tool, 4),
+            ("cited", tool, 8),
+            ("shown", tool, 12),
+            ("call", call, 0),
+            ("hook", hook, 0),
+            ("orphan", "missing", 0),
+        ];
         let mut vector = [0f32; 768];
         vector[0] = 1.;
         store.write(|tx| {
@@ -705,37 +889,81 @@ mod status_tests {
             tx.sql().execute("INSERT INTO index_failures VALUES('chunk-tool',1,1,'Fixture',0,0)", [])?;
             Ok(())
         }).unwrap();
-        let remaining = |store: &Store| store.read(|tx| {
-            let mut query = tx.sql().prepare("SELECT id FROM episode_chunks ORDER BY id")?;
-            Ok(query.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
-        }).unwrap();
+        let remaining = |store: &Store| {
+            store
+                .read(|tx| {
+                    let mut query = tx
+                        .sql()
+                        .prepare("SELECT id FROM episode_chunks ORDER BY id")?;
+                    Ok(query
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?)
+                })
+                .unwrap()
+        };
         // Ordinary writes still cannot delete messages, vector-bearing or cited chunks.
         for id in ["chunk-message", "chunk-vector", "chunk-cited"] {
-            let error = store.write(|tx| { tx.sql().execute("DELETE FROM episode_chunks WHERE id=?", [id])?; Ok(()) }).unwrap_err();
-            assert!(format!("{error:?}").contains("graph history is immutable"), "{error:?}");
+            let error = store
+                .write(|tx| {
+                    tx.sql()
+                        .execute("DELETE FROM episode_chunks WHERE id=?", [id])?;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("graph history is immutable"),
+                "{error:?}"
+            );
         }
         assert_eq!(remaining(&store).len(), 8);
         assert_eq!(retire_chunks(&store, i64::MIN).unwrap(), (8, None));
-        assert_eq!(remaining(&store), ["chunk-cited", "chunk-message", "chunk-orphan", "chunk-shown", "chunk-vector"]);
-        store.read(|tx| {
-            assert_eq!(tx.sql().query_row("SELECT count(*) FROM index_failures", [], |r| r.get::<_, i64>(0))?, 0);
-            // A cited excluded chunk still resolves to its exact span.
-            let cited = domain::history(tx.sql(), tx.data_dir(), "chunk-cited")?;
-            assert_eq!(cited[0]["chunk_id"], "chunk-cited");
-            assert_eq!(cited[0]["episode_id"], tool);
-            assert_eq!(cited[0]["text"], "put ");
-            // Literal hits on a removed chunk fall back to an episode span.
-            let hit = records::matched_passage(tx, &tool, "Tool", false)?.unwrap();
-            assert_eq!(hit["id"], tool);
-            assert!(hit["chunk_id"].is_null());
-            assert_eq!(domain::history(tx.sql(), tx.data_dir(), &tool)?[0]["text"], "Tool output listing");
-            Ok(())
-        }).unwrap();
+        assert_eq!(
+            remaining(&store),
+            [
+                "chunk-cited",
+                "chunk-message",
+                "chunk-orphan",
+                "chunk-shown",
+                "chunk-vector"
+            ]
+        );
+        store
+            .read(|tx| {
+                assert_eq!(
+                    tx.sql()
+                        .query_row("SELECT count(*) FROM index_failures", [], |r| r
+                            .get::<_, i64>(0))?,
+                    0
+                );
+                // A cited excluded chunk still resolves to its exact span.
+                let cited = domain::history(tx.sql(), tx.data_dir(), "chunk-cited")?;
+                assert_eq!(cited[0]["chunk_id"], "chunk-cited");
+                assert_eq!(cited[0]["episode_id"], tool);
+                assert_eq!(cited[0]["text"], "put ");
+                // Literal hits on a removed chunk fall back to an episode span.
+                let hit = records::matched_passage(tx, &tool, "Tool", false)?.unwrap();
+                assert_eq!(hit["id"], tool);
+                assert!(hit["chunk_id"].is_null());
+                assert_eq!(
+                    domain::history(tx.sql(), tx.data_dir(), &tool)?[0]["text"],
+                    "Tool output listing"
+                );
+                Ok(())
+            })
+            .unwrap();
         // Repeating is a no-op; the vector pass must run first for a vector-bearing chunk.
         assert_eq!(retire_chunks(&store, i64::MIN).unwrap(), (5, None));
         assert_eq!(retire_batch(&store, i64::MIN).unwrap(), (2, None));
         assert_eq!(retire_chunks(&store, i64::MIN).unwrap(), (5, None));
-        assert_eq!(remaining(&store), ["chunk-cited", "chunk-message", "chunk-orphan", "chunk-shown"]);
+        assert_eq!(
+            remaining(&store),
+            [
+                "chunk-cited",
+                "chunk-message",
+                "chunk-orphan",
+                "chunk-shown"
+            ]
+        );
     }
     #[test]
     fn chunk_retirement_takes_bounded_batches_and_resumes_by_rescanning() {
@@ -743,13 +971,28 @@ mod status_tests {
         let store = Store::open(dir.path().join("data")).unwrap();
         let tool = store.capture(serde_json::from_value(json!({"source":"synthetic","event_id":"tool","conversation_id":"thread","kind":"tool","text":"x".repeat(700),"metadata":{"extraction_mode":"tool_output"}})).unwrap()).unwrap().id;
         let total = RETIRE_BATCH + 100;
-        store.write(|tx| {
-            for start in 0..total {
-                tx.sql().execute("INSERT INTO episode_chunks VALUES(?,?,?,?)", params![format!("chunk-{start}"), tool, start, start + 1])?;
-            }
-            Ok(())
-        }).unwrap();
-        let count = |store: &Store| store.read(|tx| Ok(tx.sql().query_row("SELECT count(*) FROM episode_chunks", [], |r| r.get::<_, i64>(0))?)).unwrap();
+        store
+            .write(|tx| {
+                for start in 0..total {
+                    tx.sql().execute(
+                        "INSERT INTO episode_chunks VALUES(?,?,?,?)",
+                        params![format!("chunk-{start}"), tool, start, start + 1],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let count = |store: &Store| {
+            store
+                .read(|tx| {
+                    Ok(tx
+                        .sql()
+                        .query_row("SELECT count(*) FROM episode_chunks", [], |r| {
+                            r.get::<_, i64>(0)
+                        })?)
+                })
+                .unwrap()
+        };
         // One write deletes at most one batch, then releases the writer.
         let (scanned, next) = retire_chunks(&store, i64::MIN).unwrap();
         assert_eq!(scanned, RETIRE_BATCH);

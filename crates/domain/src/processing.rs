@@ -26,7 +26,14 @@ pub const EXTRACTION_INPUT: &str = "coalesce(json_extract(e.metadata,'$.extracti
 /// through the latest compaction marker.
 pub fn admissible_through(progress: &Value, instant: DateTime<Utc>) -> Result<i64> {
     let idle = (instant - parse_time(get_str(progress, "latest_at")?)?).num_seconds() >= 1800;
-    get_i64(progress, if idle { "latest_seq" } else { "compact_through" })
+    get_i64(
+        progress,
+        if idle {
+            "latest_seq"
+        } else {
+            "compact_through"
+        },
+    )
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -57,7 +64,9 @@ pub struct Claim {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 }
-fn default_batch_size() -> usize { 16 }
+fn default_batch_size() -> usize {
+    16
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -70,7 +79,9 @@ pub struct Pool {
     #[serde(default)]
     pub policies: bool,
 }
-fn default_pool_limit() -> usize { 50 }
+fn default_pool_limit() -> usize {
+    50
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -80,20 +91,33 @@ pub struct Work {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Submit { complete: Complete, #[serde(default)] next: Option<Claim> }
+struct Submit {
+    complete: Complete,
+    #[serde(default)]
+    next: Option<Claim>,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkStatus { id: String }
+struct WorkStatus {
+    id: String,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadWork {
-    #[serde(default)] id: Option<String>,
-    #[serde(default)] owner: Option<String>,
-    #[serde(default)] policy: Option<String>,
-    #[serde(default)] after: usize,
-    #[serde(default = "read_limit")] limit: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    policy: Option<String>,
+    #[serde(default)]
+    after: usize,
+    #[serde(default = "read_limit")]
+    limit: usize,
 }
-fn read_limit() -> usize { 2000 }
+fn read_limit() -> usize {
+    2000
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lease {
@@ -141,23 +165,36 @@ impl Processing {
     /// One agent-neutral entrypoint over the existing checked queue operations.
     pub fn work(&self, request: Work) -> Result<Value> {
         fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
-            serde_json::from_value(value).map_err(|_| Error::Validation("Invalid processing command"))
+            serde_json::from_value(value)
+                .map_err(|_| Error::Validation("Invalid processing command"))
         }
         match request.action.as_str() {
             "read" => {
                 let command: ReadWork = decode(request.command)?;
-                if !(1..=2000).contains(&command.limit) { return Err(Error::Validation("read limit must be 1..2000 characters")); }
-                let policy = |kind: &str| -> Result<Value> { match kind {
-                    "extract" => Ok(json!({"instruction":pipeline_schema::EXTRACTION_INSTRUCTION,"schema":*pipeline_schema::EXTRACTION})),
-                    "consolidate" => Ok(json!({"instruction":pipeline_schema::CONSOLIDATION_INSTRUCTION,"schema":*pipeline_schema::CONSOLIDATION})),
-                    _ => Err(Error::Validation("Invalid processing policy")),
-                }};
+                if !(1..=2000).contains(&command.limit) {
+                    return Err(Error::Validation("read limit must be 1..2000 characters"));
+                }
+                let policy = |kind: &str| -> Result<Value> {
+                    match kind {
+                        "extract" => Ok(
+                            json!({"instruction":pipeline_schema::EXTRACTION_INSTRUCTION,"schema":*pipeline_schema::EXTRACTION}),
+                        ),
+                        "consolidate" => Ok(
+                            json!({"instruction":pipeline_schema::CONSOLIDATION_INSTRUCTION,"schema":*pipeline_schema::CONSOLIDATION}),
+                        ),
+                        _ => Err(Error::Validation("Invalid processing policy")),
+                    }
+                };
                 let payload = if let Some(kind) = &command.policy {
-                    if command.id.is_some() || command.owner.is_some() { return Err(Error::Validation("Choose a policy or leased work")); }
+                    if command.id.is_some() || command.owner.is_some() {
+                        return Err(Error::Validation("Choose a policy or leased work"));
+                    }
                     policy(kind)?
                 } else {
-                    let (Some(id),Some(owner)) = (&command.id,&command.owner) else { return Err(Error::Validation("A work lease is required")); };
-                    let (job,context)=self.leased(id,owner)?;
+                    let (Some(id), Some(owner)) = (&command.id, &command.owner) else {
+                        return Err(Error::Validation("A work lease is required"));
+                    };
+                    let (job, context) = self.leased(id, owner)?;
                     self.graph.store.read(|tx| {
                         let mut episodes=std::collections::BTreeSet::new();
                         for window in context[if job.kind=="extract" {"windows"} else {"raw_windows"}].as_array().into_iter().flatten() {
@@ -175,12 +212,16 @@ impl Processing {
                     })?;
                     json!({"id":job.id,"kind":job.kind,"input":if job.kind=="extract" { Extractor::model_input(&context) } else { Consolidator::model_input(&context) }})
                 };
-                let text=encode_json(&payload)?;
-                let total=text.chars().count();
-                if command.after>total { return Err(Error::Validation("Invalid work page cursor")); }
-                let end=command.after.saturating_add(command.limit).min(total);
-                Ok(json!({"text":substring(&text,command.after,end),"after":command.after,"total_characters":total,"next":if end<total {json!(end)}else{Value::Null},"encoding":"json-utf8","cursor_unit":"characters"}))
-            },
+                let text = encode_json(&payload)?;
+                let total = text.chars().count();
+                if command.after > total {
+                    return Err(Error::Validation("Invalid work page cursor"));
+                }
+                let end = command.after.saturating_add(command.limit).min(total);
+                Ok(
+                    json!({"text":substring(&text,command.after,end),"after":command.after,"total_characters":total,"next":if end<total {json!(end)}else{Value::Null},"encoding":"json-utf8","cursor_unit":"characters"}),
+                )
+            }
             "pool" => self.pool(decode(request.command)?),
             "claim" => self.claim(decode(request.command)?),
             "renew" => self.renew(decode(request.command)?),
@@ -188,10 +229,17 @@ impl Processing {
             "release" => self.release(decode(request.command)?),
             "status" => {
                 let command: WorkStatus = decode(request.command)?;
-                let job = self.queue.get(&command.id)?.ok_or(Error::Validation("Unknown processing job"))?;
-                if !["extract","consolidate"].contains(&job["kind"].as_str().unwrap_or("")) { return Err(Error::Validation("Unknown processing job")); }
-                Ok(json!({"id":job["id"],"kind":job["kind"],"state":job["state"],"result":job["result"],"error":job["error"]}))
-            },
+                let job = self
+                    .queue
+                    .get(&command.id)?
+                    .ok_or(Error::Validation("Unknown processing job"))?;
+                if !["extract", "consolidate"].contains(&job["kind"].as_str().unwrap_or("")) {
+                    return Err(Error::Validation("Unknown processing job"));
+                }
+                Ok(
+                    json!({"id":job["id"],"kind":job["kind"],"state":job["state"],"result":job["result"],"error":job["error"]}),
+                )
+            }
             "submit" => {
                 let command: Submit = decode(request.command)?;
                 let id = command.complete.id.clone();
@@ -205,13 +253,16 @@ impl Processing {
                     }
                 }
                 Ok(receipt)
-            },
+            }
             _ => Err(Error::Validation("Unknown processing action")),
         }
     }
     /// Metadata-only discovery. Evidence is read only through a fresh leased claim.
     pub fn pool(&self, request: Pool) -> Result<Value> {
-        if request.after < 0 || !(1..=100).contains(&request.limit) || !["extract", "consolidate", "maintenance"].contains(&request.kind.as_str()) {
+        if request.after < 0
+            || !(1..=100).contains(&request.limit)
+            || !["extract", "consolidate", "maintenance"].contains(&request.kind.as_str())
+        {
             return Err(Error::Validation("Invalid processing pool page"));
         }
         self.graph.store.read(|tx| {
@@ -267,11 +318,20 @@ impl Processing {
     /// Explicit owner admission of already extracted historical candidates; no raw replay.
     pub fn release_history_candidates(&self) -> Result<Value> {
         self.graph.store.write(|tx| {
-            let targets=rows(tx.sql(),"SELECT candidate_id FROM historical_parked_candidates WHERE released_at IS NULL",[])?;
-            let count=tx.sql().execute("UPDATE historical_parked_candidates SET released_at=? WHERE released_at IS NULL",[format_time(Utc::now())])?;
-            for row in targets { tx.touch_target(get_str(&row,"candidate_id")?)?; }
-            let mut result=historical_status(tx.sql())?;
-            result["released_now"]=json!(count);
+            let targets = rows(
+                tx.sql(),
+                "SELECT candidate_id FROM historical_parked_candidates WHERE released_at IS NULL",
+                [],
+            )?;
+            let count = tx.sql().execute(
+                "UPDATE historical_parked_candidates SET released_at=? WHERE released_at IS NULL",
+                [format_time(Utc::now())],
+            )?;
+            for row in targets {
+                tx.touch_target(get_str(&row, "candidate_id")?)?;
+            }
+            let mut result = historical_status(tx.sql())?;
+            result["released_now"] = json!(count);
             Ok(result)
         })
     }
@@ -309,7 +369,9 @@ impl Processing {
         self.claim_at(command, Utc::now())
     }
     pub fn claim_at(&self, command: Claim, instant: DateTime<Utc>) -> Result<Value> {
-        if !(1..=128).contains(&command.batch_size) { return Err(Error::Validation("batch_size must be 1..128")); }
+        if !(1..=128).contains(&command.batch_size) {
+            return Err(Error::Validation("batch_size must be 1..128"));
+        }
         required(&command.agent, 64, "Invalid processing agent")?;
         required(&command.timezone_name, 128, "Invalid timezone")?;
         let zone: Tz = command
@@ -412,10 +474,9 @@ impl Processing {
                         schedule()?;
                         return Ok(None);
                     }
-                    let previous = self
-                        .graph
-                        .store
-                        .read(|tx| one(tx.sql(), "SELECT context FROM jobs WHERE id=?", [&job.id]))?;
+                    let previous = self.graph.store.read(|tx| {
+                        one(tx.sql(), "SELECT context FROM jobs WHERE id=?", [&job.id])
+                    })?;
                     let rejection = previous
                         .and_then(|row| row["context"].as_str().map(str::to_owned))
                         .map(|context| decode_json(&context))
@@ -467,8 +528,14 @@ impl Processing {
                     };
                     if let Some(output) = output {
                         let result = if kind == "extract" {
-                            self.extractor
-                                .apply(&job, &prepared, &output, &command.agent, None, None)
+                            self.extractor.apply(
+                                &job,
+                                &prepared,
+                                &output,
+                                &command.agent,
+                                None,
+                                None,
+                            )
                         } else {
                             self.consolidator.apply(
                                 &job,
@@ -497,7 +564,9 @@ impl Processing {
                     } else {
                         pipeline_schema::CONSOLIDATION.clone()
                     };
-                    Ok(Some(json!({"id":job.id,"owner":job.owner,"kind":kind,"instruction":instruction,"input":input,"schema":schema})))
+                    Ok(Some(
+                        json!({"id":job.id,"owner":job.owner,"kind":kind,"instruction":instruction,"input":input,"schema":schema}),
+                    ))
                 })();
                 lap = std::time::Instant::now();
                 match step {
@@ -510,7 +579,14 @@ impl Processing {
                     Err(error) => {
                         // Extraction retries with backoff (its job key fences the cursor);
                         // a consolidation batch fails so its candidates are rebatched.
-                        let _ = self.queue.fail(&job, crate::jobs::JobFailure { category: crate::jobs::error_category(&error), retryable: kind == "extract", retry_after: None });
+                        let _ = self.queue.fail(
+                            &job,
+                            crate::jobs::JobFailure {
+                                category: crate::jobs::error_category(&error),
+                                retryable: kind == "extract",
+                                retry_after: None,
+                            },
+                        );
                         withhold(&held);
                         return Err(error);
                     }
@@ -520,7 +596,9 @@ impl Processing {
         // Post-scheduling count of what this caller could claim now, using the queue's
         // own predicate; consolidation only inside its window or an explicit force run.
         lap = std::time::Instant::now();
-        let claimable=|db:&Connection,kind:&str|->Result<i64>{Ok(db.query_row("SELECT count(*) FROM jobs WHERE kind=?1 AND ((state='pending' AND available_at<=?2) OR (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value FROM json_each(?3)) AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE live.kind='consolidate' AND live.state='leased' AND live.lease_until>?2))",params![kind,timestamp(),encode_json(&json!(command.exclude))?],|row|row.get(0))?)};
+        let claimable = |db: &Connection, kind: &str| -> Result<i64> {
+            Ok(db.query_row("SELECT count(*) FROM jobs WHERE kind=?1 AND ((state='pending' AND available_at<=?2) OR (state='leased' AND lease_until<=?2)) AND id NOT IN (SELECT value FROM json_each(?3)) AND NOT (kind='consolidate' AND EXISTS (SELECT 1 FROM jobs live WHERE live.kind='consolidate' AND live.state='leased' AND live.lease_until>?2))",params![kind,timestamp(),encode_json(&json!(command.exclude))?],|row|row.get(0))?)
+        };
         let backlog=self.graph.store.read(|tx|Ok(json!({"pending_extract_conversations":pending_conversations(tx.sql(),None)?,"pending_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='pending' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"leased_extract_jobs":tx.sql().query_row("SELECT count(*) FROM jobs WHERE state='leased' AND kind='extract'",[],|row|row.get::<_,i64>(0))?,"claimable":{"extract":claimable(tx.sql(),"extract")?,"consolidate":if night_due {claimable(tx.sql(),"consolidate")?} else {0}}}))).inspect_err(|_| withhold(&held))?;
         crate::work_timing::lap("claim_backlog", &mut lap);
         Ok(json!({"lease_seconds":self.queue.lease_seconds,"work":work,"backlog":backlog}))
@@ -731,7 +809,9 @@ fn enqueue_extract(tx: &WriteTxn, instant: DateTime<Utc>) -> Result<()> {
         }
         let selected = rows(
             tx.sql(),
-            &format!("SELECT id,seq,text,kind,metadata FROM episodes e WHERE source=? AND conversation_id=? AND seq<=? AND seq>? AND {EXTRACTION_INPUT} ORDER BY seq LIMIT 65"),
+            &format!(
+                "SELECT id,seq,text,kind,metadata FROM episodes e WHERE source=? AND conversation_id=? AND seq<=? AND seq>? AND {EXTRACTION_INPUT} ORDER BY seq LIMIT 65"
+            ),
             params![source, conversation, through, cursor],
         )?;
         let offset = get_i64(&group, "offset")? as usize;
@@ -970,7 +1050,11 @@ fn enqueue_night(
     };
     // Continuous admission looks ahead one extra batch so it can tell which
     // following conversations fit whole; the frozen/legacy path fetches as before.
-    let fetch = if continuous { batch_size * 2 } else { batch_size };
+    let fetch = if continuous {
+        batch_size * 2
+    } else {
+        batch_size
+    };
     let mut candidates = consolidation::pending_in(tx.sql(), fetch, cursor, through, true)?;
     // A native agent selects the batch size. Fill it with whole conversations in
     // rowid order: the first always (at most batch_size of it), each following one
@@ -979,7 +1063,13 @@ fn enqueue_night(
     // conversation is pulled ahead of it. Whole is judged inside that bounded
     // lookahead only; continuous admission has no frozen cursor that could skip the rest.
     if continuous && !candidates.is_empty() {
-        let subject = |candidate: &Value| -> Result<Option<Value>> { one(tx.sql(),"SELECT e.source,e.conversation_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=1 ORDER BY e.seq LIMIT 1",[get_str(candidate,"id")?]) };
+        let subject = |candidate: &Value| -> Result<Option<Value>> {
+            one(
+                tx.sql(),
+                "SELECT e.source,e.conversation_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=? AND g.version=1 ORDER BY e.seq LIMIT 1",
+                [get_str(candidate, "id")?],
+            )
+        };
         let subjects = candidates.iter().map(subject).collect::<Result<Vec<_>>>()?;
         let mut admitted: Vec<&Option<Value>> = vec![];
         let mut room = batch_size;

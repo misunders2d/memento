@@ -1,5 +1,8 @@
 //! One native service owner. Capture/health remain independent of model/index startup.
-use crate::{AppState, Recall, RecallRequest, indexing::Indexer, recall_timings::RecallTimings, retrieval::Retrieval};
+use crate::{
+    AppState, Recall, RecallRequest, indexing::Indexer, recall_timings::RecallTimings,
+    retrieval::Retrieval,
+};
 use memento_ann::{Projection, discovery::Discovery};
 use memento_core::{Error, ModelSignature, Result, Store, Tier};
 use memento_domain::{
@@ -128,10 +131,9 @@ impl Services {
             .worker
             .lock()
             .map_or(true, |worker| worker.as_ref().is_some_and(Worker::stopped));
-        let cold = self
-            .cold_runtime
-            .lock()
-            .map_or(true, |cold| cold.as_ref().is_some_and(|cold| cold.stopped()));
+        let cold = self.cold_runtime.lock().map_or(true, |cold| {
+            cold.as_ref().is_some_and(|cold| cold.stopped())
+        });
         thread || worker || cold
     }
     pub fn close(&self) {

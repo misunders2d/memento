@@ -136,11 +136,7 @@ fn jobs(db: &Connection, kind: &str, source: Option<&str>) -> Result<Value> {
     Ok(result)
 }
 fn captured_media_status(db: &Connection, source: Option<&str>) -> Result<Value> {
-    let records = rows(
-        db,
-        CAPTURED_MEDIA,
-        [source],
-    )?;
+    let records = rows(db, CAPTURED_MEDIA, [source])?;
     let mut counts = json!({"waiting":0,"ready":0,"queued":0,"indexed":0,"failed":0,"unsupported":0,"forgotten":0});
     for row in records {
         let mut state = row["state"]
@@ -299,7 +295,14 @@ pub fn processing_summary(
     now: f64,
     instant: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value> {
-    bounded_summary(db, indexing, now, instant, COUNTED_CONVERSATIONS, COUNTED_RECORDS)
+    bounded_summary(
+        db,
+        indexing,
+        now,
+        instant,
+        COUNTED_CONVERSATIONS,
+        COUNTED_RECORDS,
+    )
 }
 fn bounded_summary(
     db: &Connection,
@@ -322,9 +325,22 @@ fn bounded_summary(
     )?);
     extraction["conversations"] = conversations;
     // Remaining live input after each cursor, newest conversations first like admission.
-    let groups = rows(db, &format!("SELECT p.source,p.conversation_id,p.latest_seq,p.latest_at,p.compact_through,coalesce(h.live_seq,p.seq) AS cursor {progress} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY p.latest_seq DESC LIMIT ?1"), [conversation_limit as i64])?;
-    let count = format!("SELECT coalesce(sum(e.seq<=?4 AND {MESSAGE}),0) AS admissible_messages,coalesce(sum(e.seq<=?4 AND NOT ({MESSAGE})),0) AS admissible_other,coalesce(sum(e.seq>?4 AND {MESSAGE}),0) AS waiting_messages,coalesce(sum(e.seq>?4 AND NOT ({MESSAGE})),0) AS waiting_other,count(*) AS rows FROM (SELECT e.seq,e.kind FROM episodes e WHERE e.source=?1 AND e.conversation_id=?2 AND e.seq>?3 AND e.seq<=?5 AND {EXTRACTION_INPUT} LIMIT ?6) e");
-    let fields = ["admissible_messages", "admissible_other", "waiting_messages", "waiting_other"];
+    let groups = rows(
+        db,
+        &format!(
+            "SELECT p.source,p.conversation_id,p.latest_seq,p.latest_at,p.compact_through,coalesce(h.live_seq,p.seq) AS cursor {progress} WHERE p.latest_seq>p.seq AND p.latest_seq>coalesce(h.live_seq,p.seq) ORDER BY p.latest_seq DESC LIMIT ?1"
+        ),
+        [conversation_limit as i64],
+    )?;
+    let count = format!(
+        "SELECT coalesce(sum(e.seq<=?4 AND {MESSAGE}),0) AS admissible_messages,coalesce(sum(e.seq<=?4 AND NOT ({MESSAGE})),0) AS admissible_other,coalesce(sum(e.seq>?4 AND {MESSAGE}),0) AS waiting_messages,coalesce(sum(e.seq>?4 AND NOT ({MESSAGE})),0) AS waiting_other,count(*) AS rows FROM (SELECT e.seq,e.kind FROM episodes e WHERE e.source=?1 AND e.conversation_id=?2 AND e.seq>?3 AND e.seq<=?5 AND {EXTRACTION_INPUT} LIMIT ?6) e"
+    );
+    let fields = [
+        "admissible_messages",
+        "admissible_other",
+        "waiting_messages",
+        "waiting_other",
+    ];
     let mut totals = json!({"admissible_messages":0,"admissible_other":0,"waiting_messages":0,"waiting_other":0});
     let (mut budget, mut counted, mut partial) = (record_limit, 0, groups.len() as i64 != pending);
     for group in &groups {
@@ -338,8 +354,24 @@ fn bounded_summary(
             partial = true;
             continue;
         };
-        let boundary = if through == 0 { cursor } else { through.clamp(cursor, latest) };
-        let row = one(db, &count, params![group["source"].as_str(), group["conversation_id"].as_str(), cursor, boundary, latest, budget + 1])?.unwrap();
+        let boundary = if through == 0 {
+            cursor
+        } else {
+            through.clamp(cursor, latest)
+        };
+        let row = one(
+            db,
+            &count,
+            params![
+                group["source"].as_str(),
+                group["conversation_id"].as_str(),
+                cursor,
+                boundary,
+                latest,
+                budget + 1
+            ],
+        )?
+        .unwrap();
         let used = row["rows"].as_i64().unwrap_or(0);
         if used > budget {
             partial = true;
@@ -357,10 +389,21 @@ fn bounded_summary(
     // Distinct episodes named by queued and leased extraction jobs.
     let empty = json!({"jobs":0,"messages":0,"other":0});
     let mut batched = json!({"pending_live":empty,"leased_live":empty,"pending_demand":empty,"leased_demand":empty});
-    for row in rows(db, &format!("SELECT j.state,CASE WHEN json_extract(j.payload,'$.mode') IS NULL THEN 'live' ELSE 'demand' END AS mode,count(DISTINCT j.id) AS jobs,count(DISTINCT CASE WHEN {MESSAGE} THEN e.id END) AS messages,count(DISTINCT CASE WHEN NOT ({MESSAGE}) THEN e.id END) AS other FROM jobs j CROSS JOIN json_each(j.payload,'$.windows') w JOIN episodes e ON e.id=json_extract(w.value,'$.episode_id') WHERE j.kind='extract' AND j.state IN ('pending','leased') GROUP BY 1,2"), [])? {
-        let key = format!("{}_{}", row["state"].as_str().unwrap_or(""), row["mode"].as_str().unwrap_or(""));
+    for row in rows(
+        db,
+        &format!(
+            "SELECT j.state,CASE WHEN json_extract(j.payload,'$.mode') IS NULL THEN 'live' ELSE 'demand' END AS mode,count(DISTINCT j.id) AS jobs,count(DISTINCT CASE WHEN {MESSAGE} THEN e.id END) AS messages,count(DISTINCT CASE WHEN NOT ({MESSAGE}) THEN e.id END) AS other FROM jobs j CROSS JOIN json_each(j.payload,'$.windows') w JOIN episodes e ON e.id=json_extract(w.value,'$.episode_id') WHERE j.kind='extract' AND j.state IN ('pending','leased') GROUP BY 1,2"
+        ),
+        [],
+    )? {
+        let key = format!(
+            "{}_{}",
+            row["state"].as_str().unwrap_or(""),
+            row["mode"].as_str().unwrap_or("")
+        );
         if batched.get(&key).is_some() {
-            batched[key] = json!({"jobs":row["jobs"],"messages":row["messages"],"other":row["other"]});
+            batched[key] =
+                json!({"jobs":row["jobs"],"messages":row["messages"],"other":row["other"]});
         }
     }
     extraction["batched"] = batched;
@@ -370,7 +413,9 @@ fn bounded_summary(
         .unwrap()
         .extend(candidate_counts(db, None, now)?);
     consolidation["repair_groups"] = repair_groups(db)?;
-    Ok(json!({"generated_at":now,"indexing":indexing,"extraction":extraction,"consolidation":consolidation,"historical":historical_status(db)?}))
+    Ok(
+        json!({"generated_at":now,"indexing":indexing,"extraction":extraction,"consolidation":consolidation,"historical":historical_status(db)?}),
+    )
 }
 #[cfg(test)]
 #[path = "processing_summary_tests.rs"]

@@ -83,7 +83,8 @@ impl Consolidator {
         let zone = context["timezone"].as_str();
         if let Some(candidates) = view.get_mut("candidates").and_then(Value::as_array_mut) {
             for candidate in candidates {
-                if let Some(evidence) = candidate.get_mut("evidence").and_then(Value::as_array_mut) {
+                if let Some(evidence) = candidate.get_mut("evidence").and_then(Value::as_array_mut)
+                {
                     for reference in evidence {
                         reference["local_time"] = json!(crate::loop_due::local_time(
                             reference["occurred_at"].as_str(),

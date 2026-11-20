@@ -370,7 +370,8 @@ fn snapshot_finishes_while_another_connection_keeps_writing() {
             db.busy_timeout(Duration::from_secs(5)).unwrap();
             db.execute_batch("PRAGMA synchronous=OFF").unwrap();
             while !stop.load(Ordering::Relaxed) {
-                db.execute("INSERT INTO filler VALUES (randomblob(64))", []).unwrap();
+                db.execute("INSERT INTO filler VALUES (randomblob(64))", [])
+                    .unwrap();
                 writes.fetch_add(1, Ordering::Relaxed);
             }
         })
@@ -391,12 +392,26 @@ fn snapshot_finishes_while_another_connection_keeps_writing() {
     let after = writes.load(Ordering::Relaxed);
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
-    result.expect("snapshot must finish while another connection writes").unwrap();
-    assert!(after > before, "the writer kept committing during the snapshot");
+    result
+        .expect("snapshot must finish while another connection writes")
+        .unwrap();
+    assert!(
+        after > before,
+        "the writer kept committing during the snapshot"
+    );
     let copy = Connection::open(&target).unwrap();
-    assert_eq!(copy.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
     assert_eq!(
-        copy.query_row("SELECT count(*) FROM filler WHERE length(x)=4000", [], |r| r.get::<_, i64>(0)).unwrap(),
+        copy.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        copy.query_row(
+            "SELECT count(*) FROM filler WHERE length(x)=4000",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         8000
     );
 }

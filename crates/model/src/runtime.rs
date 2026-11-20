@@ -1,16 +1,16 @@
 use crate::{
-    AudioInput, DIMENSIONS, Error, ImageInput, MODEL_REVISION, Preprocessor, Result, TextChunk,
-    TextInput, validation,
+    validation, AudioInput, Error, ImageInput, Preprocessor, Result, TextChunk, TextInput,
+    DIMENSIONS, MODEL_REVISION,
 };
 use memmap2::{Mmap, MmapOptions};
 use ort::{
-    session::{Session, builder::GraphOptimizationLevel},
+    session::{builder::GraphOptimizationLevel, Session},
     value::Tensor,
 };
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
-    ffi::{CStr, c_char},
+    ffi::{c_char, CStr},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -337,10 +337,7 @@ impl EmbeddingModel {
         let preprocessor = Preprocessor::load(&tokenizer)?;
         let assets = Arc::new(Assets::load(&config)?);
         let foreground = Mutex::new(SessionSet::load(assets.clone(), 1)?);
-        let background = Mutex::new(SessionSet::load(
-            assets,
-            config.background_text_threads,
-        )?);
+        let background = Mutex::new(SessionSet::load(assets, config.background_text_threads)?);
         Ok(Self {
             core: Arc::new(Core {
                 preprocessor,

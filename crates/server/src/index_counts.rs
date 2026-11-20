@@ -50,7 +50,10 @@ impl IndexCounts {
     }
     /// Latest count without scheduling a recount.
     pub(crate) fn latest(&self) -> Option<(f64, Value)> {
-        self.latest.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 

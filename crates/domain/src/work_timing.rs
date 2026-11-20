@@ -43,7 +43,10 @@ mod tests {
         assert!(super::take().is_empty());
         super::count("n", 2);
         super::count("n", 3);
-        assert_eq!(super::take_counts().into_iter().collect::<Vec<_>>(), [("n", 5)]);
+        assert_eq!(
+            super::take_counts().into_iter().collect::<Vec<_>>(),
+            [("n", 5)]
+        );
         assert!(super::take_counts().is_empty());
     }
 }

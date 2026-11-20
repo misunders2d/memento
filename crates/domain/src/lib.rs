@@ -15,12 +15,12 @@ pub mod loop_due;
 pub mod loops;
 pub mod pipeline_schema;
 pub mod processing;
-pub mod work_timing;
 mod reconciliation;
 pub mod recovery;
 /// Frozen source-runtime word and casefold data, shared with retrieval.
 pub mod unicode;
 mod util;
+pub mod work_timing;
 pub use authority::behavior_ground_truth;
 pub use demand::{demand_extract, source_text_ranges};
 #[cfg(test)]
@@ -592,8 +592,10 @@ impl TxGraph {
         }
         let (retired, protected) = Self::retire_relations(tx, commit, old, kind, &request)?;
         tx.touch_target(old)?;
-        Ok(json!({"id":old,"version":version,"previous_version":before,"kind":kind,
-            "retired_relations":retired,"protected_relations":protected}))
+        Ok(
+            json!({"id":old,"version":version,"previous_version":before,"kind":kind,
+            "retired_relations":retired,"protected_relations":protected}),
+        )
     }
 
     /// Relations stay with the revised memory. A correction or world change may
@@ -609,7 +611,9 @@ impl TxGraph {
     ) -> Result<(Vec<Value>, Vec<Value>)> {
         let mut selected = Vec::new();
         for id in request["retire_relations"].as_array().into_iter().flatten() {
-            let id = id.as_str().ok_or(Error::Validation("Invalid relation identifier"))?;
+            let id = id
+                .as_str()
+                .ok_or(Error::Validation("Invalid relation identifier"))?;
             if !selected.contains(&id) {
                 selected.push(id);
             }
@@ -624,15 +628,25 @@ impl TxGraph {
         }
         let (mut retired, mut protected) = (vec![], vec![]);
         for id in selected {
-            let edge = one(tx.sql(), "SELECT * FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1", [id])?
-                .filter(|edge| {
-                    edge["state"] == "active"
-                        && edge["rel"] != "supersedes"
-                        && (edge["src"] == target || edge["dst"] == target)
-                })
-                .ok_or(Error::Validation("Retired relations must be active relations of the revised memory"))?;
+            let edge = one(
+                tx.sql(),
+                "SELECT * FROM edge_versions WHERE id=? ORDER BY version DESC LIMIT 1",
+                [id],
+            )?
+            .filter(|edge| {
+                edge["state"] == "active"
+                    && edge["rel"] != "supersedes"
+                    && (edge["src"] == target || edge["dst"] == target)
+            })
+            .ok_or(Error::Validation(
+                "Retired relations must be active relations of the revised memory",
+            ))?;
             let version = get_i64(&edge, "version")?;
-            let other = if edge["src"] == target { get_str(&edge, "dst")? } else { get_str(&edge, "src")? };
+            let other = if edge["src"] == target {
+                get_str(&edge, "dst")?
+            } else {
+                get_str(&edge, "src")?
+            };
             let other = node(tx.sql(), other)?;
             if loops::current(tx.sql(), id)?.is_some_and(|marker| marker["state"] == "open")
                 || !loops::snapshot(tx.sql(), id, version)?["manual_choice_at"].is_null()
@@ -644,7 +658,15 @@ impl TxGraph {
             }
             tx.sql().execute(
                 "INSERT INTO edge_versions VALUES (?,?,?,?,?,?,?)",
-                params![id, version + 1, commit, edge["src"].as_str(), edge["rel"].as_str(), edge["dst"].as_str(), "inactive"],
+                params![
+                    id,
+                    version + 1,
+                    commit,
+                    edge["src"].as_str(),
+                    edge["rel"].as_str(),
+                    edge["dst"].as_str(),
+                    "inactive"
+                ],
             )?;
             curation::copy_evidence(tx, id, version, version + 1)?;
             Self::evidence(tx, id, version + 1, &request["evidence"])?;
@@ -678,7 +700,11 @@ pub fn behavior_at(db: &Connection, target: &str, version: i64) -> Result<Option
     )?;
     // Recovered legacy content keeps the behavior of the replacement it came from.
     if let Some(source) = defining.as_ref().and_then(|row| row["source_id"].as_str()) {
-        return behavior_at(db, source, get_i64(defining.as_ref().unwrap(), "source_version")?);
+        return behavior_at(
+            db,
+            source,
+            get_i64(defining.as_ref().unwrap(), "source_version")?,
+        );
     }
     let version = defining
         .and_then(|row| row["version"].as_i64())
@@ -695,8 +721,7 @@ pub fn behavior_at(db: &Connection, target: &str, version: i64) -> Result<Option
     // versions come from a same-ID supersede of exactly this version.
     let produced = |outcome: &Value, operation: &str| {
         if version == 1 {
-            outcome["superseded_by"] == target
-                || operation == "remember" && outcome["id"] == target
+            outcome["superseded_by"] == target || operation == "remember" && outcome["id"] == target
         } else {
             operation == "supersede" && outcome["id"] == target && outcome["version"] == version
         }
@@ -809,7 +834,9 @@ pub fn history(db: &Connection, data_dir: &std::path::Path, target: &str) -> Res
         let kind = object.remove("revision_kind").unwrap_or(Value::Null);
         let valid_at = object.remove("revision_valid_at").unwrap_or(Value::Null);
         let source = object.remove("revision_source_id").unwrap_or(Value::Null);
-        let source_version = object.remove("revision_source_version").unwrap_or(Value::Null);
+        let source_version = object
+            .remove("revision_source_version")
+            .unwrap_or(Value::Null);
         if !kind.is_null() {
             let version = values[index]["version"].clone();
             values[index]["revision"] = json!({"kind":kind,"valid_at":valid_at});

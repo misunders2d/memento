@@ -36,8 +36,7 @@ pub fn admit(
     headers: &HeaderMap,
     post: bool,
 ) -> std::result::Result<(), StatusCode> {
-    if !crate::single_host(headers).is_some_and(|host| trusted_host(state, host))
-    {
+    if !crate::single_host(headers).is_some_and(|host| trusted_host(state, host)) {
         return Err(StatusCode::MISDIRECTED_REQUEST);
     }
     // Every Origin value must pass MCP's stricter rule, not only the first one.
@@ -70,7 +69,10 @@ pub fn admit(
 }
 /// Host/Origin refusals are never cached, like router-wide admission.
 fn refuse(status: StatusCode) -> Response {
-    if matches!(status, StatusCode::MISDIRECTED_REQUEST | StatusCode::FORBIDDEN) {
+    if matches!(
+        status,
+        StatusCode::MISDIRECTED_REQUEST | StatusCode::FORBIDDEN
+    ) {
         (status, [("cache-control", "no-store")]).into_response()
     } else {
         status.into_response()
@@ -200,25 +202,35 @@ pub async fn request(State(state): State<AppState>, request: Request) -> Respons
 fn processing_view(value: &mut Value) {
     if let Some(work) = value["work"].as_array_mut() {
         for item in work {
-            let id=item["id"].clone(); let owner=item["owner"].clone();
-            for key in ["input","instruction","schema"] { item.as_object_mut().unwrap().remove(key); }
-            item["read"]=json!({"id":id,"owner":owner,"after":0,"limit":2000});
-            item["policy"]=json!({"policy":item["kind"]});
+            let id = item["id"].clone();
+            let owner = item["owner"].clone();
+            for key in ["input", "instruction", "schema"] {
+                item.as_object_mut().unwrap().remove(key);
+            }
+            item["read"] = json!({"id":id,"owner":owner,"after":0,"limit":2000});
+            item["policy"] = json!({"policy":item["kind"]});
         }
     }
-    if let Some(next)=value.get_mut("next").filter(|next|next.is_object()) { processing_view(next); }
+    if let Some(next) = value.get_mut("next").filter(|next| next.is_object()) {
+        processing_view(next);
+    }
     if value.get("policies").is_some() {
         value.as_object_mut().unwrap().remove("policies");
-        value["policy_pages"]=json!({"extract":{"policy":"extract"},"consolidate":{"policy":"consolidate"}});
+        value["policy_pages"] =
+            json!({"extract":{"policy":"extract"},"consolidate":{"policy":"consolidate"}});
     }
-    while serde_json::to_vec(value).unwrap().len()>16_000 && value["items"].as_array().is_some_and(|items|items.len()>1) {
+    while serde_json::to_vec(value).unwrap().len() > 16_000
+        && value["items"]
+            .as_array()
+            .is_some_and(|items| items.len() > 1)
+    {
         value["items"].as_array_mut().unwrap().pop();
-        value["next"]=value["items"].as_array().unwrap().last().unwrap()["position"].clone();
+        value["next"] = value["items"].as_array().unwrap().last().unwrap()["position"].clone();
     }
-    if serde_json::to_vec(value).unwrap().len()>16_000 && value.get("result").is_some() {
+    if serde_json::to_vec(value).unwrap().len() > 16_000 && value.get("result").is_some() {
         value.as_object_mut().unwrap().remove("result");
-        value["result_omitted"]=json!(true);
-        value["result_transport"]=json!("Use HTTP work/status for the complete committed result");
+        value["result_omitted"] = json!(true);
+        value["result_transport"] = json!("Use HTTP work/status for the complete committed result");
     }
 }
 fn omit_empty(value: Value) -> Value {
@@ -261,7 +273,9 @@ fn optional(value: Option<String>) -> Option<String> {
 }
 fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String)> {
     let value = match name {
-        "work" => state.processing.work(parse::<processing::Work>(arguments)?)?,
+        "work" => state
+            .processing
+            .work(parse::<processing::Work>(arguments)?)?,
         "recall" => {
             let args: RecallArgs = parse(arguments)?;
             let since = optional(args.since);
@@ -384,12 +398,14 @@ fn call(state: &AppState, name: &str, arguments: Value) -> Result<(Value, String
             ));
         }
         "loop" => {
-            let mut command=omit_empty(arguments);
-            if let Some(fields)=command.as_object_mut(){
-                if fields.get("evidence").is_some_and(Value::is_null){fields.remove("evidence");}
+            let mut command = omit_empty(arguments);
+            if let Some(fields) = command.as_object_mut() {
+                if fields.get("evidence").is_some_and(Value::is_null) {
+                    fields.remove("evidence");
+                }
             }
             state.graph.loop_command(parse::<dto::Loop>(command)?)?
-        },
+        }
         _ => return Err(Error::Validation("Unknown memory tool")),
     };
     let text = serde_json::to_string(&value)?;
