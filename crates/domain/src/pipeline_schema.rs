@@ -218,6 +218,7 @@ pub fn reject(code: &'static str, references: Vec<Value>) -> WorkError {
                     "episode_id",
                     "occurrence",
                     "quote",
+                    "problem",
                 ]
                 .contains(&key.as_str())
                 {

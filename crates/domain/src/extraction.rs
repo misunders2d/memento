@@ -121,7 +121,7 @@ impl Extractor {
             .filter_map(|batch| batch["id"].as_str())
             .collect::<HashSet<_>>();
         if batches.len() != windows.len() || supplied != expected {
-            return Err(reject("candidate_window_coverage_invalid", vec![]));
+            return Err(coverage_rejection(leased, batches, &windows));
         }
         let dues = resolve_dues(batches, &windows, leased)?;
         let prepared = self
@@ -175,9 +175,16 @@ impl Extractor {
         })?)
     }
 }
+// The handle the model was given for the leased window at `index`.
+fn leased_handle(leased: &Value, index: usize, item: &Value) -> Result<String> {
+    Ok(if leased["window_view"] == "handles-v1" {
+        format!("w{index}")
+    } else {
+        get_str(item, "id")?.into()
+    })
+}
 // Leased windows keyed by the handle the model was given.
 fn leased_windows(leased: &Value) -> Result<HashMap<String, Value>> {
-    let compact = leased["window_view"] == "handles-v1";
     let mut windows = HashMap::new();
     for (index, item) in leased["windows"]
         .as_array()
@@ -185,14 +192,59 @@ fn leased_windows(leased: &Value) -> Result<HashMap<String, Value>> {
         .iter()
         .enumerate()
     {
-        let handle = if compact {
-            format!("w{index}")
-        } else {
-            get_str(item, "id")?.into()
-        };
-        windows.insert(handle, item.clone());
+        windows.insert(leased_handle(leased, index, item)?, item.clone());
     }
     Ok(windows)
+}
+// Explains an output already refused for coverage: at most three offending handles, each
+// problem present named before a second of its kind, and their counts for the timing line.
+// A missing window is never read as empty: that would move the cursor past unread evidence.
+fn coverage_rejection(
+    leased: &Value,
+    batches: &[Value],
+    windows: &HashMap<String, Value>,
+) -> pipeline_schema::WorkError {
+    let mut returned: Vec<(&str, usize)> = vec![];
+    for id in batches.iter().filter_map(|batch| batch["id"].as_str()) {
+        match returned.iter_mut().find(|(known, _)| *known == id) {
+            Some((_, times)) => *times += 1,
+            None => returned.push((id, 1)),
+        }
+    }
+    let missing = leased["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, item)| leased_handle(leased, index, item).ok())
+        .filter(|handle| !returned.iter().any(|(id, _)| id == handle))
+        .map(|handle| json!({"window_id":handle,"problem":"missing"}))
+        .collect::<Vec<_>>();
+    let unexpected = returned
+        .iter()
+        .filter(|(id, _)| !windows.contains_key(*id))
+        .map(|(id, _)| json!({"window_id":id,"problem":"unexpected"}))
+        .collect::<Vec<_>>();
+    let duplicate = returned
+        .iter()
+        .filter(|(id, times)| *times > 1 && windows.contains_key(*id))
+        .map(|(id, _)| json!({"window_id":id,"problem":"duplicate"}))
+        .collect::<Vec<_>>();
+    let problems = [
+        ("apply_windows_missing", missing),
+        ("apply_windows_unexpected", unexpected),
+        ("apply_windows_duplicate", duplicate),
+    ];
+    for (name, found) in &problems {
+        crate::work_timing::count(name, found.len() as u64);
+    }
+    let mut references = vec![];
+    for rank in 0..3 {
+        for (_, found) in &problems {
+            references.extend(found.get(rank).cloned());
+        }
+    }
+    reject("candidate_window_coverage_invalid", references)
 }
 fn resolve_dues(
     batches: &[Value],
