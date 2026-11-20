@@ -38,6 +38,22 @@ struct HotPreview {
     // Requested stored-memory period and its eligible IDs/points from this snapshot.
     period: Option<(Period, Eligible)>,
 }
+// Read-only inputs shared by the phases of one recall pass.
+#[derive(Clone, Copy)]
+struct PassInputs<'a, 't, 's> {
+    tx: &'a ReadTxn<'t>,
+    db: &'a rusqlite::Connection,
+    request: &'a RecallRequest,
+    scope: Option<&'a str>,
+    period: &'a Option<(Period, Eligible)>,
+    limit: usize,
+    vector: &'a [f32; 768],
+    archive: bool,
+    at: DateTime<Utc>,
+    deadline: Instant,
+    score: Option<&'a TextScore<'s>>,
+    timings: &'a RecallTimings,
+}
 
 fn number(v: &Value, key: &str, default: f64) -> f64 {
     v[key].as_f64().unwrap_or(default)
@@ -504,6 +520,109 @@ impl Retrieval {
             (limit * 20).min(1000)
         };
         let mut hits = curated;
+        let inputs = PassInputs {
+            tx,
+            db,
+            request,
+            scope,
+            period: &period,
+            limit,
+            vector,
+            archive,
+            at,
+            deadline,
+            score,
+            timings,
+        };
+        let (and_targets, or_only, discoveries) =
+            Self::lexical_discovery(&inputs, allowed, &mut matches, &mut keyword_targets)?;
+        timings.count(Count::LexicalHits, and_targets.len());
+        timings.count(Count::Discovered, discoveries.len());
+        clock = timings.lap(Stage::Lexical, clock);
+        hits.extend(discoveries);
+        hits.sort_by(|a, b| {
+            b.cosine
+                .total_cmp(&a.cosine)
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        timings.count(Count::Hydrated, hits.len());
+        Self::admit_hits(&inputs, hits, &keyword_targets, &mut matches)?;
+        timings.count(Count::Admitted, matches.len());
+        clock = timings.lap(Stage::Hydration, clock);
+        validate_text_passages(
+            db,
+            &mut matches,
+            limit,
+            deadline,
+            score,
+            &or_only,
+            request.explain,
+        )?;
+        timings.count(Count::Validated, matches.len());
+        let meaningful = matches.values().try_fold(false, |yes, v| {
+            Ok::<_, Error>(yes || records::meaningful(db, v)?)
+        })?;
+        let need_archive = scope.is_none()
+            && period.is_none()
+            && !meaningful
+            && (request.effort != "deep" || request.automatic)
+            && matches.len() + named.len() < limit;
+        clock = timings.lap(Stage::Validation, clock);
+        if request.effort == "deep" && !request.automatic && scope.is_none() && period.is_none() {
+            Self::add_deep_raw(&inputs, cold_search, deep_raw, n, &mut clock, &mut matches)?;
+        } else if need_archive && archive {
+            Self::add_archive_fallback(
+                &inputs,
+                cold_search,
+                parked_preview,
+                &mut clock,
+                &mut matches,
+            )?;
+        } else {
+            drop(cold_search);
+        }
+        clock = timings.lap(Stage::Fallback, clock);
+        let mut records = Self::finish_rows(&inputs, matches)?;
+        records.sort_by(order);
+        timings.count(Count::Finished, records.len());
+        clock = timings.lap(Stage::Finish, clock);
+        let (mut output, facts) = Self::emit_rows(&inputs, records, named, &and_targets, &or_only)?;
+        clock = timings.lap(Stage::Rows, clock);
+        if period.is_none() {
+            let before = output.len();
+            anchors::add_partials(
+                db,
+                &request.query,
+                vector,
+                scope,
+                TEXT_FLOOR,
+                &facts,
+                &mut output,
+                limit,
+            )?;
+            timings.count(Count::PartialAnchors, output.len().saturating_sub(before));
+        }
+        timings.lap(Stage::PartialAnchors, clock);
+        if request.explain {
+            Self::explain_positional(&mut output, archive);
+        }
+        Ok((output, need_archive && !archive))
+    }
+    // All-term literal admission, then OR discovery: (AND targets, OR-only targets, discovered hits).
+    fn lexical_discovery(
+        inputs: &PassInputs<'_, '_, '_>,
+        allowed: Option<&str>,
+        matches: &mut BTreeMap<String, Value>,
+        keyword_targets: &mut HashSet<String>,
+    ) -> Result<(HashSet<String>, HashSet<String>, Vec<SearchHit>)> {
+        let PassInputs {
+            tx,
+            request,
+            scope,
+            limit,
+            vector,
+            ..
+        } = *inputs;
         if !request.automatic {
             // Existing all-term literal admission stays unchanged. Semantic-only OR discovery
             // below requires native cosine admission; a shared name token is not an identity anchor.
@@ -513,8 +632,8 @@ impl Retrieval {
                 limit,
                 scope,
                 allowed,
-                &mut matches,
-                &mut keyword_targets,
+                matches,
+                keyword_targets,
             )?;
         }
         // Public hybrid scores combine literal and OR discovery provenance.
@@ -563,16 +682,22 @@ impl Retrieval {
                 }
             }
         }
-        timings.count(Count::LexicalHits, and_targets.len());
-        timings.count(Count::Discovered, discoveries.len());
-        clock = timings.lap(Stage::Lexical, clock);
-        hits.extend(discoveries);
-        hits.sort_by(|a, b| {
-            b.cosine
-                .total_cmp(&a.cosine)
-                .then_with(|| a.target.cmp(&b.target))
-        });
-        timings.count(Count::Hydrated, hits.len());
+        Ok((and_targets, or_only, discoveries))
+    }
+    // Hydrates each hit and admits it into `matches` by its floor or keyword provenance.
+    fn admit_hits(
+        inputs: &PassInputs<'_, '_, '_>,
+        hits: Vec<SearchHit>,
+        keyword_targets: &HashSet<String>,
+        matches: &mut BTreeMap<String, Value>,
+    ) -> Result<()> {
+        let PassInputs {
+            tx,
+            db,
+            request,
+            deadline,
+            ..
+        } = *inputs;
         for hit in hits {
             check(deadline)?;
             let Some(mut record) = hydrate(tx, &hit, false)? else {
@@ -603,155 +728,184 @@ impl Retrieval {
                 matches.insert(id, record);
             }
         }
-        timings.count(Count::Admitted, matches.len());
-        clock = timings.lap(Stage::Hydration, clock);
-        validate_text_passages(
+        Ok(())
+    }
+    // Deep recall: Hot and Cold raw passages plus episode FTS, validated before joining `matches`.
+    fn add_deep_raw(
+        inputs: &PassInputs<'_, '_, '_>,
+        cold_search: impl FnOnce(usize, Pool) -> Result<Vec<SearchHit>>,
+        deep_raw: Vec<SearchHit>,
+        n: usize,
+        clock: &mut Instant,
+        matches: &mut BTreeMap<String, Value>,
+    ) -> Result<()> {
+        let PassInputs {
+            tx,
             db,
-            &mut matches,
+            request,
             limit,
             deadline,
             score,
-            &or_only,
-            request.explain,
-        )?;
-        timings.count(Count::Validated, matches.len());
-        let meaningful = matches.values().try_fold(false, |yes, v| {
-            Ok::<_, Error>(yes || records::meaningful(db, v)?)
-        })?;
-        let need_archive = scope.is_none()
-            && period.is_none()
-            && !meaningful
-            && (request.effort != "deep" || request.automatic)
-            && matches.len() + named.len() < limit;
-        clock = timings.lap(Stage::Validation, clock);
-        if request.effort == "deep" && !request.automatic && scope.is_none() && period.is_none() {
-            let mut raw_matches = BTreeMap::new();
-            let mut raw_hits = deep_raw;
-            let cold = cold_search(n, Pool::Ordinary)?;
-            timings.count(Count::ColdHits, cold.len());
-            clock = timings.lap(Stage::SearchCold, clock);
-            raw_hits.extend(cold);
-            for hit in raw_hits {
-                if hit.cosine as f64 >= TEXT_FLOOR {
-                    if let Some(mut row) = hydrate(tx, &hit, false)? {
-                        records::merge(
-                            &mut row,
-                            json!({"cosine":hit.cosine,"score":hit.cosine,"match":"semantic"}),
-                        );
-                        raw_matches.entry(key(&row).to_owned()).or_insert(row);
-                    }
+            timings,
+            ..
+        } = *inputs;
+        let mut raw_matches = BTreeMap::new();
+        let mut raw_hits = deep_raw;
+        let cold = cold_search(n, Pool::Ordinary)?;
+        timings.count(Count::ColdHits, cold.len());
+        *clock = timings.lap(Stage::SearchCold, *clock);
+        raw_hits.extend(cold);
+        for hit in raw_hits {
+            if hit.cosine as f64 >= TEXT_FLOOR {
+                if let Some(mut row) = hydrate(tx, &hit, false)? {
+                    records::merge(
+                        &mut row,
+                        json!({"cosine":hit.cosine,"score":hit.cosine,"match":"semantic"}),
+                    );
+                    raw_matches.entry(key(&row).to_owned()).or_insert(row);
                 }
             }
-            for episode in
-                tx.search_episodes(Some(&request.query), (limit * 4).min(100), None, None, None)?
+        }
+        for episode in
+            tx.search_episodes(Some(&request.query), (limit * 4).min(100), None, None, None)?
+        {
+            if let Some(mut row) =
+                records::matched_passage(tx, key(&episode), &request.query, false)?
             {
-                if let Some(mut row) =
-                    records::matched_passage(tx, key(&episode), &request.query, false)?
-                {
-                    let old = raw_matches.get(key(&row));
-                    let cosine = old.and_then(|v| v["cosine"].as_f64());
+                let old = raw_matches.get(key(&row));
+                let cosine = old.and_then(|v| v["cosine"].as_f64());
+                records::merge(
+                    &mut row,
+                    json!({
+                        "score":cosine.unwrap_or(TEXT_FLOOR)+0.25,
+                        "cosine":cosine,
+                        "match":if cosine.is_some(){"hybrid"}else{"keyword"}
+                    }),
+                );
+                raw_matches.insert(key(&row).into(), row);
+            }
+        }
+        validate_text_passages(
+            db,
+            &mut raw_matches,
+            limit,
+            deadline,
+            score,
+            &HashSet::new(),
+            request.explain,
+        )?;
+        for (id, row) in raw_matches {
+            matches.entry(id).or_insert(row);
+        }
+        Ok(())
+    }
+    // Archive cut: raw fallback passages and, for automatic recall, at most one parked candidate.
+    fn add_archive_fallback(
+        inputs: &PassInputs<'_, '_, '_>,
+        cold_search: impl FnOnce(usize, Pool) -> Result<Vec<SearchHit>>,
+        parked_preview: Option<Result<Vec<SearchHit>>>,
+        clock: &mut Instant,
+        matches: &mut BTreeMap<String, Value>,
+    ) -> Result<()> {
+        let PassInputs {
+            tx,
+            db,
+            request,
+            limit,
+            at,
+            deadline,
+            score,
+            timings,
+            ..
+        } = *inputs;
+        let fallback_limit = if request.automatic { 1 } else { limit };
+        let fallback_hits = cold_search((fallback_limit * 4).max(8), Pool::RawFallback)?;
+        timings.count(Count::ColdHits, fallback_hits.len());
+        *clock = timings.lap(Stage::SearchCold, *clock);
+        let mut fallback = Self::raw_fallback_scored(
+            tx,
+            fallback_hits,
+            &request.query,
+            fallback_limit,
+            !request.automatic,
+            at,
+            deadline,
+            score,
+            request.explain,
+        )?;
+        if request.automatic {
+            let mut parked = Vec::new();
+            for hit in parked_preview.ok_or(Error::Unavailable(
+                "Parked candidate preview is unavailable",
+            ))?? {
+                if (hit.cosine as f64) < AUTO_FLOOR {
+                    continue;
+                }
+                if let Some(mut row) = records::candidate(db, &hit.target)? {
+                    if !automatic_allowed(db, &row)? {
+                        continue;
+                    }
+                    finish(db, &mut row, at)?;
                     records::merge(
                         &mut row,
                         json!({
-                            "score":cosine.unwrap_or(TEXT_FLOOR)+0.25,
-                            "cosine":cosine,
-                            "match":if cosine.is_some(){"hybrid"}else{"keyword"}
+                            "category":"memory",
+                            "cosine":hit.cosine,
+                            "score":hit.cosine,
+                            "match":"semantic",
+                            "related":[],
+                            "duplicate_ids":[]
                         }),
                     );
-                    raw_matches.insert(key(&row).into(), row);
+                    let label = source_label(&row);
+                    if let Some(full) = row["_full_text"].as_str() {
+                        row["_full_render"] =
+                            json!(format!("Unverified historical candidate{label}: {full}"));
+                    }
+                    row["text"] = json!(format!(
+                        "Unverified historical candidate{label}: {}",
+                        row["text"].as_str().unwrap_or("")
+                    ));
+                    parked.push(row);
                 }
             }
+            parked.sort_by(order);
+            let mut eligible: BTreeMap<String, Value> = parked
+                .into_iter()
+                .map(|row| (key(&row).to_owned(), row))
+                .collect();
             validate_text_passages(
                 db,
-                &mut raw_matches,
+                &mut eligible,
                 limit,
                 deadline,
                 score,
                 &HashSet::new(),
                 request.explain,
             )?;
-            for (id, row) in raw_matches {
-                matches.entry(id).or_insert(row);
+            let mut parked: Vec<Value> = eligible.into_values().collect();
+            parked.sort_by(order);
+            if let Some(row) = parked.into_iter().next() {
+                fallback.push(row);
             }
-        } else if need_archive && archive {
-            let fallback_limit = if request.automatic { 1 } else { limit };
-            let fallback_hits = cold_search((fallback_limit * 4).max(8), Pool::RawFallback)?;
-            timings.count(Count::ColdHits, fallback_hits.len());
-            clock = timings.lap(Stage::SearchCold, clock);
-            let mut fallback = Self::raw_fallback_scored(
-                tx,
-                fallback_hits,
-                &request.query,
-                fallback_limit,
-                !request.automatic,
-                at,
-                deadline,
-                score,
-                request.explain,
-            )?;
-            if request.automatic {
-                let mut parked = Vec::new();
-                for hit in parked_preview.ok_or(Error::Unavailable(
-                    "Parked candidate preview is unavailable",
-                ))?? {
-                    if (hit.cosine as f64) < AUTO_FLOOR {
-                        continue;
-                    }
-                    if let Some(mut row) = records::candidate(db, &hit.target)? {
-                        if !automatic_allowed(db, &row)? {
-                            continue;
-                        }
-                        finish(db, &mut row, at)?;
-                        records::merge(
-                            &mut row,
-                            json!({
-                                "category":"memory",
-                                "cosine":hit.cosine,
-                                "score":hit.cosine,
-                                "match":"semantic",
-                                "related":[],
-                                "duplicate_ids":[]
-                            }),
-                        );
-                        let label = source_label(&row);
-                        if let Some(full) = row["_full_text"].as_str() {
-                            row["_full_render"] =
-                                json!(format!("Unverified historical candidate{label}: {full}"));
-                        }
-                        row["text"] = json!(format!(
-                            "Unverified historical candidate{label}: {}",
-                            row["text"].as_str().unwrap_or("")
-                        ));
-                        parked.push(row);
-                    }
-                }
-                parked.sort_by(order);
-                let mut eligible: BTreeMap<String, Value> = parked
-                    .into_iter()
-                    .map(|row| (key(&row).to_owned(), row))
-                    .collect();
-                validate_text_passages(
-                    db,
-                    &mut eligible,
-                    limit,
-                    deadline,
-                    score,
-                    &HashSet::new(),
-                    request.explain,
-                )?;
-                let mut parked: Vec<Value> = eligible.into_values().collect();
-                parked.sort_by(order);
-                if let Some(row) = parked.into_iter().next() {
-                    fallback.push(row);
-                }
-            }
-            for row in fallback {
-                matches.entry(key(&row).into()).or_insert(row);
-            }
-        } else {
-            drop(cold_search);
         }
-        clock = timings.lap(Stage::Fallback, clock);
+        for row in fallback {
+            matches.entry(key(&row).into()).or_insert(row);
+        }
+        Ok(())
+    }
+    // Completes admitted rows: media sources, ranking fields, period gate and query feedback.
+    fn finish_rows(
+        inputs: &PassInputs<'_, '_, '_>,
+        matches: BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>> {
+        let PassInputs {
+            db,
+            request,
+            period,
+            at,
+            ..
+        } = *inputs;
         let mut records = Vec::new();
         for (_, mut row) in matches {
             if !records::media_sources(db, &mut row)? {
@@ -793,9 +947,24 @@ impl Retrieval {
             }
             records.push(row);
         }
-        records.sort_by(order);
-        timings.count(Count::Finished, records.len());
-        clock = timings.lap(Stage::Finish, clock);
+        Ok(records)
+    }
+    // Emits ranked rows after the name anchors; returns the output and its meaningful facts.
+    fn emit_rows(
+        inputs: &PassInputs<'_, '_, '_>,
+        records: Vec<Value>,
+        named: Vec<Value>,
+        and_targets: &HashSet<String>,
+        or_only: &HashSet<String>,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let PassInputs {
+            db,
+            request,
+            scope,
+            period,
+            limit,
+            ..
+        } = *inputs;
         let mut facts = Vec::new();
         // Exact full-name/alias T1 anchors keep their existing priority and budget.
         let mut emitted_ids = named
@@ -816,83 +985,15 @@ impl Retrieval {
             // Automatic only: the same framing applied to the complete stored assertion.
             let mut full: Option<String> = None;
             if request.automatic {
-                let signature = format!(
-                    "{}\0{}\0{}\0{}",
-                    row["category"],
-                    row["authority"],
-                    row["scope"],
-                    if row["type"] == "media" {
-                        row["sha256"].as_str().unwrap_or("").to_owned()
-                    } else {
-                        unicode::casefold(
-                            row["_full_text"]
-                                .as_str()
-                                .unwrap_or(row["text"].as_str().unwrap_or("")),
-                        )
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .trim_end_matches(['.', '!'])
-                        .to_owned()
-                    }
-                );
-                if let Some(index) = grouped.get(&signature) {
-                    let previous = &mut output[*index];
-                    previous["duplicate_ids"]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(row["id"].clone());
-                    for evidence in row["evidence"].as_array().into_iter().flatten() {
-                        if !previous["evidence"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .any(|r| {
-                                r["episode_id"] == evidence["episode_id"]
-                                    && r["start"] == evidence["start"]
-                                    && r["end"] == evidence["end"]
-                            })
-                        {
-                            previous["evidence"]
-                                .as_array_mut()
-                                .unwrap()
-                                .push(evidence.clone());
-                        }
-                    }
+                if !Self::frame_automatic(
+                    &mut row,
+                    &mut full,
+                    &mut output,
+                    &mut grouped,
+                    &mut suggestions,
+                    &mut media,
+                ) {
                     continue;
-                }
-                if row["category"] == "behavioral_suggestion" {
-                    if suggestions == 2 {
-                        continue;
-                    }
-                    suggestions += 1;
-                }
-                if row["category"] == "media_reference" {
-                    if media == 1 {
-                        continue;
-                    }
-                    media += 1;
-                }
-                grouped.insert(signature, output.len());
-                row["duplicate_ids"] = json!([]);
-                full = row
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("_full_render")
-                    .or_else(|| row.get("_full_text").cloned())
-                    .and_then(|v| v.as_str().map(str::to_owned));
-                if let Some(date) = row["source_occurred_at"].as_str() {
-                    let prefix = format!("Source {}: ", &date[..10.min(date.len())]);
-                    if let Some(full) = full.as_mut() {
-                        *full = format!("{prefix}{full}");
-                    }
-                    row["text"] = json!(format!("{prefix}{}", row["text"].as_str().unwrap_or("")));
-                    if row["behavior"].is_object() {
-                        row["behavior"]["applicability"] = json!(format!(
-                            "{prefix}{}",
-                            row["behavior"]["applicability"].as_str().unwrap_or("")
-                        ));
-                    }
                 }
             } else if request.effort != "cheap" && row["tier"] == "durable" {
                 row["related"] = json!(records::related(
@@ -928,95 +1029,13 @@ impl Retrieval {
                 }
             }
             if request.automatic {
-                // Role-only requests retain recorded names without inventing standalone subjects.
-                // Keep related=[] and never alter the stored assertion or behavioral applicability.
-                let mut provenance = Vec::new();
-                for (endpoint, base) in &connections {
-                    let name = base["name"].as_str().unwrap();
-                    if anchors::contains_name(name, row["text"].as_str().unwrap_or("")) {
-                        continue;
-                    }
-                    let clean = name
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .chars()
-                        .take(160)
-                        .collect::<String>();
-                    provenance.push(format!(
-                        "{clean} [{}; {} {}; edge {}]",
-                        base["type"].as_str().unwrap(),
-                        endpoint["relation"].as_str().unwrap(),
-                        endpoint["direction"].as_str().unwrap(),
-                        endpoint["edge_id"].as_str().unwrap()
-                    ));
-                    if provenance.len() == 2 {
-                        break;
-                    }
-                }
-                if !provenance.is_empty() {
-                    // Same suffix for both renderings; `text` decides it, so legacy output is unchanged.
-                    if let Some(full) = full.as_mut() {
-                        *full = format!("{full} (Connected: {})", provenance.join("; "));
-                    }
-                    row["text"] = json!(format!(
-                        "{} (Connected: {})",
-                        row["text"].as_str().unwrap_or(""),
-                        provenance.join("; ")
-                    ));
-                }
-                // Additive complete rendering for current-fact rows only; legacy `text` keeps
-                // its summary for old bridges. Long bodies travel whole when the rendering
-                // fits one reminder (owner decision 2026-11-02); sensitive types stay withheld.
-                if let Some(full) = full {
-                    if row["category"] == "memory"
-                        && row["type"] != "media"
-                        && row["behavior"].is_null()
-                        && full.len() <= FULL_TEXT_BYTES
-                        && !sensitive_type(db, row["type"].as_str().unwrap_or(""))?
-                    {
-                        row["full_text"] = json!(full);
-                    }
-                }
+                Self::render_automatic(db, &mut row, full, &connections)?;
             }
             if records::meaningful(db, &row)? {
                 facts.push(row.clone());
             }
             if request.explain {
-                // Facts the pipeline already computed for this returned row; no extra search or clock.
-                let raw = row["tier"] == "raw" || row["type"] == "raw_episode";
-                let deep = request.effort == "deep"
-                    && !request.automatic
-                    && scope.is_none()
-                    && period.is_none();
-                let (route, gate) = if raw {
-                    (if deep { "deep_raw" } else { "raw_fallback" }, TEXT_FLOOR)
-                } else if row["tier"] == "candidate" && row["historical"] == true {
-                    ("parked_fallback", AUTO_FLOOR)
-                } else {
-                    ("ranked", floor(&row, request.automatic))
-                };
-                let logit = row.as_object_mut().unwrap().remove("_logit");
-                row["explain"] = json!({
-                    "route": route,
-                    "pass": if archive { "archive" } else { "hot" },
-                    "ann": {"cosine": row["cosine"], "floor": gate},
-                    "lexical": {
-                        "and_literal": and_targets.contains(key(&row)),
-                        "or_discovery": or_only.contains(key(&row)),
-                        "episode_fts": raw && matches!(row["match"].as_str(), Some("keyword" | "hybrid")),
-                    },
-                    "passage_validation": match logit {
-                        Some(logit) => json!({"status":"passed","logit":logit,"floor":SEMANTIC_TEXT_LOGIT_FLOOR}),
-                        None => json!({
-                            "status":"not_run",
-                            "reason":if score.is_none() {"no_scorer"} else {"route_exempt"}
-                        }),
-                    },
-                    // Ranked rows only; anchors and connections are positional.
-                    "ordering": "sort_key",
-                    "sort_key": [relevance(&row), number(&row, "score", 0.), number(&row, "decay", 1.), number(&row, "importance", 0.5), number(&row, "_feedback", 0.), key(&row)],
-                });
+                Self::explain_ranked(inputs, &mut row, and_targets, or_only);
             }
             row.as_object_mut().unwrap().remove("_full_text");
             row.as_object_mut().unwrap().remove("_feedback");
@@ -1046,40 +1065,219 @@ impl Retrieval {
                 }
             }
         }
-        clock = timings.lap(Stage::Rows, clock);
-        if period.is_none() {
-            let before = output.len();
-            anchors::add_partials(
-                db,
-                &request.query,
-                vector,
-                scope,
-                TEXT_FLOOR,
-                &facts,
-                &mut output,
-                limit,
-            )?;
-            timings.count(Count::PartialAnchors, output.len().saturating_sub(before));
+        Ok((output, facts))
+    }
+    // Automatic framing of one row. False skips it: folded into a duplicate or out of category slots.
+    fn frame_automatic(
+        row: &mut Value,
+        full: &mut Option<String>,
+        output: &mut Vec<Value>,
+        grouped: &mut BTreeMap<String, usize>,
+        suggestions: &mut i32,
+        media: &mut i32,
+    ) -> bool {
+        let signature = format!(
+            "{}\0{}\0{}\0{}",
+            row["category"],
+            row["authority"],
+            row["scope"],
+            if row["type"] == "media" {
+                row["sha256"].as_str().unwrap_or("").to_owned()
+            } else {
+                unicode::casefold(
+                    row["_full_text"]
+                        .as_str()
+                        .unwrap_or(row["text"].as_str().unwrap_or("")),
+                )
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_end_matches(['.', '!'])
+                .to_owned()
+            }
+        );
+        if let Some(index) = grouped.get(&signature) {
+            let previous = &mut output[*index];
+            previous["duplicate_ids"]
+                .as_array_mut()
+                .unwrap()
+                .push(row["id"].clone());
+            for evidence in row["evidence"].as_array().into_iter().flatten() {
+                if !previous["evidence"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|r| {
+                        r["episode_id"] == evidence["episode_id"]
+                            && r["start"] == evidence["start"]
+                            && r["end"] == evidence["end"]
+                    })
+                {
+                    previous["evidence"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(evidence.clone());
+                }
+            }
+            return false;
         }
-        timings.lap(Stage::PartialAnchors, clock);
-        if request.explain {
-            for row in output.iter_mut().filter(|r| r.get("explain").is_none()) {
-                let route = match row["match"].as_str() {
-                    Some("entity_name") => "anchor",
-                    Some("partial_entity_name") => "partial_anchor",
-                    Some("recorded_connection") => "recorded_connection",
-                    _ => "positional",
-                };
-                row["explain"] = json!({
-                    "route":route,
-                    "pass":if archive { "archive" } else { "hot" },
-                    "ordering":"positional",
-                    "sort_key":null,
-                    "passage_validation":{"status":"not_run","reason":"positional"}
-                });
+        if row["category"] == "behavioral_suggestion" {
+            if *suggestions == 2 {
+                return false;
+            }
+            *suggestions += 1;
+        }
+        if row["category"] == "media_reference" {
+            if *media == 1 {
+                return false;
+            }
+            *media += 1;
+        }
+        grouped.insert(signature, output.len());
+        row["duplicate_ids"] = json!([]);
+        *full = row
+            .as_object_mut()
+            .unwrap()
+            .remove("_full_render")
+            .or_else(|| row.get("_full_text").cloned())
+            .and_then(|v| v.as_str().map(str::to_owned));
+        if let Some(date) = row["source_occurred_at"].as_str() {
+            let prefix = format!("Source {}: ", &date[..10.min(date.len())]);
+            if let Some(full) = full.as_mut() {
+                *full = format!("{prefix}{full}");
+            }
+            row["text"] = json!(format!("{prefix}{}", row["text"].as_str().unwrap_or("")));
+            if row["behavior"].is_object() {
+                row["behavior"]["applicability"] = json!(format!(
+                    "{prefix}{}",
+                    row["behavior"]["applicability"].as_str().unwrap_or("")
+                ));
             }
         }
-        Ok((output, need_archive && !archive))
+        true
+    }
+    // Automatic connection provenance suffix and the additive complete `full_text` rendering.
+    fn render_automatic(
+        db: &rusqlite::Connection,
+        row: &mut Value,
+        mut full: Option<String>,
+        connections: &[(Value, Value)],
+    ) -> Result<()> {
+        // Role-only requests retain recorded names without inventing standalone subjects.
+        // Keep related=[] and never alter the stored assertion or behavioral applicability.
+        let mut provenance = Vec::new();
+        for (endpoint, base) in connections {
+            let name = base["name"].as_str().unwrap();
+            if anchors::contains_name(name, row["text"].as_str().unwrap_or("")) {
+                continue;
+            }
+            let clean = name
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(160)
+                .collect::<String>();
+            provenance.push(format!(
+                "{clean} [{}; {} {}; edge {}]",
+                base["type"].as_str().unwrap(),
+                endpoint["relation"].as_str().unwrap(),
+                endpoint["direction"].as_str().unwrap(),
+                endpoint["edge_id"].as_str().unwrap()
+            ));
+            if provenance.len() == 2 {
+                break;
+            }
+        }
+        if !provenance.is_empty() {
+            // Same suffix for both renderings; `text` decides it, so legacy output is unchanged.
+            if let Some(full) = full.as_mut() {
+                *full = format!("{full} (Connected: {})", provenance.join("; "));
+            }
+            row["text"] = json!(format!(
+                "{} (Connected: {})",
+                row["text"].as_str().unwrap_or(""),
+                provenance.join("; ")
+            ));
+        }
+        // Additive complete rendering for current-fact rows only; legacy `text` keeps
+        // its summary for old bridges. Long bodies travel whole when the rendering
+        // fits one reminder (owner decision 2026-11-02); sensitive types stay withheld.
+        if let Some(full) = full {
+            if row["category"] == "memory"
+                && row["type"] != "media"
+                && row["behavior"].is_null()
+                && full.len() <= FULL_TEXT_BYTES
+                && !sensitive_type(db, row["type"].as_str().unwrap_or(""))?
+            {
+                row["full_text"] = json!(full);
+            }
+        }
+        Ok(())
+    }
+    fn explain_ranked(
+        inputs: &PassInputs<'_, '_, '_>,
+        row: &mut Value,
+        and_targets: &HashSet<String>,
+        or_only: &HashSet<String>,
+    ) {
+        let PassInputs {
+            request,
+            scope,
+            period,
+            archive,
+            score,
+            ..
+        } = *inputs;
+        // Facts the pipeline already computed for this returned row; no extra search or clock.
+        let raw = row["tier"] == "raw" || row["type"] == "raw_episode";
+        let deep =
+            request.effort == "deep" && !request.automatic && scope.is_none() && period.is_none();
+        let (route, gate) = if raw {
+            (if deep { "deep_raw" } else { "raw_fallback" }, TEXT_FLOOR)
+        } else if row["tier"] == "candidate" && row["historical"] == true {
+            ("parked_fallback", AUTO_FLOOR)
+        } else {
+            ("ranked", floor(row, request.automatic))
+        };
+        let logit = row.as_object_mut().unwrap().remove("_logit");
+        row["explain"] = json!({
+            "route": route,
+            "pass": if archive { "archive" } else { "hot" },
+            "ann": {"cosine": row["cosine"], "floor": gate},
+            "lexical": {
+                "and_literal": and_targets.contains(key(row)),
+                "or_discovery": or_only.contains(key(row)),
+                "episode_fts": raw && matches!(row["match"].as_str(), Some("keyword" | "hybrid")),
+            },
+            "passage_validation": match logit {
+                Some(logit) => json!({"status":"passed","logit":logit,"floor":SEMANTIC_TEXT_LOGIT_FLOOR}),
+                None => json!({
+                    "status":"not_run",
+                    "reason":if score.is_none() {"no_scorer"} else {"route_exempt"}
+                }),
+            },
+            // Ranked rows only; anchors and connections are positional.
+            "ordering": "sort_key",
+            "sort_key": [relevance(row), number(row, "score", 0.), number(row, "decay", 1.), number(row, "importance", 0.5), number(row, "_feedback", 0.), key(row)],
+        });
+    }
+    fn explain_positional(output: &mut [Value], archive: bool) {
+        for row in output.iter_mut().filter(|r| r.get("explain").is_none()) {
+            let route = match row["match"].as_str() {
+                Some("entity_name") => "anchor",
+                Some("partial_entity_name") => "partial_anchor",
+                Some("recorded_connection") => "recorded_connection",
+                _ => "positional",
+            };
+            row["explain"] = json!({
+                "route":route,
+                "pass":if archive { "archive" } else { "hot" },
+                "ordering":"positional",
+                "sort_key":null,
+                "passage_validation":{"status":"not_run","reason":"positional"}
+            });
+        }
     }
     fn keywords(
         tx: &ReadTxn<'_>,
