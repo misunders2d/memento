@@ -5,6 +5,8 @@ mod claim_link_tests;
 mod due_tests;
 #[path = "lesson_link_tests.rs"]
 mod lesson_link_tests;
+#[path = "packet_tests.rs"]
+mod packet_tests;
 use super::*;
 use crate::{
     pipeline_schema,
