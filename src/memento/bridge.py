@@ -1592,10 +1592,10 @@ def hook(spool, harness, data, *, recall=automatic):
     spool.episode(harness, conversation, 'hook:' + digest(data), 'native_hook', encode(data).decode('utf-8'),
                   metadata={'extraction_mode': 'skip'})
     expected = {'source': source(spool.config, harness), 'conversation_id': conversation}
-    if harness == 'claude':
-        # The hook checks, never rewrites, Claude's attribution, so an agent
-        # cannot label its mutation with another actor such as human:uid:N.
-        expected['actor'] = f"claude:{spool.config['uid']}"
+    # Only Claude and Codex reach this hook. It checks, never rewrites, their
+    # attribution, so an agent cannot label a mutation with another actor
+    # such as human:uid:N.
+    expected['actor'] = f"{harness}:{spool.config['uid']}"
     provenance = 'Memento current-conversation quote context: ' + encode(expected).decode('utf-8')
     provenance += '\nFor quote-only remember/link/supersede/reconcile, use those exact command context fields; episode IDs are optional.'
     if event == 'SessionStart' and data.get('source') != 'compact':

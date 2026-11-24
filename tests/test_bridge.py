@@ -651,8 +651,8 @@ def test_mutation_callers_flush_only_unresolved_quotes_without_permission_change
     monkeypatch.setattr(bridge, 'http', accepted)
     command = {'source': bridge.source(spool.config, harness), 'conversation_id': 'current',
                'evidence': [{'episode_id': 'already-remote', 'quote': 'Remote quote.'}, {'quote': 'Pending quote.'}]}
-    if harness == 'claude':
-        command['actor'] = 'claude:1000'
+    if harness in ('claude', 'codex'):
+        command['actor'] = f'{harness}:1000'
     for evidence in (command['evidence'], command['evidence'][:1]):
         command['evidence'] = evidence
         flushed.clear()
@@ -710,13 +710,12 @@ def test_mcp_provenance_hooks_never_auto_approve(tmp_path, monkeypatch):
         assert f'"source":"native:test-device:{harness}"' in denied['permissionDecisionReason']
         assert '"conversation_id":"s"' in denied['permissionDecisionReason']
         data['tool_input']['command'].update(source=f'native:test-device:{harness}', conversation_id='s')
-        if harness == 'claude':
-            assert '"actor":"claude:1000"' in denied['permissionDecisionReason']
-            for forged in ('human:uid:1000', 'claude'):
-                data['tool_input']['command']['actor'] = forged
-                again = bridge.hook(spool, harness, data)['hookSpecificOutput']
-                assert again['permissionDecision'] == 'deny' and 'updatedInput' not in again
-            data['tool_input']['command']['actor'] = 'claude:1000'
+        assert f'"actor":"{harness}:1000"' in denied['permissionDecisionReason']
+        for forged in ('human:uid:1000', harness):
+            data['tool_input']['command']['actor'] = forged
+            again = bridge.hook(spool, harness, data)['hookSpecificOutput']
+            assert again['permissionDecision'] == 'deny' and 'updatedInput' not in again
+        data['tool_input']['command']['actor'] = f'{harness}:1000'
         assert bridge.hook(spool, harness, data) == {}
     spool.close()
 
@@ -1288,7 +1287,7 @@ def test_codex_evidence_and_compaction_hooks_reconcile_before_the_boundary(tmp_p
     result = bridge.hook(spool, 'codex', {'session_id': 'current', 'hook_event_name': event,
         'source': 'compact', 'transcript_path': str(path), 'tool_name': 'mcp__memento__remember',
         'tool_input': {'command': {'source': bridge.source(spool.config, 'codex'),
-            'conversation_id': 'current', 'evidence': [{'quote': quote}]}}},
+            'conversation_id': 'current', 'actor': 'codex:1000', 'evidence': [{'quote': quote}]}}},
         recall=lambda *_args, **_kwargs: {'context': '', 'shown': []})
     assert spool.db.execute('SELECT offset FROM journals').fetchone()[0] == len(raw)
     if event == 'PreToolUse':
