@@ -543,6 +543,167 @@ fn forget_cascades_to_memories_left_without_unforgotten_evidence() {
 }
 
 #[test]
+fn forget_episode_hides_its_event_and_cascades_only_to_memories_wholly_based_on_it() {
+    let f = Fixture::new();
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO \
+                episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+                VALUES ('fixture-episode-2','contract','two','thread','user','Orion belongs to \
+                Vega.','2026-10-19T12:00:00+00:00','{}','2026-10-25T12:00:00+00:00')", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let only = f.remember("a", "Preserve this decision.", "Preserve this decision.");
+    let mut both = f.command("c", "Orion belongs to Vega.", "Orion belongs to Vega.");
+    both["evidence"] = json!([
+        {"episode_id":f.episode,"quote":"Orion belongs to Vega."},
+        {"episode_id":"fixture-episode-2","quote":"Orion belongs to Vega."}
+    ]);
+    let both = f.graph.remember(parse(both)).unwrap();
+    let (only, both) = (only["id"].as_str().unwrap(), both["id"].as_str().unwrap());
+    // Older-version evidence elsewhere must not widen the forgotten event set.
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute(
+                "INSERT INTO graph_evidence VALUES(?,0,'fixture-episode-2',0,5,'Orion')",
+                [only],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let found = |word: &str| {
+        f.graph
+            .store
+            .search_episodes(Some(word), 10, None, None, None)
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(found("Incorporated").contains(&f.episode));
+
+    let preview = f.graph.forget_preview(&f.episode).unwrap();
+    assert_eq!(preview["kind"], "episode");
+    assert_eq!(preview["dependents"], json!([only]));
+    assert_eq!(
+        preview["sources"],
+        json!([{"source":"contract","event_id":"one"}])
+    );
+    assert!(!preview["label"].as_str().unwrap().contains("Vega"));
+    let result = f
+        .graph
+        .forget(parse(json!({
+            "command_id":"forget-episode",
+            "actor":"owner",
+            "why":"Explicit raw episode exclusion",
+            "target":f.episode,
+            "token":preview["token"]
+        })))
+        .unwrap();
+    assert_eq!(result["status"], "forgotten");
+    assert_eq!(f.history(only).last().unwrap()["state"], "forgotten");
+    assert_eq!(f.history(both).last().unwrap()["state"], "active");
+    assert!(found("Incorporated").is_empty());
+    assert_eq!(found("Orion"), vec!["fixture-episode-2".to_owned()]);
+    assert!(
+        f.graph
+            .recall_keywords("Preserve", 20, None)
+            .unwrap()
+            .is_empty()
+    );
+    // Raw bytes are retained; a repeat is reported as already forgotten.
+    assert_eq!(
+        f.graph
+            .store
+            .read(|tx| tx.original_text(&f.episode))
+            .unwrap()
+            .unwrap(),
+        TEXT
+    );
+    assert_eq!(
+        f.graph.forget_preview(&f.episode).unwrap()["already_forgotten"],
+        true
+    );
+    assert!(matches!(
+        f.graph.forget_preview("no-such-identifier"),
+        Err(Error::Validation(_))
+    ));
+}
+
+#[test]
+fn forget_episode_also_hides_its_transcript_sibling() {
+    let f = Fixture::new();
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO \
+                episodes(id,source,event_id,conversation_id,kind,text,occurred_at,metadata,captured_at) \
+                VALUES ('projection','contract','message:n1','thread','user','Orion belongs to Vega.',\
+                '2026-10-19T12:00:00+00:00','{\"native_id\":\"n1\"}','2026-10-25T12:00:00+00:00'),\
+                ('raw-record','contract','raw:n1:sha','thread','native_record','{\"text\":\"Orion\"}',\
+                '2026-10-19T12:00:00+00:00','{\"extraction_mode\":\"skip\",\"native_id\":\"n1\"}',\
+                '2026-10-25T12:00:00+00:00'),\
+                ('tool-result','contract','message:n1:result','thread','tool','Orion output',\
+                '2026-10-19T12:00:00+00:00','{\"native_id\":\"n1:result\"}','2026-10-25T12:00:00+00:00'),\
+                ('blank-a','contract','blank-a','thread','user','Unrelated one',\
+                '2026-10-19T12:00:00+00:00','{\"native_id\":\"\"}','2026-10-25T12:00:00+00:00'),\
+                ('blank-b','contract','blank-b','thread','user','Unrelated two',\
+                '2026-10-19T12:00:00+00:00','{\"native_id\":\"\"}','2026-10-25T12:00:00+00:00')", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let listed = || {
+        f.graph
+            .store
+            .search_episodes(None, 100, Some("thread"), None, None)
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(listed().contains(&"raw-record".to_owned()));
+    assert_eq!(
+        f.graph.forget_preview("blank-a").unwrap()["episodes"],
+        json!(["blank-a"])
+    );
+    let preview = f.graph.forget_preview("projection").unwrap();
+    assert_eq!(
+        preview["episodes"],
+        json!(["projection", "raw-record", "tool-result"])
+    );
+    assert_eq!(
+        preview["sources"],
+        json!([
+            {"source":"contract","event_id":"message:n1"},
+            {"source":"contract","event_id":"message:n1:result"},
+            {"source":"contract","event_id":"raw:n1:sha"}
+        ])
+    );
+    f.graph
+        .forget(parse(json!({
+            "command_id":"forget-projection",
+            "actor":"owner",
+            "why":"Explicit raw episode exclusion",
+            "target":"projection",
+            "token":preview["token"]
+        })))
+        .unwrap();
+    let left = listed();
+    for gone in ["projection", "raw-record", "tool-result"] {
+        assert!(!left.contains(&gone.to_owned()));
+    }
+    assert!(left.contains(&f.episode) && left.contains(&"blank-b".to_owned()));
+    // A sibling hidden through the projection is reported as already forgotten.
+    assert_eq!(
+        f.graph.forget_preview("raw-record").unwrap()["already_forgotten"],
+        true
+    );
+}
+
+#[test]
 fn forget_retains_raw_and_history_fences_evidence_and_enqueues_vector_removal() {
     let f = Fixture::new();
     let n = f.remember("fact", "Preserve this decision.", "Preserve this decision.");

@@ -5,10 +5,12 @@ use memento_core::{Error, Result, WriteTxn};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
-/// Active nodes/edges outside `?1` that cite a source event of `?1` and whose whole
-/// current evidence lies in that event set or in already forgotten source events.
+/// Active nodes/edges outside `?1` that cite a source event of seeds `?2` (memory
+/// targets' evidence, or forgotten episodes themselves) and whose whole current
+/// evidence lies in that event set or in already forgotten source events.
 const ORPHANED: &str = "WITH t(id) AS (SELECT value FROM json_each(?1)),
-fresh(source,event_id) AS (SELECT DISTINCT e.source,e.event_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target IN (SELECT id FROM t)),
+fresh(source,event_id) AS (SELECT DISTINCT e.source,e.event_id FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target IN (SELECT value FROM json_each(?2))
+ UNION SELECT source,event_id FROM episodes WHERE id IN (SELECT value FROM json_each(?2))),
 gone(source,event_id) AS (SELECT source,event_id FROM fresh UNION SELECT source,event_id FROM forgotten_sources),
 touched(id) AS (SELECT DISTINCT g.target FROM fresh JOIN episodes e ON e.source=fresh.source AND e.event_id=fresh.event_id JOIN graph_evidence g ON g.episode_id=e.id WHERE g.target NOT IN (SELECT id FROM t)),
 cur(id,version,kind) AS (SELECT n.id,n.version,'node' FROM node_versions n JOIN touched ON touched.id=n.id WHERE n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id)
@@ -103,14 +105,79 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
             json!({}),
             vec![target.into()],
         )
+    } else if let Some(episode) = one(
+        db,
+        "SELECT kind,conversation_id,occurred_at FROM episodes WHERE id=?",
+        [target],
+    )? {
+        // A raw episode: exclude its source event everywhere active memory reads.
+        // The label names no episode text; bytes stay in raw history.
+        (
+            "episode",
+            format!(
+                "{} episode in conversation {} at {}",
+                get_str(&episode, "kind")?,
+                get_str(&episode, "conversation_id")?,
+                episode["occurred_at"].as_str().unwrap_or("unknown time")
+            ),
+            json!({}),
+            json!({}),
+            vec![target.into()],
+        )
     } else {
         return Err(Error::Validation("Unknown active-memory identifier"));
     };
+    // An episode's event set is fixed: it and its transcript siblings (raw record and
+    // projections share source, conversation and native_id; Codex/AGY tool
+    // projections add a ':result'/':tools' suffix). Hook envelopes carry no
+    // native_id and are forgotten by their own ID. Dependents' other evidence never
+    // widens the set.
+    let episodes = if kind == "episode" {
+        let siblings = rows(
+            db,
+            "WITH k(source,conversation_id,n) AS (SELECT source,conversation_id,\
+            json_extract(metadata,'$.native_id') FROM episodes WHERE id=?1), \
+            b(source,conversation_id,n) AS (SELECT source,conversation_id,CASE WHEN n LIKE \
+            '%:result' THEN substr(n,1,length(n)-7) WHEN n LIKE '%:tools' THEN \
+            substr(n,1,length(n)-6) ELSE n END FROM k WHERE typeof(n)='text' AND n<>'') \
+            SELECT s.id FROM b JOIN episodes s ON s.source=b.source AND \
+            s.conversation_id=b.conversation_id AND json_extract(s.metadata,'$.native_id') IN \
+            (b.n,b.n||':result',b.n||':tools') UNION SELECT ?1 ORDER BY 1",
+            [target],
+        )?;
+        Some(
+            siblings
+                .iter()
+                .map(|row| get_str(row, "id").map(str::to_owned))
+                .collect::<Result<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
+    // An episode already excluded through any forget (its own or a citing memory's)
+    // is reported as already forgotten.
+    let existing = existing
+        || match &episodes {
+            Some(ids) => one(
+                db,
+                "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id IN (SELECT value \
+                FROM json_each(?1)) AND NOT EXISTS (SELECT 1 FROM forgotten_sources f WHERE \
+                f.source=e.source AND f.event_id=e.event_id))",
+                [encode_json(&json!(ids))?],
+            )?
+            .is_some(),
+            None => false,
+        };
+    let seeds = |targets: &Vec<String>| encode_json(&json!(episodes.as_ref().unwrap_or(targets)));
     // Owner decision 2026-10-31: forgetting a source event also forgets other active
     // memories whose entire current evidence lies in forgotten source events.
     let mut dependents = vec![];
     while !existing {
-        let found = rows(db, ORPHANED, [encode_json(&json!(targets))?])?;
+        let found = rows(
+            db,
+            ORPHANED,
+            [encode_json(&json!(targets))?, seeds(&targets)?],
+        )?;
         if found.is_empty() {
             break;
         }
@@ -136,10 +203,11 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
     }
     let sources = rows(
         db,
-        "SELECT DISTINCT e.source,e.event_id FROM graph_evidence g JOIN episodes e ON \
-        e.id=g.episode_id WHERE g.target IN (SELECT value FROM json_each(?)) ORDER BY \
-        e.source,e.event_id",
-        [encode_json(&json!(targets))?],
+        "SELECT DISTINCT source,event_id FROM (SELECT e.source,e.event_id FROM graph_evidence g \
+        JOIN episodes e ON e.id=g.episode_id WHERE g.target IN (SELECT value FROM json_each(?1)) \
+        UNION SELECT source,event_id FROM episodes WHERE id IN (SELECT value FROM json_each(?1))) \
+        ORDER BY source,event_id",
+        [seeds(&targets)?],
     )?;
     let mut record = json!({
         "target":target,
@@ -149,6 +217,7 @@ pub fn preview(db: &Connection, target: &str) -> Result<Value> {
         "edges":edges,
         "targets":targets,
         "dependents":dependents,
+        "episodes":episodes,
         "sources":sources,
         "already_forgotten":existing,
         "policy":"active_memory_only",
