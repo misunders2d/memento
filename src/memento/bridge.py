@@ -1610,9 +1610,12 @@ def hook(spool, harness, data, *, recall=automatic):
         except (OSError, ValueError, sqlite3.Error, _http_exception()):
             return {'hookSpecificOutput': {'hookEventName': event, 'permissionDecision': 'deny',
                     'permissionDecisionReason': 'Memento current-conversation capture is pending; retry after upload.'}}
-        if harness == 'codex':
-            # Codex requires "allow" to rewrite inputs. Never grant a tool
-            # permission merely to supply provenance; retain its permission flow.
+        if harness in ('codex', 'claude'):
+            # Check, never rewrite: Codex requires "allow" to rewrite inputs, and
+            # Claude auto mode refuses inputs a hook changed after its review.
+            # Never grant a tool permission merely to supply provenance; retain
+            # the native permission flow. The agent's own stable command_id and
+            # actor stay untouched; the server replays identical retries.
             if any(command.get(key) != value for key, value in expected.items()):
                 return {'hookSpecificOutput': {'hookEventName': event, 'permissionDecision': 'deny',
                         'permissionDecisionReason': 'Retry this Memento command with ' + encode(expected).decode('utf-8')}}

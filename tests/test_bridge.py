@@ -662,7 +662,7 @@ def test_mutation_callers_flush_only_unresolved_quotes_without_permission_change
         else:
             result = bridge.hook(spool, harness, {'hook_event_name': 'PreToolUse', 'session_id': 'current',
                 'tool_name': 'mcp__memento__' + tool, 'tool_use_id': 'call', 'tool_input': {'command': command}})
-            if harness == 'codex':
+            if harness in ('codex', 'claude'):
                 assert result == {}
             else:
                 assert 'permissionDecision' not in result['hookSpecificOutput']
@@ -700,14 +700,29 @@ def test_mcp_provenance_hooks_never_auto_approve(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {'id': 'captured'})
     data = {'hook_event_name': 'PreToolUse', 'session_id': 's', 'tool_use_id': 'call',
             'tool_name': 'mcp__memento__remember', 'tool_input': {'command': {'evidence': [{'quote': 'quote'}]}}}
-    result = bridge.hook(spool, 'claude', data)['hookSpecificOutput']
-    assert 'permissionDecision' not in result
-    assert result['updatedInput']['command']['source'] == 'native:test-device:claude'
-    assert result['updatedInput']['command']['conversation_id'] == 's'
-    assert result['updatedInput']['command']['command_id'] == 'claude:s:call:remember'
-    assert bridge.hook(spool, 'codex', data)['hookSpecificOutput']['permissionDecision'] == 'deny'
-    data['tool_input']['command'].update(source='native:test-device:codex', conversation_id='s')
-    assert bridge.hook(spool, 'codex', data) == {}
+    for harness in ('claude', 'codex'):
+        data['tool_input']['command'] = {'evidence': [{'quote': 'quote'}]}
+        denied = bridge.hook(spool, harness, data)['hookSpecificOutput']
+        assert denied['permissionDecision'] == 'deny' and 'updatedInput' not in denied
+        assert f'"source":"native:test-device:{harness}"' in denied['permissionDecisionReason']
+        assert '"conversation_id":"s"' in denied['permissionDecisionReason']
+        data['tool_input']['command'].update(source=f'native:test-device:{harness}', conversation_id='s')
+        assert bridge.hook(spool, harness, data) == {}
+    spool.close()
+
+
+@pytest.mark.parametrize('tool', ['remember', 'link', 'supersede', 'reconcile'])
+def test_claude_mutation_hook_never_rewrites_agent_command(tmp_path, monkeypatch, tool):
+    # Claude auto mode refuses any input a hook changed after its review.
+    spool = spool_at(tmp_path)
+    monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {'id': 'captured'})
+    command = {'source': 'native:test-device:claude', 'conversation_id': 's',
+               'command_id': 'agent-chosen-stable-id', 'actor': 'claude',
+               'evidence': [{'quote': 'quote'}]}
+    for tool_use_id in ('first-call', 'retry-call'):
+        data = {'hook_event_name': 'PreToolUse', 'session_id': 's', 'tool_use_id': tool_use_id,
+                'tool_name': 'mcp__memento__' + tool, 'tool_input': {'command': dict(command)}}
+        assert bridge.hook(spool, 'claude', data) == {}
     spool.close()
 
 
