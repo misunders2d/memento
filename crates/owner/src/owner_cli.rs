@@ -3,6 +3,7 @@ use crate::owner;
 use memento_core::{Error, Result};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
@@ -53,7 +54,7 @@ pub const HELP: &str = "Human-only Memento review and portable export console\nU
     {list|inventory|backup|compact|history|export|approve|reject|merge|forget|revisions|recover-revisions}\n  \
     history {park|status|release-candidates}\n  export --output PATH\n  approve|reject PROPOSAL \
     --why TEXT [--command-id ID]\n  merge CLUSTER [--into ID] [--exclude ID] [--include ID] \
-    --why TEXT [--command-id ID]\n  forget TARGET --why TEXT [--command-id ID]\n  revisions \
+    --why TEXT [--command-id ID]\n  forget TARGET... --why TEXT [--command-id ID]\n  revisions \
     [--limit N] [--exclude ROOT] [--protected ROOT]\n  recover-revisions [--limit N] [--exclude \
     ROOT] [--protected ROOT] --why TEXT [--command-id ID]\n";
 #[derive(Debug)]
@@ -61,6 +62,7 @@ pub struct AdminArgs {
     pub data: PathBuf,
     pub operation: String,
     pub positional: Option<String>,
+    pub targets: Vec<String>,
     pub output: Option<PathBuf>,
     pub why: Option<String>,
     pub command_id: Option<String>,
@@ -123,6 +125,7 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
         data,
         operation,
         positional: None,
+        targets: Vec::new(),
         output: None,
         why: None,
         command_id: None,
@@ -135,10 +138,14 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
     while i < args.len() {
         let key = &args[i];
         if !key.starts_with("--") {
-            if !needs_target || parsed.positional.is_some() {
+            if parsed.operation == "forget" {
+                if !parsed.targets.contains(key) {
+                    parsed.targets.push(key.clone());
+                }
+            } else if !needs_target || parsed.positional.is_some() {
                 return Err(usage("Unexpected administrative argument"));
             }
-            parsed.positional = Some(key.clone());
+            parsed.positional.get_or_insert_with(|| key.clone());
             i += 1;
             continue;
         }
@@ -193,6 +200,9 @@ pub fn parse(args: &[String]) -> CliResult<AdminArgs> {
         && parsed.why.is_none()
     {
         return Err(usage("--why is required"));
+    }
+    if parsed.targets.len() > 1 && parsed.command_id.is_some() {
+        return Err(usage("--command-id applies to a single forget target"));
     }
     Ok(parsed)
 }
@@ -257,6 +267,9 @@ pub fn run(args: &[String], console: &mut dyn Console, request: &Requester<'_>) 
                 return Err(usage(
                     "Administrative decisions require an interactive human terminal",
                 ));
+            }
+            if args.targets.len() > 1 {
+                return forget_many(&args, console, request);
             }
             let expected = match args.operation.as_str() {
                 "merge" => {
@@ -387,6 +400,133 @@ pub fn run(args: &[String], console: &mut dyn Console, request: &Requester<'_>) 
             1
         } else {
             0
+        },
+    )
+}
+fn forget_plan(
+    args: &AdminArgs,
+    request: &Requester<'_>,
+    target: &str,
+) -> CliResult<Option<Value>> {
+    let preview = request(
+        &args.data,
+        &json!({"operation":"forget_preview","target":target}),
+    )
+    .map_err(|_| unavailable())?;
+    Ok(preview
+        .get("result")
+        .filter(|plan| plan["token"].is_string())
+        .cloned())
+}
+/// Everything a plan would exclude, with memory versions, so a refreshed plan that grew or
+/// changed shows up as an item outside the confirmed scope.
+fn forget_scope(plan: &Value) -> Vec<String> {
+    let mut scope = Vec::new();
+    for kind in ["targets", "sources", "episodes", "dependents"] {
+        scope.extend(
+            plan[kind]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(Value::to_string),
+        );
+    }
+    for kind in ["nodes", "edges"] {
+        scope.extend(
+            plan[kind]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(id, version)| format!("{id}@{version}")),
+        );
+    }
+    scope
+}
+/// One confirmation for several targets: preview all, confirm the count, then forget each
+/// against a fresh preview. A refreshed plan that grew beyond the confirmed scope (two forgotten
+/// episodes jointly supporting a memory) is skipped and reported for a rerun.
+fn forget_many(
+    args: &AdminArgs,
+    console: &mut dyn Console,
+    request: &Requester<'_>,
+) -> CliResult<i32> {
+    let (mut pending, mut already, mut rejected) = (Vec::new(), 0, Vec::new());
+    let (mut memories, mut scope) = (BTreeSet::new(), BTreeSet::new());
+    for target in &args.targets {
+        match forget_plan(args, request, target)? {
+            None => rejected.push(target.clone()),
+            Some(plan) if plan["already_forgotten"] == true => already += 1,
+            Some(plan) => {
+                for kind in ["nodes", "edges"] {
+                    memories.extend(
+                        plan[kind]
+                            .as_object()
+                            .into_iter()
+                            .flat_map(|m| m.keys().cloned()),
+                    );
+                }
+                scope.extend(forget_scope(&plan));
+                pending.push(target.clone());
+            }
+        }
+    }
+    print(
+        console,
+        &json!({"targets":args.targets.len(),"to_forget":pending.len(),"already_forgotten":already,
+            "rejected":rejected,"memories":memories.len(),"policy":"active_memory_only"}),
+    )?;
+    if pending.is_empty() {
+        return Ok(if rejected.is_empty() { 0 } else { 1 });
+    }
+    let expected = format!("forget {} targets from active memory", pending.len());
+    let prompt = format!("Type {expected:?} to confirm (raw history and backups are retained): ");
+    if !confirm(console, &prompt, &expected)? {
+        return Ok(1);
+    }
+    let (mut forgotten, mut failed, mut rerun) = (0, Vec::new(), Vec::new());
+    let mut unverified = None;
+    for target in &pending {
+        let plan = match forget_plan(args, request, target) {
+            Err(_) => {
+                unverified = Some(target.clone());
+                break;
+            }
+            Ok(None) => {
+                failed.push(target.clone());
+                continue;
+            }
+            Ok(Some(plan)) => plan,
+        };
+        if plan["already_forgotten"] == true {
+            already += 1;
+            continue;
+        }
+        if forget_scope(&plan).iter().any(|item| !scope.contains(item)) {
+            rerun.push(target.clone());
+            continue;
+        }
+        let command = json!({"operation":"forget","target":target,"token":plan["token"],
+            "why":args.why,"command_id":uuid::Uuid::new_v4().simple().to_string()});
+        match request(&args.data, &command) {
+            Err(_) => {
+                unverified = Some(target.clone());
+                break;
+            }
+            Ok(result) if result.get("error").is_some() => failed.push(target.clone()),
+            Ok(_) => forgotten += 1,
+        }
+    }
+    let stopped = unverified.is_some();
+    print(
+        console,
+        &json!({"forgotten":forgotten,"already_forgotten":already,"failed":failed,
+            "rejected":rejected,"rerun_to_confirm_wider_scope":rerun,"unverified_then_stopped":unverified}),
+    )?;
+    Ok(
+        if failed.is_empty() && rejected.is_empty() && rerun.is_empty() && !stopped {
+            0
+        } else {
+            1
         },
     )
 }

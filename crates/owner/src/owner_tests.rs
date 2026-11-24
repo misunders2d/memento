@@ -626,6 +626,136 @@ fn cli_cancellation_performs_preview_only_and_confirmed_forget_uses_its_token() 
     }
 }
 #[test]
+fn cli_forget_many_confirms_once_and_forgets_each_against_a_fresh_preview() {
+    for answer in ["wrong", "forget 2 targets from active memory"] {
+        let previews = AtomicUsize::new(0);
+        let forgets = std::sync::Mutex::new(Vec::new());
+        let mut console = FakeConsole {
+            terminal: true,
+            answer: answer.into(),
+            ..Default::default()
+        };
+        let status = owner_cli::run(
+            &argv(&[
+                "--data-dir", "synthetic", "forget", "a", "gone", "b", "a", "missing", "--why",
+                "Human request",
+            ]),
+            &mut console,
+            &|_, v| {
+                let target = v["target"].as_str().unwrap();
+                if v["operation"] == "forget_preview" {
+                    let n = previews.fetch_add(1, Ordering::SeqCst);
+                    return Ok(match target {
+                        "missing" => json!({"error":{"message":"unknown"}}),
+                        "gone" => json!({"result":{"token":"t","already_forgotten":true}}),
+                        _ => json!({"result":{"token":format!("{target}-{n}"),"already_forgotten":false,
+                            "nodes":{"shared":1}}}),
+                    });
+                }
+                assert_eq!(v["why"], "Human request");
+                assert_eq!(v["command_id"].as_str().unwrap().len(), 32);
+                forgets.lock().unwrap().push((target.to_owned(), v["token"].as_str().unwrap().to_owned()));
+                Ok(json!({"result":{"id":target}}))
+            },
+        )
+        .unwrap();
+        assert_eq!(status, 1, "the unknown target keeps a nonzero status");
+        assert!(console.printed.contains("\"memories\": 1"));
+        assert!(console.printed.contains("\"missing\""));
+        let forgets = forgets.into_inner().unwrap();
+        if answer == "wrong" {
+            assert_eq!(
+                previews.load(Ordering::SeqCst),
+                4,
+                "duplicates are previewed once"
+            );
+            assert!(forgets.is_empty());
+        } else {
+            assert_eq!(previews.load(Ordering::SeqCst), 6);
+            assert_eq!(
+                forgets,
+                vec![("a".into(), "a-4".into()), ("b".into(), "b-5".into())]
+            );
+        }
+    }
+    let mut console = FakeConsole {
+        terminal: true,
+        ..Default::default()
+    };
+    assert!(
+        owner_cli::run(
+            &argv(&[
+                "--data-dir",
+                "x",
+                "forget",
+                "a",
+                "b",
+                "--why",
+                "w",
+                "--command-id",
+                "c"
+            ]),
+            &mut console,
+            &|_, _| panic!("no request"),
+        )
+        .is_err()
+    );
+}
+#[test]
+fn cli_forget_many_skips_a_grown_scope_and_reports_a_lost_socket() {
+    let mut console = FakeConsole {
+        terminal: true,
+        answer: "forget 4 targets from active memory".into(),
+        ..Default::default()
+    };
+    let previews = AtomicUsize::new(0);
+    let forgets = std::sync::Mutex::new(Vec::new());
+    let status = owner_cli::run(
+        &argv(&[
+            "--data-dir",
+            "x",
+            "forget",
+            "a",
+            "b",
+            "d",
+            "c",
+            "--why",
+            "w",
+        ]),
+        &mut console,
+        &|_, v| {
+            let target = v["target"].as_str().unwrap();
+            if v["operation"] == "forget" {
+                forgets.lock().unwrap().push(target.to_owned());
+                return Ok(json!({"result":{"id":target}}));
+            }
+            let refreshed = previews.fetch_add(1, Ordering::SeqCst) >= 4;
+            if refreshed && target == "c" {
+                return Err(memento_core::Error::Validation("socket closed"));
+            }
+            let mut targets = vec![target];
+            if refreshed && target == "b" {
+                targets.push("jointly-supported");
+            }
+            Ok(json!({"result":{"token":"t","targets":targets,
+                "sources":[{"source":"s","event_id":target}],
+                "edges":{"rel":if refreshed && target == "d" { 2 } else { 1 }}}}))
+        },
+    )
+    .unwrap();
+    assert_eq!(status, 1);
+    assert_eq!(*forgets.lock().unwrap(), vec!["a".to_owned()]);
+    assert!(
+        console.printed.contains("\"memories\": 1"),
+        "relations count as memories"
+    );
+    let summary: Value =
+        serde_json::from_str(&console.printed[console.printed.rfind("{\n").unwrap()..]).unwrap();
+    assert_eq!(summary["rerun_to_confirm_wider_scope"], json!(["b", "d"]));
+    assert_eq!(summary["unverified_then_stopped"], "c");
+    assert_eq!(summary["forgotten"], 1);
+}
+#[test]
 fn cli_export_confirmation_names_exact_absolute_destination() {
     let data = private();
     let output = data.path().join("archive.tar");
