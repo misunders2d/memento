@@ -1614,22 +1614,16 @@ def hook(spool, harness, data, *, recall=automatic):
         except (OSError, ValueError, sqlite3.Error, _http_exception()):
             return {'hookSpecificOutput': {'hookEventName': event, 'permissionDecision': 'deny',
                     'permissionDecisionReason': 'Memento current-conversation capture is pending; retry after upload.'}}
-        if harness in ('codex', 'claude'):
-            # Check, never rewrite: Codex requires "allow" to rewrite inputs, and
-            # Claude auto mode refuses inputs a hook changed after its review.
-            # Never grant a tool permission merely to supply provenance; retain
-            # the native permission flow. The agent's own stable command_id and
-            # actor stay untouched; the server replays identical retries.
-            if any(command.get(key) != value for key, value in expected.items()):
-                return {'hookSpecificOutput': {'hookEventName': event, 'permissionDecision': 'deny',
-                        'permissionDecisionReason': 'Retry this Memento command with ' + encode(expected).decode('utf-8')}}
-            return {}
-        verb = data['tool_name'].rsplit('__', 1)[-1]
-        updated = {**command, **expected,
-                   'command_id': f"{harness}:{conversation}:{data.get('tool_use_id') or digest(data)}:{verb}",
-                   'actor': f"{harness}:{spool.config['uid']}"}
-        return {'hookSpecificOutput': {'hookEventName': event,
-                'updatedInput': {**original, 'command': updated}}}
+        # Only Claude and Codex reach this hook (agy_hook and native own the
+        # others). Check, never rewrite: Codex requires "allow" to rewrite
+        # inputs, and Claude auto mode refuses inputs a hook changed after its
+        # review. Never grant a tool permission merely to supply provenance;
+        # retain the native permission flow. The agent's own stable command_id
+        # stays untouched; the server replays identical retries.
+        if any(command.get(key) != value for key, value in expected.items()):
+            return {'hookSpecificOutput': {'hookEventName': event, 'permissionDecision': 'deny',
+                    'permissionDecisionReason': 'Retry this Memento command with ' + encode(expected).decode('utf-8')}}
+        return {}
     if event in ('PreCompact', 'PostCompact') or (event == 'SessionStart' and data.get('source') == 'compact'):
         spool.queue('/work/compaction', {'source': source(spool.config, harness), 'conversation_id': conversation},
                     'compact-hook:' + digest(data))

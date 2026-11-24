@@ -664,11 +664,7 @@ def test_mutation_callers_flush_only_unresolved_quotes_without_permission_change
         else:
             result = bridge.hook(spool, harness, {'hook_event_name': 'PreToolUse', 'session_id': 'current',
                 'tool_name': 'mcp__memento__' + tool, 'tool_use_id': 'call', 'tool_input': {'command': command}})
-            if harness in ('codex', 'claude'):
-                assert result == {}
-            else:
-                assert 'permissionDecision' not in result['hookSpecificOutput']
-                assert result['hookSpecificOutput']['updatedInput']['command']['evidence'] == evidence
+            assert result == {}
         assert flushed == ([['Pending quote.']] if len(evidence) == 2 else [])
     spool.close()
 
@@ -703,6 +699,11 @@ def test_mcp_provenance_hooks_never_auto_approve(tmp_path, monkeypatch):
     data = {'hook_event_name': 'PreToolUse', 'session_id': 's', 'tool_use_id': 'call',
             'tool_name': 'mcp__memento__remember', 'tool_input': {'command': {'evidence': [{'quote': 'quote'}]}}}
     for harness in ('claude', 'codex'):
+        for stale in ({'source': 'native:other-device:' + harness, 'conversation_id': 's'},
+                      {'source': f'native:test-device:{harness}', 'conversation_id': 'other'}):
+            data['tool_input']['command'] = {'evidence': [{'quote': 'quote'}], 'actor': f'{harness}:1000', **stale}
+            mismatch = bridge.hook(spool, harness, data)['hookSpecificOutput']
+            assert mismatch['permissionDecision'] == 'deny' and 'updatedInput' not in mismatch
         data['tool_input']['command'] = {'evidence': [{'quote': 'quote'}]}
         denied = bridge.hook(spool, harness, data)['hookSpecificOutput']
         assert denied['permissionDecision'] == 'deny' and 'updatedInput' not in denied
