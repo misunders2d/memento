@@ -364,6 +364,12 @@ impl Worker {
         let wake = Arc::clone(&self.wake);
         self.thread = Some(thread::Builder::new().name("memento-jobs".into()).spawn(
             move || {
+                // Background work (indexing, media, compression) yields to
+                // interactive work. Per-thread niceness on Linux.
+                // SAFETY: changes only this thread's niceness.
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                }
                 while !stop.load(Ordering::Acquire) {
                     let worked = match run_once(&queue, &handlers, maintenance.as_ref()) {
                         Ok(worked) => worked,

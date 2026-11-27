@@ -2315,6 +2315,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "libc",
  "memento-core",
  "regex",
  "rusqlite",
@@ -2330,6 +2331,7 @@ name = "memento-embedding"
 version = "0.1.0"
 dependencies = [
  "image",
+ "libc",
  "libloading 0.8.9",
  "memmap2",
  "ort",

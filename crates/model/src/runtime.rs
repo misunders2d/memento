@@ -337,7 +337,23 @@ impl EmbeddingModel {
         let preprocessor = Preprocessor::load(&tokenizer)?;
         let assets = Arc::new(Assets::load(&config)?);
         let foreground = Mutex::new(SessionSet::load(assets.clone(), 1)?);
-        let background = Mutex::new(SessionSet::load(assets, config.background_text_threads)?);
+        // ORT creates each session's intra-op pool threads on the loading
+        // thread, and Linux threads inherit that thread's niceness. Loading the
+        // background set on a niced thread keeps indexing below interactive work.
+        let threads = config.background_text_threads;
+        let background = Mutex::new(std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("memento-index".into())
+                .spawn_scoped(scope, move || {
+                    // SAFETY: changes only this thread's niceness.
+                    unsafe {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    }
+                    SessionSet::load(assets, threads)
+                })?
+                .join()
+                .map_err(|_| Error::InvalidAssets("background session load panicked".into()))?
+        })?);
         Ok(Self {
             core: Arc::new(Core {
                 preprocessor,
