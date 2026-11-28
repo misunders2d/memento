@@ -9,6 +9,7 @@ pub mod indexing;
 mod legacy_text;
 pub mod mcp;
 mod media_input;
+mod name_index;
 pub mod operational_status;
 mod period;
 mod query_api;

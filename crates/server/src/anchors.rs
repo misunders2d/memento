@@ -91,7 +91,7 @@ pub fn anchors(
             identity(item["text"].as_str().unwrap()),
         )];
         let mut anchor = if item["tier"] == "durable" {
-            durable(db, &item, scope)?
+            durable(db, &summary(db, &item)?, scope)?
         } else {
             pending(db, &item, scope)?
         };
@@ -119,81 +119,89 @@ pub fn anchors(
     }
     Ok(result)
 }
-/// Whole-name rows by id; the first index to find an id keeps it. Each index
-/// ranks its top 64 by bm25 then id, and only kept rows load summary columns.
+/// Whole-name rows by id over the whole prompt (J2): the phrase index proposes every
+/// source row whose name is a contiguous token window of the request, with no token
+/// cap and no ranking before containment; each proposal is then re-read on this cut
+/// under the live visibility, version, merge, forget and scope rules. Node names win
+/// over aliases, aliases over candidates, for the same id.
 fn exact(
     db: &Connection,
     request: &[String],
     scope: Option<&str>,
 ) -> Result<BTreeMap<String, Value>> {
     let mut found = BTreeMap::new();
-    let mut seen = HashSet::new();
-    let terms = request
-        .iter()
-        .filter(|t| seen.insert((*t).clone()))
-        .take(64)
-        .collect::<Vec<_>>();
-    if terms.is_empty() {
+    if request.is_empty() {
         return Ok(found);
     }
-    let matched = terms
-        .into_iter()
-        .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" OR ");
     let entity = "(n.type IN ('person','organization','project','concept','place','tool') OR EXISTS(SELECT 1 FROM memory_types t WHERE t.name=n.type AND t.category='entity'))";
     let visible = format!(
         "n.state='active' AND n.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=n.id) AND {entity} AND {} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(n.scope) WHERE value=?2)) AND NOT EXISTS(SELECT 1 FROM entity_merges m WHERE m.source=n.id) AND NOT EXISTS(SELECT 1 FROM forgotten_targets f WHERE f.target=n.id)",
         visible_sql("n.id")
     );
-    let count = "(SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS evidence_count";
-    let node = format!(
-        "SELECT {},{count},?3 AS alias,'durable' AS tier FROM node_versions n WHERE n.id=?1 AND n.version=?2",
-        records::NODE_SUMMARY
+    // Ranking needs only light columns; the full summary loads for rendered picks only.
+    let proposed = crate::name_index::lookup(db, request)?;
+    use crate::name_index::Kind;
+    let ids = |kind: Kind| -> Result<String> {
+        Ok(serde_json::to_string(
+            &proposed.iter().filter(|(k, _)| *k == kind).map(|(_, rowid)| rowid).collect::<Vec<_>>(),
+        )?)
+    };
+    // One live read per source over every proposed row; containment re-checked on live text.
+    let current_nodes = format!(
+        "SELECT n.id,n.version,n.type,substr(n.text,1,240) AS text,NULL AS alias,'durable' AS tier,\
+        (SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS evidence_count \
+        FROM node_versions n WHERE n.rowid IN (SELECT value FROM json_each(?1)) AND {visible} ORDER BY n.id"
     );
-    let missing = || Error::Unavailable("Entity name row is unavailable");
-    for row in rows(
-        db,
-        &format!(
-            "SELECT n.id,n.version,substr(n.text,1,240) AS text FROM node_fts JOIN node_versions n ON n.id=node_fts.id AND n.version=node_fts.version WHERE node_fts MATCH ?1 AND {visible} ORDER BY bm25(node_fts),n.id LIMIT 64"
-        ),
-        params![matched, scope],
-    )? {
-        let id = row["id"].as_str().unwrap();
-        if contained(row["text"].as_str().unwrap_or(""), request) && !found.contains_key(id) {
-            let full = one(
-                db,
-                &node,
-                params![id, row["version"].as_i64(), None::<&str>],
-            )?;
-            found.insert(id.to_owned(), full.ok_or_else(missing)?);
+    for row in rows(db, &current_nodes, params![ids(Kind::Node)?, scope])? {
+        let id = row["id"].as_str().unwrap().to_owned();
+        if contained(row["text"].as_str().unwrap_or(""), request) {
+            found.entry(id).or_insert(row);
         }
     }
-    let aliases = format!(
-        "WITH RECURSIVE canonical(source,target,depth) AS (SELECT source,target,0 FROM entity_merges UNION ALL SELECT c.source,m.superseded_by,c.depth+1 FROM canonical c JOIN node_versions m ON m.id=c.target AND m.state IN ('merged','refined') AND m.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=m.id) WHERE m.superseded_by IS NOT NULL AND c.depth<64) SELECT n.id,n.version,alias_fts.text AS alias FROM alias_fts JOIN canonical a ON a.source=alias_fts.id JOIN node_versions n ON n.id=a.target WHERE alias_fts MATCH ?1 AND {visible} ORDER BY bm25(alias_fts),n.id LIMIT 64"
+    // Of several aliases naming one target, the longest (most specific) spelling labels it.
+    let mut aliases = rows(
+        db,
+        "SELECT rowid,id,text FROM alias_fts WHERE rowid IN (SELECT value FROM json_each(?1))",
+        [ids(Kind::Alias)?],
+    )?
+    .into_iter()
+    .filter(|alias| contained(alias["text"].as_str().unwrap_or(""), request))
+    .collect::<Vec<_>>();
+    aliases.sort_by_key(|alias| {
+        (
+            std::cmp::Reverse(tokens(alias["text"].as_str().unwrap_or("")).len()),
+            alias["rowid"].as_i64(),
+        )
+    });
+    let canonical = format!(
+        "WITH RECURSIVE canonical(source,target,depth) AS (SELECT source,target,0 FROM entity_merges WHERE source=?1 UNION ALL SELECT c.source,m.superseded_by,c.depth+1 FROM canonical c JOIN node_versions m ON m.id=c.target AND m.state IN ('merged','refined') AND m.version=(SELECT max(x.version) FROM node_versions x WHERE x.id=m.id) WHERE m.superseded_by IS NOT NULL AND c.depth<64) SELECT n.id,n.version,n.type,substr(n.text,1,240) AS text,?3 AS alias,'durable' AS tier,(SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS evidence_count FROM canonical a JOIN node_versions n ON n.id=a.target WHERE {visible} ORDER BY n.id LIMIT 64"
     );
-    for row in rows(db, &aliases, params![matched, scope])? {
-        let (id, alias) = (row["id"].as_str().unwrap(), row["alias"].as_str());
-        if contained(alias.unwrap_or(""), request) && !found.contains_key(id) {
-            let full = one(db, &node, params![id, row["version"].as_i64(), alias])?;
-            found.insert(id.to_owned(), full.ok_or_else(missing)?);
+    for alias in &aliases {
+        for row in rows(db, &canonical, params![alias["id"].as_str(), scope, alias["text"].as_str()])? {
+            let id = row["id"].as_str().unwrap().to_owned();
+            found.entry(id).or_insert(row);
         }
     }
-    let candidate = "SELECT c.id,c.type,c.text,c.scope,'candidate' AS tier,(SELECT max(julianday(e.occurred_at)) FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND g.version=1 AND e.occurred_at IS NOT NULL) AS source_at FROM candidates c WHERE c.id=?1";
-    for row in rows(
-        db,
-        &format!(
-            "SELECT c.id,c.text FROM candidate_fts JOIN candidates c ON c.id=candidate_fts.id WHERE candidate_fts MATCH ?1 AND c.kind='entity' AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(c.scope) WHERE value=?2)) ORDER BY bm25(candidate_fts),c.id LIMIT 64"
-        ),
-        params![matched, scope],
-    )? {
-        let id = row["id"].as_str().unwrap();
-        if contained(row["text"].as_str().unwrap_or(""), request) && !found.contains_key(id) {
-            let full = one(db, candidate, [id])?;
-            found.insert(id.to_owned(), full.ok_or_else(missing)?);
+    let candidates = format!(
+        "SELECT c.id,c.type,c.text,c.scope,'candidate' AS tier,(SELECT max(julianday(e.occurred_at)) FROM graph_evidence g JOIN episodes e ON e.id=g.episode_id WHERE g.target=c.id AND g.version=1 AND e.occurred_at IS NOT NULL) AS source_at FROM candidates c WHERE c.rowid IN (SELECT value FROM json_each(?1)) AND c.kind='entity' AND {ACTIVE_CANDIDATE} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(c.scope) WHERE value=?2)) ORDER BY c.id"
+    );
+    for row in rows(db, &candidates, params![ids(Kind::Candidate)?, scope])? {
+        let id = row["id"].as_str().unwrap().to_owned();
+        if contained(row["text"].as_str().unwrap_or(""), request) {
+            found.entry(id).or_insert(row);
         }
     }
     Ok(found)
+}
+/// The full durable summary row (as the name lookup returned it before J2) for one pick.
+fn summary(db: &Connection, item: &Value) -> Result<Value> {
+    let sql = format!(
+        "SELECT {},(SELECT count(*) FROM graph_evidence g WHERE g.target=n.id AND g.version=n.version) AS \
+        evidence_count,?3 AS alias,'durable' AS tier FROM node_versions n WHERE n.id=?1 AND n.version=?2",
+        records::NODE_SUMMARY
+    );
+    one(db, &sql, params![item["id"].as_str(), item["version"].as_i64(), item["alias"].as_str()])?
+        .ok_or(Error::Unavailable("Entity name row is unavailable"))
 }
 fn durable(db: &Connection, item: &Value, scope: Option<&str>) -> Result<Option<Value>> {
     let id = item["id"].as_str().unwrap();
@@ -1549,24 +1557,48 @@ mod exact_name_equivalence_tests {
         result
     }
 
+    // J2: the whole-prompt index finds every row the previous top-64 FTS path found,
+    // with identical rows, plus whatever that cap dropped; where nothing was dropped
+    // the rendered anchors are unchanged.
     #[test]
-    fn top_64_then_hydrate_matches_previous_name_anchors() {
+    fn whole_prompt_index_finds_a_superset_of_previous_name_anchors() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("data")).unwrap();
         fixture(&store, 0);
         store
             .read(|tx| {
                 let db = tx.sql();
-                let mut compared = 0;
+                let (mut compared, mut widened) = (0, 0);
                 for query in queries() {
                     for scope in [None, Some("personal"), Some("professional"), Some("absent")] {
                         let before = found_before(db, &query, scope)?;
                         let after = exact(db, &tokens(&query), scope)?;
-                        assert_eq!(
-                            serde_json::to_string(&before)?,
-                            serde_json::to_string(&after)?,
-                            "{query:?} {scope:?}"
-                        );
+                        for (id, row) in &before {
+                            let mut now = after
+                                .get(id)
+                                .cloned()
+                                .ok_or(Error::Unavailable("row missing after J2"))
+                                .unwrap_or_else(|_| panic!("{query:?} {scope:?} {id} missing"));
+                            if now["tier"] == "durable" {
+                                now = summary(db, &now)?;
+                            }
+                            // A row the old cap reached only through an alias is now found by
+                            // its own name (node names precede aliases); the label may differ.
+                            let strip = |mut v: Value| {
+                                v.as_object_mut().unwrap().remove("alias");
+                                v
+                            };
+                            assert_eq!(
+                                serde_json::to_string(&strip(row.clone()))?,
+                                serde_json::to_string(&strip(now.clone()))?,
+                                "{query:?} {scope:?} {id}"
+                            );
+                            assert!(now["alias"].as_str().is_none_or(|a| contained(a, &tokens(&query))));
+                        }
+                        if after.len() > before.len() {
+                            widened += 1;
+                            continue;
+                        }
                         for limit in [0, 1, 2, 6] {
                             let before = anchors_before(db, &query, limit, scope)?;
                             let after = anchors(db, &query, limit, scope)?;
@@ -1580,21 +1612,23 @@ mod exact_name_equivalence_tests {
                     }
                 }
                 assert!(compared > 20, "{compared}");
-                // Each index really hits its 64-row limit with more passing rows beyond it.
+                assert!(widened > 0, "the fixture must exercise rows the old cap dropped");
+                // Past the previous 64-row cap: every live spelling is found and counted.
                 let tier = |found: &BTreeMap<String, Value>, f: &dyn Fn(&Value) -> bool| {
                     found.values().filter(|r| f(r)).count()
                 };
                 let acme = exact(db, &tokens("Acme"), None)?;
                 assert_eq!(
                     tier(&acme, &|r| r["id"].as_str().unwrap().starts_with("acme")),
-                    64
+                    90
                 );
                 let orion = exact(db, &tokens("Orion"), None)?;
-                assert_eq!(tier(&orion, &|r| r["alias"] == "Orion"), 64);
+                assert_eq!(tier(&orion, &|r| r["alias"] == "Orion"), 80);
+                // 80 Zeta candidates less one promoted and one rejected.
                 let zeta = exact(db, &tokens("Zeta"), None)?;
-                assert_eq!(tier(&zeta, &|r| r["tier"] == "candidate"), 64);
+                assert_eq!(tier(&zeta, &|r| r["tier"] == "candidate"), 78);
                 let named = anchors(db, "Acme", 2, None)?;
-                assert_eq!(named[0]["same_name_count"], 64);
+                assert_eq!(named[0]["same_name_count"], 90);
                 assert!(exact(db, &tokens("Mila Stone Mila"), None)?["t-tie"]["alias"].is_string());
                 Ok(())
             })
@@ -1622,8 +1656,103 @@ mod exact_name_equivalence_tests {
                 };
                 let (old, before) = time(&|| anchors_before(db, query, 6, None))?;
                 let (new, after) = time(&|| anchors(db, query, 6, None))?;
-                assert_eq!(before, after);
-                eprintln!("synthetic name anchors, broad match: previous={old:?} top-64-then-hydrate={new:?}");
+                let (was, now) = (found_before(db, query, None)?, exact(db, &tokens(query), None)?);
+                if was.len() == now.len() {
+                    assert_eq!(before, after);
+                } else {
+                    // The old cap hid rows; the new pick comes from the complete set.
+                    assert!(was.keys().all(|id| now.contains_key(id)));
+                    let picked: Vec<Value> = serde_json::from_str(&after)?;
+                    assert!(picked.iter().all(|row| now.contains_key(row["id"].as_str().unwrap())));
+                }
+                eprintln!(
+                    "synthetic name anchors, broad match: previous={old:?} ({} rows) whole-prompt-index={new:?} ({} rows)",
+                    was.len(),
+                    now.len()
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod name_index_tests {
+    use super::*;
+    use memento_core::Store;
+
+    fn seed(db: &Connection, from: usize, to: usize) -> Result<()> {
+        for i in from..to {
+            db.execute(
+                "INSERT INTO node_versions VALUES(?1,1,'c0','person',?2,'active',NULL,NULL,NULL,0,'[\"personal\"]')",
+                params![format!("ni{i:04}"), format!("Name{} Person{}", i % 7, i % 5)],
+            )?;
+            if i % 3 == 0 {
+                db.execute(
+                    "INSERT INTO node_versions VALUES(?1,2,'c0','person',?2,'active',NULL,NULL,NULL,0,'[\"personal\"]')",
+                    params![format!("ni{i:04}"), format!("Renamed{i}")],
+                )?;
+            }
+            if i % 4 == 0 {
+                db.execute("INSERT INTO alias_fts(id,text) VALUES(?,?)", params![format!("ni{i:04}"), format!("Alias {i}")])?;
+            }
+        }
+        Ok(())
+    }
+
+    // J2: incremental catch-up over append-only sources equals a fresh rebuild.
+    #[test]
+    fn incremental_name_index_equals_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO graph_commits VALUES('c0','c0','{}','{}','owner','Fixture','2026-01-01T00:00:00Z')", [])?;
+                seed(tx.sql(), 0, 40)
+            })
+            .unwrap();
+        let mut index = store.read(|tx| crate::name_index::rebuilt(tx.sql())).unwrap();
+        for step in 1..4 {
+            store.write(|tx| seed(tx.sql(), 40 * step, 40 * (step + 1))).unwrap();
+            store.read(|tx| crate::name_index::incremental(tx.sql(), &mut index)).unwrap();
+            let fresh = store.read(|tx| crate::name_index::rebuilt(tx.sql())).unwrap();
+            assert_eq!(crate::name_index::normalized(&index), crate::name_index::normalized(&fresh));
+            assert_eq!(index, fresh);
+        }
+        // A renamed node is found only by its current name; its old name is not exposed.
+        store
+            .read(|tx| {
+                let old = exact(tx.sql(), &tokens("did Name0 Person0 call"), None)?;
+                assert!(!old.contains_key("ni0105"), "{old:?}");
+                let renamed = exact(tx.sql(), &tokens("did Renamed105 call"), None)?;
+                assert!(renamed.contains_key("ni0105"));
+                let alias = exact(tx.sql(), &tokens("news on Alias 104 today"), None)?;
+                assert!(alias.is_empty(), "alias rows without a merge are not names: {alias:?}");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    // J2: a name past the old 64-token window is found; the token cap is gone.
+    #[test]
+    fn name_after_token_64_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        store
+            .write(|tx| {
+                tx.sql().execute("INSERT INTO graph_commits VALUES('c0','c0','{}','{}','owner','Fixture','2026-01-01T00:00:00Z')", [])?;
+                tx.sql().execute(
+                    "INSERT INTO node_versions VALUES('late','1','c0','person','Quill Ardent','active',NULL,NULL,NULL,0,'[\"personal\"]')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let filler = (0..120).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+        store
+            .read(|tx| {
+                let found = exact(tx.sql(), &tokens(&format!("{filler} then ask Quill Ardent")), None)?;
+                assert!(found.contains_key("late"));
                 Ok(())
             })
             .unwrap();

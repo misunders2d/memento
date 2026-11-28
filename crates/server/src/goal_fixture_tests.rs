@@ -433,6 +433,11 @@ fn goal_fixture_report() {
     for case in ["named", "semantic_only", "cold_down_hot_useful"] {
         assert_eq!(gf_case(&reports, case)["status"], "complete");
     }
+    // J2: a name past the old 64-token window anchors its entity and connected fact.
+    for case in ["long_tail_name_after_token64", "long_middle_name_after_token64"] {
+        let r = gf_case(&reports, case);
+        assert_eq!((r["entity_hit"].as_bool(), r["connected_hit"].as_u64()), (Some(true), Some(1)), "{r}");
+    }
     // J11: automatic delivery holds at most one parked candidate, always labelled,
     // and none when a current fact matched; anchors and connections included.
     for case in ["parked_one", "parked_multiple", "parked_connection"] {
