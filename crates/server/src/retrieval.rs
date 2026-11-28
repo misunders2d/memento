@@ -1824,6 +1824,7 @@ mod tests {
     include!("explain_tests.rs");
     include!("recall_timing_tests.rs");
     include!("score_memo_tests.rs");
+    include!("goal_fixture_tests.rs");
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Arc<Store>,
