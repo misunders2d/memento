@@ -165,12 +165,14 @@ impl Extractor {
                 )?;
             }
             advance_cursor(tx, job)?;
-            Ok(json!({
+            let result = json!({
                 "candidate_count":count,
                 "window_count":prepared.len(),
                 "job_id":job.id,
                 "loop_responsibilities":loop_responsibilities
-            }))
+            });
+            crate::jobs::Queue::complete_in(tx, job, &result)?;
+            Ok(result)
         })?)
     }
 }

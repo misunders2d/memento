@@ -3677,3 +3677,220 @@ fn worker_reports_a_dispatch_thread_stopped_by_an_escaping_panic() {
     worker.close();
     assert!(!worker.stopped(), "an intentional close is not a failure");
 }
+
+// B10: a test-only trigger aborts the job's completion; receipt and completion must
+// commit or roll back together, never leaving a receipt beside a still-leased job.
+#[test]
+fn completion_fault_rolls_back_receipt_and_response_loss_keeps_one_receipt() {
+    let f = Fixture::new();
+    f.seed();
+    let claimed = f.claim("contract", "thread", Some(vec!["extract".into()]));
+    let work = claimed["work"][0].clone();
+    let id = work["id"].as_str().unwrap().to_string();
+    let output = json!({"windows":work["input"]["windows"].as_array().unwrap().iter().map(|window| json!({
+        "id":window["id"],
+        "candidates":if window["text"].as_str().unwrap().contains(FACT) {vec![draft(FACT,"knowledge",false)]} else {vec![]}
+    })).collect::<Vec<_>>()});
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute_batch(
+                "CREATE TRIGGER synthetic_completion_fault BEFORE UPDATE OF state ON jobs WHEN NEW.state='done' \
+                 BEGIN SELECT RAISE(ABORT,'synthetic completion fault'); END",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(f.complete(&work, output.clone()).is_err());
+    let receipts = |f: &Fixture| {
+        f.stored::<i64>(&format!(
+            "SELECT count(*) FROM graph_commits WHERE command_id='extract/{id}'"
+        ))
+    };
+    assert_eq!(receipts(&f), 0, "receipt committed without its completion");
+    assert_eq!(
+        f.stored::<String>(&format!("SELECT state||':'||attempts FROM jobs WHERE id='{id}'")),
+        "leased:1"
+    );
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidates"), 0);
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql()
+                .execute_batch("DROP TRIGGER synthetic_completion_fault")?;
+            Ok(())
+        })
+        .unwrap();
+    // The same lease retries after the fault and commits once.
+    let result = f.complete(&work, output.clone()).unwrap();
+    assert_eq!(result["candidate_count"], 1);
+    assert_eq!(receipts(&f), 1);
+    assert_eq!(
+        f.stored::<String>(&format!("SELECT state FROM jobs WHERE id='{id}'")),
+        "done"
+    );
+    // A response lost after commit: the retry is refused and adds nothing.
+    assert!(matches!(
+        f.complete(&work, output),
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(receipts(&f), 1);
+    assert_eq!(f.stored::<i64>("SELECT count(*) FROM candidates"), 1);
+}
+
+struct CountingDiscovery(std::sync::atomic::AtomicUsize);
+impl crate::consolidation::DiscoveryProvider for CountingDiscovery {
+    fn discover(&self, _candidate_ids: &[String]) -> Result<Value> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({"candidates":{}}))
+    }
+}
+
+// B10: an older release's receipt without completion replays before discovery runs.
+#[test]
+fn legacy_receipt_completes_its_job_before_discovery() {
+    let f = Fixture::new();
+    f.seed();
+    f.extract("contract", "thread", FACT, "knowledge", false);
+    let counter = Arc::new(CountingDiscovery(Default::default()));
+    let processing = Processing::new(f.graph.clone()).with_discovery(counter.clone());
+    let claim = || {
+        processing.claim(Claim {
+            agent: "fixture".into(),
+            timezone_name: "UTC".into(),
+            compaction: None,
+            exclude: vec![],
+            consolidate_now: true,
+            kinds: Some(vec!["consolidate".into()]),
+            consolidation_start: None,
+            consolidation_end: None,
+            continuous: false,
+            batch_size: 16,
+        })
+    };
+    let work = claim().unwrap()["work"][0].clone();
+    assert_eq!(work["kind"], "consolidate");
+    let id = work["id"].as_str().unwrap().to_string();
+    assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // Simulate the old split: receipt committed, completion lost, lease then expired.
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute(
+                "INSERT INTO graph_commits VALUES(?,?,?,?,?,?,?)",
+                params![
+                    util::id(),
+                    format!("consolidate/{id}"),
+                    "{}",
+                    r#"{"candidate_count":0,"legacy":true}"#,
+                    "consolidator/fixture",
+                    "Synthetic legacy receipt",
+                    util::now()
+                ],
+            )?;
+            tx.sql()
+                .execute("UPDATE jobs SET lease_until=0 WHERE id=?", [&id])?;
+            Ok(())
+        })
+        .unwrap();
+    let again = claim().unwrap();
+    let delivered = again["work"].as_array().unwrap();
+    assert!(delivered.iter().all(|work| work["id"] != id.as_str()));
+    // Discovery runs only for newly delivered batches, never for the receipted job.
+    assert_eq!(
+        counter.0.load(std::sync::atomic::Ordering::SeqCst),
+        1 + delivered.len(),
+        "discovery ran for a job whose receipt already committed"
+    );
+    assert_eq!(
+        f.stored::<String>(&format!(
+            "SELECT state||':'||json_extract(result,'$.legacy') FROM jobs WHERE id='{id}'"
+        )),
+        "done:1"
+    );
+}
+
+// B10 goal guard: a job whose preparation fails every time must not block later work.
+#[test]
+fn failing_extraction_preparation_never_starves_later_work() {
+    let f = Fixture::new();
+    f.seed();
+    let first = f.claim("contract", "thread", Some(vec!["extract".into()]))["work"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Test-only corruption: this job's preparation now fails deterministically.
+    f.graph
+        .store
+        .write(|tx| {
+            tx.sql().execute(
+                "UPDATE jobs SET payload=json_set(payload,'$.windows','corrupt'),state='pending',owner=NULL,\
+                    lease_until=NULL WHERE id=?",
+                [&first],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    f.capture(
+        "two",
+        "other",
+        "The relay cabinet uses brass hinges.",
+        "user",
+        "contract",
+        json!({}),
+        "2026-10-18T13:00:00Z",
+    );
+    let claim = |compaction: Option<Compaction>| {
+        f.processing.claim(Claim {
+            agent: "fixture".into(),
+            timezone_name: "UTC".into(),
+            compaction,
+            exclude: vec![],
+            consolidate_now: false,
+            kinds: Some(vec!["extract".into()]),
+            consolidation_start: None,
+            consolidation_end: None,
+            continuous: false,
+            batch_size: 16,
+        })
+    };
+    let mut outcomes = vec![format!(
+        "{:?}",
+        claim(Some(Compaction {
+            source: "contract".into(),
+            conversation_id: "other".into(),
+        }))
+    )];
+    let mut delivered = None;
+    for _ in 0..3 {
+        let claimed = claim(None);
+        outcomes.push(format!("{claimed:?}"));
+        if let Ok(claimed) = claimed {
+            if let Some(work) = claimed["work"].as_array().and_then(|work| work.first()) {
+                delivered = Some(work.clone());
+                break;
+            }
+        }
+    }
+    let jobs = f
+        .graph
+        .store
+        .read(|tx| {
+            let mut statement = tx
+                .sql()
+                .prepare("SELECT id||':'||state||':'||attempts||':'||ifnull(error,'') FROM jobs")?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    let work = delivered.unwrap_or_else(|| {
+        panic!("later extraction work starved behind a failing preparation: {outcomes:?} jobs {jobs:?}")
+    });
+    assert_ne!(work["id"], first.as_str());
+    assert!(work["input"]["windows"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("brass hinges"));
+}

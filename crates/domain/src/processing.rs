@@ -614,12 +614,7 @@ impl Processing {
                 crate::work_timing::lap("claim_queue", &mut lap);
                 let step = (|| -> Result<Option<Value>> {
                     let mut lap = std::time::Instant::now();
-                    let discovery = if kind == "consolidate" {
-                        self.consolidator.prepare_discovery(&job)?
-                    } else {
-                        None
-                    };
-                    crate::work_timing::lap("claim_discovery", &mut lap);
+                    // A committed receipt completes its job before any discovery or model work.
                     let prior = self.graph.store.read(|tx| {
                         one(
                             tx.sql(),
@@ -633,6 +628,12 @@ impl Processing {
                         schedule()?;
                         return Ok(None);
                     }
+                    let discovery = if kind == "consolidate" {
+                        self.consolidator.prepare_discovery(&job)?
+                    } else {
+                        None
+                    };
+                    crate::work_timing::lap("claim_discovery", &mut lap);
                     let previous = self.graph.store.read(|tx| {
                         one(tx.sql(), "SELECT context FROM jobs WHERE id=?", [&job.id])
                     })?;
@@ -706,7 +707,7 @@ impl Processing {
                             )
                         }
                         .map_err(|error| error.error)?;
-                        self.queue.complete(&job, &result)?;
+                        self.queue.complete_receipt(&job, &result)?;
                         schedule()?;
                         return Ok(None);
                     }
@@ -892,8 +893,10 @@ impl Processing {
         };
         match result {
             Ok(result) => {
+                // The commit already completed the job; this only finishes a job whose
+                // receipt an older release committed without completing it.
                 lap = std::time::Instant::now();
-                self.queue.complete(&job, &result)?;
+                self.queue.complete_receipt(&job, &result)?;
                 crate::work_timing::lap("complete_queue", &mut lap);
                 Ok(result)
             }

@@ -192,6 +192,31 @@ impl Queue {
             )? == 1)
         })
     }
+    /// Completes the job inside the caller's authority transaction, so its receipt and
+    /// completion commit or roll back together. A lost or reassigned lease aborts both.
+    pub fn complete_in(tx: &WriteTxn, job: &Job, result: &Value) -> Result<()> {
+        let changed = tx.sql().execute(
+            "UPDATE jobs SET state='done',result=?,error=NULL,owner=NULL,lease_until=NULL,context=NULL \
+                WHERE id=? AND owner=? AND state='leased' AND lease_until>?",
+            params![encode_json(result)?, job.id, job.owner, timestamp()],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict("Work lease expired or was reassigned"));
+        }
+        Ok(())
+    }
+    /// Completes a job whose receipt committed earlier without its completion (older
+    /// releases completed separately); a job that is no longer leased is left as it is.
+    pub fn complete_receipt(&self, job: &Job, result: &Value) -> Result<()> {
+        self.graph.store.write(|tx| {
+            tx.sql().execute(
+                "UPDATE jobs SET state='done',result=?,error=NULL,owner=NULL,lease_until=NULL,context=NULL \
+                    WHERE id=? AND owner=? AND state='leased'",
+                params![encode_json(result)?, job.id, job.owner],
+            )?;
+            Ok(())
+        })
+    }
     pub fn complete(&self, job: &Job, result: &Value) -> Result<()> {
         self.graph.store.write(|tx| {
             job.check_in(tx.sql())?;

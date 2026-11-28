@@ -1063,7 +1063,7 @@ fn commit_plan(
         progressed,
     )?;
     seed_lesson_links(tx, &lessons)?;
-    Ok(json!({
+    let result = json!({
         "candidate_count":results.len(),
         "results":results,
         "reported_model":model,
@@ -1072,7 +1072,9 @@ fn commit_plan(
         "repair_results":repair_results,
         "redirected_relations":redirected,
         "loop_responsibilities":loop_responsibilities
-    }))
+    });
+    crate::jobs::Queue::complete_in(tx, job, &result)?;
+    Ok(result)
 }
 // Refuses the plan when repair targets, eligibility or supplied graph versions changed.
 fn check_plan_fences(
