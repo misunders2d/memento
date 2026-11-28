@@ -3,6 +3,7 @@ import json
 import sqlite3
 import base64
 import builtins
+import contextlib
 import io
 import http.server
 from http.client import BadStatusLine
@@ -1507,3 +1508,121 @@ def test_slow_blob_retains_original_while_later_text_uploads_and_retry_resumes(t
     monkeypatch.setattr(bridge, 'http', lambda _config, endpoint, body, **_kwargs: retried.append(body) or {})
     assert bridge.upload(config_path, config) == {'pending': 0, 'conflicts': 0}
     assert retried == [original]
+
+
+def _refuse(code):
+    return bridge.urllib.error.HTTPError('http://synthetic/episodes', code, 'refused', {}, io.BytesIO(b''))
+
+
+@pytest.mark.parametrize('code', [400, 413])
+def test_terminal_refusal_at_queue_head_parks_visibly_and_later_records_upload(tmp_path, monkeypatch,
+                                                                              capsys, code):
+    spool = spool_at(tmp_path)
+    for index in range(3):
+        spool.episode('pi', 's', str(index), 'user', 'synthetic message ' + str(index))
+    spool.commit()
+    spool.close()
+    attempted = []
+
+    def transport(_config, _endpoint, body, **_kwargs):
+        attempted.append(body['text'])
+        if body['text'] == 'synthetic message 0':
+            raise _refuse(code)
+        return {}
+
+    monkeypatch.setattr(bridge, 'http', transport)
+    assert bridge.main(['upload', '--config', str(tmp_path / 'runner.json')]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert (result['pending'], result['conflicts'], result['rejected']) == (0, 0, 1)
+    assert result['error']['http_status'] == code
+    assert attempted == ['synthetic message 0', 'synthetic message 1', 'synthetic message 2']
+    spool = spool_at(tmp_path)
+    status = spool.status()
+    assert status['rejected'] == 1 and status['rejected_by_class'] == {'http_' + str(code): 1}
+    # Retained, never acknowledged: the refused bytes stay in the outbox.
+    assert [body['text'] for body in pending(spool)] == ['synthetic message 0']
+    spool.close()
+    # An explicit upload retries parked rows once; acceptance then clears them.
+    monkeypatch.setattr(bridge, 'http', lambda *args, **kwargs: {})
+    assert bridge.main(['upload', '--config', str(tmp_path / 'runner.json')]) == 0
+    assert json.loads(capsys.readouterr().out) == {'pending': 0, 'conflicts': 0}
+
+
+def test_codex_record_reaches_service_after_rejected_head_in_background(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    spool.episode('pi', 's', 'head', 'user', 'synthetic refused head')
+    journal = tmp_path / 'codex.jsonl'
+    line = json.dumps({'id': 'c1', 'type': 'synthetic_codex_item'}) + '\n'
+    journal.write_text(line, encoding='utf-8')
+    spool.journal(journal, 'codex', 'conversation', defer=True)
+    spool.commit()
+    spool.close()
+    uploaded = []
+
+    def transport(_config, endpoint, body, **_kwargs):
+        if body.get('text') == 'synthetic refused head':
+            raise _refuse(413)
+        uploaded.append(body)
+        return {}
+
+    monkeypatch.setattr(bridge, 'http', transport)
+    monkeypatch.setattr(bridge.time, 'sleep', lambda *_: None)
+    config = json.loads((tmp_path / 'runner.json').read_bytes())
+    result = bridge.upload(tmp_path / 'runner.json', config, background=True, paths=[str(journal.resolve())])
+    assert result == {'pending': 0, 'conflicts': 0, 'rejected': 1, 'error': result['error']}
+    assert [body['text'] for body in uploaded if body.get('kind') == 'native_record'] == [line]
+
+
+def test_background_reconcile_runs_in_bounded_slices_between_uploads(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    journal = tmp_path / 'codex.jsonl'
+    lines = [json.dumps({'id': 'r' + str(index), 'type': 'synthetic_codex_item'}) + '\n' for index in range(4)]
+    journal.write_text(''.join(lines), encoding='utf-8')
+    spool.journal(journal, 'codex', 'conversation', defer=True)
+    spool.commit()
+    spool.close()
+    monkeypatch.setattr(bridge, 'RECONCILE_SLICE', 1)  # One complete line per slice.
+    database = tmp_path / 'runner.bridge.sqlite3'
+    seen = []
+
+    def transport(_config, _endpoint, body, **_kwargs):
+        if body.get('kind') == 'native_record':
+            with contextlib.closing(sqlite3.connect(database)) as probe:
+                seen.append((body['text'], probe.execute('SELECT count(*) FROM records').fetchone()[0]))
+        return {}
+
+    monkeypatch.setattr(bridge, 'http', transport)
+    monkeypatch.setattr(bridge.time, 'sleep', lambda *_: None)
+    config = json.loads((tmp_path / 'runner.json').read_bytes())
+    assert bridge.upload(tmp_path / 'runner.json', config, background=True,
+                         paths=[str(journal.resolve())]) == {'pending': 0, 'conflicts': 0}
+    # Each record uploads before the next slice is read; the cursor resumes, never rereads.
+    assert seen == [(line, index) for index, line in enumerate(lines, 1)]
+    spool = spool_at(tmp_path)
+    assert spool.db.execute('SELECT offset FROM journals').fetchone()[0] == journal.stat().st_size
+    spool.close()
+
+
+def test_background_outage_still_captures_every_slice_locally(tmp_path, monkeypatch):
+    spool = spool_at(tmp_path)
+    journal = tmp_path / 'codex.jsonl'
+    lines = [json.dumps({'id': 'o' + str(index), 'type': 'synthetic_codex_item'}) + '\n' for index in range(4)]
+    journal.write_text(''.join(lines), encoding='utf-8')
+    spool.journal(journal, 'codex', 'conversation', defer=True)
+    spool.commit()
+    spool.close()
+    monkeypatch.setattr(bridge, 'RECONCILE_SLICE', 1)
+
+    def down(*_args, **_kwargs):
+        raise OSError('synthetic outage')
+
+    monkeypatch.setattr(bridge, 'http', down)
+    monkeypatch.setattr(bridge.time, 'sleep', lambda *_: None)
+    config = json.loads((tmp_path / 'runner.json').read_bytes())
+    result = bridge.upload(tmp_path / 'runner.json', config, background=True, paths=[str(journal.resolve())])
+    assert result['error']['category'] == 'network'
+    spool = spool_at(tmp_path)
+    assert spool.db.execute('SELECT count(*) FROM records').fetchone()[0] == 4
+    assert [body['text'] for body in pending(spool) if body['kind'] == 'native_record'] == lines
+    assert spool.db.execute('SELECT offset FROM journals').fetchone()[0] == journal.stat().st_size
+    spool.close()

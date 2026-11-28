@@ -37,6 +37,9 @@ import urllib.parse
 from uuid import uuid4
 
 MAX_BODY = 1024 * 1024
+RECONCILE_SLICE = 2 * MAX_BODY  # Background journal bytes read between upload rounds.
+# Service refusals that a retry of the same bytes cannot fix (validation, size, media type).
+TERMINAL_HTTP = frozenset((400, 413, 415, 422))
 CONTEXT_BYTES = 1500  # A conservative byte ceiling, including framing and citations.
 STEP_CONTEXT_BYTES = 1500  # Separate, owner-authorized mid-run reminder allowance.
 STEP_INTERVAL = 30
@@ -282,6 +285,7 @@ class Spool:
                 ('journals', 'fingerprint', "TEXT NOT NULL DEFAULT ''"),
                 ('journals', 'error', 'TEXT'),
                 ('outbox', 'content_type', 'TEXT'),
+                ('outbox', 'error', 'TEXT'),
                 ('recall_cache', 'state', 'TEXT')):
             columns = {row[1] for row in self.db.execute('PRAGMA table_info(' + table + ')')}
             if name not in columns:
@@ -289,6 +293,7 @@ class Spool:
         self.db.execute('''CREATE INDEX IF NOT EXISTS outbox_pending_order
             ON outbox(content_type IS NOT NULL,id) WHERE state='pending' ''')
         self.attachment_roots = ()
+        self.partial = False
         self.coverage = {'unsupported_records': 0, 'attachments': 0,
                          'missing_attachments': 0, 'unsupported_attachments': 0,
                          'inline_payload_bytes': 0}
@@ -568,7 +573,8 @@ class Spool:
                         (path, harness, conversation))
         return 0 if defer else self.reconcile(path, force=force)
 
-    def reconcile(self, path, *, force=False):
+    def reconcile(self, path, *, force=False, limit=None):
+        """Read complete new journal lines; `limit` bounds bytes per call and leaves the rest for the next slice."""
         row = self.db.execute('SELECT harness,conversation,offset,prefix,fingerprint FROM journals WHERE path=?', (path,)).fetchone()
         if not row:
             return 0
@@ -591,7 +597,15 @@ class Spool:
                     offset = 0
                 stream.seek(offset)
                 committed_offset = offset
+                slice_start = offset
                 while True:
+                    if limit is not None and offset - slice_start >= limit:
+                        # Bounded slice: keep the cursor, not the fingerprint, so the
+                        # next call resumes here; uploads run between slices.
+                        self.db.execute('UPDATE journals SET offset=?,prefix=?,error=NULL WHERE path=?',
+                                        (offset, actual_prefix, path))
+                        self.partial = True
+                        return added
                     start = stream.tell()
                     line = stream.readline()
                     if not line or not line.endswith(b'\n'):
@@ -625,15 +639,21 @@ class Spool:
                             ('missing' if isinstance(exc, FileNotFoundError) else 'unreadable', path))
         return added
 
-    def reconcile_all(self, paths=None):
+    def reconcile_all(self, paths=None, *, limit=None):
+        """True when a bounded slice left unread complete lines in some journal."""
+        self.partial = False
         selected = paths if paths is not None else [row[0] for row in self.db.execute('SELECT path FROM journals')]
         for path in selected:
-            self.reconcile(path)
+            self.reconcile(path, limit=limit)
+        return self.partial
 
     def status(self):
         counts = dict(self.db.execute('SELECT state,COUNT(*) FROM outbox GROUP BY state'))
+        rejected = dict(self.db.execute("SELECT coalesce(error,'unknown'),COUNT(*) FROM outbox WHERE state='rejected' GROUP BY 1"))
         return {'captured_records': self.db.execute('SELECT COUNT(*) FROM records').fetchone()[0],
                 'pending': counts.get('pending', 0), 'conflicts': counts.get('conflict', 0),
+                # Terminally refused by the service: retained, never acknowledged as captured.
+                'rejected': counts.get('rejected', 0), 'rejected_by_class': rejected,
                 'registered_journals': self.db.execute('SELECT COUNT(*) FROM journals').fetchone()[0],
                 'journal_errors': [{'path': path, 'error': error} for path, error in self.db.execute(
                     'SELECT path,error FROM journals WHERE error IS NOT NULL ORDER BY path')]}
@@ -677,9 +697,18 @@ def upload(config_path, config, *, background=False, paths=()):
             stopped = False
             failed_blobs = set()
             failure = None
+            if not background:
+                # An explicit upload retries terminally refused rows once (e.g. after a
+                # service update); a repeated refusal parks them again without blocking.
+                spool.db.execute("UPDATE outbox SET state='pending' WHERE state='rejected'")
+                spool.commit()
             # Re-read only complete lines during native asynchronous journal flushes.
-            for attempt in range(4 if background else 1):
-                spool.reconcile_all(paths if background else None)
+            # Background reconciliation runs in bounded slices interleaved with uploads,
+            # so a large journal suffix never delays already queued records.
+            attempt, more = 0, False
+            while attempt < (4 if background else 1):
+                more = spool.reconcile_all(paths if background else None,
+                                           limit=RECONCILE_SLICE if background else None)
                 spool.commit()
                 while deadline is None or time.monotonic() < deadline:
                     excluded = (' AND id NOT IN (' + ','.join('?' for _ in failed_blobs) + ')') if failed_blobs else ''
@@ -703,9 +732,19 @@ def upload(config_path, config, *, background=False, paths=()):
                         failure = {**upload_error(exc), 'outbox_id': identifier}
                         if exc.code == 409:
                             # Immutable collisions remain visible, never acknowledged/deleted.
-                            spool.db.execute("UPDATE outbox SET state='conflict' WHERE id=?", (identifier,))
+                            spool.db.execute("UPDATE outbox SET state='conflict',error='http_409' WHERE id=?",
+                                             (identifier,))
                             spool.commit()
                             continue
+                        if exc.code in TERMINAL_HTTP:
+                            # A refused record cannot succeed by retrying; park it visibly
+                            # like a conflict so later records keep uploading.
+                            spool.db.execute("UPDATE outbox SET state='rejected',error=? WHERE id=?",
+                                             ('http_' + str(exc.code), identifier))
+                            spool.commit()
+                            continue
+                        spool.db.execute('UPDATE outbox SET error=? WHERE id=?', ('http_' + str(exc.code), identifier))
+                        spool.commit()
                         if content_type:
                             failed_blobs.add(identifier)
                             continue
@@ -713,6 +752,9 @@ def upload(config_path, config, *, background=False, paths=()):
                         break
                     except (OSError, ValueError, _http_exception()) as exc:
                         failure = {**upload_error(exc), 'outbox_id': identifier}
+                        with contextlib.suppress(sqlite3.Error):
+                            spool.db.execute('UPDATE outbox SET error=? WHERE id=?', (failure['category'], identifier))
+                            spool.commit()
                         if content_type:
                             failed_blobs.add(identifier)
                             continue
@@ -721,11 +763,20 @@ def upload(config_path, config, *, background=False, paths=()):
                     spool.db.execute('DELETE FROM outbox WHERE id=?', (identifier,))
                     spool.commit()
                 if stopped:
+                    # The service is unreachable: still capture the rest of the journal
+                    # locally (bounded by the hook deadline) so nothing waits on uploads.
+                    while more and time.monotonic() < deadline:
+                        more = spool.reconcile_all(paths, limit=RECONCILE_SLICE)
+                        spool.commit()
                     break
-                if background and attempt < 3 and time.monotonic() < deadline:
+                if more and time.monotonic() < deadline:
+                    continue  # Next bounded slice of the same pass.
+                attempt += 1
+                if background and attempt < 4 and time.monotonic() < deadline:
                     time.sleep(.5)
             counts = dict(spool.db.execute('SELECT state,count(*) FROM outbox GROUP BY state'))
             return {'pending': counts.get('pending', 0), 'conflicts': counts.get('conflict', 0),
+                    **({'rejected': counts['rejected']} if counts.get('rejected') else {}),
                     **({'error': failure} if failure else {})}
         finally:
             spool.close()
@@ -1958,7 +2009,7 @@ def main(argv=None):
             result = upload(args.config, config, background=args.background, paths=args.journal)
             if not args.background:
                 print(json.dumps(result))
-            return 1 if result and (result['pending'] or result['conflicts']) else 0
+            return 1 if result and (result['pending'] or result['conflicts'] or result.get('rejected')) else 0
         if args.operation == 'status':
             spool = Spool(args.config, config)
             try:
@@ -2020,7 +2071,8 @@ def main(argv=None):
                 uri = Path(args.config).resolve().with_suffix('.bridge.sqlite3').as_uri() + '?mode=ro'
                 with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=.1)) as db:
                     states = dict(db.execute('SELECT state,count(*) FROM outbox GROUP BY state'))
-                    counts = {'pending': states.get('pending', 0), 'conflicts': states.get('conflict', 0)}
+                    counts = {'pending': states.get('pending', 0), 'conflicts': states.get('conflict', 0),
+                              **({'rejected': states['rejected']} if states.get('rejected') else {})}
             print(json.dumps({'status': 'error', **counts, 'error': upload_error(exc)}))
             return 1
         if args.operation == 'flush-conversation':
