@@ -565,6 +565,7 @@ async fn admission(State(state): State<AppState>, request: Request, next: Next) 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/health/serving", get(health_serving))
         .route("/docs", get(api_docs))
         .route("/redoc", get(api_redoc))
         .route("/openapi.json", get(api_schema))
@@ -653,6 +654,34 @@ async fn health(State(state): State<AppState>) -> std::result::Result<Json<Value
         }
     }
     let mut result = json!({"status":"ok","processing":"host_runner"});
+    if let Some(recall) = &state.recall {
+        result["search_ready"] = json!(recall.ready());
+    }
+    Ok(Json(result))
+}
+/// Serving capability alone (capture, recall, processing API): stays 200 while Drive
+/// needs reauthorization or cold archival is incomplete, and reports those separately.
+/// `/health` keeps its stricter all-capability semantics for existing probes.
+async fn health_serving(State(state): State<AppState>) -> std::result::Result<Json<Value>, ApiError> {
+    let store = state.store.clone();
+    blocking(move || store.health()).await?;
+    let mut drive = json!({"reauthorization_required":false,"archive_incomplete":false});
+    let mut indexing_failed = false;
+    if let Some(services) = &state.services {
+        if let Some(message) = services.startup_error.lock().ok().and_then(|e| *e) {
+            return Err(Error::Unavailable(message).into());
+        }
+        if services.stopped_thread() {
+            return Err(Error::Unavailable("Background service stopped; restart required").into());
+        }
+        indexing_failed = services.index_error.load(std::sync::atomic::Ordering::Acquire);
+        drive = json!({
+            "connected":services.cold().is_some(),
+            "reauthorization_required":services.reauthorization.load(std::sync::atomic::Ordering::Acquire),
+            "archive_incomplete":services.cold_status()?.is_some_and(|s| !s["last_error"].is_null())
+        });
+    }
+    let mut result = json!({"status":"ok","processing":"host_runner","indexing_failed":indexing_failed,"drive":drive});
     if let Some(recall) = &state.recall {
         result["search_ready"] = json!(recall.ready());
     }

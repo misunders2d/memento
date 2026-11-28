@@ -258,3 +258,41 @@ fn busy_viewer_reads_queue_without_starving_recall() {
         assert_eq!(state.viewer_admission.available_permits(), 2);
     });
 }
+
+// B15: serving health stays up while Drive or indexing fails; /health keeps its semantics.
+#[test]
+fn serving_health_is_split_from_drive_and_keeps_existing_probe() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memento_core::Store::open(dir.path().join("data")).unwrap();
+        let mut state = AppState::new(store).unwrap();
+        state.recall = Some(Arc::new(StubRecall));
+        let services = Arc::new(crate::runtime::Services::idle());
+        state.services = Some(services.clone());
+        let (health, serving) = (request(state.clone(), "/health").await, request(state.clone(), "/health/serving").await);
+        assert_eq!((health.0, serving.0), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(serving.1["drive"]["reauthorization_required"], false);
+        // Simulated revoked Drive while recall serves.
+        services.reauthorization.store(true, Ordering::Release);
+        let health = request(state.clone(), "/health").await;
+        assert_eq!(health.0, StatusCode::SERVICE_UNAVAILABLE);
+        let serving = request(state.clone(), "/health/serving").await;
+        assert_eq!(serving.0, StatusCode::OK, "{}", serving.1);
+        assert_eq!(serving.1["drive"]["reauthorization_required"], true);
+        assert_eq!(serving.1["search_ready"], true);
+        let recall = request(state.clone(), "/recall?q=fixture").await;
+        assert_eq!(recall.0, StatusCode::OK);
+        // Indexing failure is reported, not hidden; startup failure stops serving too.
+        services.index_error.store(true, Ordering::Release);
+        let serving = request(state.clone(), "/health/serving").await;
+        assert_eq!((serving.0, serving.1["indexing_failed"].as_bool()), (StatusCode::OK, Some(true)));
+        *services.startup_error.lock().unwrap() = Some("Synthetic startup failure");
+        assert_eq!(request(state.clone(), "/health/serving").await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(request(state.clone(), "/health").await.0, StatusCode::SERVICE_UNAVAILABLE);
+    });
+}

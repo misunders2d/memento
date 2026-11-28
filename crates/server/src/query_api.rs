@@ -162,6 +162,7 @@ pub async fn status(
     >,
 ) -> std::result::Result<Response, ApiError> {
     let Query(query) = query.map_err(|_| ApiError(Error::Validation("Invalid status query")))?;
+    let page = query.page()?;
     Ok(protect(
         Json(
             admitted_blocking(state.status_admission.clone(), move || {
@@ -207,6 +208,7 @@ pub async fn status(
                         query.source.as_deref(),
                         &runtime,
                         memento_domain::jobs::timestamp(),
+                        &page,
                         &mut stages,
                     )
                 });

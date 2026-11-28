@@ -14,6 +14,31 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 #[serde(deny_unknown_fields)]
 pub struct StatusQuery {
     pub source: Option<String>,
+    /// Opt-in paging of `extraction.progress` (ordered by source, conversation); without
+    /// it the full list is returned exactly as before.
+    pub progress_limit: Option<usize>,
+    pub progress_after_source: Option<String>,
+    pub progress_after_conversation: Option<String>,
+}
+impl StatusQuery {
+    pub fn page(&self) -> Result<ProgressPage> {
+        let after = match (&self.progress_after_source, &self.progress_after_conversation) {
+            (Some(source), Some(conversation)) => Some((source.clone(), conversation.clone())),
+            (None, None) => None,
+            _ => return Err(Error::Validation("progress_after_source and progress_after_conversation go together")),
+        };
+        if self.progress_limit.is_some_and(|limit| !(1..=10_000).contains(&limit))
+            || (after.is_some() && self.progress_limit.is_none())
+        {
+            return Err(Error::Validation("progress_limit must be 1..10000 and precede any cursor"));
+        }
+        Ok(ProgressPage { limit: self.progress_limit, after })
+    }
+}
+#[derive(Default)]
+pub struct ProgressPage {
+    pub limit: Option<usize>,
+    pub after: Option<(String, String)>,
 }
 #[derive(Clone, Serialize)]
 pub struct DriveStatus {
@@ -228,7 +253,7 @@ pub fn operational_status(
     runtime: &RuntimeStatus,
     now: f64,
 ) -> Result<Value> {
-    operational_status_timed(db, source, runtime, now, &mut Vec::new())
+    operational_status_timed(db, source, runtime, now, &ProgressPage::default(), &mut Vec::new())
 }
 /// Same counts; appends per-section elapsed microseconds for the timing log.
 pub fn operational_status_timed(
@@ -236,6 +261,7 @@ pub fn operational_status_timed(
     source: Option<&str>,
     runtime: &RuntimeStatus,
     now: f64,
+    page: &ProgressPage,
     stages: &mut Vec<(&'static str, u128)>,
 ) -> Result<Value> {
     let mut last = Instant::now();
@@ -321,9 +347,23 @@ pub fn operational_status_timed(
         cursor,p.offset,p.compact_through,p.latest_seq,h.parked_through,h.live_seq AS \
         live_cursor,h.live_offset FROM processing_progress p LEFT JOIN historical_parking h ON \
         h.source=p.source AND h.conversation_id=p.conversation_id WHERE (?1 IS NULL OR p.source=?1) \
-        ORDER BY p.source,p.conversation_id",
-        [source],
+        AND (?2 IS NULL OR (p.source,p.conversation_id)>(?2,?3)) ORDER BY p.source,p.conversation_id LIMIT ?4",
+        rusqlite::params![
+            source,
+            page.after.as_ref().map(|after| after.0.as_str()),
+            page.after.as_ref().map(|after| after.1.as_str()),
+            // One past the page shows whether another page follows.
+            page.limit.map_or(-1, |limit| limit as i64 + 1)
+        ],
     )?;
+    let next = match page.limit {
+        Some(limit) if progress.len() > limit => {
+            progress.truncate(limit);
+            let last = &progress[limit - 1];
+            json!({"source":last["source"],"conversation_id":last["conversation_id"]})
+        }
+        _ => Value::Null,
+    };
     for row in &mut progress {
         if row["parked_through"].is_null() {
             let object = row.as_object_mut().unwrap();
@@ -333,6 +373,9 @@ pub fn operational_status_timed(
         }
     }
     extraction["progress"] = json!(progress);
+    if page.limit.is_some() {
+        extraction["progress_next"] = next;
+    }
     lap("extraction_progress");
     let mut consolidation = jobs(db, "consolidate", source)?;
     lap("consolidation_jobs");
@@ -538,6 +581,42 @@ pub fn status(
 #[cfg(test)]
 mod plan_tests {
     use super::*;
+    // B15: opt-in progress pages cover every conversation once; no page keeps the old shape.
+    #[test]
+    fn progress_pages_cover_every_conversation_and_default_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("data")).unwrap();
+        store
+            .write(|tx| {
+                for conversation in ["a", "b", "c"] {
+                    tx.sql().execute(
+                        "INSERT INTO processing_progress(source,conversation_id,latest_seq,latest_at) VALUES('synthetic',?,1,0)",
+                        [conversation],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let runtime = RuntimeStatus::disabled();
+        let status = |page: &ProgressPage| {
+            store
+                .read(|tx| operational_status_timed(tx.sql(), None, &runtime, 0., page, &mut Vec::new()))
+                .unwrap()["extraction"]
+                .clone()
+        };
+        let full = status(&ProgressPage::default());
+        assert_eq!(full["progress"].as_array().unwrap().len(), 3);
+        assert!(full.get("progress_next").is_none());
+        let first = status(&ProgressPage { limit: Some(2), after: None });
+        assert_eq!(first["progress"].as_array().unwrap().len(), 2);
+        assert_eq!(first["progress_next"], json!({"source":"synthetic","conversation_id":"b"}));
+        let rest = status(&ProgressPage { limit: Some(2), after: Some(("synthetic".into(), "b".into())) });
+        assert_eq!(rest["progress"][0]["conversation_id"], "c");
+        assert_eq!((rest["progress"].as_array().unwrap().len(), rest["progress_next"].clone()), (1, Value::Null));
+        assert_eq!(first["pending_conversations"], full["pending_conversations"]);
+        let bad = StatusQuery { progress_after_source: Some("x".into()), ..Default::default() };
+        assert!(bad.page().is_err());
+    }
     // Source-filtered counts must probe each job/file's own rows, never range
     // over every episode of the source once per row.
     #[test]

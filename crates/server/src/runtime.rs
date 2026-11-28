@@ -99,6 +99,23 @@ pub struct Services {
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 impl Services {
+    /// Idle services with no Drive, index or worker, for router tests.
+    #[cfg(test)]
+    pub fn idle() -> Self {
+        Self {
+            cold: RwLock::new(None),
+            cold_runtime: Mutex::new(None),
+            install: Mutex::new(()),
+            drive_authorization: RwLock::new(None),
+            reauthorization: AtomicBool::new(false),
+            startup_error: Mutex::new(None),
+            index_error: AtomicBool::new(false),
+            stop: Arc::new(AtomicBool::new(false)),
+            projection: Arc::new(RwLock::new(None)),
+            worker: Mutex::new(None),
+            threads: Mutex::new(Vec::new()),
+        }
+    }
     pub fn cold(&self) -> Option<Arc<ColdManager>> {
         self.cold.read().ok().and_then(|v| v.clone())
     }
