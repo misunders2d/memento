@@ -433,6 +433,41 @@ fn goal_fixture_report() {
     for case in ["named", "semantic_only", "cold_down_hot_useful"] {
         assert_eq!(gf_case(&reports, case)["status"], "complete");
     }
+    // J11: automatic delivery holds at most one parked candidate, always labelled,
+    // and none when a current fact matched; anchors and connections included.
+    for case in ["parked_one", "parked_multiple", "parked_connection"] {
+        let r = gf_case(&reports, case);
+        assert_eq!((r["parked_delivered"].as_u64(), r["parked_labelled"].as_u64()), (Some(1), Some(1)), "{r}");
+    }
+    let r = gf_case(&reports, "parked_one");
+    assert_eq!(r["entity_hit"], true, "{r}");
+    let r = gf_case(&reports, "parked_vs_current_fact");
+    assert_eq!(
+        (r["parked_delivered"].as_u64(), r["entity_hit"].as_bool(), r["connected_hit"].as_u64()),
+        (Some(0), Some(true), Some(1)),
+        "{r}"
+    );
+}
+#[test]
+fn j11_explicit_recall_still_returns_parked_anchors_unchanged() {
+    let mut f = Fixture::new();
+    for (id, name) in [("gf-park-1", "Tamsin Hollow"), ("gf-park-2", "Ivo Marsh")] {
+        gf_candidate(&mut f, id, "entity", "person", name, (None, None), "personal", true);
+    }
+    gf_rebuild(&f, true);
+    let mut vector = [0f32; 768];
+    vector[0] = 1.;
+    let request = RecallRequest {
+        query: "Tamsin Hollow and Ivo Marsh".into(),
+        effort: "cheap".into(),
+        limit: 6,
+        automatic: false,
+        ..Default::default()
+    };
+    let score = |documents: &[&str], _: Instant| Ok(vec![1.; documents.len()]);
+    let rows = Retrieval::passes(&f.projection, &request, &vector, Instant::now() + 5 * SECOND, &score, &RecallTimings::default()).unwrap();
+    let parked = rows.iter().filter(|r| r["historical"] == true).count();
+    assert_eq!(parked, 2, "explicit recall must keep every parked anchor: {rows:?}");
 }
 #[test]
 fn j4_kept_hot_rows_are_revalidated_against_forget_and_revision() {

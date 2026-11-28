@@ -385,8 +385,27 @@ fn compose(
             serde_json::to_string(&clean(alias))?
         ));
     }
+    let body = body(&connections);
+    merge(
+        &mut record,
+        json!({
+            "text":format!("{head} {body}"),
+            "category":"entity_context",
+            "match":"entity_name",
+            "connections":connections,
+            "cosine":null,
+            "score":1.0,
+            "related":[]
+        }),
+    );
+    record["duplicate_ids"] = json!([]);
+    Ok(record)
+}
+// The rendered connection sentence of an entity context row.
+fn body(connections: &[Value]) -> String {
+    let clean = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut lines = Vec::new();
-    for item in &connections {
+    for item in connections {
         let reference = match item["basis"].as_str() {
             Some("edge") => format!("edge {}", item["relation_id"].as_str().unwrap()),
             Some("pending_relation") => {
@@ -411,25 +430,50 @@ fn compose(
             format!("{other} {} this", item["relation"].as_str().unwrap())
         });
     }
-    let body = if lines.is_empty() {
+    if lines.is_empty() {
         "No recorded connections.".into()
     } else {
         format!("Connections: {}.", lines.join("; "))
+    }
+}
+/// Automatic delivery only: drops connections through parked (unverified historical)
+/// candidates from an entity context row and re-renders its sentence; the row's own
+/// parked state is handled by the caller's one-parked-candidate cap. Returns how many.
+pub fn drop_parked_connections(db: &Connection, row: &mut Value) -> Result<usize> {
+    let Some(connections) = row["connections"].as_array().cloned() else {
+        return Ok(0);
     };
-    merge(
-        &mut record,
-        json!({
-            "text":format!("{head} {body}"),
-            "category":"entity_context",
-            "match":"entity_name",
-            "connections":connections,
-            "cosine":null,
-            "score":1.0,
-            "related":[]
-        }),
-    );
-    record["duplicate_ids"] = json!([]);
-    Ok(record)
+    let parked = |id: Option<&str>| -> Result<bool> {
+        Ok(match id {
+            Some(id) => one(
+                db,
+                "SELECT 1 AS parked FROM historical_parked_candidates WHERE candidate_id=? AND released_at IS NULL",
+                [id],
+            )?
+            .is_some(),
+            None => false,
+        })
+    };
+    let mut kept = Vec::new();
+    for item in &connections {
+        let pending = item["basis"] == "pending_relation";
+        if pending && (parked(item["relation_id"].as_str())? || parked(item["id"].as_str())?) {
+            continue;
+        }
+        kept.push(item.clone());
+    }
+    let removed = connections.len() - kept.len();
+    if removed > 0 {
+        let text = row["text"].as_str().unwrap_or("").to_owned();
+        match text.strip_suffix(&body(&connections)) {
+            Some(head) => row["text"] = json!(format!("{head}{}", body(&kept))),
+            // A sentence that cannot be re-rendered counts as parked itself, so the
+            // caller's cap labels or drops it; it never reaches delivery unlabelled.
+            None => row["historical"] = json!(true),
+        }
+        row["connections"] = json!(kept);
+    }
+    Ok(removed)
 }
 
 /// Recorded-connection context uses the same bounded renderer as exact name anchors.

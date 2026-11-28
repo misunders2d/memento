@@ -762,6 +762,9 @@ impl Retrieval {
             timings.count(Count::PartialAnchors, output.len().saturating_sub(before));
         }
         timings.lap(Stage::PartialAnchors, clock);
+        if request.automatic {
+            cap_parked(db, &mut output)?;
+        }
         if request.explain {
             Self::explain_positional(&mut output, archive);
         }
@@ -1699,6 +1702,43 @@ impl Recall for Retrieval {
     fn ready(&self) -> bool {
         self.projection.ready(Tier::Hot)
     }
+}
+/// Automatic delivery holds at most one parked (unverified historical) candidate, labelled,
+/// and only when no current fact or lesson matched; this covers exact and partial name
+/// anchors and rendered connections, not only the semantic parked fallback. Explicit
+/// recall and citation-triggered extraction are unchanged.
+fn cap_parked(db: &rusqlite::Connection, output: &mut Vec<Value>) -> Result<()> {
+    for row in output.iter_mut() {
+        if row["category"] == "entity_context" {
+            anchors::drop_parked_connections(db, row)?;
+        }
+    }
+    let mut current = false;
+    for row in output.iter() {
+        if row["historical"] != true
+            && (records::meaningful(db, row)?
+                || row["connections"].as_array().is_some_and(|c| !c.is_empty()))
+        {
+            current = true;
+            break;
+        }
+    }
+    let mut kept = current;
+    output.retain_mut(|row| {
+        if row["historical"] != true {
+            return true;
+        }
+        if kept {
+            return false;
+        }
+        kept = true;
+        let text = row["text"].as_str().unwrap_or("");
+        if !text.starts_with("Unverified historical") {
+            row["text"] = json!(format!("Unverified historical candidate{}: {text}", source_label(row)));
+        }
+        true
+    });
+    Ok(())
 }
 fn source_label(row: &Value) -> String {
     row["source_occurred_at"]

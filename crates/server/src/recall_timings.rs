@@ -111,7 +111,6 @@ pub fn failure_class(error: &memento_core::Error) -> &'static str {
             memento_ann::DEADLINE
             | memento_core::store::READ_DEADLINE
             | "Native query encoding deadline expired"
-            | "Semantic search deadline expired"
             | "Text passage scoring deadline expired" => "deadline",
             memento_ann::LAGGING => "index_lag",
             "Native query encoding failed" => "encoder",
