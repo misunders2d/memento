@@ -11,7 +11,7 @@ pub use audio::{AudioInput, AUDIO_MAX_SAMPLES, AUDIO_SAMPLE_RATE};
 pub use error::{Error, Result};
 pub use image::ImageInput;
 pub use runtime::{
-    initialize_runtime, BackgroundLane, EmbeddingModel, ForegroundLane, ModelConfig,
+    initialize_runtime, BackgroundLane, EmbeddingModel, ForegroundLane, ModelConfig, QueryTiming,
 };
 use std::path::Path;
 pub use text::{document_prompt, TextChunk, TextInput, MAX_SEQUENCE_LENGTH, QUERY_PREFIX};

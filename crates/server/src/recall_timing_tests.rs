@@ -40,7 +40,10 @@ fn explain_reports_stage_timings_and_the_log_line_has_no_request_text() {
     let timings = &body["timings"];
     let mut keys: Vec<&str> = timings.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["automatic", "counts", "effort", "index_caught_up", "limit", "pass", "scope", "stages_us", "total_us"]);
+    assert_eq!(keys, ["automatic", "counts", "cuts", "effort", "failure", "failure_tier", "index_caught_up", "limit", "pass", "scope", "stages_us", "total_us"]);
+    assert_eq!((&timings["failure"], &timings["failure_tier"]), (&Value::Null, &Value::Null));
+    assert_eq!(timings["cuts"].as_array().unwrap().len(), 1);
+    assert_eq!((&timings["cuts"][0]["pass"], &timings["cuts"][0]["ok"]), (&json!("hot"), &json!(true)));
     for (group, expected) in [("stages_us", STAGES), ("counts", COUNTS)] {
         let mut names: Vec<&str> = timings[group].as_object().unwrap().keys().map(String::as_str).collect();
         let mut expected = expected.to_vec();
@@ -58,7 +61,7 @@ fn explain_reports_stage_timings_and_the_log_line_has_no_request_text() {
     assert!(counts["ann_hits"].as_u64().unwrap() >= 1 && counts["returned"].as_u64().unwrap() >= 1);
     assert!(counts["scorer_calls"].as_u64().unwrap() >= 1 && counts["scored_passages"].as_u64().unwrap() >= 1);
     // Measured stages are disjoint intervals inside their pass wall; the scorer overlaps validation.
-    let outside = ["queue", "embedding", "first_pass", "archive_pass", "scorer", "scorer_lock_wait"];
+    let outside = ["queue", "embedding", "embedding_lane_wait", "embedding_tokenize", "embedding_inference", "first_pass", "archive_pass", "scorer", "scorer_lock_wait"];
     let inside: u64 = STAGES.iter().filter(|s| !outside.contains(*s)).map(|s| us(timings, s)).sum();
     assert!(inside <= us(timings, "first_pass"), "{timings}");
     assert!(us(timings, "scorer") <= us(timings, "validation") + us(timings, "fallback"), "{timings}");
@@ -70,6 +73,21 @@ fn explain_reports_stage_timings_and_the_log_line_has_no_request_text() {
     let timings = &archive["timings"];
     assert_eq!((&timings["pass"], &timings["counts"]["passes"], &timings["scope"]), (&json!("archive"), &json!(2), &json!("all")));
     assert!(us(timings, "archive_pass") <= timings["total_us"].as_u64().unwrap());
+    let passes: Vec<&Value> = timings["cuts"].as_array().unwrap().iter().map(|c| &c["pass"]).collect();
+    assert_eq!(passes, [&json!("hot"), &json!("archive")]);
+    // A failed archive cut (Cold never built) is classified by fixed class and tier only.
+    let mut down = Fixture::new();
+    down.add("Unrelated harbor schedule note.", "knowledge", "2026-10-18T00:00:00Z", 0.5, 0.2, "personal");
+    down.projection.rebuild(Tier::Hot, &AtomicBool::new(false)).unwrap();
+    let mut cold_down = crate::AppState::new(down.store.clone()).unwrap();
+    cold_down.recall = Some(Arc::new(TimedRecall(down.projection.clone())));
+    let (status, failed) = runtime.block_on(call_status(&cold_down, "GET", &format!("/recall?q={query}&automatic=true&explain=true"), None));
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{failed}");
+    let line = LOGGED.lock().unwrap().iter().rev()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["ok"] == false).expect("failed recall is logged");
+    assert_eq!((&line["timings"]["failure"], &line["timings"]["failure_tier"]), (&json!("index_unavailable"), &json!("cold")), "{failed} {line}");
+    assert_eq!(line["timings"]["cuts"][1]["ok"], false);
     // The log line is exactly the response object; no request text reaches it.
     let logged = LOGGED.lock().unwrap().clone();
     for expected in [&body["timings"], &archive["timings"]] {

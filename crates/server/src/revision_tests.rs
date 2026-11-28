@@ -18,6 +18,16 @@ impl crate::Recall for FixedRecall {
     }
 }
 async fn call(state: &crate::AppState, method: &str, path: &str, body: Option<Value>) -> Value {
+    let (status, value) = call_status(state, method, path, body).await;
+    assert!(status.is_success(), "{method} {path}: {status} {value}");
+    value
+}
+async fn call_status(
+    state: &crate::AppState,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (axum::http::StatusCode, Value) {
     use tower::ServiceExt;
     let request = axum::http::Request::builder()
         .method(method)
@@ -32,8 +42,7 @@ async fn call(state: &crate::AppState, method: &str, path: &str, body: Option<Va
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), 4 << 20).await.unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(status.is_success(), "{method} {path}: {status} {value}");
-    value
+    (status, value)
 }
 fn current_vector(store: &Store, target: &str, version: i64, seq: i64) {
     let mut vector = [0f32; 768];

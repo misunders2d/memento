@@ -33,6 +33,10 @@ const PROJECTION_FORMAT: u32 = 3;
 fn unavailable() -> Error {
     Error::Unavailable("Semantic search is not ready")
 }
+/// Foreground catch-up refused: more than the bounded event admission is pending.
+pub const LAGGING: &str = "Semantic search index lags its authority";
+/// The caller's request deadline passed inside the projection.
+pub const DEADLINE: &str = "Semantic search deadline expired";
 fn edge<T, E>(value: std::result::Result<T, E>) -> Result<T> {
     value.map_err(|_| unavailable())
 }
@@ -159,6 +163,8 @@ pub struct SnapshotTiming {
     pub hot_sync: Duration,
     /// A foreground catch-up advanced an index cursor.
     pub caught_up: bool,
+    /// The tier whose lock or sync failed, when the snapshot failed there.
+    pub failed_tier: Option<Tier>,
 }
 /// Single-use Cold query from the same pinned authority cut as owned Hot hits.
 /// The guard is released before the owned result reaches hydration/scoring.
@@ -190,7 +196,7 @@ impl ColdQuery<'_> {
 }
 fn check(deadline: Option<Instant>) -> Result<()> {
     if deadline.is_some_and(|v| Instant::now() >= v) {
-        Err(unavailable())
+        Err(Error::Unavailable(DEADLINE))
     } else {
         Ok(())
     }
@@ -588,7 +594,7 @@ impl Projection {
             return Err(unavailable());
         }
         if foreground && events.len() > FOREGROUND_EVENTS {
-            return Err(unavailable());
+            return Err(Error::Unavailable(LAGGING));
         }
         let events = &events[..events.len().min(limit)];
         let through = events.last().unwrap().0.clone();
@@ -806,10 +812,16 @@ impl Projection {
             .then(|| lock_ready_until(&self.cold, deadline))
             .transpose();
         timing.cold_lock = at.elapsed();
+        if cold_guard.is_err() {
+            timing.failed_tier = Some(Tier::Cold);
+        }
         let mut cold_guard = cold_guard?;
         let at = Instant::now();
         let hot_guard = lock_until(&self.hot.state, deadline);
         timing.hot_lock = at.elapsed();
+        if hot_guard.is_err() {
+            timing.failed_tier = Some(Tier::Hot);
+        }
         let mut hot_guard = hot_guard?;
         fn cursor(state: &State) -> Option<i64> {
             state.checkpoint.as_ref().map(|c| c.cursor.id)
@@ -822,12 +834,18 @@ impl Projection {
                 let synced = self.sync_snapshot(tx, Tier::Cold, state, deadline);
                 timing.cold_sync = at.elapsed();
                 timing.caught_up |= cursor(state) != before;
+                if synced.is_err() {
+                    timing.failed_tier = Some(Tier::Cold);
+                }
                 synced?;
             }
             let (at, before) = (Instant::now(), cursor(&hot_guard));
             let synced = self.sync_snapshot(tx, Tier::Hot, &mut hot_guard, deadline);
             timing.hot_sync = at.elapsed();
             timing.caught_up |= cursor(&hot_guard) != before;
+            if synced.is_err() {
+                timing.failed_tier = Some(Tier::Hot);
+            }
             synced?;
             let owned_hot = {
                 let hot_view = SearchView {

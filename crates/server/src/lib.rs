@@ -851,7 +851,7 @@ async fn recall(
             memories.as_ref().map_or(0, Vec::len),
         );
         // Also on error: an expired deadline is when the stage split matters most.
-        let value = timings.json(&query, started.elapsed());
+        let value = timings.json_outcome(&query, started.elapsed(), memories.as_ref().err());
         recall_timings::log(&value, memories.is_ok());
         Ok((memories, query.explain.then_some(value)))
     })

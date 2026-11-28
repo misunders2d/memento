@@ -300,11 +300,12 @@ impl Retrieval {
         }
     }
     /// EmbeddingGemma query encoding precedes the search lock/SQLite snapshot.
-    fn encode(&self, request: &RecallRequest) -> Result<[f32; 768]> {
+    fn encode(&self, request: &RecallRequest, timings: &RecallTimings) -> Result<[f32; 768]> {
         let text = effective_query(request);
-        self.model
-            .encode_query(&text)
-            .map_err(|_| Error::Unavailable("Native query encoding failed"))
+        let mut timing = memento_embedding::QueryTiming::default();
+        let vector = self.model.encode_query_timed(&text, &mut timing);
+        timings.embedding(&timing);
+        vector.map_err(|_| Error::Unavailable("Native query encoding failed"))
     }
     pub fn recall_vector(
         &self,
@@ -383,6 +384,12 @@ impl Retrieval {
                 },
             );
             timings.index(&wait);
+            timings.cut(
+                if archive { "archive" } else { "hot" },
+                at.elapsed(),
+                &wait,
+                value.is_ok(),
+            );
             timings.count(Count::Passes, 1);
             (value, at)
         };
@@ -560,13 +567,15 @@ impl Retrieval {
         };
         // Entity anchors/connections are recall context, not period-ranked memories.
         let mut clock = Instant::now();
+        // Each stage's time is recorded before its error propagates.
         let named = if period.is_some() {
-            Vec::new()
+            Ok(Vec::new())
         } else {
-            anchors::anchors(db, &request.query, limit, scope)?
+            anchors::anchors(db, &request.query, limit, scope)
         };
-        timings.count(Count::Named, named.len());
         clock = timings.lap(Stage::NameAnchors, clock);
+        let named = named?;
+        timings.count(Count::Named, named.len());
         let mut matches = BTreeMap::<String, Value>::new();
         let mut keyword_targets = HashSet::new();
         let n = if request.automatic {
@@ -589,11 +598,11 @@ impl Retrieval {
             score,
             timings,
         };
-        let (and_targets, or_only, discoveries) =
-            Self::lexical_discovery(&inputs, allowed, &mut matches, &mut keyword_targets)?;
+        let lexical = Self::lexical_discovery(&inputs, allowed, &mut matches, &mut keyword_targets);
+        clock = timings.lap(Stage::Lexical, clock);
+        let (and_targets, or_only, discoveries) = lexical?;
         timings.count(Count::LexicalHits, and_targets.len());
         timings.count(Count::Discovered, discoveries.len());
-        clock = timings.lap(Stage::Lexical, clock);
         hits.extend(discoveries);
         hits.sort_by(|a, b| {
             b.cosine
@@ -601,10 +610,11 @@ impl Retrieval {
                 .then_with(|| a.target.cmp(&b.target))
         });
         timings.count(Count::Hydrated, hits.len());
-        Self::admit_hits(&inputs, hits, &keyword_targets, &mut matches)?;
-        timings.count(Count::Admitted, matches.len());
+        let admitted = Self::admit_hits(&inputs, hits, &keyword_targets, &mut matches);
         clock = timings.lap(Stage::Hydration, clock);
-        validate_text_passages(
+        admitted?;
+        timings.count(Count::Admitted, matches.len());
+        let validated = validate_text_passages(
             db,
             &mut matches,
             limit,
@@ -612,7 +622,11 @@ impl Retrieval {
             score,
             &or_only,
             request.explain,
-        )?;
+        );
+        if validated.is_err() {
+            timings.lap(Stage::Validation, clock);
+        }
+        validated?;
         timings.count(Count::Validated, matches.len());
         let meaningful = matches.values().try_fold(false, |yes, v| {
             Ok::<_, Error>(yes || records::meaningful(db, v)?)
@@ -623,8 +637,12 @@ impl Retrieval {
             && (request.effort != "deep" || request.automatic)
             && matches.len() + named.len() < limit;
         clock = timings.lap(Stage::Validation, clock);
-        if request.effort == "deep" && !request.automatic && scope.is_none() && period.is_none() {
-            Self::add_deep_raw(&inputs, cold_search, deep_raw, n, &mut clock, &mut matches)?;
+        let fallback = if request.effort == "deep"
+            && !request.automatic
+            && scope.is_none()
+            && period.is_none()
+        {
+            Self::add_deep_raw(&inputs, cold_search, deep_raw, n, &mut clock, &mut matches)
         } else if need_archive && archive {
             Self::add_archive_fallback(
                 &inputs,
@@ -632,11 +650,13 @@ impl Retrieval {
                 parked_preview,
                 &mut clock,
                 &mut matches,
-            )?;
+            )
         } else {
             drop(cold_search);
-        }
+            Ok(())
+        };
         clock = timings.lap(Stage::Fallback, clock);
+        fallback?;
         let mut records = Self::finish_rows(&inputs, matches)?;
         records.sort_by(order);
         timings.count(Count::Finished, records.len());
@@ -1586,7 +1606,7 @@ impl Recall for Retrieval {
         timings: &RecallTimings,
     ) -> Result<Vec<Value>> {
         let at = Instant::now();
-        let vector = self.encode(request);
+        let vector = self.encode(request, timings);
         timings.lap(Stage::Embedding, at);
         let vector = vector?;
         check(deadline)?;

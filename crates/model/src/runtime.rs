@@ -375,6 +375,13 @@ impl EmbeddingModel {
     pub fn encode_query(&self, text: &str) -> Result<[f32; DIMENSIONS]> {
         self.foreground().encode_query(text)
     }
+    pub fn encode_query_timed(
+        &self,
+        text: &str,
+        timing: &mut QueryTiming,
+    ) -> Result<[f32; DIMENSIONS]> {
+        self.foreground().encode_query_timed(text, timing)
+    }
     pub fn encode_document(&self, text: &str, title: Option<&str>) -> Result<[f32; DIMENSIONS]> {
         self.background().encode_document(text, title)
     }
@@ -401,14 +408,40 @@ impl EmbeddingModel {
     }
 }
 
+/// Where one foreground query encode spent its wall time. Diagnostics only:
+/// durations and the token count, never text.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryTiming {
+    /// Waiting for the foreground session lock.
+    pub lane_wait: std::time::Duration,
+    pub tokenize: std::time::Duration,
+    pub inference: std::time::Duration,
+    /// Model input length, special tokens included.
+    pub tokens: usize,
+}
 impl ForegroundLane {
     pub fn encode_query(&self, text: &str) -> Result<[f32; DIMENSIONS]> {
-        let mut lane = self
-            .core
-            .foreground
-            .lock()
-            .map_err(|_| Error::PoisonedLane)?;
-        lane.text(self.core.preprocessor.query(text)?)
+        self.encode_query_timed(text, &mut QueryTiming::default())
+    }
+    /// `encode_query` with the same lock/tokenize/inference order, also timed on error.
+    pub fn encode_query_timed(
+        &self,
+        text: &str,
+        timing: &mut QueryTiming,
+    ) -> Result<[f32; DIMENSIONS]> {
+        let at = std::time::Instant::now();
+        let lane = self.core.foreground.lock();
+        timing.lane_wait = at.elapsed();
+        let mut lane = lane.map_err(|_| Error::PoisonedLane)?;
+        let at = std::time::Instant::now();
+        let input = self.core.preprocessor.query(text);
+        timing.tokenize = at.elapsed();
+        let input = input?;
+        timing.tokens = input.input_ids.len();
+        let at = std::time::Instant::now();
+        let vector = lane.text(input);
+        timing.inference = at.elapsed();
+        vector
     }
 }
 impl BackgroundLane {
