@@ -40,8 +40,9 @@ fn explain_reports_stage_timings_and_the_log_line_has_no_request_text() {
     let timings = &body["timings"];
     let mut keys: Vec<&str> = timings.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["automatic", "counts", "cuts", "effort", "failure", "failure_tier", "index_caught_up", "limit", "pass", "scope", "stages_us", "total_us"]);
-    assert_eq!((&timings["failure"], &timings["failure_tier"]), (&Value::Null, &Value::Null));
+    assert_eq!(keys, ["automatic", "counts", "cuts", "effort", "failure", "failure_tier", "index_caught_up", "limit", "pass", "scope", "stages_us", "status", "total_us"]);
+    assert_eq!((&timings["failure"], &timings["failure_tier"], &timings["status"]), (&Value::Null, &Value::Null, &json!("complete")));
+    assert!(body.get("recall_status").is_none() && plain.get("recall_status").is_none());
     assert_eq!(timings["cuts"].as_array().unwrap().len(), 1);
     assert_eq!((&timings["cuts"][0]["pass"], &timings["cuts"][0]["ok"]), (&json!("hot"), &json!(true)));
     for (group, expected) in [("stages_us", STAGES), ("counts", COUNTS)] {
@@ -86,7 +87,7 @@ fn explain_reports_stage_timings_and_the_log_line_has_no_request_text() {
     let line = LOGGED.lock().unwrap().iter().rev()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .find(|line| line["ok"] == false).expect("failed recall is logged");
-    assert_eq!((&line["timings"]["failure"], &line["timings"]["failure_tier"]), (&json!("index_unavailable"), &json!("cold")), "{failed} {line}");
+    assert_eq!((&line["timings"]["failure"], &line["timings"]["failure_tier"], &line["timings"]["status"]), (&json!("index_unavailable"), &json!("cold"), &json!("failed")), "{failed} {line}");
     assert_eq!(line["timings"]["cuts"][1]["ok"], false);
     // The log line is exactly the response object; no request text reaches it.
     let logged = LOGGED.lock().unwrap().clone();

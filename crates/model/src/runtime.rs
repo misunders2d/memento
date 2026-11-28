@@ -382,6 +382,14 @@ impl EmbeddingModel {
     ) -> Result<[f32; DIMENSIONS]> {
         self.foreground().encode_query_timed(text, timing)
     }
+    pub fn encode_query_until(
+        &self,
+        text: &str,
+        deadline: Option<std::time::Instant>,
+        timing: &mut QueryTiming,
+    ) -> Result<[f32; DIMENSIONS]> {
+        self.foreground().encode_query_until(text, deadline, timing)
+    }
     pub fn encode_document(&self, text: &str, title: Option<&str>) -> Result<[f32; DIMENSIONS]> {
         self.background().encode_document(text, title)
     }
@@ -429,10 +437,34 @@ impl ForegroundLane {
         text: &str,
         timing: &mut QueryTiming,
     ) -> Result<[f32; DIMENSIONS]> {
+        self.encode_query_until(text, None, timing)
+    }
+    /// Deadline-aware admission: waiting for a busy foreground lane stops at `deadline`
+    /// (`Error::Deadline`); an admitted inference is not interrupted.
+    pub fn encode_query_until(
+        &self,
+        text: &str,
+        deadline: Option<std::time::Instant>,
+        timing: &mut QueryTiming,
+    ) -> Result<[f32; DIMENSIONS]> {
         let at = std::time::Instant::now();
-        let lane = self.core.foreground.lock();
+        let lane = match deadline {
+            None => self.core.foreground.lock().map_err(|_| Error::PoisonedLane),
+            Some(deadline) => loop {
+                match self.core.foreground.try_lock() {
+                    Ok(lane) => break Ok(lane),
+                    Err(std::sync::TryLockError::Poisoned(_)) => break Err(Error::PoisonedLane),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if std::time::Instant::now() >= deadline {
+                            break Err(Error::Deadline);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            },
+        };
         timing.lane_wait = at.elapsed();
-        let mut lane = lane.map_err(|_| Error::PoisonedLane)?;
+        let mut lane = lane?;
         let at = std::time::Instant::now();
         let input = self.core.preprocessor.query(text);
         timing.tokenize = at.elapsed();

@@ -7,7 +7,7 @@ edition = "2024"
 rust-version = "1.98"
 
 [workspace.dependencies]
-rusqlite = { version = "=0.37.0", features = ["bundled", "functions", "backup", "blob"] }
+rusqlite = { version = "=0.37.0", features = ["bundled", "functions", "backup", "blob", "hooks"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["preserve_order", "arbitrary_precision"] }
 chrono = { version = "=0.4.45", features = ["serde"] }

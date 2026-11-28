@@ -827,7 +827,8 @@ impl Projection {
             state.checkpoint.as_ref().map(|c| c.cursor.id)
         }
         let at = Instant::now();
-        self.store.read(|tx| {
+        // SQL inside the cut is interrupted at the request deadline as well.
+        self.store.read_until(deadline, |tx| {
             timing.open = at.elapsed();
             if let Some(state) = cold_guard.as_mut() {
                 let (at, before) = (Instant::now(), cursor(state));
@@ -899,7 +900,7 @@ impl Projection {
         } else {
             None
         };
-        self.store.read(|tx| {
+        self.store.read_until(deadline, |tx| {
             if let Some(state) = cold_guard.as_mut() {
                 self.sync_snapshot(tx, Tier::Cold, state, deadline)?;
             }
@@ -915,6 +916,12 @@ impl Projection {
             check(Some(deadline))?;
             Ok(value)
         })
+    }
+}
+impl Projection {
+    /// The authority this projection derives from.
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 }
 impl SearchView<'_> {

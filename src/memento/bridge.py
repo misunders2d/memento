@@ -896,7 +896,11 @@ def recall_fetch(config, request, timeout):
             version=version if suggestion and isinstance(memory['id'], str) and len(identifier) <= 64
                     and type(version) is int and version > 0 else None))
     revision = result.get('client_revision')
-    return dict(items=items, revision=revision if isinstance(revision, str) and len(revision) == 64 else None)
+    # A knowingly partial service result (e.g. archive search failed) stays partial in delivery.
+    status = result.get('recall_status')
+    partial = status if isinstance(status, str) and status != 'complete' else None
+    return dict(items=items, revision=revision if isinstance(revision, str) and len(revision) == 64 else None,
+                **({'incomplete': partial[:64]} if partial else {}))
 
 
 def recall_offer(spool, conversation, query, result, *, budget, notice_in_context, harness, delayed=False, step=False):
@@ -911,6 +915,10 @@ def recall_offer(spool, conversation, query, result, *, budget, notice_in_contex
         excerpt = query.encode('utf-8')[:160].decode('utf-8', 'ignore')
         lines.append('Delayed recall for an earlier request: ' + json.dumps(excerpt, ensure_ascii=False) +
                      (' [excerpt]' if excerpt != query else '') + '. Check applicability to the current request.')
+    if result.get('incomplete'):
+        # Never presented as complete recall, even with no item that fits.
+        lines.append('Recall incomplete (' + result['incomplete'] + '): part of memory search failed; '
+                     'this context may be partial.')
     shown, exposure, rendered = [], [], []
     for item in result['items']:
         # Coverage first: every item is rendered whole in rank order, or skipped.
@@ -927,7 +935,7 @@ def recall_offer(spool, conversation, query, result, *, budget, notice_in_contex
         extra = ' Rationale: ' + item['rationale']
         if item['suggestion'] and item['rationale'] and len(('\n'.join(lines) + extra).encode('utf-8')) <= budget:
             lines[index] += extra
-    context = '\n'.join(lines) if shown else ''
+    context = '\n'.join(lines) if shown or result.get('incomplete') else ''
     if not step:
         spool.db.execute('''INSERT INTO recall_cache(conversation,query,context,shown,updated) VALUES(?,?,?,?,?)
             ON CONFLICT(conversation) DO UPDATE SET query=excluded.query,context=excluded.context,
@@ -1192,7 +1200,8 @@ def _automatic(spool, conversation, query, cwd=None, *, budget, notice_in_contex
                 save_recall_state(spool, conversation, state)
                 # One query per offer: current nonempty results supersede the
                 # old offer; healthy-empty results may use that delayed fallback.
-                selected = delayed if delayed and not completed.get('error') and not completed['items'] else completed
+                selected = (delayed if delayed and not completed.get('error') and not completed['items']
+                            and not completed.get('incomplete') else completed)
                 selected_query = selected['query'] if selected is delayed else query
                 offered = (recall_offer(spool, conversation, selected_query, selected,
                             delayed=selected is delayed, **options) if not selected.get('error') else None)

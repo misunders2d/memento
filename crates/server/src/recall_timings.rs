@@ -86,6 +86,8 @@ pub struct RecallTimings {
     // One entry per snapshot cut, in order: (pass, wall, index wait, ok, failed tier).
     cuts: std::cell::RefCell<Vec<Value>>,
     failure_tier: Cell<Option<&'static str>>,
+    // A successful response that is knowingly partial: (status, failure class of the missing part).
+    incomplete: Cell<Option<(&'static str, &'static str)>>,
 }
 impl Default for RecallTimings {
     fn default() -> Self {
@@ -96,6 +98,7 @@ impl Default for RecallTimings {
             caught_up: Cell::new(false),
             cuts: Default::default(),
             failure_tier: Cell::new(None),
+            incomplete: Cell::new(None),
         }
     }
 }
@@ -106,6 +109,8 @@ pub fn failure_class(error: &memento_core::Error) -> &'static str {
         Error::Validation(_) => "validation",
         Error::Unavailable(m) => match *m {
             memento_ann::DEADLINE
+            | memento_core::store::READ_DEADLINE
+            | "Native query encoding deadline expired"
             | "Semantic search deadline expired"
             | "Text passage scoring deadline expired" => "deadline",
             memento_ann::LAGGING => "index_lag",
@@ -164,6 +169,18 @@ impl RecallTimings {
             "failed_tier": tier,
         }));
     }
+    /// Marks a returned result as partial, e.g. Hot context kept after the archive cut failed.
+    pub fn incomplete(&self, status: &'static str, class: &'static str) {
+        self.incomplete.set(Some((status, class)));
+    }
+    /// `complete`, or the partial status set by `incomplete`.
+    pub fn status(&self) -> &'static str {
+        self.incomplete.get().map_or("complete", |(status, _)| status)
+    }
+    /// Failure class of the missing part of a partial result.
+    pub fn incomplete_class(&self) -> Option<&'static str> {
+        self.incomplete.get().map(|(_, class)| class)
+    }
     pub fn embedding(&self, timing: &memento_embedding::QueryTiming) {
         self.add(Stage::EmbeddingLaneWait, timing.lane_wait);
         self.add(Stage::EmbeddingTokenize, timing.tokenize);
@@ -190,8 +207,9 @@ impl RecallTimings {
         error: Option<&memento_core::Error>,
     ) -> Value {
         let mut value = self.json(request, total);
-        value["failure"] = json!(error.map(failure_class));
-        value["failure_tier"] = json!(error.and(self.failure_tier.get()));
+        value["failure"] = json!(error.map(failure_class).or(self.incomplete_class()));
+        value["failure_tier"] = json!(self.failure_tier.get().filter(|_| error.is_some() || self.incomplete.get().is_some()));
+        value["status"] = json!(if error.is_some() { "failed" } else { self.status() });
         value
     }
     pub fn json(&self, request: &RecallRequest, total: Duration) -> Value {

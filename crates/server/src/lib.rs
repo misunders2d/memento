@@ -814,7 +814,7 @@ async fn recall(
     let revision = state.assets.revision.clone();
     let started = Instant::now();
     let deadline = started + std::time::Duration::from_secs(if query.automatic { 15 } else { 30 });
-    let (memories, timings) = blocking(move || {
+    let memories = blocking(move || {
         let timings = RecallTimings::default();
         timings.lap(recall_timings::Stage::Queue, started);
         timings.count(
@@ -853,10 +853,17 @@ async fn recall(
         // Also on error: an expired deadline is when the stage split matters most.
         let value = timings.json_outcome(&query, started.elapsed(), memories.as_ref().err());
         recall_timings::log(&value, memories.is_ok());
-        Ok((memories, query.explain.then_some(value)))
+        let partial = timings.incomplete_class().map(|class| (timings.status(), class));
+        Ok((memories, query.explain.then_some(value), partial))
     })
     .await?;
+    let (memories, timings, partial) = memories;
     let mut body = json!({"client_revision":revision,"memories":memories.map_err(ApiError)?});
+    // Additive: a knowingly partial result says so; clients must not present it as complete.
+    if let Some((status, class)) = partial {
+        body["recall_status"] = json!(status);
+        body["recall_failure"] = json!(class);
+    }
     if let Some(timings) = timings {
         body["timings"] = timings;
     }

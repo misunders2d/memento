@@ -10,6 +10,8 @@ pub enum Error {
     Tokenizer(String),
     #[error("embedding lane lock was poisoned")]
     PoisonedLane,
+    #[error("embedding request deadline expired before the lane was free")]
+    Deadline,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

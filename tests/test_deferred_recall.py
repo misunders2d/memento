@@ -542,3 +542,22 @@ process.stdin.destroy();
         if process.poll() is None:
             process.terminate()
             process.communicate(timeout=3)
+
+
+def test_incomplete_service_result_is_delivered_as_partial_never_complete_or_healthy_empty(client, monkeypatch):
+    # J4: the service keeps Hot context when its archive cut fails and marks it partial.
+    monkeypatch.setattr(bridge, 'RECALL_WAIT', 2)
+    fact = dict(id='anchor', version=1, category='entity_context', text='Odile Brack [person; personal] No recorded connections.')
+    client.routes['has Odile Brack written'] = None, {
+        'memories': [fact], 'recall_status': 'archive_incomplete', 'recall_failure': 'index_unavailable'}
+    partial = bridge.automatic(client.spool, 's', 'has Odile Brack written', harness='pi')
+    assert 'Recall incomplete (archive_incomplete)' in partial['context']
+    assert 'Odile Brack' in partial['context'] and partial['shown'] == ['anchor']
+    # With nothing renderable the partial notice still reaches the agent: not healthy-empty.
+    client.routes['nothing fits'] = None, {'memories': [], 'recall_status': 'archive_incomplete'}
+    empty = bridge.automatic(client.spool, 's2', 'nothing fits', harness='pi')
+    assert 'Recall incomplete (archive_incomplete)' in empty['context'] and empty['shown'] == []
+    # A complete result renders exactly as before, with no partial marker.
+    client.routes['complete one'] = None, {'memories': [fact], 'recall_status': 'complete'}
+    complete = bridge.automatic(client.spool, 's3', 'complete one', harness='pi')
+    assert 'Recall incomplete' not in complete['context'] and complete['shown'] == ['anchor']

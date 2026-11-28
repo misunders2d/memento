@@ -300,12 +300,25 @@ impl Retrieval {
         }
     }
     /// EmbeddingGemma query encoding precedes the search lock/SQLite snapshot.
-    fn encode(&self, request: &RecallRequest, timings: &RecallTimings) -> Result<[f32; 768]> {
+    fn encode(
+        &self,
+        request: &RecallRequest,
+        deadline: Instant,
+        timings: &RecallTimings,
+    ) -> Result<[f32; 768]> {
         let text = effective_query(request);
         let mut timing = memento_embedding::QueryTiming::default();
-        let vector = self.model.encode_query_timed(&text, &mut timing);
+        // A busy foreground lane is waited for only until the request deadline.
+        let vector = self
+            .model
+            .encode_query_until(&text, Some(deadline), &mut timing);
         timings.embedding(&timing);
-        vector.map_err(|_| Error::Unavailable("Native query encoding failed"))
+        vector.map_err(|e| match e {
+            memento_embedding::Error::Deadline => {
+                Error::Unavailable("Native query encoding deadline expired")
+            }
+            _ => Error::Unavailable("Native query encoding failed"),
+        })
     }
     pub fn recall_vector(
         &self,
@@ -403,9 +416,80 @@ impl Retrieval {
             let (value, at) = cut(true);
             timings.lap(Stage::ArchivePass, at);
             timings.pass("archive");
-            results = value?.0;
+            match value {
+                Ok((rows, _)) => results = rows,
+                // Automatic recall keeps the already ranked Hot context when the archive cut
+                // fails, marked incomplete; it never becomes healthy-empty or complete.
+                // Nothing usable from Hot keeps the failure. Explicit recall is unchanged.
+                Err(error) if request.automatic && !results.is_empty() => {
+                    let rows = Self::revalidate(projection.store(), results)?;
+                    if rows.is_empty() {
+                        return Err(error);
+                    }
+                    timings.incomplete("archive_incomplete", crate::recall_timings::failure_class(&error));
+                    results = rows;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(results)
+    }
+    /// Hot rows kept past a failed archive cut are re-read on a fresh authority cut:
+    /// a forget, decision or revision committed meanwhile removes the row or connection.
+    fn revalidate(store: &Store, rows: Vec<Value>) -> Result<Vec<Value>> {
+        store.read(|tx| {
+            let db = tx.sql();
+            let forgotten = |id: &str| -> Result<bool> {
+                Ok(db
+                    .query_row("SELECT 1 FROM forgotten_targets WHERE target=?", [id], |_| Ok(()))
+                    .optional()?
+                    .is_some())
+            };
+            let current = |row: &Value| -> Result<bool> {
+                let id = key(row);
+                if id.is_empty() || forgotten(id)? {
+                    return Ok(false);
+                }
+                if row["tier"] == "candidate" {
+                    return Ok(db
+                        .query_row(
+                            &format!("SELECT 1 FROM candidates c WHERE c.id=? AND {}", crate::query_rows::ACTIVE_CANDIDATE),
+                            [id],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some());
+                }
+                match row["version"].as_i64() {
+                    Some(version) => Ok(db
+                        .query_row(
+                            "SELECT max(version) FROM node_versions WHERE id=?",
+                            [id],
+                            |r| r.get::<_, Option<i64>>(0),
+                        )?
+                        == Some(version)),
+                    // Rows without a node version (raw/reference) keep the forget check only.
+                    None => Ok(true),
+                }
+            };
+            let mut kept = Vec::new();
+            for mut row in rows {
+                if !current(&row)? {
+                    continue;
+                }
+                if let Some(connections) = row["connections"].as_array().cloned() {
+                    let mut live = Vec::new();
+                    for c in connections {
+                        if !c["id"].as_str().is_some_and(|id| forgotten(id).unwrap_or(true)) {
+                            live.push(c);
+                        }
+                    }
+                    row["connections"] = json!(live);
+                }
+                kept.push(row);
+            }
+            Ok(kept)
+        })
     }
     #[cfg(test)]
     fn current(
@@ -1606,7 +1690,7 @@ impl Recall for Retrieval {
         timings: &RecallTimings,
     ) -> Result<Vec<Value>> {
         let at = Instant::now();
-        let vector = self.encode(request, timings);
+        let vector = self.encode(request, deadline, timings);
         timings.lap(Stage::Embedding, at);
         let vector = vector?;
         check(deadline)?;

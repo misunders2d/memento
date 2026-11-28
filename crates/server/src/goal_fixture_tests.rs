@@ -156,6 +156,7 @@ fn gf_report(spec: &GoalCase, rows: &Result<Vec<Value>>, timings: &Value) -> Val
     let report = json!({
         "case": spec.case,
         "ok": rows.is_ok(),
+        "status": timings["status"],
         "failure": timings["failure"],
         "failure_tier": timings["failure_tier"],
         "pass": timings["pass"],
@@ -419,4 +420,52 @@ fn goal_fixture_report() {
     // Never healthy-empty when the archive tier needed for completeness is down.
     let r = gf_case(&reports, "cold_down_hot_empty");
     assert_eq!(r["ok"], false, "{r}");
+    // J4: a failed or stalled archive cut keeps the Hot entity context, marked incomplete.
+    for (case, class) in [("cold_down_hot_labels_only", "index_unavailable"), ("cold_stall_hot_labels_only", "deadline")] {
+        let r = gf_case(&reports, case);
+        assert_eq!(
+            (r["ok"].as_bool(), r["entity_hit"].as_bool(), r["status"].as_str(), r["failure"].as_str(), r["failure_tier"].as_str()),
+            (Some(true), Some(true), Some("archive_incomplete"), Some(class), Some("cold")),
+            "{r}"
+        );
+    }
+    // Complete answers stay complete.
+    for case in ["named", "semantic_only", "cold_down_hot_useful"] {
+        assert_eq!(gf_case(&reports, case)["status"], "complete");
+    }
+}
+#[test]
+fn j4_kept_hot_rows_are_revalidated_against_forget_and_revision() {
+    let mut f = Fixture::new();
+    let (p, fact) = gf_person_with_fact(&mut f, "Odile Brack", "Odile Brack keeps the tide tables", "personal");
+    let other = f.add("Odile Brack", "person", "2026-01-01T00:00:00Z", 0.5, 0.1, "personal");
+    gf_rebuild(&f, false);
+    let (rows, t) = gf_recall(&f, "has Odile Brack written", "", None, 5 * SECOND);
+    let rows = rows.unwrap();
+    assert_eq!(t["status"], "archive_incomplete", "{t}");
+    assert!(rows.iter().any(|r| r["id"] == p.as_str() && gf_connections(r).contains(&fact)));
+    assert!(rows.iter().any(|r| r["id"] == other.as_str()));
+    // A forget of one anchor and of the other's connected fact land after the Hot cut.
+    f.store
+        .write(|tx| {
+            tx.sql().execute("INSERT INTO forgotten_targets VALUES(?,'gf-c','node')", [&other])?;
+            tx.sql().execute("INSERT INTO forgotten_targets VALUES(?,'gf-c','node')", [&fact])?;
+            Ok(())
+        })
+        .unwrap();
+    let kept = Retrieval::revalidate(&f.store, rows.clone()).unwrap();
+    assert!(kept.iter().all(|r| r["id"] != other.as_str()));
+    let anchor = kept.iter().find(|r| r["id"] == p.as_str()).unwrap();
+    assert!(!gf_connections(anchor).contains(&fact));
+    // A newer version of a kept row removes it too.
+    let mut stale = rows[0].clone();
+    stale["version"] = json!(stale["version"].as_i64().unwrap() - 1);
+    assert!(Retrieval::revalidate(&f.store, vec![stale]).unwrap().is_empty());
+    // Explicit (non-automatic) recall keeps today's failure on the same Cold outage.
+    let mut vector = [0f32; 768];
+    vector[0] = 1.;
+    let explicit = RecallRequest { query: "has Odile Brack written".into(), effort: "cheap".into(), limit: 6, ..Default::default() };
+    let score = |documents: &[&str], _: Instant| Ok(vec![1.; documents.len()]);
+    let result = Retrieval::passes(&f.projection, &explicit, &vector, Instant::now() + 5 * SECOND, &score, &RecallTimings::default());
+    assert!(result.is_err());
 }

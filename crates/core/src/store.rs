@@ -15,6 +15,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
+/// A deadline-bounded read was interrupted inside SQLite.
+pub const READ_DEADLINE: &str = "Read deadline expired";
 fn nonce() -> String {
     Uuid::new_v4().simple().to_string()
 }
@@ -238,28 +240,59 @@ impl Store {
         &self.directory
     }
     pub fn read<T>(&self, apply: impl FnOnce(&ReadTxn<'_>) -> Result<T>) -> Result<T> {
+        self.read_with(None, apply)
+    }
+    /// `read` whose SQL is interrupted once `deadline` passes (SQLite progress handler).
+    /// The connection is per call, so an interrupt never reaches the next read.
+    pub fn read_until<T>(
+        &self,
+        deadline: std::time::Instant,
+        apply: impl FnOnce(&ReadTxn<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.read_with(Some(deadline), apply)
+    }
+    fn read_with<T>(
+        &self,
+        deadline: Option<std::time::Instant>,
+        apply: impl FnOnce(&ReadTxn<'_>) -> Result<T>,
+    ) -> Result<T> {
         let db = Connection::open_with_flags(
             self.directory.join("memory.sqlite"),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         raw::register(&db, Arc::new(Mutex::new(Default::default())))?;
         db.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=2000; BEGIN;")?;
+        if let Some(deadline) = deadline {
+            db.progress_handler(1000, Some(move || std::time::Instant::now() >= deadline));
+        }
+        let interrupted = |error: Error| match &error {
+            Error::Storage(e)
+                if e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) =>
+            {
+                Error::Unavailable(READ_DEADLINE)
+            }
+            _ => error,
+        };
         // The first actual SELECT pins this request's WAL cut.
-        let source = db.query_row(
-            "SELECT db_uuid,generation FROM runtime_state WHERE singleton=1",
-            [],
-            |r| {
-                Ok(SourceCut {
-                    db_uuid: r.get(0)?,
-                    generation: r.get(1)?,
-                })
-            },
-        )?;
+        let source = db
+            .query_row(
+                "SELECT db_uuid,generation FROM runtime_state WHERE singleton=1",
+                [],
+                |r| {
+                    Ok(SourceCut {
+                        db_uuid: r.get(0)?,
+                        generation: r.get(1)?,
+                    })
+                },
+            )
+            .map_err(|e| interrupted(e.into()))?;
         let result = apply(&ReadTxn {
             sql: &db,
             directory: &self.directory,
             source,
-        });
+        })
+        .map_err(interrupted);
+        db.progress_handler(0, None::<fn() -> bool>);
         db.execute_batch("ROLLBACK")?;
         result
     }
